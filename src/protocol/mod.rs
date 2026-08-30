@@ -16,6 +16,7 @@
 
 pub mod capability;
 pub mod command;
+pub mod config;
 pub mod envelope;
 pub mod event;
 pub mod methods;
