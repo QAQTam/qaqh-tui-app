@@ -3,6 +3,7 @@
 pub mod composer;
 pub mod modal;
 pub mod overlays;
+pub mod settings;
 pub mod sidebar;
 pub mod status_bar;
 pub mod tab_bar;

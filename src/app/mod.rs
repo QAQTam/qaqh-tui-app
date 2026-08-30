@@ -6,6 +6,7 @@
 pub mod render_line;
 pub mod render_transcript;
 pub mod session;
+pub mod settings;
 pub mod timeline_model;
 
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -17,6 +18,7 @@ use ratatui::crossterm::event::{KeyEvent, MouseEvent};
 use crate::protocol::command::{
     ConversationCommand, ControlCommand, RingingCommand, ToolCommand,
 };
+use crate::protocol::config::ConfigDto;
 use crate::protocol::envelope::{CommandState, RingingCommandStatus};
 use crate::protocol::event::{
     ActivityState, AskResolution, ContentRef, ConversationEvent, ControlEvent, NoticeLevel,
@@ -88,29 +90,13 @@ pub enum ConfirmAction {
 #[derive(Debug, Clone)]
 pub enum Overlay {
     SessionList { selected: usize, show_archived: bool },
-    Config,
+    Settings(settings::SettingsState),
     Help,
     AttachPath { input: Vec<char>, cursor: usize, seed: String },
     Confirm { action: ConfirmAction },
 }
 
-/// config.load 的展示视图（camelCase DTO，宽松解析）。
-#[derive(Debug, Clone)]
-pub struct ConfigView {
-    pub raw: serde_json::Value,
-}
-
-impl ConfigView {
-    pub fn field(&self, key: &str) -> String {
-        match self.raw.get(key) {
-            Some(serde_json::Value::String(s)) => s.clone(),
-            Some(serde_json::Value::Number(n)) => n.to_string(),
-            Some(serde_json::Value::Bool(b)) => b.to_string(),
-            Some(serde_json::Value::Null) | None => "—".into(),
-            Some(other) => other.to_string(),
-        }
-    }
-}
+use self::settings::{FieldKind, SettingsState};
 
 pub struct App {
     pub quit: bool,
@@ -133,7 +119,10 @@ pub struct App {
     pub session_list_cache: Vec<SessionMetaView>,
     pub session_list_at: Option<Instant>,
     pub activity_cache: HashMap<String, ActivityState>,
-    pub config: Option<ConfigView>,
+    /// config.load 的 typed 快照（ConfigDto 镜像；ConfigChanged 到达时重拉）。
+    pub config: Option<ConfigDto>,
+    /// settings 保存请求在途标记（防 config.save 双发——事故 R4）。
+    pub settings_saving: bool,
     pub show_reasoning: bool,
     /// 右侧 workspace 面板开关（F4；窄终端自动隐藏）。
     pub show_workspace: bool,
@@ -172,6 +161,7 @@ impl App {
             session_list_at: None,
             activity_cache: HashMap::new(),
             config: None,
+            settings_saving: false,
             show_reasoning: false,
             show_workspace: true,
             tracked_seeds: HashSet::new(),
@@ -243,6 +233,18 @@ impl App {
                 }
             }
             return;
+        }
+        // 设置页编辑态：粘贴进当前字段缓冲。
+        if let Some(Overlay::Settings(st)) = self.overlays.last_mut() {
+            if let Some(buf) = st.editing.as_mut() {
+                for ch in text.chars() {
+                    if ch != '\n' && ch != '\r' {
+                        buf.buf.insert(buf.cursor.min(buf.buf.len()), ch);
+                        buf.cursor += 1;
+                    }
+                }
+                return;
+            }
         }
         let Some(sess) = self.active_session_mut() else { return };
         if let Some(panel) = sess.pending_ask.as_mut() {
@@ -415,8 +417,14 @@ impl App {
                 self.session_list_at = None;
             }
             ControlEvent::ConfigChanged { .. } => {
-                self.config = None; // 打开配置面板时重拉
-                if self.overlays.iter().any(|o| matches!(o, Overlay::Config)) {
+                // 任何 config.*/profile.* 写路径的广播（seed=""）：重拉 typed 快照，
+                // 保留设置页草稿（脏字段展示优先于 loaded——B5 回声教训），
+                // 并复位端口候选（应用后跟随服务端现值）。
+                if let Some(Overlay::Settings(st)) = self.overlays.last_mut() {
+                    st.profile_sel = None;
+                    st.ws_sel = None;
+                }
+                if self.overlays.iter().any(|o| matches!(o, Overlay::Settings(_))) {
                     self.fetch_config();
                 }
             }
@@ -718,15 +726,32 @@ impl App {
                 }
             }
             ActionResult::SessionActivity(Err(_)) => {}
-            ActionResult::ConfigLoaded(Ok(v)) => {
-                self.config = Some(ConfigView { raw: v });
-            }
+            ActionResult::ConfigLoaded(Ok(v)) => match serde_json::from_value::<ConfigDto>(v) {
+                Ok(dto) => self.config = Some(dto),
+                Err(e) => self.toast(NoticeLevel::Error, format!("config.load 解析失败: {e}")),
+            },
             ActionResult::ConfigLoaded(Err(e)) => {
                 self.toast(NoticeLevel::Error, format!("config.load: {e}"));
             }
             ActionResult::ConfigWrite { label, result } => match result {
-                Ok(_) => self.toast(NoticeLevel::Info, format!("{label} 已保存")),
-                Err(e) => self.toast(NoticeLevel::Error, format!("{label}: {e}")),
+                Ok(_) => {
+                    self.toast(NoticeLevel::Info, format!("{label} 已保存"));
+                    if label == "设置" {
+                        // 保存成功：清草稿（loaded 由 ConfigChanged 重拉替换，
+                        // 此处显式重拉一次兜底 SSE 延迟）。
+                        self.settings_saving = false;
+                        if let Some(Overlay::Settings(st)) = self.overlays.last_mut() {
+                            st.draft = settings::SettingsState::default().draft;
+                        }
+                        self.fetch_config();
+                    }
+                }
+                Err(e) => {
+                    if label == "设置" {
+                        self.settings_saving = false;
+                    }
+                    self.toast(NoticeLevel::Error, format!("{label}: {e}"));
+                }
             },
             ActionResult::Uploaded { seed, path, result } => match result {
                 Ok(content) => {
@@ -1223,6 +1248,124 @@ impl App {
         });
     }
 
+    /// `config.save`：把设置页草稿作为 Merge Patch 发送（只发脏字段）。
+    fn save_settings(&mut self, st: &mut SettingsState) {
+        if self.settings_saving {
+            return;
+        }
+        if st.draft.is_empty() {
+            self.toast(NoticeLevel::Info, "设置无改动");
+            return;
+        }
+        if let Err(e) = st.draft.validate() {
+            self.toast(NoticeLevel::Error, format!("校验失败：{e}"));
+            return;
+        }
+        self.settings_saving = true;
+        let client = self.client.clone();
+        let tx = self.msg_tx.clone();
+        let payload = st.draft.to_json();
+        tokio::spawn(async move {
+            let result = client
+                .service(methods::CONFIG_SAVE, &payload)
+                .await
+                .map_err(|e| e.to_string());
+            let _ = tx.send(AppMsg::Action(ActionResult::ConfigWrite { label: "设置", result }));
+        });
+    }
+
+    /// 端口字段回车：即时走各自的单写口（不进草稿）。
+    fn settings_port_activate(&mut self, st: &mut SettingsState) {
+        match st.row().id {
+            settings::FieldId::PermissionLevel => {
+                self.toast(NoticeLevel::Info, "聚焦权限级别后按 1-4 即时生效");
+            }
+            settings::FieldId::ActiveProfile => {
+                let name = st
+                    .profile_sel
+                    .clone()
+                    .or_else(|| self.config.as_ref().map(|c| c.active_profile.clone()));
+                if let Some(name) = name {
+                    self.apply_profile(name);
+                }
+            }
+            settings::FieldId::WorkspaceMode => {
+                let mode = st
+                    .ws_sel
+                    .clone()
+                    .or_else(|| self.config.as_ref().map(|c| c.workspace.mode.clone()));
+                if let Some(mode) = mode {
+                    self.set_workspace_mode(mode);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// 端口字段 ←→：切换候选（回车才真正应用）。
+    fn settings_port_cycle(&mut self, st: &mut SettingsState, delta: i32) {
+        match st.row().id {
+            settings::FieldId::ActiveProfile => {
+                let Some(cfg) = self.config.as_ref() else { return };
+                if cfg.profiles.is_empty() {
+                    return;
+                }
+                let cur = st
+                    .profile_sel
+                    .clone()
+                    .unwrap_or_else(|| cfg.active_profile.clone());
+                let idx = cfg.profiles.iter().position(|n| *n == cur).unwrap_or(0);
+                let next = (idx as i32 + delta).rem_euclid(cfg.profiles.len() as i32) as usize;
+                st.profile_sel = Some(cfg.profiles[next].clone());
+            }
+            settings::FieldId::WorkspaceMode => {
+                // local（全平台）/ wsl（仅 Windows）——与后端 workspace.set_mode 校验一致。
+                let modes: &[&str] = if cfg!(windows) { &["local", "wsl"] } else { &["local"] };
+                let cur = st
+                    .ws_sel
+                    .clone()
+                    .or_else(|| self.config.as_ref().map(|c| c.workspace.mode.clone()))
+                    .unwrap_or_else(|| "local".into());
+                let idx = modes.iter().position(|m| *m == cur).unwrap_or(0);
+                let next = (idx as i32 + delta).rem_euclid(modes.len() as i32) as usize;
+                st.ws_sel = Some(modes[next].to_string());
+            }
+            _ => {}
+        }
+    }
+
+    /// `profile.apply`：切换活跃 profile（服务端单写口，写后广播 reload）。
+    pub fn apply_profile(&mut self, name: String) {
+        let client = self.client.clone();
+        let tx = self.msg_tx.clone();
+        tokio::spawn(async move {
+            let result = client
+                .service(methods::PROFILE_APPLY, &serde_json::json!({ "name": name }))
+                .await
+                .map_err(|e| e.to_string());
+            let _ = tx.send(AppMsg::Action(ActionResult::ConfigWrite {
+                label: "应用 Profile",
+                result,
+            }));
+        });
+    }
+
+    /// `workspace.set_mode`：local / wsl（仅 Windows）（服务端单写口）。
+    pub fn set_workspace_mode(&mut self, mode: String) {
+        let client = self.client.clone();
+        let tx = self.msg_tx.clone();
+        tokio::spawn(async move {
+            let result = client
+                .service(methods::WORKSPACE_SET_MODE, &serde_json::json!({ "mode": mode }))
+                .await
+                .map_err(|e| e.to_string());
+            let _ = tx.send(AppMsg::Action(ActionResult::ConfigWrite {
+                label: "workspace 模式",
+                result,
+            }));
+        });
+    }
+
     pub fn set_permission_level(&mut self, level: u8) {
         let client = self.client.clone();
         let tx = self.msg_tx.clone();
@@ -1365,7 +1508,7 @@ impl App {
                 return;
             }
             KeyCode::Char(',') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.toggle_config();
+                self.toggle_settings();
                 return;
             }
             KeyCode::F(1) => {
@@ -1462,15 +1605,15 @@ impl App {
         self.overlays.push(Overlay::SessionList { selected: 0, show_archived: false });
     }
 
-    pub fn toggle_config(&mut self) {
-        let open = self.overlays.last().is_some_and(|o| matches!(o, Overlay::Config));
+    pub fn toggle_settings(&mut self) {
+        let open = self.overlays.last().is_some_and(|o| matches!(o, Overlay::Settings(_)));
         if open {
             self.overlays.pop();
         } else {
             if self.config.is_none() {
                 self.fetch_config();
             }
-            self.overlays.push(Overlay::Config);
+            self.overlays.push(Overlay::Settings(SettingsState::default()));
         }
     }
 
@@ -1773,18 +1916,112 @@ impl App {
                 self.overlays.pop();
                 return true;
             }
-            Overlay::Config => {
+            Overlay::Settings(mut st) => {
+                use ratatui::crossterm::event::KeyCode;
+                // ── 编辑态：按键全部进缓冲 ──
+                if st.editing.is_some() {
+                    let mut buf = st.editing.take().expect("checked");
+                    match key.code {
+                        KeyCode::Esc => {} // 取消：editing 保持 None
+                        KeyCode::Enter => {
+                            if let Err(e) = st.commit_edit(self.config.as_ref(), buf) {
+                                self.toast(NoticeLevel::Error, e);
+                            }
+                        }
+                        KeyCode::Backspace => {
+                            if buf.cursor > 0 {
+                                buf.cursor -= 1;
+                                buf.buf.remove(buf.cursor);
+                            }
+                            st.editing = Some(buf);
+                        }
+                        KeyCode::Delete => {
+                            if buf.cursor < buf.buf.len() {
+                                buf.buf.remove(buf.cursor);
+                            }
+                            st.editing = Some(buf);
+                        }
+                        KeyCode::Left => {
+                            buf.cursor = buf.cursor.saturating_sub(1);
+                            st.editing = Some(buf);
+                        }
+                        KeyCode::Right => {
+                            if buf.cursor < buf.buf.len() {
+                                buf.cursor += 1;
+                            }
+                            st.editing = Some(buf);
+                        }
+                        KeyCode::Home => {
+                            buf.cursor = 0;
+                            st.editing = Some(buf);
+                        }
+                        KeyCode::End => {
+                            buf.cursor = buf.buf.len();
+                            st.editing = Some(buf);
+                        }
+                        KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            buf.buf.insert(buf.cursor.min(buf.buf.len()), c);
+                            buf.cursor += 1;
+                            st.editing = Some(buf);
+                        }
+                        _ => st.editing = Some(buf),
+                    }
+                    self.replace_overlay(Overlay::Settings(st));
+                    return true;
+                }
+
+                // ── 浏览态 ──
+                let row = st.row();
+                let id = row.id;
+                let kind = row.kind;
                 match key.code {
                     KeyCode::Esc | KeyCode::Char('q') => {
                         self.overlays.pop();
+                        return true; // 关闭即丢弃草稿（标题有 ● 未保存提示）
                     }
+                    KeyCode::Up | KeyCode::Char('k') => st.move_focus(-1),
+                    KeyCode::Down | KeyCode::Char('j') => st.move_focus(1),
+                    KeyCode::PageUp => st.move_focus(-8),
+                    KeyCode::PageDown => st.move_focus(8),
+                    KeyCode::Enter => match kind {
+                        FieldKind::Text | FieldKind::Secret | FieldKind::Number | FieldKind::Float => {
+                            st.editing = st.start_edit(self.config.as_ref());
+                        }
+                        FieldKind::Enum => {
+                            if let Err(e) = st.cycle(self.config.as_ref(), 1) {
+                                self.toast(NoticeLevel::Error, e);
+                            }
+                        }
+                        FieldKind::Toggle => {
+                            let _ = st.cycle(self.config.as_ref(), 1);
+                        }
+                        FieldKind::Port => self.settings_port_activate(&mut st),
+                    },
+                    KeyCode::Left => match kind {
+                        FieldKind::Port => self.settings_port_cycle(&mut st, -1),
+                        _ => {
+                            if let Err(e) = st.cycle(self.config.as_ref(), -1) {
+                                self.toast(NoticeLevel::Error, e);
+                            }
+                        }
+                    },
+                    KeyCode::Right => match kind {
+                        FieldKind::Port => self.settings_port_cycle(&mut st, 1),
+                        _ => {
+                            if let Err(e) = st.cycle(self.config.as_ref(), 1) {
+                                self.toast(NoticeLevel::Error, e);
+                            }
+                        }
+                    },
+                    KeyCode::Char('s') | KeyCode::Char('S') => self.save_settings(&mut st),
                     KeyCode::Char('r') => self.fetch_config(),
-                    KeyCode::Char(c @ '1'..='4') => {
+                    // 权限级别：聚焦该行时数字键即时生效（沿用旧面板行为）。
+                    KeyCode::Char(c @ '1'..='4') if id == settings::FieldId::PermissionLevel => {
                         self.set_permission_level(c as u8 - b'0');
-                        self.fetch_config();
                     }
                     _ => {}
                 }
+                self.replace_overlay(Overlay::Settings(st));
                 return true;
             }
             Overlay::AttachPath { mut input, mut cursor, seed } => {

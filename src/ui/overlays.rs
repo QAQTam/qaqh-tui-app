@@ -16,7 +16,7 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) {
         Overlay::SessionList { selected, show_archived } => {
             draw_session_list(f, app, area, *selected, *show_archived)
         }
-        Overlay::Config => draw_config(f, app, area),
+        Overlay::Settings(_) => crate::ui::settings::draw(f, app, area),
         Overlay::Help => draw_help(f, area),
         Overlay::AttachPath { input, cursor, .. } => draw_attach(f, input, *cursor, area),
         Overlay::Confirm { action } => draw_confirm(f, action, area),
@@ -96,55 +96,6 @@ fn draw_session_list(f: &mut Frame, app: &App, area: Rect, selected: usize, show
     f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
 }
 
-fn draw_config(f: &mut Frame, app: &App, area: Rect) {
-    let inner = box_frame(f, area, 72, 22, "配置 (config.load · camelCase DTO)");
-    let mut lines: Vec<Line> = Vec::new();
-    match &app.config {
-        None => {
-            lines.push(Line::from(Span::styled(" 加载中…", theme::dim())));
-        }
-        Some(cfg) => {
-            let rows: Vec<(&str, &str)> = vec![
-                ("model", "model"),
-                ("providerId", "providerId"),
-                ("baseUrl", "baseUrl"),
-                ("maxTokens", "maxTokens"),
-                ("contextLimit", "contextLimit"),
-                ("reasoningEffort", "reasoningEffort"),
-                ("autoCompactThreshold", "autoCompactThreshold"),
-                ("permissionLevel", "permissionLevel"),
-                ("activeProfile", "activeProfile"),
-                ("lang", "lang"),
-                ("theme", "theme"),
-                ("workspace.mode", "workspace.mode"),
-                ("apiKey", "apiKey"),
-            ];
-            for (key, label) in rows {
-                let value = if key.contains('.') {
-                    let (k1, k2) = key.split_once('.').unwrap();
-                    cfg.raw.get(k1).and_then(|v| v.get(k2)).map(|v| match v {
-                        serde_json::Value::String(s) => s.clone(),
-                        other => other.to_string(),
-                    }).unwrap_or_else(|| "—".into())
-                } else {
-                    cfg.field(key)
-                };
-                lines.push(Line::from(vec![
-                    Span::styled(format!(" {label:<22}"), theme::accent()),
-                    Span::raw(value),
-                ]));
-            }
-            lines.push(Line::from(""));
-            lines.push(modal::footer_line(&[
-                ("1-4", "设置权限级别"),
-                ("r", "刷新"),
-                ("Esc", "关闭"),
-            ]));
-        }
-    }
-    f.render_widget(Paragraph::new(lines), inner);
-}
-
 fn draw_help(f: &mut Frame, area: Rect) {
     let inner = box_frame(f, area, 78, 30, "按键帮助");
     let keys: Vec<(&str, &str)> = vec![
@@ -153,7 +104,7 @@ fn draw_help(f: &mut Frame, area: Rect) {
         ("Ctrl+T", "新建会话"),
         ("Ctrl+W", "关闭当前标签（不影响会话本身）"),
         ("Ctrl+L", "会话列表（恢复/归档/删除）"),
-        ("Ctrl+,", "配置面板"),
+        ("Ctrl+,", "设置页（读写 daemon 配置）"),
         ("Enter", "发送消息"),
         ("Esc", "中止当前回合 / 关闭弹窗"),
         ("Ctrl+P", "切换 plan/code 模式"),
