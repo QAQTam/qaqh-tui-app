@@ -29,6 +29,164 @@ fn fmt_ln(n: u32, w: usize) -> String {
     format!("{n:>width$}", width = w)
 }
 
+// ── Reasoning summary 特判：动词-ing 每句换行 ─────────────────────────────
+// summary 来自 OpenAI Responses `response.reasoning_summary_text.delta`，
+// 前端收到的是单段无换行的 gerund 句拼接（如 `Gathering ...feature.Synthesizing ...`，
+// 句间缺空格/缺换行）；传统 thinking 则已含换行或多段。我们仅对 summary 做句级换行。
+fn is_gerund_word(word: &str) -> bool {
+    let w = word.trim_matches(|c: char| !c.is_alphabetic());
+    if w.len() < 4 {
+        return false;
+    }
+    let lower = w.to_ascii_lowercase();
+    lower.ends_with("ing") && lower.chars().all(|c| c.is_ascii_alphabetic())
+}
+
+fn sentence_starts_with_gerund(sentence: &str) -> bool {
+    let trimmed = sentence.trim_start_matches(|c: char| matches!(c, '•' | '-' | '"' | '\'' | '(' | ' '));
+    if let Some(first) = trimmed.split_whitespace().next() {
+        let w = first.trim_matches(|c: char| !c.is_alphabetic());
+        is_gerund_word(w)
+    } else {
+        false
+    }
+}
+
+fn is_cjk(ch: char) -> bool {
+    let cp = ch as u32;
+    // 简化：命中中日韩统一表意文字区段即可
+    (0x4E00..=0x9FFF).contains(&cp)
+        || (0x3400..=0x4DBF).contains(&cp)
+        || (0x3000..=0x303F).contains(&cp)
+        || (0xFF00..=0xFFEF).contains(&cp)
+}
+
+fn split_reasoning_sentences(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut current = String::new();
+    let chars: Vec<char> = text.chars().collect();
+    let n = chars.len();
+    let mut i = 0;
+    while i < n {
+        let c = chars[i];
+        current.push(c);
+        if c == '.' || c == '。' || c == '!' || c == '！' || c == '?' || c == '？' {
+            // 小数点保护：1.2 不拆
+            let prev_is_digit = i > 0 && chars[i - 1].is_ascii_digit();
+            let next_is_digit = i + 1 < n && chars[i + 1].is_ascii_digit();
+            if c == '.' && prev_is_digit && next_is_digit {
+                i += 1;
+                continue;
+            }
+            // 寻下一个非空格字符
+            let mut j = i + 1;
+            while j < n && chars[j].is_whitespace() && chars[j] != '\n' {
+                j += 1;
+            }
+            if j >= n {
+                let s = current.trim().to_string();
+                if !s.is_empty() {
+                    out.push(s);
+                }
+                current.clear();
+            } else {
+                let next = chars[j];
+                let is_boundary = if c == '.' {
+                    next.is_ascii_uppercase()
+                } else if c == '。' || c == '！' || c == '？' {
+                    true
+                } else {
+                    next.is_ascii_uppercase() || is_cjk(next)
+                };
+                // 缩写保护：".a" 小写不算句界
+                if is_boundary {
+                    let s = current.trim().to_string();
+                    if !s.is_empty() {
+                        out.push(s);
+                    }
+                    current.clear();
+                    // 跳过句间空白（已入下一句）
+                    i = j - 1;
+                }
+            }
+        }
+        i += 1;
+    }
+    if !current.trim().is_empty() {
+        out.push(current.trim().to_string());
+    }
+    out.retain(|s| !s.is_empty());
+    out
+}
+
+fn looks_like_reasoning_summary(text: &str) -> bool {
+    let t = text.trim();
+    if t.is_empty() || t.contains('\n') {
+        return false;
+    }
+    // 强信号：缺空格的句界 "feature.Synthesizing"
+    let has_missing_space = {
+        let ch: Vec<char> = t.chars().collect();
+        let mut found = false;
+        for idx in 0..ch.len().saturating_sub(1) {
+            if ch[idx] == '.' && ch[idx + 1].is_ascii_uppercase() {
+                found = true;
+                break;
+            }
+        }
+        found
+    };
+    let sentences = split_reasoning_sentences(t);
+    if has_missing_space {
+        if sentences.len() >= 2 && sentences.iter().any(|s| sentence_starts_with_gerund(s)) {
+            return true;
+        }
+        return sentences.len() >= 2;
+    }
+    if sentences.len() < 2 {
+        return false;
+    }
+    // 中文句：含 "。" 且多句即视为 summary
+    if t.contains('。') {
+        return sentences.len() >= 2;
+    }
+    let gerund_cnt = sentences.iter().filter(|s| sentence_starts_with_gerund(s)).count();
+    gerund_cnt >= 1 && gerund_cnt * 2 >= sentences.len()
+}
+
+fn normalize_reasoning_content(text: &str) -> String {
+    if looks_like_reasoning_summary(text) {
+        return split_reasoning_sentences(text).join("\n");
+    }
+    if text.contains('\n') {
+        // 段内仍可能藏 summary（如单段内拼接），逐段二次判别
+        let mut paras: Vec<String> = Vec::new();
+        for para in text.split('\n') {
+            if para.trim().is_empty() {
+                paras.push(String::new());
+            } else if looks_like_reasoning_summary(para) {
+                paras.extend(split_reasoning_sentences(para));
+            } else {
+                // 进一步：即便整段不像 summary，也尝试在缺空格场景下修复
+                // 只有当 split 后句数>1 且含 gerund 时才替换，避免误伤普通段
+                let split = split_reasoning_sentences(para);
+                if split.len() >= 2 && split.iter().any(|s| sentence_starts_with_gerund(s)) {
+                    paras.extend(split);
+                } else {
+                    paras.push(para.to_string());
+                }
+            }
+        }
+        // 若未发生任何分裂，直接返回原文避免无意义重组
+        let joined = paras.join("\n");
+        if joined != text {
+            return joined;
+        }
+        return text.to_string();
+    }
+    text.to_string()
+}
+
 #[allow(dead_code)]
 pub fn render_transcript(session: &SessionState, width: u16) -> Vec<RenderLine> {
     // 兼容入口：show_reasoning=true 时展示全文（F3 切换由外层 App 控制缓存失效）
@@ -147,9 +305,12 @@ fn push_reasoning_block(lines: &mut Vec<RenderLine>, text: &str, width: usize, s
     if text.trim().is_empty() {
         return;
     }
+    // summary 特判：无换行的动词-ing 句拼接自动逐句换行（eeacd19a 实测句间缺空格/缺换行）
+    // normalize 仅在 looks_like_reasoning_summary 为真时注入换行，传统 thinking 保持原样
+    let normalized = normalize_reasoning_content(text);
     // opencode ReasoningHeader：流式 Spinner + 折叠标题对齐 `index.tsx:1652`
     // 解析首段作为标题（**Title**\n\nBody 或首行），其余为 body
-    let trimmed = text.trim();
+    let trimmed = normalized.trim();
     let (title, body) = if let Some(stripped) = trimmed.strip_prefix("**") {
         if let Some(end) = stripped.find("**") {
             let t = stripped[..end].trim();
@@ -774,5 +935,63 @@ mod tests {
         // hide 应折叠为单行 + 提示
         assert!(lines_hide.iter().any(|l| l.spans.iter().any(|s| s.text.contains("F3"))));
         assert!(lines_show.iter().any(|l| l.spans.iter().any(|s| s.text.contains("Body"))));
+    }
+
+    #[test]
+    fn reasoning_summary_split_gerund() {
+        let text = "Gathering project structure, git state, and key modules to summarize the Rust TUI architecture and ongoing markdown feature.Synthesizing the exploration into a Chinese summary with architecture layers, PLAN.md divergence, git history, and risks.";
+        let normalized = normalize_reasoning_content(text);
+        assert!(normalized.contains('\n'), "summary 应被注入换行");
+        let parts: Vec<&str> = normalized.split('\n').collect();
+        assert_eq!(parts.len(), 2);
+        assert!(parts[0].starts_with("Gathering"));
+        assert!(parts[1].starts_with("Synthesizing"));
+        // 渲染后应产生多行 Reasoning
+        let mut sess = crate::app::session::SessionState::new("s".into());
+        let block = Block { block_id: "b1".into(), block_order: 0, kind: TimelineBlockKind::Reasoning, state: TimelineBlockState::Sealed, text: text.to_string(), tool: None, last_fragment: 0 };
+        sess.timeline.turns.push(Turn { turn_id: "t1".into(), user_text: "".into(), state: TimelineTurnState::Completed, failure: None, rounds: vec![Round { round_num: 0, sealed: true, is_final: true, blocks: vec![block]}]});
+        let lines = render_transcript_with_opts(&sess, 120, true);
+        // 至少 Thought 标题 + 2 行 body
+        let reasoning_lines = lines.iter().filter(|l| l.spans.iter().any(|s| s.text.contains("Gathering") || s.text.contains("Synthesizing"))).count();
+        assert!(reasoning_lines >= 2);
+    }
+
+    #[test]
+    fn reasoning_traditional_not_split() {
+        let text = "This is a normal paragraph with Reasoning content. It should not be split because not gerund.";
+        assert!(!looks_like_reasoning_summary(text));
+        assert_eq!(normalize_reasoning_content(text), text);
+    }
+
+    #[test]
+    fn reasoning_summary_with_space_also_split() {
+        let text = "Reviewing collected project files and planning a systematic bash-based read to complete the exploration. Batching bash reads to collect remaining protocol files.";
+        assert!(looks_like_reasoning_summary(text));
+        let n = normalize_reasoning_content(text);
+        assert_eq!(n.split('\n').count(), 2);
+    }
+
+    #[test]
+    fn reasoning_single_sentence_no_split() {
+        let text = "Synthesizing gathered file and git data to summarize architecture, tech stack, and uncommitted changes.";
+        assert!(!looks_like_reasoning_summary(text));
+    }
+
+    #[test]
+    fn reasoning_decimal_protection() {
+        let text = "Updating version to 1.2 for release. Checking tests.";
+        // 虽含小数点但仍是两句，且 Checking 为 gerund -> 视为 summary，允许分裂
+        // 关键是 1.2 不被误拆为两句
+        let parts = split_reasoning_sentences(text);
+        assert_eq!(parts.len(), 2);
+        assert!(parts[0].contains("1.2"));
+    }
+
+    #[test]
+    fn reasoning_chinese_sentences() {
+        let text = "分析架构。评估方案。设计菜单。";
+        let parts = split_reasoning_sentences(text);
+        assert_eq!(parts.len(), 3);
+        assert!(looks_like_reasoning_summary(text));
     }
 }
