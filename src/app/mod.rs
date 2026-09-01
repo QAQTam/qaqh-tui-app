@@ -183,7 +183,7 @@ impl App {
             activity_cache: HashMap::new(),
             config: None,
             settings_saving: false,
-            show_reasoning: false,
+            show_reasoning: true,
             show_workspace: true,
             tracked_seeds: HashSet::new(),
             focus_order: Vec::new(),

@@ -4,7 +4,8 @@ use crate::app::render_line::{wrap_text, RenderLine, SpanStyle};
 use crate::app::session::SessionState;
 use crate::protocol::timeline::{TimelineBlockKind, TimelineToolState, TimelineTurnState};
 
-/// 推理块折叠时保留的尾部行数。
+/// 推理块折叠时保留的尾部行数（历史常量，当前默认展开路径不再截尾，保留供 hide 回退）。
+#[allow(dead_code)]
 const REASONING_TAIL: usize = 2;
 /// 工具输出保留的尾部行数（已由折叠逻辑替代，保留作历史阈值参考）。
 /// 单元格截断宽度。
@@ -336,11 +337,10 @@ fn push_reasoning_block(lines: &mut Vec<RenderLine>, text: &str, width: usize, s
             // hide 模式流式仅保留标题行，不展 body（与 opencode hide 对齐）
             return;
         }
-        // 流式 body 仅展示尾部，保持低开销
+        // 默认展开：流式即全显（8行以上时不截尾，cursor 附末行）
         let wrapped = wrap_text(&body, width.saturating_sub(4));
-        let start = wrapped.len().saturating_sub(REASONING_TAIL);
-        for (i, seg) in wrapped[start..].iter().enumerate() {
-            let is_last = i == wrapped[start..].len() - 1;
+        for (i, seg) in wrapped.iter().enumerate() {
+            let is_last = i == wrapped.len() - 1;
             let shown = if is_last { format!("{seg}▌") } else { seg.clone() };
             lines.push(RenderLine::new().span("    ", SpanStyle::Dim).span(shown, SpanStyle::Reasoning));
         }
@@ -373,7 +373,7 @@ fn push_reasoning_block(lines: &mut Vec<RenderLine>, text: &str, width: usize, s
 /// opencode 式工具图标（对齐 `toolDisplay` 集合） `packages/tui/src/routes/session/index.tsx:2638`
 fn tool_icon(name: &str) -> &'static str {
     match name {
-        "bash" | "exec" | "shell" => "$",
+        "bash" | "exec" | "shell" | "pwsh" | "powershell" => "$",
         "write" => "←",
         "edit" => "←",
         "glob" => "✱",
@@ -448,6 +448,51 @@ fn extract_path(args_json: Option<&str>) -> Option<String> {
         if let Some(serde_json::Value::String(p)) = obj.get(key) { return Some(p.clone()); }
     }
     None
+}
+
+
+fn is_shell_tool(name: &str) -> bool {
+    matches!(name, "bash" | "exec" | "shell" | "pwsh" | "powershell")
+}
+
+/// 尝试将工具的 `output` JSON 外壳剥离，仅取内部 `output` 字段。
+/// 若不是 ExecOutput JSON，则回退为原文；不引入额外错误提示，保持视觉干净。
+fn extract_shell_output_text(raw: &str) -> Option<String> {
+    let s = raw.trim();
+    if !s.starts_with('{') {
+        return None;
+    }
+    let v: serde_json::Value = serde_json::from_str(s).ok()?;
+    let obj = v.as_object()?;
+    // ExecOutput 形状：{status, command, exit_code, output, truncated, timed_out, cancelled, process_id}
+    // backgrounded 时 output 为内层 JSON 字符串，仍以字符串形式透出
+    if let Some(out) = obj.get("output").and_then(|x| x.as_str()) {
+        return Some(out.to_string());
+    }
+    // 非字符串 output（如意外对象）则序列化回文本
+    if let Some(out) = obj.get("output") {
+        if !out.is_null() {
+            // 保持可读：若是对象则 pretty-free json
+            if out.is_string() {
+                return Some(out.as_str().unwrap_or("").to_string());
+            } else {
+                return Some(out.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn shell_meta_from_raw(raw: &str) -> Option<(Option<i32>, bool, String)> {
+    let v: serde_json::Value = serde_json::from_str(raw.trim()).ok()?;
+    let obj = v.as_object()?;
+    if !obj.contains_key("output") {
+        return None;
+    }
+    let exit_code = obj.get("exit_code").and_then(|x| x.as_i64()).map(|x| x as i32);
+    let truncated = obj.get("truncated").and_then(|x| x.as_bool()).unwrap_or(false);
+    let status = obj.get("status").and_then(|x| x.as_str()).unwrap_or("").to_string();
+    Some((exit_code, truncated, status))
 }
 
 fn push_tool_card(lines: &mut Vec<RenderLine>, tool: &crate::app::timeline_model::ToolCard, width: usize, expanded: bool) {
@@ -747,38 +792,120 @@ fn push_tool_card(lines: &mut Vec<RenderLine>, tool: &crate::app::timeline_model
         }
     }
 
-    // ── 输出：折叠（对齐 collapseToolOutput）`opencode 1804 maxLines 3/10`
-    let mut combined = String::new();
-    if let Some(output) = tool.output.as_deref().filter(|s| !s.is_empty()) {
-        combined.push_str(output);
-        if !tool.progress.is_empty() { combined.push('\n'); }
-    }
-    combined.push_str(&tool.progress);
-    // 流式 Running 时追加尾替换语义：progress 已是覆盖式最后 4K，无需再拼接历史
-    if !combined.trim().is_empty() {
-        let is_shell = matches!(tool.name.as_str(), "bash" | "exec" | "shell");
-        let max_lines = if is_shell { 10 } else { 4 };
-        let max_chars = max_lines * width.saturating_sub(6).max(20);
-        // 展开态由调用方传入（SessionState.expanded_tools）
-        let (shown_text, overflow) = collapse_output(&combined, max_lines, max_chars);
-        let display = if overflow && !expanded { shown_text } else { combined };
-        let line_prefix = if is_block { " ┃ │ " } else { "    │ " };
-        let mut shown_lines = 0usize;
-        for out in display.lines().take( if overflow && !expanded { max_lines } else { 24 }) {
-            for seg in wrap_text(out, width.saturating_sub(6)) {
-                lines.push(RenderLine::new().span(line_prefix, SpanStyle::Dim).span(seg, SpanStyle::Dim));
-                shown_lines += 1;
-                if shown_lines > 24 { break; }
+    // ── 输出：shell 8 行流动 + JSON 剥壳，视觉一致无 [stderr] 前缀 ──
+    if is_shell_tool(&tool.name) {
+        let raw_output = tool.output.as_deref().unwrap_or("");
+        let unwrapped = extract_shell_output_text(raw_output);
+        let shell_meta = shell_meta_from_raw(raw_output);
+        let src = if tool.state == TimelineToolState::Running {
+            if !tool.progress.trim().is_empty() {
+                tool.progress.clone()
+            } else {
+                unwrapped.clone().unwrap_or_default()
+            }
+        } else if let Some(ref inner) = unwrapped {
+            if !inner.trim().is_empty() {
+                inner.clone()
+            } else if !tool.progress.trim().is_empty() {
+                tool.progress.clone()
+            } else {
+                String::new()
+            }
+        } else if !tool.progress.trim().is_empty() {
+            tool.progress.clone()
+        } else if !raw_output.trim().is_empty() {
+            raw_output.to_string()
+        } else {
+            String::new()
+        };
+        if !src.trim().is_empty() {
+            let max_lines = 8usize;
+            let expanded_limit = 24usize;
+            let total_raw_lines = src.lines().count();
+            let max_chars = max_lines * width.saturating_sub(6).max(20);
+            let needs_collapse = total_raw_lines > max_lines || src.chars().count() > max_chars;
+            let display_text = if tool.state == TimelineToolState::Running {
+                if total_raw_lines > max_lines {
+                    src.lines().skip(total_raw_lines - max_lines).collect::<Vec<_>>().join("\n")
+                } else {
+                    src.clone()
+                }
+            } else if needs_collapse && !expanded {
+                if total_raw_lines > max_lines {
+                    src.lines().skip(total_raw_lines - max_lines).collect::<Vec<_>>().join("\n")
+                } else {
+                    let mut truncated: String = src.chars().take(max_chars.saturating_sub(1)).collect();
+                    truncated.push('…');
+                    truncated
+                }
+            } else if src.lines().count() > expanded_limit && !expanded {
+                src.lines().take(expanded_limit).collect::<Vec<_>>().join("\n")
+            } else {
+                src.clone()
+            };
+            let overflow = needs_collapse;
+            let line_prefix = if is_block { " ┃ │ " } else { "    │ " };
+            let mut shown_lines = 0usize;
+            for out in display_text.lines() {
+                if out.is_empty() {
+                    lines.push(RenderLine::new().span(line_prefix, SpanStyle::Dim).span("", SpanStyle::Dim));
+                    shown_lines += 1;
+                    continue;
+                }
+                for seg in wrap_text(out, width.saturating_sub(6)) {
+                    lines.push(RenderLine::new().span(line_prefix, SpanStyle::Dim).span(seg, SpanStyle::Dim));
+                    shown_lines += 1;
+                    if shown_lines >= expanded_limit { break; }
+                }
+                if shown_lines >= expanded_limit { break; }
+            }
+            if overflow {
+                let mut hint_text = if expanded { "F7 收起".to_string() } else { "F7 展开".to_string() };
+                if !is_running {
+                    if let Some((exit, truncated, _)) = shell_meta {
+                        if let Some(code) = exit {
+                            if code != 0 { hint_text.push_str(&format!(" · exit {code}")); }
+                        }
+                        if truncated { hint_text.push_str(" · 截断"); }
+                    }
+                }
+                lines.push(RenderLine::new().span(format!("{}  ", line_prefix), SpanStyle::Dim).span(hint_text, SpanStyle::Dim));
+            }
+            if is_running {
+                if let Some(last) = lines.last_mut() {
+                    if let Some(span) = last.spans.last_mut() { span.text.push('▌'); }
+                }
             }
         }
-        if overflow {
-            let hint = if expanded { "F7 收起" } else { "F7 展开" };
-            lines.push(RenderLine::new().span(format!("{}  ", line_prefix), SpanStyle::Dim).span(hint, SpanStyle::Dim));
+    } else {
+        let mut combined = String::new();
+        if let Some(output) = tool.output.as_deref().filter(|s| !s.is_empty()) {
+            combined.push_str(output);
+            if !tool.progress.is_empty() { combined.push('\n'); }
         }
-        if is_running && !overflow {
-            // 流式尾光标（Block 内也保持）
-            if let Some(last) = lines.last_mut() {
-                if let Some(span) = last.spans.last_mut() { span.text.push('▌'); }
+        combined.push_str(&tool.progress);
+        if !combined.trim().is_empty() {
+            let max_lines = 4usize;
+            let max_chars = max_lines * width.saturating_sub(6).max(20);
+            let (shown_text, overflow) = collapse_output(&combined, max_lines, max_chars);
+            let display = if overflow && !expanded { shown_text } else { combined };
+            let line_prefix = if is_block { " ┃ │ " } else { "    │ " };
+            let mut shown_lines = 0usize;
+            for out in display.lines().take(if overflow && !expanded { max_lines } else { 24 }) {
+                for seg in wrap_text(out, width.saturating_sub(6)) {
+                    lines.push(RenderLine::new().span(line_prefix, SpanStyle::Dim).span(seg, SpanStyle::Dim));
+                    shown_lines += 1;
+                    if shown_lines > 24 { break; }
+                }
+            }
+            if overflow {
+                let hint = if expanded { "F7 收起" } else { "F7 展开" };
+                lines.push(RenderLine::new().span(format!("{}  ", line_prefix), SpanStyle::Dim).span(hint, SpanStyle::Dim));
+            }
+            if is_running && !overflow {
+                if let Some(last) = lines.last_mut() {
+                    if let Some(span) = last.spans.last_mut() { span.text.push('▌'); }
+                }
             }
         }
     }
@@ -993,5 +1120,70 @@ mod tests {
         let parts = split_reasoning_sentences(text);
         assert_eq!(parts.len(), 3);
         assert!(looks_like_reasoning_summary(text));
+    }
+
+    #[test]
+    fn shell_output_unwrap_and_streaming_slice() {
+        let raw = r#"{"status":"completed","command":"bash ...","exit_code":0,"output":"line1\nline2\nline3","truncated":false,"timed_out":false,"cancelled":false}"#;
+        let inner = extract_shell_output_text(raw).unwrap();
+        assert_eq!(inner, "line1\nline2\nline3");
+        // streaming 8 行尾
+        let mut long = String::new();
+        for i in 1..=20 {
+            long.push_str(&format!("line{i}\n"));
+        }
+        let tool = ToolCard {
+            tool_call_id: "c1".into(),
+            name: "bash".into(),
+            state: TimelineToolState::Running,
+            summary: None,
+            args_json: None,
+            output: Some(raw.to_string()),
+            diff: None,
+            progress: long.clone(),
+            failure: None,
+            permission: None,
+        };
+        let mut lines = Vec::new();
+        push_tool_card(&mut lines, &tool, 80, false);
+        // 应包含尾行 line20，且不含 JSON 外壳
+        assert!(lines.iter().any(|l| l.spans.iter().any(|s| s.text.contains("line20"))));
+        assert!(!lines.iter().any(|l| l.spans.iter().any(|s| s.text.contains("\"command\""))));
+        assert!(lines.iter().any(|l| l.spans.iter().any(|s| s.text.contains("▌"))));
+    }
+
+    #[test]
+    fn shell_done_shows_unwrapped_tail_and_no_stderr_prefix() {
+        let raw = r#"{"status":"completed","command":"bash ...","exit_code":1,"output":"out line\nerr line","truncated":false,"timed_out":false,"cancelled":false}"#;
+        let tool = ToolCard {
+            tool_call_id: "c2".into(),
+            name: "bash".into(),
+            state: TimelineToolState::Failed,
+            summary: None,
+            args_json: None,
+            output: Some(raw.to_string()),
+            diff: None,
+            progress: String::new(),
+            failure: None,
+            permission: None,
+        };
+        let mut lines = Vec::new();
+        push_tool_card(&mut lines, &tool, 80, false);
+        let flat: String = lines.iter().flat_map(|l| l.spans.iter().map(|s| s.text.clone())).collect::<Vec<_>>().join("\n");
+        assert!(flat.contains("out line"));
+        assert!(flat.contains("err line"));
+        assert!(!flat.contains("[stderr]"));
+        assert!(!flat.contains("\"status\""));
+    }
+
+    #[test]
+    fn reasoning_streaming_full_expand_by_default() {
+        let mut sess = crate::app::session::SessionState::new("s".into());
+        let text = (1..=8).map(|i| format!("line {i}")).collect::<Vec<_>>().join("\n");
+        let block = Block { block_id: "b1".into(), block_order: 0, kind: TimelineBlockKind::Reasoning, state: TimelineBlockState::Open, text: text.clone(), tool: None, last_fragment: 0 };
+        sess.timeline.turns.push(Turn { turn_id: "t1".into(), user_text: "".into(), state: TimelineTurnState::Running, failure: None, rounds: vec![Round { round_num: 0, sealed: false, is_final: false, blocks: vec![block]}]});
+        let lines = render_transcript_with_opts(&sess, 120, true);
+        let reasoning_cnt = lines.iter().filter(|l| l.spans.iter().any(|s| s.text.contains("line"))).count();
+        assert!(reasoning_cnt >= 8, "streaming 默认全显 {reasoning_cnt}");
     }
 }
