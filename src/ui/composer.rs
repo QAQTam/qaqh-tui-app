@@ -3,7 +3,7 @@
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::Frame;
 use unicode_width::UnicodeWidthStr;
 
@@ -12,6 +12,47 @@ use crate::ui::theme;
 
 pub fn height() -> u16 {
     3 // 上下边框 + 1 行输入
+}
+
+pub fn draw_slash_menu(f: &mut Frame, app: &App, composer_area: Rect) {
+    if app.overlays.len() > 0 {
+        return;
+    }
+    let candidates = app.slash_candidates();
+    if candidates.is_empty() {
+        return;
+    }
+    let selected = app.slash_selected.min(candidates.len().saturating_sub(1));
+    // 在 composer 上方弹出，最多 5 行
+    let visible = candidates.iter().take(6).collect::<Vec<_>>();
+    let h = (visible.len() as u16).min(6) + 2; // border
+    let w = 58u16.min(composer_area.width.saturating_sub(2));
+    let menu_area = Rect {
+        x: composer_area.x + 2,
+        y: composer_area.y.saturating_sub(h),
+        width: w,
+        height: h,
+    };
+    if menu_area.width < 20 || menu_area.height < 3 {
+        return;
+    }
+    f.render_widget(Clear, menu_area);
+    let block = Block::new().borders(Borders::ALL).border_style(theme::accent()).title(" / 命令 · Tab 补全 · ↑↓ 选择 · Enter 执行 · Esc 关闭 ");
+    let inner = Rect { x: menu_area.x+1, y: menu_area.y+1, width: menu_area.width.saturating_sub(2), height: menu_area.height.saturating_sub(2) };
+    f.render_widget(block, menu_area);
+    let mut lines: Vec<Line> = Vec::new();
+    for (idx, def) in visible.iter().enumerate() {
+        let is_sel = idx == selected;
+        let marker = if is_sel { "▸" } else { " " };
+        let style = if is_sel { Style::new().add_modifier(Modifier::REVERSED) } else { Style::new() };
+        lines.push(Line::from(vec![
+            Span::styled(format!(" {marker} "), if is_sel { theme::accent() } else { theme::dim() }),
+            Span::styled(format!("/{:<10}", def.name), style),
+            Span::styled(def.desc.to_string(), theme::dim()),
+        ]));
+    }
+    f.render_widget(Paragraph::new(lines), inner);
+    // 选中项的 hint 画在最后一行下方（若空间允许，已在标题中展示 Tab 提示）
 }
 
 pub fn draw(f: &mut Frame, app: &App, area: Rect) {
@@ -31,6 +72,15 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) {
         let names: Vec<String> =
             sess.composer.attachments.iter().map(|a| a.path.clone()).collect();
         title.push_str(&format!("✎ [{}] ", names.join(",")));
+    }
+    // slash 时给出更精确的标题提示：按回退链预告最终 cwd
+    let val = sess.composer.value();
+    if val.trim_start().starts_with('/') {
+        title.push_str(" / 命令（Tab 补全 · ↑↓ 选择 · Enter 执行）· ");
+        if val.trim() == "/new" || val.trim() == "/n" {
+            let hint = app.effective_cwd(None).map(|c| format!("[{}] ", truncate_cwd(&c))).unwrap_or_default();
+            title.push_str(&hint);
+        }
     }
     title.push_str("Enter 发送 · Ctrl+P 模式 · Ctrl+A 附件 · Ctrl+Y 撤销 · Ctrl+E 压缩 · F1 帮助 ");
 
@@ -88,4 +138,12 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) {
     if cursor_x < inner.x + inner.width {
         f.set_cursor_position((cursor_x, inner.y));
     }
+}
+
+fn truncate_cwd(cwd: &str) -> String {
+    let s = cwd.trim();
+    if s.chars().count() <= 36 { return s.to_string(); }
+    // 保留尾段
+    let tail: String = s.chars().rev().take(33).collect::<String>().chars().rev().collect();
+    format!("…{tail}")
 }

@@ -3,10 +3,12 @@
 //! 事件驱动（无轮询泵）：所有后端状态变化经 runtime 消息到达后立即生效，
 //! UI 在同一帧内重绘。
 
+pub mod markdown;
 pub mod render_line;
 pub mod render_transcript;
 pub mod session;
 pub mod settings;
+pub mod slash;
 pub mod timeline_model;
 
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -18,6 +20,7 @@ use ratatui::crossterm::event::{KeyEvent, MouseEvent};
 use crate::protocol::command::{
     ConversationCommand, ControlCommand, RingingCommand, ToolCommand,
 };
+use crate::app::slash::SlashCmd;
 use crate::protocol::config::ConfigDto;
 use crate::protocol::envelope::{CommandState, RingingCommandStatus};
 use crate::protocol::event::{
@@ -94,6 +97,8 @@ pub enum Overlay {
     Help,
     AttachPath { input: Vec<char>, cursor: usize, seed: String },
     Confirm { action: ConfirmAction },
+    /// 二级：/new 的 cwd 输入（/ 本身的一级菜单为 inline 浮层，非 overlay）
+    CwdInput { input: Vec<char>, cursor: usize },
 }
 
 use self::settings::{FieldKind, SettingsState};
@@ -135,6 +140,13 @@ pub struct App {
     pub last_tick: Instant,
     /// Ctrl+C 二次确认。
     pub quit_armed: Option<Instant>,
+    /// 首页会话列表选中与归档显隐（tabs.is_empty() 时生效）。
+    pub home_selected: usize,
+    pub home_show_archived: bool,
+    /// 一级斜杠菜单选中（Tab/↑↓ 循环）
+    pub slash_selected: usize,
+    /// 启动时的进程 cwd（hybrid 回退 3），捕获后不再随 cd 变化
+    pub initial_cwd: Option<String>,
 }
 
 impl App {
@@ -142,6 +154,15 @@ impl App {
         client: Arc<HttpClient>,
         runtime: Arc<Runtime>,
         msg_tx: tokio::sync::mpsc::UnboundedSender<AppMsg>,
+    ) -> Self {
+        Self::new_with_cwd(client, runtime, msg_tx, std::env::current_dir().ok().map(|p| p.to_string_lossy().into_owned()))
+    }
+
+    pub fn new_with_cwd(
+        client: Arc<HttpClient>,
+        runtime: Arc<Runtime>,
+        msg_tx: tokio::sync::mpsc::UnboundedSender<AppMsg>,
+        initial_cwd: Option<String>,
     ) -> Self {
         Self {
             quit: false,
@@ -170,6 +191,10 @@ impl App {
             show_todo_detail: true,
             last_tick: Instant::now(),
             quit_armed: None,
+            home_selected: 0,
+            home_show_archived: false,
+            slash_selected: 0,
+            initial_cwd,
         }
     }
 
@@ -206,6 +231,21 @@ impl App {
         if let Some(armed) = self.quit_armed {
             if armed.elapsed() > Duration::from_secs(3) {
                 self.quit_armed = None;
+            }
+        }
+        // 首页自动刷新：无 tab 时保持列表新鲜（对齐 opencode Home 的常驻列表感）
+        if self.tabs.is_empty() {
+            let stale = self
+                .session_list_at
+                .map(|t| t.elapsed() > Duration::from_secs(3))
+                .unwrap_or(true);
+            if stale {
+                self.fetch_session_list();
+            }
+            // 选中越界时回绕
+            let count = self.filtered_sessions(self.home_show_archived).len();
+            if count > 0 && self.home_selected >= count {
+                self.home_selected = count - 1;
             }
         }
     }
@@ -485,11 +525,29 @@ impl App {
             }
             ControlEvent::AgentLifecycleChanged { .. } => {}
             ControlEvent::DashboardSnapshot { snapshot } => {
-                if let Some(sess) = self.sessions.get_mut(&seed) {
+                // 容错：envelope seed 可能与 snapshot.seed 不一致（旧 daemon/重连时序），
+                // 优先 envelope seed，兜底 snapshot.seed。
+                let target = if self.sessions.contains_key(&seed) {
+                    seed.clone()
+                } else if self.sessions.contains_key(&snapshot.seed) {
+                    snapshot.seed.clone()
+                } else {
+                    seed.clone()
+                };
+                if let Some(sess) = self.sessions.get_mut(&target) {
                     sess.dashboard = Some(snapshot);
+                } else if self.sessions.contains_key(&snapshot.seed) {
+                    if let Some(sess) = self.sessions.get_mut(&snapshot.seed) {
+                        sess.dashboard = Some(snapshot);
+                    }
                 }
+                // 若对应会话在后台 tabs 中，dashboard 仍更新以便切回即现
             }
-            ControlEvent::DashboardUpdated { .. } => {}
+            ControlEvent::DashboardUpdated { session_seed, .. } => {
+                // 轻量心跳：若已跟踪但 dashboard 仍为空，且 envelope seed 指向该会话，
+                // 不主动拉取（避免轮询风暴），仅标记；具体兜底由 bootstrap 完成后覆盖。
+                let _ = session_seed;
+            }
             ControlEvent::SubagentStatus { name, state, .. } => {
                 self.toast(NoticeLevel::Info, format!("子代理 {name}: {state}"));
             }
@@ -708,6 +766,11 @@ impl App {
             ActionResult::SessionList(Ok(list)) => {
                 self.session_list_cache = list;
                 self.session_list_at = Some(Instant::now());
+                // 首页选中越界回绕
+                let count = self.filtered_sessions(self.home_show_archived).len();
+                if count > 0 && self.home_selected >= count {
+                    self.home_selected = count - 1;
+                }
             }
             ActionResult::SessionList(Err(e)) => {
                 self.toast(NoticeLevel::Error, format!("session.list: {e}"))
@@ -855,9 +918,32 @@ impl App {
     }
 
     pub fn new_session(&mut self) {
-        let cwd = self
-            .active_session()
-            .and_then(|s| s.meta.as_ref().and_then(|m| m.cwd.clone()));
+        self.new_session_with_cwd(None);
+    }
+
+    /// 三档回退：显式 > 环境变量 > 启动目录 > 当前会话 > None（让后端迁移）
+    pub fn effective_cwd(&self, explicit: Option<String>) -> Option<String> {
+        if let Some(p) = explicit {
+            let t = p.trim().to_string();
+            if !t.is_empty() {
+                let expanded = crate::app::slash::expand_tilde(&t);
+                return Some(expanded);
+            }
+        }
+        if let Ok(env) = std::env::var("QAQH_DEFAULT_CWD") {
+            let env = crate::app::slash::expand_tilde(env.trim());
+            if !env.trim().is_empty() && crate::app::slash::is_absolute_path(&env) {
+                return Some(env.trim().to_string());
+            }
+        }
+        if let Some(cur) = self.initial_cwd.as_deref().filter(|s| !s.trim().is_empty()) {
+            return Some(cur.to_string());
+        }
+        self.active_session().and_then(|s| s.meta.as_ref().and_then(|m| m.cwd.clone()))
+    }
+
+    pub fn new_session_with_cwd(&mut self, cwd: Option<String>) {
+        let cwd = self.effective_cwd(cwd);
         let client = self.client.clone();
         let tx = self.msg_tx.clone();
         let cmd = build_envelope(
@@ -1511,6 +1597,10 @@ impl App {
                 self.toggle_settings();
                 return;
             }
+            KeyCode::F(10) => {
+                self.toggle_settings();
+                return;
+            }
             KeyCode::F(1) => {
                 self.toggle_overlay(Overlay::Help);
                 return;
@@ -1528,6 +1618,10 @@ impl App {
             }
             KeyCode::F(6) => {
                 self.show_todo_detail = !self.show_todo_detail;
+                return;
+            }
+            KeyCode::F(7) => {
+                self.toggle_tool_expand();
                 return;
             }
             _ => {}
@@ -1571,6 +1665,13 @@ impl App {
         // 覆盖层。
         if self.overlay_key(key) {
             return;
+        }
+
+        // 首页（无 tab 且无覆盖层时，会话列表即首页）
+        if self.tabs.is_empty() {
+            if self.home_key(key) {
+                return;
+            }
         }
 
         // Composer。
@@ -1617,6 +1718,48 @@ impl App {
         }
     }
 
+    fn toggle_tool_expand(&mut self) {
+        let Some(seed) = self.active_seed() else { return };
+        let Some(sess) = self.sessions.get_mut(&seed) else { return };
+        // 收集所有可折叠工具（有输出或 diff），按时间逆序
+        let mut candidates: Vec<String> = Vec::new();
+        for turn in sess.timeline.turns.iter().rev() {
+            for round in turn.rounds.iter().rev() {
+                for block in round.blocks.iter().rev() {
+                    if let Some(tool) = &block.tool {
+                        let has_content = tool.output.as_deref().is_some_and(|s| !s.trim().is_empty())
+                            || !tool.progress.trim().is_empty()
+                            || tool.diff.as_deref().is_some_and(|d| !d.trim().is_empty());
+                        if has_content {
+                            candidates.push(tool.tool_call_id.clone());
+                        }
+                    }
+                }
+            }
+        }
+        if candidates.is_empty() { return; }
+        // 策略：优先展开最近的收起态；若全部已展开，则收起最近的展开态（循环）
+        let mut target: Option<String> = None;
+        for id in &candidates {
+            if !sess.expanded_tools.contains(id) {
+                target = Some(id.clone());
+                break;
+            }
+        }
+        if target.is_none() {
+            // 全部已展开 → 收起最近一个
+            target = candidates.first().cloned();
+        }
+        if let Some(id) = target {
+            if sess.expanded_tools.contains(&id) {
+                sess.expanded_tools.remove(&id);
+            } else {
+                sess.expanded_tools.insert(id);
+            }
+            sess.rendered = None;
+        }
+    }
+
     /// 会话列表的过滤谓词（与渲染一致）。
     fn filtered_sessions(&self, show_archived: bool) -> Vec<usize> {
         self.session_list_cache
@@ -1625,6 +1768,76 @@ impl App {
             .filter(|(_, m)| (show_archived || !m.archived) && !m.ephemeral)
             .map(|(i, _)| i)
             .collect()
+    }
+
+    /// 首页（无 tab 时）按键：复用会话列表的导航，视觉更直接
+    fn home_key(&mut self, key: KeyEvent) -> bool {
+        use ratatui::crossterm::event::{KeyCode, KeyModifiers};
+        // 允许 Ctrl 组合已被全局键处理，这里只处理首页专属
+        let items = self.filtered_sessions(self.home_show_archived);
+        let count = items.len();
+        match key.code {
+            KeyCode::Up | KeyCode::Char('k') => {
+                if count > 0 {
+                    if self.home_selected == 0 {
+                        self.home_selected = count - 1;
+                    } else {
+                        self.home_selected -= 1;
+                    }
+                }
+                return true;
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                if count > 0 {
+                    self.home_selected = (self.home_selected + 1) % count;
+                }
+                return true;
+            }
+            KeyCode::Enter => {
+                if let Some(&idx) = items.get(self.home_selected) {
+                    let seed = self.session_list_cache[idx].seed.clone();
+                    self.open_session_tab(&seed);
+                }
+                return true;
+            }
+            KeyCode::Char('n') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.new_session();
+                return true;
+            }
+            KeyCode::Char('r') => {
+                self.fetch_session_list();
+                return true;
+            }
+            KeyCode::Char('a') => {
+                self.home_show_archived = !self.home_show_archived;
+                self.home_selected = 0;
+                return true;
+            }
+            KeyCode::Char('x') => {
+                if let Some(&idx) = items.get(self.home_selected) {
+                    let seed = self.session_list_cache[idx].seed.clone();
+                    self.overlays.push(Overlay::Confirm { action: ConfirmAction::ArchiveSession(seed) });
+                }
+                return true;
+            }
+            KeyCode::Char('u') => {
+                if let Some(&idx) = items.get(self.home_selected) {
+                    let seed = self.session_list_cache[idx].seed.clone();
+                    self.unarchive_session(seed);
+                }
+                return true;
+            }
+            KeyCode::Char('D') => {
+                if let Some(&idx) = items.get(self.home_selected) {
+                    let seed = self.session_list_cache[idx].seed.clone();
+                    self.overlays.push(Overlay::Confirm { action: ConfirmAction::DeleteSession(seed) });
+                }
+                return true;
+            }
+            _ => {}
+        }
+        // 首页下也允许 j/k 翻页等，防止落入 composer
+        matches!(key.code, KeyCode::Up | KeyCode::Down | KeyCode::Char('j') | KeyCode::Char('k') | KeyCode::Enter | KeyCode::Char('n') | KeyCode::Char('r') | KeyCode::Char('a') | KeyCode::Char('x') | KeyCode::Char('u') | KeyCode::Char('D'))
     }
 
     /// 交互弹窗按键。返回 true = 已消费。优先级 permission > ask > plan。
@@ -2144,6 +2357,34 @@ impl App {
                 }
                 return true;
             }
+            Overlay::CwdInput { mut input, mut cursor } => {
+                match key.code {
+                    KeyCode::Esc => { self.overlays.pop(); }
+                    KeyCode::Enter => {
+                        let raw: String = input.iter().collect();
+                        self.overlays.pop();
+                        self.confirm_cwd_input(raw);
+                    }
+                    KeyCode::Backspace => {
+                        if cursor > 0 { input.remove(cursor-1); cursor-=1; }
+                        self.replace_overlay(Overlay::CwdInput{ input, cursor });
+                    }
+                    KeyCode::Delete => {
+                        if cursor < input.len() { input.remove(cursor); }
+                        self.replace_overlay(Overlay::CwdInput{ input, cursor });
+                    }
+                    KeyCode::Left => { cursor = cursor.saturating_sub(1); self.replace_overlay(Overlay::CwdInput{ input, cursor }); }
+                    KeyCode::Right => { if cursor < input.len() { cursor+=1; } self.replace_overlay(Overlay::CwdInput{ input, cursor }); }
+                    KeyCode::Home => { self.replace_overlay(Overlay::CwdInput{ input, cursor: 0 }); }
+                    KeyCode::End => { let n = input.len(); self.replace_overlay(Overlay::CwdInput{ input, cursor: n }); }
+                    KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        input.insert(cursor.min(input.len()), c); cursor+=1;
+                        self.replace_overlay(Overlay::CwdInput{ input, cursor });
+                    }
+                    _ => {}
+                }
+                return true;
+            }
         }
     }
 
@@ -2154,15 +2395,200 @@ impl App {
         }
     }
 
+    // ── slash 二级菜单辅助 ──
+    pub fn slash_visible(&self) -> bool {
+        if !self.overlays.is_empty() {
+            return false;
+        }
+        if let Some(sess) = self.active_session() {
+            let val = sess.composer.value();
+            !crate::app::slash::completions_for(&val).is_empty()
+        } else {
+            false
+        }
+    }
+
+    pub fn slash_candidates(&self) -> Vec<crate::app::slash::SlashDef> {
+        if let Some(sess) = self.active_session() {
+            crate::app::slash::completions_for(&sess.composer.value())
+                .into_iter()
+                .cloned()
+                .collect()
+        } else {
+            vec![]
+        }
+    }
+
+    fn clamp_slash_selected(&mut self) {
+        let n = self.slash_candidates().len();
+        if n == 0 {
+            self.slash_selected = 0;
+        } else if self.slash_selected >= n {
+            self.slash_selected = n - 1;
+        }
+    }
+
+    fn autocomplete_slash(&mut self) {
+        let candidates = self.slash_candidates();
+        if candidates.is_empty() {
+            return;
+        }
+        let idx = self.slash_selected.min(candidates.len() - 1);
+        let name = candidates[idx].name;
+        if let Some(sess) = self.active_session_mut() {
+            let new = format!("/{name} ");
+            sess.composer.input = new.chars().collect();
+            sess.composer.cursor = sess.composer.input.len();
+        }
+        self.slash_selected = 0;
+    }
+
+    fn execute_slash_text(&mut self, raw: &str) -> bool {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() || !trimmed.starts_with('/') {
+            return false;
+        }
+        // 裸 "/" 留给菜单，不算命令
+        if trimmed == "/" {
+            return false;
+        }
+        let Some(cmd) = crate::app::slash::parse(trimmed) else {
+            return false;
+        };
+        match cmd {
+            SlashCmd::New { cwd } => {
+                // 静默创建：按 effective_cwd 回退链；二级编辑仅按 Tab 按需触发
+                match cwd {
+                    Some(p) => {
+                        let raw = p.trim().to_string();
+                        if raw.is_empty() {
+                            if let Some(sess) = self.active_session_mut() { sess.composer.clear(); }
+                            self.slash_selected = 0;
+                            self.new_session_with_cwd(None);
+                        } else if raw == "?" || raw.eq_ignore_ascii_case("edit") {
+                            let initial = self.effective_cwd(None).unwrap_or_default();
+                            self.overlays.push(Overlay::CwdInput { input: initial.chars().collect(), cursor: initial.len() });
+                            if let Some(sess) = self.active_session_mut() { sess.composer.clear(); }
+                            self.slash_selected = 0;
+                        } else {
+                            let expanded = crate::app::slash::expand_tilde(&raw);
+                            if !crate::app::slash::is_absolute_path(&expanded) {
+                                self.toast(NoticeLevel::Error, format!("cwd 需为绝对路径：{raw}"));
+                                return true;
+                            }
+                            if let Some(sess) = self.active_session_mut() { sess.composer.clear(); }
+                            self.slash_selected = 0;
+                            self.new_session_with_cwd(Some(expanded));
+                        }
+                    }
+                    None => {
+                        if let Some(sess) = self.active_session_mut() { sess.composer.clear(); }
+                        self.slash_selected = 0;
+                        self.new_session_with_cwd(None);
+                    }
+                }
+                true
+            }
+            SlashCmd::Help => {
+                if let Some(sess) = self.active_session_mut() { sess.composer.clear(); }
+                self.slash_selected = 0;
+                self.toggle_overlay(Overlay::Help);
+                true
+            }
+            SlashCmd::Clear => {
+                if let Some(sess) = self.active_session_mut() { sess.composer.clear(); }
+                self.slash_selected = 0;
+                true
+            }
+            SlashCmd::Unknown(s) => {
+                if s.is_empty() {
+                    false
+                } else {
+                    self.toast(NoticeLevel::Error, format!("未知命令：/{s}"));
+                    if let Some(sess) = self.active_session_mut() { sess.composer.clear(); }
+                    true
+                }
+            }
+        }
+    }
+
+    /// CwdInput 二级弹窗确认
+    fn confirm_cwd_input(&mut self, raw: String) {
+        let cwd = raw.trim().to_owned();
+        if cwd.is_empty() {
+            self.new_session_with_cwd(None);
+            return;
+        }
+        let cwd = crate::app::slash::expand_tilde(&cwd);
+        if !crate::app::slash::is_absolute_path(&cwd) {
+            self.toast(NoticeLevel::Error, format!("cwd 需为绝对路径：{cwd}"));
+            return;
+        }
+        self.new_session_with_cwd(Some(cwd));
+    }
+
     /// Composer 按键。
     fn composer_key(&mut self, key: KeyEvent) {
         use ratatui::crossterm::event::{KeyCode, KeyModifiers};
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        // 斜杠菜单优先：Up/Down/Tab/Esc/Enter 劫持（需在借用前计算）
+        let slash_vis = self.slash_visible();
         match key.code {
-            KeyCode::Enter => self.send_message(),
+            KeyCode::Esc if slash_vis => {
+                self.slash_selected = 0;
+                return;
+            }
+            KeyCode::Tab if slash_vis => {
+                self.autocomplete_slash();
+                return;
+            }
+            KeyCode::Tab => {
+                // composer 为 /new 或 /n 且无参时，Tab 打开二级编辑（显式 CwdInput）
+                let val = self.active_session().map(|s| s.composer.value()).unwrap_or_default();
+                let trimmed = val.trim().to_string();
+                if trimmed == "/new" || trimmed == "/n" {
+                    let initial = self.effective_cwd(None).unwrap_or_default();
+                    self.overlays.push(Overlay::CwdInput { input: initial.chars().collect(), cursor: initial.len() });
+                    if let Some(sess) = self.active_session_mut() { sess.composer.clear(); }
+                    self.slash_selected = 0;
+                    return;
+                }
+            }
+            KeyCode::Enter if slash_vis || self.active_session().is_some_and(|s| s.composer.value().trim_start().starts_with('/')) => {
+                // 若为 slash 输入，优先走 slash 执行或补全
+                let val = self.active_session().map(|s| s.composer.value()).unwrap_or_default();
+                let trimmed = val.trim().to_string();
+                if trimmed.starts_with('/') {
+                    if trimmed == "/" {
+                        self.autocomplete_slash();
+                        return;
+                    }
+                    // 若菜单可见且输入仍是前缀（无空格），Tab/Enter 应补全而非直接执行部分命令
+                    let has_space = trimmed.contains(char::is_whitespace);
+                    if slash_vis && !has_space {
+                        // 若输入已是完整命令（如 "/new"），直接执行；否则补全
+                        let without = trimmed[1..].to_ascii_lowercase();
+                        let exact = crate::app::slash::SLASH_COMMANDS.iter().any(|d| d.name == without || (d.name == "new" && without == "n"));
+                        if exact {
+                            if self.execute_slash_text(&trimmed) { return; }
+                        } else {
+                            self.autocomplete_slash();
+                            return;
+                        }
+                    } else if self.execute_slash_text(&trimmed) {
+                        return;
+                    } else if slash_vis {
+                        self.autocomplete_slash();
+                        return;
+                    }
+                }
+                self.send_message();
+                return;
+            }
+            KeyCode::Enter => { self.send_message(); return; },
             KeyCode::Esc => self.cancel_turn(),
             KeyCode::Backspace => {
-                if let Some(s) = self.active_session_mut() {
+                let need_clamp = if let Some(s) = self.active_session_mut() {
                     if ctrl {
                         s.composer.word_left();
                         let cur = s.composer.cursor;
@@ -2172,12 +2598,16 @@ impl App {
                     } else {
                         s.composer.backspace();
                     }
-                }
+                    true
+                } else { false };
+                if need_clamp { self.clamp_slash_selected(); }
             }
             KeyCode::Delete => {
-                if let Some(s) = self.active_session_mut() {
+                let need_clamp = if let Some(s) = self.active_session_mut() {
                     s.composer.delete();
-                }
+                    true
+                } else { false };
+                if need_clamp { self.clamp_slash_selected(); }
             }
             KeyCode::Left => {
                 if let Some(s) = self.active_session_mut() {
@@ -2212,12 +2642,20 @@ impl App {
                 }
             }
             KeyCode::Up => {
-                if let Some(s) = self.active_session_mut() {
+                if slash_vis {
+                    let n = self.slash_candidates().len();
+                    if n > 0 {
+                        if self.slash_selected == 0 { self.slash_selected = n - 1; } else { self.slash_selected -= 1; }
+                    }
+                } else if let Some(s) = self.active_session_mut() {
                     s.composer.history_up();
                 }
             }
             KeyCode::Down => {
-                if let Some(s) = self.active_session_mut() {
+                if slash_vis {
+                    let n = self.slash_candidates().len();
+                    if n > 0 { self.slash_selected = (self.slash_selected + 1) % n; }
+                } else if let Some(s) = self.active_session_mut() {
                     s.composer.history_down();
                 }
             }
@@ -2256,9 +2694,11 @@ impl App {
                 }
             }
             KeyCode::Char(c) if !ctrl && !key.modifiers.contains(KeyModifiers::ALT) => {
-                if let Some(s) = self.active_session_mut() {
+                let need_clamp = if let Some(s) = self.active_session_mut() {
                     s.composer.insert(c);
-                }
+                    true
+                } else { false };
+                if need_clamp { self.clamp_slash_selected(); }
             }
             _ => {}
         }
@@ -2287,12 +2727,17 @@ impl App {
             self.last_focused = Some(active.clone());
         }
         let Some(sess) = self.sessions.get_mut(&active) else { return };
+        // 流式/运行中工具需动画：即使 version 未变也定期重绘（对齐 opencode Spinner 60fps，tui 侧 500ms Tick 驱动）
+        let streaming = sess.timeline.is_streaming()
+            || sess.timeline.turns.iter().any(|t| t.rounds.iter().any(|r| r.blocks.iter().any(|b| {
+                b.tool.as_ref().is_some_and(|tl| tl.state == crate::protocol::timeline::TimelineToolState::Running)
+            })));
         let need = match &sess.rendered {
-            Some(cached) => cached.version != sess.timeline.version || cached.width != width,
+            Some(cached) => cached.version != sess.timeline.version || cached.width != width || streaming,
             None => true,
         };
         if need {
-            let lines = render_transcript::render_transcript(sess, width);
+            let lines = render_transcript::render_transcript_with_opts(sess, width, self.show_reasoning);
             sess.rendered = Some(session::RenderedTranscript {
                 version: sess.timeline.version,
                 width,

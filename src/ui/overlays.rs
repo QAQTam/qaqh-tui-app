@@ -19,6 +19,7 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) {
         Overlay::Settings(_) => crate::ui::settings::draw(f, app, area),
         Overlay::Help => draw_help(f, area),
         Overlay::AttachPath { input, cursor, .. } => draw_attach(f, input, *cursor, area),
+        Overlay::CwdInput { input, cursor } => draw_cwd(f, input, *cursor, area),
         Overlay::Confirm { action } => draw_confirm(f, action, area),
     }
 }
@@ -101,12 +102,14 @@ fn draw_help(f: &mut Frame, area: Rect) {
     let keys: Vec<(&str, &str)> = vec![
         ("Alt+1..9", "切换会话标签"),
         ("Alt+←/→", "前后切换标签"),
-        ("Ctrl+T", "新建会话"),
+        ("Ctrl+T", "新建会话（回退链：QAQH_DEFAULT_CWD>启动目录>当前会话）"),
+        ("/ + Tab/↑↓/Enter", "斜杠命令（/new [cwd] · /help · /clear）"),
+        ("/new [cwd]", "留空静默用回退链，/new ? 或 /new Tab 打开二级 cwd 编辑（支持 ~/）"),
         ("Ctrl+W", "关闭当前标签（不影响会话本身）"),
         ("Ctrl+L", "会话列表（恢复/归档/删除）"),
-        ("Ctrl+,", "设置页（读写 daemon 配置）"),
+        ("Ctrl+, / F10", "设置页（读写 daemon 配置）"),
         ("Enter", "发送消息"),
-        ("Esc", "中止当前回合 / 关闭弹窗"),
+        ("Esc", "中止当前回合 / 关闭弹窗（/ 菜单下仅关闭菜单）"),
         ("Ctrl+P", "切换 plan/code 模式"),
         ("Ctrl+Y", "撤销最后一个回合"),
         ("Ctrl+E", "上下文压缩（compact）"),
@@ -116,6 +119,7 @@ fn draw_help(f: &mut Frame, area: Rect) {
         ("F3", "展开/折叠思考块"),
         ("F4", "workspace 侧栏（todo 列表）开/关"),
         ("F6", "todo 详情展开/折叠"),
+        ("F7", "工具输出展开/折叠（长输出/diff）"),
         ("F1", "本帮助"),
         ("Ctrl+C ×2 / Ctrl+Q", "退出"),
     ];
@@ -147,6 +151,24 @@ fn draw_attach(f: &mut Frame, input: &[char], cursor: usize, area: Rect) {
     ]);
     f.render_widget(Paragraph::new(line), inner);
     let x = inner.x + " 路径> ".width() as u16 + before_w;
+    if x < inner.x + inner.width {
+        f.set_cursor_position((x, inner.y));
+    }
+}
+
+fn draw_cwd(f: &mut Frame, input: &[char], cursor: usize, area: Rect) {
+    let inner = box_frame(f, area, 80, 5, "新建会话 · cwd（绝对路径，留空走 QAQH_DEFAULT_CWD>启动目录>当前会话）Enter 确认 · Esc 取消");
+    let cursor = cursor.min(input.len());
+    let before: String = input[..cursor].iter().collect();
+    let before_w = before.width() as u16;
+    let at: String = input.get(cursor).map(|c| c.to_string()).unwrap_or_else(|| " ".into());
+    let line = Line::from(vec![
+        Span::styled(" cwd> ", theme::accent()),
+        Span::raw(before),
+        Span::styled(at, Style::new().add_modifier(Modifier::REVERSED)),
+    ]);
+    f.render_widget(Paragraph::new(line), inner);
+    let x = inner.x + " cwd> ".width() as u16 + before_w;
     if x < inner.x + inner.width {
         f.set_cursor_position((x, inner.y));
     }

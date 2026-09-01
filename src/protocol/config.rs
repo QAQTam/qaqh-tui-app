@@ -169,6 +169,9 @@ pub struct SubagentPatch {
     pub max_tokens: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none", alias = "timeout_secs")]
     pub timeout_secs: Option<u64>,
+    /// 空数组 = 全部工具可用（与后端 `qaqh-config-api` 语义一致）。
+    #[serde(skip_serializing_if = "Option::is_none", alias = "default_tools")]
+    pub default_tools: Option<Vec<String>>,
 }
 
 impl ConfigPatch {

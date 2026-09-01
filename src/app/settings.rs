@@ -33,6 +33,7 @@ pub enum FieldId {
     SubMaxTokens,
     SubTimeoutSecs,
     SubApiKey,
+    SubDefaultTools,
     Lang,
     Theme,
     FontFamily,
@@ -85,6 +86,7 @@ pub const ROWS: &[Row] = &[
     Row { id: FieldId::SubMaxTokens, label: "子代理 maxTokens", kind: FieldKind::Number, section: "子代理" },
     Row { id: FieldId::SubTimeoutSecs, label: "子代理超时(s)", kind: FieldKind::Number, section: "子代理" },
     Row { id: FieldId::SubApiKey, label: "子代理 Key", kind: FieldKind::Secret, section: "子代理" },
+    Row { id: FieldId::SubDefaultTools, label: "子代理工具", kind: FieldKind::Text, section: "子代理" },
     Row { id: FieldId::Lang, label: "语言", kind: FieldKind::Text, section: "通用" },
     Row { id: FieldId::Theme, label: "主题", kind: FieldKind::Text, section: "通用" },
     Row { id: FieldId::FontFamily, label: "字体", kind: FieldKind::Text, section: "通用" },
@@ -142,7 +144,7 @@ impl SettingsState {
             FieldId::NotificationsEnabled => self.draft.notifications_enabled.is_some(),
             FieldId::ComplianceEnabled => self.draft.compliance_enabled.is_some(),
             FieldId::TokenizerPath => self.draft.tokenizer_path.is_some(),
-            FieldId::SubModel | FieldId::SubBaseUrl | FieldId::SubApiKey | FieldId::SubMaxTokens | FieldId::SubTimeoutSecs => {
+            FieldId::SubModel | FieldId::SubBaseUrl | FieldId::SubApiKey | FieldId::SubMaxTokens | FieldId::SubTimeoutSecs | FieldId::SubDefaultTools => {
                 let Some(sub) = &self.draft.subagent else { return false };
                 match id {
                     FieldId::SubModel => sub.model.is_some(),
@@ -150,6 +152,7 @@ impl SettingsState {
                     FieldId::SubApiKey => sub.api_key.is_some(),
                     FieldId::SubMaxTokens => sub.max_tokens.is_some(),
                     FieldId::SubTimeoutSecs => sub.timeout_secs.is_some(),
+                    FieldId::SubDefaultTools => sub.default_tools.is_some(),
                     _ => false,
                 }
             }
@@ -227,6 +230,16 @@ impl SettingsState {
                 (None, Some(c)) if c.subagent.api_key_set => "(已配置 ****)".into(),
                 (None, _) => "(未配置)".into(),
             },
+            FieldId::SubDefaultTools => {
+                let draft_val = d.subagent.as_ref().and_then(|s| s.default_tools.clone());
+                let loaded_val = loaded.map(|c| c.subagent.default_tools.clone());
+                let tools = draft_val.or(loaded_val);
+                match tools {
+                    None => "…".into(),
+                    Some(v) if v.is_empty() => "(全部工具)".into(),
+                    Some(v) => v.join(", "),
+                }
+            }
             FieldId::Lang => opt_str(d.lang.clone(), loaded.and_then(|c| c.lang.clone())),
             FieldId::Theme => opt_str(d.theme.clone(), loaded.and_then(|c| c.theme.clone())),
             FieldId::FontFamily => owned_or(d.font_family.clone(), loaded.map(|c| c.font_family.as_str()).filter(|s| !s.is_empty()), "—"),
@@ -265,6 +278,10 @@ impl SettingsState {
             FieldId::AutoCompactThreshold => {
                 self.effective(loaded, |d, c| d.auto_compact_threshold.unwrap_or(c.auto_compact_threshold).to_string())
             }
+            FieldId::SubDefaultTools => self.effective(loaded, |d, c| {
+                let v = d.subagent.as_ref().and_then(|s| s.default_tools.clone()).unwrap_or_else(|| c.subagent.default_tools.clone());
+                if v.is_empty() { String::new() } else { v.join(", ") }
+            }),
             FieldId::ApiKey | FieldId::SubApiKey => String::new(),
             FieldId::Provider | FieldId::Endpoint | FieldId::ReasoningEffort
             | FieldId::NotificationsEnabled | FieldId::ComplianceEnabled
@@ -320,6 +337,18 @@ impl SettingsState {
             FieldId::TokenizerPath => self.draft.tokenizer_path = Some(text),
             FieldId::SubModel => self.draft.subagent.get_or_insert_with(SubagentPatch::default).model = Some(text),
             FieldId::SubBaseUrl => self.draft.subagent.get_or_insert_with(SubagentPatch::default).base_url = Some(text),
+            FieldId::SubDefaultTools => {
+                // 空输入 = 全部工具（Some([])），逗号分隔，非空则按逗号切分去空白。
+                let tools = if text.is_empty() {
+                    Vec::new()
+                } else {
+                    text.split(',')
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect()
+                };
+                self.draft.subagent.get_or_insert_with(SubagentPatch::default).default_tools = Some(tools);
+            }
             // 不可编辑字段：静默忽略（理论上不会到达）。
             FieldId::Provider | FieldId::Endpoint | FieldId::ReasoningEffort
             | FieldId::NotificationsEnabled | FieldId::ComplianceEnabled

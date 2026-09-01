@@ -33,7 +33,7 @@ fn main() -> Result<()> {
             println!("  qaqh-tui --no-spawn 不自动拉起 daemon（仅连接已有实例）");
             println!("  qaqh-tui doctor     自检：发现/健康/open 握手");
             println!();
-            println!("环境: QAQH_DATA_DIR（数据目录覆盖）、QAQH_BACKEND_ROOT（daemon 拉起候选）");
+            println!("环境: QAQH_DATA_DIR（数据目录覆盖）、QAQH_BACKEND_ROOT（daemon 拉起候选）、QAQH_DEFAULT_CWD（新建会话默认目录，支持 ~/ 展开）");
             return Ok(());
         }
         _ => {}
@@ -110,11 +110,11 @@ async fn run_tui(no_spawn: bool) -> Result<()> {
         });
     }
 
-    // 心跳任务（toast 过期 / Ctrl+C 双击窗口 / 时钟）。
+    // 心跳任务（toast 过期 / Ctrl+C 双击窗口 / 时钟 / 动画 200ms）。
     {
         let tick_tx = app_tx.clone();
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_millis(500));
+            let mut interval = tokio::time::interval(std::time::Duration::from_millis(200));
             loop {
                 interval.tick().await;
                 if tick_tx.send(AppMsg::Tick).is_err() {
@@ -125,6 +125,8 @@ async fn run_tui(no_spawn: bool) -> Result<()> {
     }
 
     let mut app = App::new(client.clone(), runtime.clone(), app_tx.clone());
+    // 首页：无 tab 时直接展示会话列表，立即拉取一次避免首帧空白
+    app.fetch_session_list();
 
     // 主循环：事件驱动，批量消费后单帧重绘。
     let loop_result: Result<()> = async {

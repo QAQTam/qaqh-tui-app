@@ -6,7 +6,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState};
 use ratatui::Frame;
 
-use crate::app::render_line::SpanStyle;
+use crate::app::render_line::{RenderStyle, SpanStyle};
 use crate::app::App;
 use crate::ui::theme;
 
@@ -17,7 +17,7 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) {
     let width = area.width.saturating_sub(1); // 右侧滚动条留 1 列
     let lines: Vec<crate::app::render_line::RenderLine> = match &sess.rendered {
         Some(cached) if cached.width == width => cached.lines.clone(),
-        _ => crate::app::render_transcript::render_transcript(sess, width),
+        _ => crate::app::render_transcript::render_transcript_with_opts(sess, width, app.show_reasoning),
     };
 
     let total = lines.len();
@@ -37,7 +37,13 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) {
             let spans: Vec<Span> = rl
                 .spans
                 .iter()
-                .map(|s| Span::styled(s.text.clone(), theme::style_of(s.style)))
+                .map(|s| {
+                    let style = match &s.style {
+                        RenderStyle::Semantic(ss) => theme::style_of(*ss),
+                        RenderStyle::Direct(st) => *st,
+                    };
+                    Span::styled(s.text.clone(), style)
+                })
                 .collect();
             Line::from(spans)
         })
@@ -68,7 +74,13 @@ pub fn draw_session_info(f: &mut Frame, app: &App, area: Rect) {
             let spans: Vec<Span> = rl
                 .spans
                 .iter()
-                .map(|s| Span::styled(s.text.clone(), theme::style_of(s.style)))
+                .map(|s| {
+                    let style = match &s.style {
+                        RenderStyle::Semantic(ss) => theme::style_of(*ss),
+                        RenderStyle::Direct(st) => *st,
+                    };
+                    Span::styled(s.text.clone(), style)
+                })
                 .collect();
             Line::from(spans)
         })

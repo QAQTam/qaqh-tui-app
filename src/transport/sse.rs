@@ -195,4 +195,30 @@ mod tests {
         assert_eq!(backoff_delay(0).as_millis() >= 1000, true);
         assert_eq!(backoff_delay(10).as_millis() <= 30_250, true);
     }
+
+    #[test]
+    fn perf_sse_throughput() {
+        use std::time::Instant;
+        let mut d = SseDecoder::new();
+        let frame = b"id: ep:conversation:1\nevent: text_delta\ndata: {\"d\":\"hello **md**\"}\n\n";
+        let n = 10000;
+        let mut buf = Vec::with_capacity(frame.len() * n);
+        for i in 0..n {
+            buf.extend_from_slice(format!("id: ep:conversation:{i}\n").as_bytes());
+            buf.extend_from_slice(b"event: text_delta\ndata: {\"d\":\"x\"}\n\n");
+        }
+        // 分 1KB chunk 推送，模拟 TCP 流
+        let start = Instant::now();
+        let mut produced = 0usize;
+        for chunk in buf.chunks(1024) {
+            d.push(chunk);
+            while let Some(Ok(_)) = d.next_frame() {
+                produced += 1;
+            }
+        }
+        let elapsed = start.elapsed();
+        eprintln!("sse {} frames in {:?} ({:.0} frames/s, {:.2} MB/s)", n, elapsed, n as f64 / elapsed.as_secs_f64(), buf.len() as f64 / elapsed.as_secs_f64() / 1e6);
+        assert_eq!(produced, n);
+        assert!(elapsed.as_millis() < 500, "10k SSE frames should be <500ms, got {:?}", elapsed);
+    }
 }

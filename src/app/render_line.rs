@@ -11,6 +11,7 @@ pub enum SpanStyle {
     Dim,
     Reasoning,
     Italic,
+    Bold,
     User,
     Accent,
     ToolRun,
@@ -21,17 +22,43 @@ pub enum SpanStyle {
     DiffAdd,
     DiffDel,
     Inverse,
+    // Markdown 扩展（首版：标题/粗斜/行内码/代码块/链接/引用/分割线/表格）
+    MdH1,
+    MdH2,
+    MdH3,
+    MdInlineCode,
+    MdCodeBlock,
+    MdLink,
+    MdQuote,
+    MdRuler,
+    MdTableHead,
+    MdTableCell,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RenderStyle {
+    Semantic(SpanStyle),
+    Direct(ratatui::style::Style),
+}
+
+impl From<SpanStyle> for RenderStyle {
+    fn from(s: SpanStyle) -> Self {
+        Self::Semantic(s)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RenderSpan {
     pub text: String,
-    pub style: SpanStyle,
+    pub style: RenderStyle,
 }
 
 impl RenderSpan {
     pub fn new(text: impl Into<String>, style: SpanStyle) -> Self {
-        Self { text: text.into(), style }
+        Self { text: text.into(), style: RenderStyle::Semantic(style) }
+    }
+    pub fn with_style(text: impl Into<String>, style: ratatui::style::Style) -> Self {
+        Self { text: text.into(), style: RenderStyle::Direct(style) }
     }
 }
 
@@ -47,6 +74,11 @@ impl RenderLine {
 
     pub fn span(mut self, text: impl Into<String>, style: SpanStyle) -> Self {
         self.spans.push(RenderSpan::new(text, style));
+        self
+    }
+
+    pub fn span_direct(mut self, text: impl Into<String>, style: ratatui::style::Style) -> Self {
+        self.spans.push(RenderSpan::with_style(text, style));
         self
     }
 

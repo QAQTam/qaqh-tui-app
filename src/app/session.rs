@@ -342,6 +342,8 @@ pub struct SessionState {
     pub needs_rebaseline: bool,
     /// 加载更早：in-flight 去重。
     pub loading_older: bool,
+    /// 已展开的工具输出（tool_call_id 集合，折叠态默认收起超长输出）
+    pub expanded_tools: std::collections::HashSet<String>,
 }
 
 impl SessionState {
@@ -373,6 +375,7 @@ impl SessionState {
             ready: false,
             needs_rebaseline: false,
             loading_older: false,
+            expanded_tools: std::collections::HashSet::new(),
         }
     }
 

@@ -51,7 +51,7 @@ pub struct Block {
     pub text: String,
     pub tool: Option<ToolCard>,
     /// TextDelta 的单调 fragment 计数（BlockCheckpoint 不重置）。
-    last_fragment: u64,
+    pub(crate) last_fragment: u64,
 }
 
 impl Block {
