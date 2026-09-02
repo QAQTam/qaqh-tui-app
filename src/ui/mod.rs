@@ -21,7 +21,7 @@ pub fn draw(f: &mut Frame, app: &App) {
     let [tab_area, main_area, composer_area, status_area] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Min(3),
-        Constraint::Length(composer::height()),
+        Constraint::Length(composer::height(app)),
         Constraint::Length(1),
     ])
     .areas(area);

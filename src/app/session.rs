@@ -142,7 +142,7 @@ pub struct Attachment {
     pub content: ContentRef,
 }
 
-/// 单行输入框（手写：char 粒度光标 + 历史）。
+/// 多行输入框（手写：char 粒度光标 + 历史；\n 为行分隔，Enter 发送、Alt+Enter/Ctrl+J 换行）。
 #[derive(Debug, Clone, Default)]
 pub struct Composer {
     pub input: Vec<char>,
@@ -169,14 +169,64 @@ impl Composer {
         self.history_idx = None;
     }
 
+    /// 插入字符串；换行归一化（`\r\n`/`\r` → 单个 `\n`）并保留多行（粘贴）。
     pub fn insert_str(&mut self, s: &str) {
-        for ch in s.chars() {
-            if ch == '\n' || ch == '\r' {
-                self.insert(' ');
-            } else {
-                self.insert(ch);
+        let mut chars = s.chars().peekable();
+        while let Some(ch) = chars.next() {
+            match ch {
+                '\r' => {
+                    if chars.peek() == Some(&'\n') {
+                        chars.next();
+                    }
+                    self.insert('\n');
+                }
+                _ => self.insert(ch),
             }
         }
+    }
+
+    /// 行数（含光标所在行的尾部空行）。
+    pub fn rows(&self) -> usize {
+        self.input.iter().filter(|c| **c == '\n').count() + 1
+    }
+
+    /// 光标的 (行号 0-based, 行内 char 偏移)。
+    pub fn line_col(&self) -> (usize, usize) {
+        let line = self.input[..self.cursor.min(self.input.len())]
+            .iter()
+            .filter(|c| **c == '\n')
+            .count();
+        let col = match self.input[..self.cursor.min(self.input.len())]
+            .iter()
+            .rposition(|c| *c == '\n')
+        {
+            Some(pos) => self.cursor - pos - 1,
+            None => self.cursor,
+        };
+        (line, col)
+    }
+
+    /// 第 `line` 行（0-based）的 char 切片范围 `[start, end)`；越界行返回空行。
+    pub fn line_bounds(&self, line: usize) -> (usize, usize) {
+        let mut idx = 0usize;
+        let mut cur = 0usize;
+        let mut start = 0usize;
+        while cur < line && idx < self.input.len() {
+            if self.input[idx] == '\n' {
+                cur += 1;
+                start = idx + 1;
+            }
+            idx += 1;
+        }
+        if cur < line {
+            return (self.input.len(), self.input.len());
+        }
+        let end = self.input[idx..]
+            .iter()
+            .position(|c| *c == '\n')
+            .map(|p| idx + p)
+            .unwrap_or(self.input.len());
+        (start, end)
     }
 
     pub fn backspace(&mut self) {
@@ -471,5 +521,50 @@ pub fn sync_streaming_from_timeline(session: &mut SessionState) {
             // 这里不提前清除（事件是权威终态）。
         }
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rows_and_line_col_track_newlines() {
+        let mut c = Composer::default();
+        assert_eq!(c.rows(), 1);
+        assert_eq!(c.line_col(), (0, 0));
+        for ch in "ab".chars() { c.insert(ch); }
+        c.insert('\n');
+        for ch in "cd".chars() { c.insert(ch); }
+        assert_eq!(c.value(), "ab\ncd");
+        assert_eq!(c.rows(), 2);
+        assert_eq!(c.line_col(), (1, 2));
+        c.left();
+        c.left();
+        assert_eq!(c.line_col(), (1, 0));
+    }
+
+    #[test]
+    fn line_bounds_split_multiline() {
+        let mut c = Composer::default();
+        for ch in "ab\ncd\n\n".chars() { c.insert(ch); }
+        let (s0, e0) = c.line_bounds(0);
+        assert_eq!(c.input[s0..e0], ['a', 'b']);
+        let (s1, e1) = c.line_bounds(1);
+        assert_eq!(c.input[s1..e1], ['c', 'd']);
+        let (s2, e2) = c.line_bounds(2);
+        assert_eq!(c.input[s2..e2], Vec::<char>::new());
+        // 越界行：空窗口。
+        let (s3, e3) = c.line_bounds(9);
+        assert_eq!(s3, e3);
+        assert_eq!(c.line_col(), (3, 0));
+    }
+
+    #[test]
+    fn insert_str_keeps_paste_newlines() {
+        let mut c = Composer::default();
+        c.insert_str("第一行\n第二行\r\n第三行");
+        assert_eq!(c.rows(), 3);
+        assert!(c.value().starts_with("第一行\n第二行\n第三行"));
     }
 }

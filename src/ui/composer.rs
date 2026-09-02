@@ -7,11 +7,19 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::Frame;
 use unicode_width::UnicodeWidthStr;
 
+use unicode_width::UnicodeWidthChar;
+
+use crate::app::render_line::edit_window;
 use crate::app::App;
 use crate::ui::theme;
 
-pub fn height() -> u16 {
-    3 // 上下边框 + 1 行输入
+/// composer 显示行数上限（超出后以尾部窗口展示，光标行恒可见）。
+const MAX_ROWS: usize = 6;
+
+/// 自适应高度：上下边框 + min(输入行数, MAX_ROWS)。
+pub fn height(app: &App) -> u16 {
+    let rows = app.active_session().map(|s| s.composer.rows()).unwrap_or(1);
+    (rows.clamp(1, MAX_ROWS) as u16).saturating_add(2)
 }
 
 pub fn draw_slash_menu(f: &mut Frame, app: &App, composer_area: Rect) {
@@ -93,50 +101,78 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) {
         x: area.x + 1,
         y: area.y + 1,
         width: area.width.saturating_sub(2),
-        height: 1,
+        height: area.height.saturating_sub(2),
     };
+    // 尾部窗口：光标行恒可见（输入超过 MAX_ROWS 时只显示最后 shown 行）。
+    let shown = inner.height as usize;
+    let (cursor_line, cursor_col) = sess.composer.line_col();
+    let first = (cursor_line + 1).saturating_sub(shown);
+
     let prompt = "❯ ";
     let prompt_w = prompt.width();
+    let avail_w = (inner.width as usize).saturating_sub(prompt_w);
 
-    let cursor_char = sess.composer.cursor.min(sess.composer.input.len());
-    let before: String = sess.composer.input[..cursor_char].iter().collect();
-    let at: String = sess.composer.input.get(cursor_char).map(|c| c.to_string()).unwrap_or_default();
-    let after: String = sess.composer.input[(cursor_char + if at.is_empty() { 0 } else { 1 }).min(sess.composer.input.len())..]
-        .iter()
-        .collect();
+    let mut rows: Vec<Line> = Vec::with_capacity(shown);
+    let mut cursor_pos: Option<(u16, u16)> = None;
+    for i in 0..shown {
+        let line_no = first + i;
+        let (ls, le) = sess.composer.line_bounds(line_no);
+        let line_slice = &sess.composer.input[ls..le];
+        let is_cursor_line = line_no == cursor_line;
+        let col = if is_cursor_line { cursor_col.min(line_slice.len()) } else { line_slice.len() };
+        let (window, cursor_off) = edit_window(line_slice, col, avail_w.max(1));
 
-    let mut spans = vec![
-        Span::styled(prompt, theme::accent()),
-        Span::raw(before.clone()),
-    ];
-    if at.is_empty() {
-        spans.push(Span::styled(" ", Style::new().add_modifier(Modifier::REVERSED)));
-    } else {
-        spans.push(Span::styled(at.clone(), Style::new().add_modifier(Modifier::REVERSED)));
-        spans.push(Span::raw(after.clone()));
-    }
+        let wchars: Vec<char> = window.chars().collect();
+        let before: String = wchars[..cursor_off.min(wchars.len())].iter().collect();
+        let at: Option<char> = wchars.get(cursor_off).copied();
+        let after: String = wchars[(cursor_off + usize::from(at.is_some())).min(wchars.len())..].iter().collect();
 
-    let used = prompt_w + before.width() + at.width() + after.width();
-    if let Some(s) = &sess.streaming {
-        let phase = match &s.tool_name {
-            Some(t) => format!("{}({t})", s.phase.label()),
-            None => s.phase.label().to_string(),
-        };
-        let label = format!(" Esc 中止 · {phase} ");
-        let label_w = label.width();
-        if used + label_w <= inner.width as usize {
-            let pad = inner.width as usize - used - label_w;
-            spans.push(Span::styled(" ".repeat(pad), Style::new()));
-            spans.push(Span::styled(label, theme::warn()));
+        let row_prompt = if line_no == 0 { prompt } else { "  " };
+        let row_prompt_w = if line_no == 0 { prompt_w } else { 2 };
+        let before_w = before.width();
+        let at_w = at.map(|c| c.width().unwrap_or(0)).unwrap_or(1);
+        let after_w = after.width();
+        let mut spans = vec![Span::styled(row_prompt, theme::accent()), Span::raw(before)];
+        spans.push(Span::styled(
+            at.map(String::from).unwrap_or_else(|| " ".to_string()),
+            Style::new().add_modifier(Modifier::REVERSED),
+        ));
+        spans.push(Span::raw(after));
+
+        // 流式状态标签：仅画在光标行的行尾。
+        let mut used = row_prompt_w + before_w + at_w + after_w;
+        if is_cursor_line {
+            if let Some(st) = &sess.streaming {
+                let phase = match &st.tool_name {
+                    Some(t) => format!("{}({t})", st.phase.label()),
+                    None => st.phase.label().to_string(),
+                };
+                let label = format!(" Esc 中止 · {phase} ");
+                let label_w = label.width();
+                if used + label_w <= inner.width as usize {
+                    let pad = inner.width as usize - used - label_w;
+                    spans.push(Span::styled(" ".repeat(pad), Style::new()));
+                    spans.push(Span::styled(label, theme::warn()));
+                }
+                used = inner.width as usize;
+            }
         }
+
+        if is_cursor_line {
+            // edit_window 保证 off + 1 <= avail_w → 终端光标恒在界内。
+            cursor_pos = Some((inner.x + row_prompt_w as u16 + cursor_off as u16, inner.y + i as u16));
+        }
+        let _ = used;
+        rows.push(Line::from(spans));
     }
 
-    f.render_widget(Line::from(spans), inner);
+    f.render_widget(Paragraph::new(rows), inner);
 
     // 终端光标定位（IME/复制友好）。
-    let cursor_x = inner.x + (prompt_w + before.width()) as u16;
-    if cursor_x < inner.x + inner.width {
-        f.set_cursor_position((cursor_x, inner.y));
+    if let Some((x, y)) = cursor_pos {
+        if x < inner.x + inner.width {
+            f.set_cursor_position((x, y));
+        }
     }
 }
 

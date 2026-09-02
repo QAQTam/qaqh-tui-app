@@ -173,7 +173,18 @@ impl App {
                     self.slash_selected = 0;
                 }
             }
-            KeyCode::Enter if slash_vis || self.active_session().is_some_and(|s| s.composer.value().trim_start().starts_with('/')) => {
+            // 多行输入：Alt+Enter / Ctrl+J 插入换行（Enter 仍为发送）。
+            KeyCode::Enter if key.modifiers.contains(KeyModifiers::ALT) || (ctrl && key.code == KeyCode::Char('j')) => {
+                if let Some(sess) = self.active_session_mut() {
+                    sess.composer.insert('\n');
+                }
+            }
+            KeyCode::Enter
+                if slash_vis
+                    || self.active_session().is_some_and(|s| {
+                        !s.composer.value().contains('\n')
+                            && s.composer.value().trim_start().starts_with('/')
+                    }) => {
                 // 若为 slash 输入，优先走 slash 执行或补全
                 let val = self.active_session().map(|s| s.composer.value()).unwrap_or_default();
                 let trimmed = val.trim().to_string();
