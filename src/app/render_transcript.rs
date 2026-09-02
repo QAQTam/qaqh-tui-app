@@ -503,17 +503,11 @@ fn shell_meta_from_raw(raw: &str) -> Option<(Option<i32>, bool, String)> {
 fn push_tool_card(lines: &mut Vec<RenderLine>, tool: &crate::app::timeline_model::ToolCard, width: usize, expanded_raw: bool) {
     // 默认展开的工具：expanded_raw 的语义做 xor，使 F7 仍可“收起”
     let expanded = expanded_raw ^ is_default_expanded(&tool.name);
-    // 动画帧：Running 时用四帧转轮（与 opencode Spinner 对齐，200ms/帧，Tick 500ms 驱动重绘）
+    // 动画帧：Running 时用八帧 braille 转轮（200ms/帧，Tick 驱动重绘；帧源=墙钟，无状态）
     let (icon_raw, base_style, is_running) = match tool.state {
         TimelineToolState::Prepared => (tool_icon(&tool.name), SpanStyle::Dim, false),
         TimelineToolState::Running => {
-            let frames = ["◐", "◑", "◒", "◓"];
-            let ms = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_millis())
-                .unwrap_or(0);
-            let idx = ((ms / 200) % frames.len() as u128) as usize;
-            (frames[idx], SpanStyle::ToolRun, true)
+            (crate::app::anim::spinner_glyph(crate::app::anim::frame_now()), SpanStyle::ToolRun, true)
         }
         TimelineToolState::Succeeded => ("●", SpanStyle::ToolOk, false),
         TimelineToolState::Failed => ("✗", SpanStyle::ToolFail, false),
@@ -947,8 +941,15 @@ pub fn render_session_info(session: &SessionState, width: u16) -> Vec<RenderLine
         spans.push((format!("+{}", session.code_added), SpanStyle::DiffAdd));
         spans.push((format!("−{}", session.code_removed), SpanStyle::DiffDel));
     }
-    if let Some(compact) = &session.compact_status {
-        spans.push((format!("compact:{compact}"), SpanStyle::Dim));
+    if let Some(anim) = &session.compact_anim {
+        // 伪进度（≈）+ 协议真实信息（turns/delta）；info 行每帧独立渲染 → 自然逐帧动画。
+        let ratio = crate::app::anim::pseudo_progress(anim.started_at.elapsed());
+        let bar = crate::app::anim::bar(Some(ratio), 10, crate::app::anim::frame_now());
+        let delta = anim.last_delta.as_deref().unwrap_or("估算");
+        spans.push((
+            format!("≈{bar} 压缩中 {}/{} · {delta}", anim.turns_keeping, anim.turns_total),
+            SpanStyle::Warn,
+        ));
     }
     if let Some(err) = &session.last_error {
         spans.push((format!("err:{}", err.code), SpanStyle::Error));
@@ -1041,7 +1042,6 @@ mod tests {
 
     #[test]
     fn rendering_respects_show_reasoning() {
-        let mut model = TimelineModel::default();
         let block = Block {
             block_id: "b1".into(),
             block_order: 0,

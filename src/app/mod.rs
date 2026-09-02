@@ -4,6 +4,7 @@
 //! UI 在同一帧内重绘。
 
 pub(crate) mod keymap;
+pub(crate) mod anim;
 mod composer_ops;
 mod paste_guard;
 mod interaction;
@@ -344,6 +345,8 @@ impl App {
             }
             RuntimeMsg::TimelineRebaseline { seed, page } => {
                 let Some(sess) = self.sessions.get_mut(&seed) else { return };
+                // 重基线 = 权威时间线已就绪：压缩动画兜底清除。
+                sess.compact_anim = None;
                 let was_follow = sess.scroll.follow;
                 let first_load = !sess.ready;
                 sess.needs_rebaseline = false;
@@ -649,11 +652,20 @@ impl App {
                 sess.apply_usage(usage, context_limit, model);
             }
             ConversationEvent::CompactStarted { turns_total, turns_keeping, .. } => {
-                sess.compact_status = Some(format!("压缩中 {turns_keeping}/{turns_total}"));
+                sess.compact_anim = Some(crate::app::session::CompactionAnim {
+                    started_at: Instant::now(),
+                    turns_total,
+                    turns_keeping,
+                    last_delta: None,
+                });
             }
-            ConversationEvent::CompactProgress { .. } => {}
+            ConversationEvent::CompactProgress { delta, .. } => {
+                if let Some(anim) = &mut sess.compact_anim {
+                    anim.last_delta = Some(delta);
+                }
+            }
             ConversationEvent::CompactFinished { status, turns_compacted, .. } => {
-                sess.compact_status = Some(format!("{status:?}"));
+                sess.compact_anim = None;
                 self.toast(
                     match status {
                         crate::protocol::event::CompactStatus::Completed => NoticeLevel::Info,

@@ -23,9 +23,10 @@ pub const PREFERRED_WIDTH: u16 = 34;
 /// 最低展示宽度：<80 列时根布局自动隐藏以保 transcript 可读性（见 `ui::mod`）。
 pub const MIN_MAIN_WIDTH: u16 = 85;
 
-fn glyph_and_style(status: &str, current: bool) -> (&'static str, Style) {
+fn glyph_and_style(status: &str, current: bool, frame: u64, phase: u64) -> (&'static str, Style) {
     match status {
-        "in_progress" => ("◐", theme::warn()),
+        // in_progress：braille 八帧转轮；task_id 相位偏移避免所有行同步闪动。
+        "in_progress" => (crate::app::anim::spinner_glyph(frame + phase), theme::warn()),
         "completed" => ("●", theme::ok()),
         "cancelled" => ("✕", theme::dim()),
         _ => ("○", if current { theme::accent() } else { theme::dim() }),
@@ -179,7 +180,8 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) {
 
     if all_settled {
         for task in &dash.tasks {
-            let (glyph, glyph_style) = glyph_and_style(&task.status, false);
+            let phase = task.id.bytes().map(|b| b as u64).sum::<u64>();
+            let (glyph, glyph_style) = glyph_and_style(&task.status, false, crate::app::anim::frame_now(), phase);
             let subject = truncate_str(&task.subject, width.saturating_sub(7));
             lines.push(Line::from(vec![
                 Span::styled(format!(" {glyph} "), glyph_style),
@@ -259,7 +261,8 @@ fn push_task(
     show_detail: bool,
 ) {
     let current = current_id == Some(task.id.as_str());
-    let (glyph, glyph_style) = glyph_and_style(&task.status, current);
+    let phase = task.id.bytes().map(|b| b as u64).sum::<u64>();
+    let (glyph, glyph_style) = glyph_and_style(&task.status, current, crate::app::anim::frame_now(), phase);
     let mark = if current { "▸" } else { " " };
     // ID 徽标更易扫视（T1 / T12）
     let id_tag = format!("{} ", task.id);

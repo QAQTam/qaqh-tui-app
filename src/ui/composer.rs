@@ -93,7 +93,13 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) {
     title.push_str("Enter 发送 · Ctrl+P 模式 · Ctrl+A 附件 · Ctrl+Y 撤销 · Ctrl+E 压缩 · F1 帮助 ");
 
     let streaming = sess.streaming.is_some();
-    let border_style = if streaming { theme::warn() } else { theme::dim() };
+    // 边框呼吸：流式中 warn ↔ warn+DIM 交替（200ms 帧），静默时恒 dim。
+    let frame = crate::app::anim::frame_now();
+    let border_style = if streaming {
+        if frame.is_multiple_of(2) { theme::warn() } else { theme::warn().add_modifier(Modifier::DIM) }
+    } else {
+        theme::dim()
+    };
     let block = Block::new().borders(Borders::ALL).border_style(border_style).title(title);
     f.render_widget(block, area);
 
@@ -141,21 +147,28 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) {
 
         // 流式状态标签：仅画在光标行的行尾。
         let mut used = row_prompt_w + before_w + at_w + after_w;
-        if is_cursor_line {
-            if let Some(st) = &sess.streaming {
+        if is_cursor_line
+            && let Some(st) = &sess.streaming
+        {
                 let phase = match &st.tool_name {
                     Some(t) => format!("{}({t})", st.phase.label()),
                     None => st.phase.label().to_string(),
                 };
-                let label = format!(" Esc 中止 · {phase} ");
-                let label_w = label.width();
-                if used + label_w <= inner.width as usize {
-                    let pad = inner.width as usize - used - label_w;
+                let label = format!("工作中 · {phase} · Esc 中止");
+                // 空间充足时跑马灯滚动；局促时退化为静态截断标签。
+                let animate = inner.width as usize > used + 16;
+                let show = if animate {
+                    crate::app::anim::marquee(&label, (inner.width as usize - used - 1).min(40), frame)
+                } else {
+                    label
+                };
+                let show_w = show.width();
+                if used + show_w <= inner.width as usize {
+                    let pad = inner.width as usize - used - show_w;
                     spans.push(Span::styled(" ".repeat(pad), Style::new()));
-                    spans.push(Span::styled(label, theme::warn()));
+                    spans.push(Span::styled(show, theme::warn()));
                 }
-                used = inner.width as usize;
-            }
+            used = inner.width as usize;
         }
 
         if is_cursor_line {
@@ -169,10 +182,10 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(Paragraph::new(rows), inner);
 
     // 终端光标定位（IME/复制友好）。
-    if let Some((x, y)) = cursor_pos {
-        if x < inner.x + inner.width {
-            f.set_cursor_position((x, y));
-        }
+    if let Some((x, y)) = cursor_pos
+        && x < inner.x + inner.width
+    {
+        f.set_cursor_position((x, y));
     }
 }
 

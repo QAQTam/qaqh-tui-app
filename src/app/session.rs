@@ -357,6 +357,16 @@ pub struct RenderedTranscript {
 
 // ───────────────────────── 会话状态 ─────────────────────────
 
+/// 压缩过程动画状态（由 Conversation 事件驱动；结束/重基线时清除）。
+#[derive(Debug, Clone)]
+pub struct CompactionAnim {
+    pub started_at: std::time::Instant,
+    pub turns_total: u32,
+    pub turns_keeping: u32,
+    /// CompactProgress 的 delta 文本（协议真实信息，随条展示）。
+    pub last_delta: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct SessionState {
     pub seed: String,
@@ -377,7 +387,8 @@ pub struct SessionState {
     pub skills: Option<SkillsStatus>,
     /// workspace 面板数据（bootstrap control state + DashboardSnapshot 推送）。
     pub dashboard: Option<crate::protocol::event::DashboardSnapshot>,
-    pub compact_status: Option<String>,
+    /// 压缩进度动画（Some = 压缩进行中）。
+    pub compact_anim: Option<CompactionAnim>,
     /// 代码变更聚合（+行 / −行）。
     pub code_added: usize,
     pub code_removed: usize,
@@ -414,7 +425,7 @@ impl SessionState {
             pending_permissions: Vec::new(),
             skills: None,
             dashboard: None,
-            compact_status: None,
+            compact_anim: None,
             code_added: 0,
             code_removed: 0,
             last_error: None,
