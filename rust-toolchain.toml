@@ -1,0 +1,5 @@
+# 钉住工具链版本：保证 cargo fmt 在 Debian/Windows 上输出字节级一致。
+# rustfmt 属 stable 工具链默认组件，无需显式列出。
+# 升级时同步更新本文件并单独跑一次 fmt --check。
+[toolchain]
+channel = "1.98.0"
