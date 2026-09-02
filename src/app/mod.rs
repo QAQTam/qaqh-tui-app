@@ -3,6 +3,7 @@
 //! 事件驱动（无轮询泵）：所有后端状态变化经 runtime 消息到达后立即生效，
 //! UI 在同一帧内重绘。
 
+pub(crate) mod keymap;
 pub mod markdown;
 pub mod render_line;
 pub mod render_transcript;
@@ -10,6 +11,8 @@ pub mod session;
 pub mod settings;
 pub mod slash;
 pub mod timeline_model;
+
+use self::keymap::{GlobalKey, ModalRoute};
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
@@ -1679,102 +1682,73 @@ impl App {
     // ───────────────────────── 按键路由 ─────────────────────────
 
     fn handle_key(&mut self, key: KeyEvent) {
-        use ratatui::crossterm::event::{KeyCode, KeyModifiers};
+        use ratatui::crossterm::event::KeyModifiers;
 
-        // 退出（Ctrl+C 二次确认 / Ctrl+Q）。
-        if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
-            if self.quit_armed.is_some() {
+        // 退出与全局键：先经 keymap 纯映射（可单测），再做状态副作用。
+        match keymap::map_global_key(&key) {
+            Some(GlobalKey::QuitArmed) => {
+                if self.quit_armed.is_some() {
+                    self.quit = true;
+                } else {
+                    self.quit_armed = Some(Instant::now());
+                    self.toast(NoticeLevel::Info, "再按一次 Ctrl+C 退出");
+                }
+                return;
+            }
+            Some(GlobalKey::QuitNow) => {
                 self.quit = true;
                 return;
             }
-            self.quit_armed = Some(Instant::now());
-            self.toast(NoticeLevel::Info, "再按一次 Ctrl+C 退出");
-            return;
-        }
-        if key.code == KeyCode::Char('q') && key.modifiers.contains(KeyModifiers::CONTROL) {
-            self.quit = true;
-            return;
-        }
-
-        // 全局键。
-        match key.code {
-            KeyCode::Char('t') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            Some(GlobalKey::NewSession) => {
                 self.new_session();
                 return;
             }
-            KeyCode::Char('w') if key.modifiers.contains(KeyModifiers::ALT) => {
+            Some(GlobalKey::CloseTab) => {
                 if let Some(seed) = self.active_seed() {
                     self.overlays.push(Overlay::Confirm { action: ConfirmAction::CloseTab(seed) });
                 }
                 return;
             }
-            KeyCode::Char('l') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            Some(GlobalKey::SessionList) => {
                 self.open_session_list();
                 return;
             }
-            KeyCode::Char(',') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            Some(GlobalKey::ToggleSettings) => {
                 self.toggle_settings();
                 return;
             }
-            KeyCode::F(10) => {
-                self.toggle_settings();
-                return;
-            }
-            KeyCode::F(1) => {
+            Some(GlobalKey::Help) => {
                 self.toggle_overlay(Overlay::Help);
                 return;
             }
-            KeyCode::F(3) => {
+            Some(GlobalKey::ToggleReasoning) => {
                 self.show_reasoning = !self.show_reasoning;
                 for s in self.sessions.values_mut() {
                     s.rendered = None;
                 }
                 return;
             }
-            KeyCode::F(4) => {
+            Some(GlobalKey::ToggleWorkspace) => {
                 self.show_workspace = !self.show_workspace;
                 return;
             }
-            KeyCode::F(6) => {
+            Some(GlobalKey::ToggleTodoDetail) => {
                 self.show_todo_detail = !self.show_todo_detail;
                 return;
             }
-            KeyCode::F(7) => {
+            Some(GlobalKey::ToggleToolExpand) => {
                 self.toggle_tool_expand();
                 return;
             }
-            _ => {}
+            None => {}
         }
 
-        // Alt+数字 / Alt+方向：标签切换。
-        if key.modifiers.contains(KeyModifiers::ALT) {
-            match key.code {
-                KeyCode::Char(c @ '1'..='9') => {
-                    let idx = (c as u8 - b'1') as usize;
-                    if idx < self.tabs.len() {
-                        self.active = idx;
-                    }
-                    return;
-                }
-                KeyCode::Left => {
-                    if self.active > 0 {
-                        self.active -= 1;
-                    } else if !self.tabs.is_empty() {
-                        self.active = self.tabs.len() - 1;
-                    }
-                    return;
-                }
-                KeyCode::Right => {
-                    if self.active + 1 < self.tabs.len() {
-                        self.active += 1;
-                    } else {
-                        self.active = 0;
-                    }
-                    return;
-                }
-                _ => {}
+        // Alt+数字 / Alt+方向：标签切换（目标计算为纯函数，见 keymap）。
+        if key.modifiers.contains(KeyModifiers::ALT)
+            && let Some(next) = keymap::alt_tab_target(self.active, self.tabs.len(), key.code) {
+                self.active = next;
+                return;
             }
-        }
 
         // 交互弹窗（permission > ask > plan）吃掉全部按键。
         if self.modal_key(key) {
@@ -1966,23 +1940,19 @@ impl App {
     /// 交互弹窗按键。返回 true = 已消费。优先级 permission > ask > plan。
     fn modal_key(&mut self, key: KeyEvent) -> bool {
         let Some(seed) = self.active_seed() else { return false };
-        let which = {
+        let route = {
             let Some(sess) = self.sessions.get(&seed) else { return false };
-            if sess.active_permission().is_some() {
-                1
-            } else if sess.pending_ask.is_some() {
-                2
-            } else if sess.pending_plan.is_some() {
-                3
-            } else {
-                0
-            }
+            keymap::modal_route(
+                sess.active_permission().is_some(),
+                sess.pending_ask.is_some(),
+                sess.pending_plan.is_some(),
+            )
         };
-        match which {
-            1 => self.permission_key(&seed, key),
-            2 => self.ask_key(&seed, key),
-            3 => self.plan_key(&seed, key),
-            _ => false,
+        match route {
+            Some(ModalRoute::Permission) => self.permission_key(&seed, key),
+            Some(ModalRoute::Ask) => self.ask_key(&seed, key),
+            Some(ModalRoute::Plan) => self.plan_key(&seed, key),
+            None => false,
         }
     }
 
