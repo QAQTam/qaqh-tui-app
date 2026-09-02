@@ -8,10 +8,10 @@ mod ui;
 
 use std::sync::Arc;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use futures::StreamExt;
 use ratatui::crossterm::event::{
-    Event, EventStream, EnableBracketedPaste, EnableMouseCapture, KeyEventKind,
+    EnableBracketedPaste, EnableMouseCapture, Event, EventStream, KeyEventKind,
 };
 use ratatui::crossterm::execute;
 use tokio::sync::mpsc;
@@ -19,21 +19,26 @@ use tokio::sync::mpsc;
 use app::{App, AppMsg};
 use runtime::{Runtime, RuntimeMsg};
 use transport::discovery::{ensure_daemon, read_discovery};
-use transport::http::{new_instance_id, ApiError, HttpClient};
+use transport::http::{ApiError, HttpClient, new_instance_id};
 
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         Some("doctor") => return doctor(),
         Some("--help") | Some("-h") | Some("help") => {
-            println!("qaqh-tui — QAQ-Harness 终端客户端 (qaqh.Ringing v{})", protocol::RINGING_VERSION);
+            println!(
+                "qaqh-tui — QAQ-Harness 终端客户端 (qaqh.Ringing v{})",
+                protocol::RINGING_VERSION
+            );
             println!();
             println!("用法:");
             println!("  qaqh-tui            连接本地 daemon 并进入 TUI");
             println!("  qaqh-tui --no-spawn 不自动拉起 daemon（仅连接已有实例）");
             println!("  qaqh-tui doctor     自检：发现/健康/open 握手");
             println!();
-            println!("环境: QAQH_DATA_DIR（数据目录覆盖）、QAQH_BACKEND_ROOT（daemon 拉起候选）、QAQH_DEFAULT_CWD（新建会话默认目录，支持 ~/ 展开）");
+            println!(
+                "环境: QAQH_DATA_DIR（数据目录覆盖）、QAQH_BACKEND_ROOT（daemon 拉起候选）、QAQH_DEFAULT_CWD（新建会话默认目录，支持 ~/ 展开）"
+            );
             return Ok(());
         }
         _ => {}
@@ -138,7 +143,9 @@ async fn run_tui(no_spawn: bool) -> Result<()> {
             app.ensure_render_caches(width);
             terminal.draw(|f| ui::draw(f, &app))?;
 
-            let Some(msg) = app_rx.recv().await else { break };
+            let Some(msg) = app_rx.recv().await else {
+                break;
+            };
             app.handle(msg);
             // 排空积压（一帧内合并多个事件）。
             while let Ok(msg) = app_rx.try_recv() {
@@ -160,7 +167,9 @@ async fn run_tui(no_spawn: bool) -> Result<()> {
 // ───────────────────────── doctor 自检 ─────────────────────────
 
 fn doctor() -> Result<()> {
-    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
     rt.block_on(doctor_async())
 }
 
@@ -191,7 +200,11 @@ async fn doctor_async() -> Result<()> {
         }
     };
 
-    let client = HttpClient::new(discovery.base_url(), discovery.token.clone(), new_instance_id());
+    let client = HttpClient::new(
+        discovery.base_url(),
+        discovery.token.clone(),
+        new_instance_id(),
+    );
 
     match client.health().await {
         Ok(body) => println!("[3] /health: {body}"),

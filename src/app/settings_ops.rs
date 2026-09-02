@@ -33,7 +33,10 @@ impl App {
                 .service(methods::CONFIG_SAVE, &payload)
                 .await
                 .map_err(|e| e.to_string());
-            let _ = tx.send(AppMsg::Action(ActionResult::ConfigWrite { label: "设置", result }));
+            let _ = tx.send(AppMsg::Action(ActionResult::ConfigWrite {
+                label: "设置",
+                result,
+            }));
         });
     }
 
@@ -69,7 +72,9 @@ impl App {
     pub(super) fn settings_port_cycle(&mut self, st: &mut SettingsState, delta: i32) {
         match st.row().id {
             settings::FieldId::ActiveProfile => {
-                let Some(cfg) = self.config.as_ref() else { return };
+                let Some(cfg) = self.config.as_ref() else {
+                    return;
+                };
                 if cfg.profiles.is_empty() {
                     return;
                 }
@@ -83,7 +88,11 @@ impl App {
             }
             settings::FieldId::WorkspaceMode => {
                 // local（全平台）/ wsl（仅 Windows）——与后端 workspace.set_mode 校验一致。
-                let modes: &[&str] = if cfg!(windows) { &["local", "wsl"] } else { &["local"] };
+                let modes: &[&str] = if cfg!(windows) {
+                    &["local", "wsl"]
+                } else {
+                    &["local"]
+                };
                 let cur = st
                     .ws_sel
                     .clone()
@@ -115,7 +124,10 @@ impl App {
     pub fn set_workspace_mode(&mut self, mode: String) {
         self.spawn_api(move |client, tx| async move {
             let result = client
-                .service(methods::WORKSPACE_SET_MODE, &serde_json::json!({ "mode": mode }))
+                .service(
+                    methods::WORKSPACE_SET_MODE,
+                    &serde_json::json!({ "mode": mode }),
+                )
                 .await
                 .map_err(|e| e.to_string());
             let _ = tx.send(AppMsg::Action(ActionResult::ConfigWrite {
@@ -142,15 +154,18 @@ impl App {
     }
 
     pub fn toggle_settings(&mut self) {
-        let open = self.overlays.last().is_some_and(|o| matches!(o, Overlay::Settings(_)));
+        let open = self
+            .overlays
+            .last()
+            .is_some_and(|o| matches!(o, Overlay::Settings(_)));
         if open {
             self.overlays.pop();
         } else {
             if self.config.is_none() {
                 self.fetch_config();
             }
-            self.overlays.push(Overlay::Settings(SettingsState::default()));
+            self.overlays
+                .push(Overlay::Settings(SettingsState::default()));
         }
     }
-
 }

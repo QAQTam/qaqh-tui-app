@@ -57,10 +57,16 @@ pub struct RenderSpan {
 
 impl RenderSpan {
     pub fn new(text: impl Into<String>, style: SpanStyle) -> Self {
-        Self { text: text.into(), style: RenderStyle::Semantic(style) }
+        Self {
+            text: text.into(),
+            style: RenderStyle::Semantic(style),
+        }
     }
     pub fn with_style(text: impl Into<String>, style: ratatui::style::Style) -> Self {
-        Self { text: text.into(), style: RenderStyle::Direct(style) }
+        Self {
+            text: text.into(),
+            style: RenderStyle::Direct(style),
+        }
     }
 }
 
@@ -158,7 +164,6 @@ pub fn wrap_text(text: &str, width: usize) -> Vec<String> {
     out
 }
 
-
 /// 编辑缓冲的可视窗口：返回 (窗口文本, 光标在窗口内的列偏移)。
 /// 保证光标列恒在窗口内（`off + 1 <= max_w`），供单行输入框水平滚动。
 /// 从 ui/settings.rs 提升为共享（composer 与 settings 编辑态共用）。
@@ -213,7 +218,9 @@ mod tests {
 
     #[test]
     fn render_line_width() {
-        let l = RenderLine::new().span("中文", SpanStyle::Plain).span("ab", SpanStyle::Dim);
+        let l = RenderLine::new()
+            .span("中文", SpanStyle::Plain)
+            .span("ab", SpanStyle::Dim);
         assert_eq!(l.display_width(), 6);
     }
 

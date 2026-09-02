@@ -157,7 +157,10 @@ pub enum CommandState {
 
 impl CommandState {
     pub fn is_terminal(self) -> bool {
-        matches!(self, CommandState::Succeeded | CommandState::Failed | CommandState::Rejected)
+        matches!(
+            self,
+            CommandState::Succeeded | CommandState::Failed | CommandState::Rejected
+        )
     }
 }
 

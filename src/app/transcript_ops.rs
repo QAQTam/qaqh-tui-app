@@ -4,8 +4,12 @@ use super::*;
 
 impl App {
     pub fn send_message(&mut self) {
-        let Some(seed) = self.active_seed() else { return };
-        let Some(sess) = self.sessions.get_mut(&seed) else { return };
+        let Some(seed) = self.active_seed() else {
+            return;
+        };
+        let Some(sess) = self.sessions.get_mut(&seed) else {
+            return;
+        };
         if sess.composer.is_empty() {
             return;
         }
@@ -32,15 +36,22 @@ impl App {
     }
 
     pub fn cancel_turn(&mut self) {
-        let Some(seed) = self.active_seed() else { return };
-        let streaming = self.sessions.get(&seed).is_some_and(|s| s.streaming.is_some());
+        let Some(seed) = self.active_seed() else {
+            return;
+        };
+        let streaming = self
+            .sessions
+            .get(&seed)
+            .is_some_and(|s| s.streaming.is_some());
         if !streaming {
             return;
         }
         self.spawn_api(move |client, tx| async move {
             let cmd = build_envelope(
                 &client,
-                RingingCommand::Conversation(ConversationCommand::ConversationCancel { turn_id: None }),
+                RingingCommand::Conversation(ConversationCommand::ConversationCancel {
+                    turn_id: None,
+                }),
             )
             .with_seed(seed.clone());
             let result = client.command(&cmd).await.map_err(|e| e.to_string());
@@ -53,7 +64,9 @@ impl App {
     }
 
     pub fn toggle_mode(&mut self) {
-        let Some(seed) = self.active_seed() else { return };
+        let Some(seed) = self.active_seed() else {
+            return;
+        };
         let next = match self.sessions.get(&seed).map(|s| s.mode) {
             Some(crate::protocol::command::ConversationMode::Plan) => {
                 crate::protocol::command::ConversationMode::Code
@@ -67,7 +80,9 @@ impl App {
         self.spawn_api(move |client, tx| async move {
             let cmd = build_envelope(
                 &client,
-                RingingCommand::Conversation(ConversationCommand::ConversationSetMode { mode: next }),
+                RingingCommand::Conversation(ConversationCommand::ConversationSetMode {
+                    mode: next,
+                }),
             )
             .with_seed(seed.clone());
             let result = client.command(&cmd).await.map_err(|e| e.to_string());
@@ -80,11 +95,15 @@ impl App {
     }
 
     pub fn compact(&mut self) {
-        let Some(seed) = self.active_seed() else { return };
+        let Some(seed) = self.active_seed() else {
+            return;
+        };
         self.spawn_api(move |client, tx| async move {
             let cmd = build_envelope(
                 &client,
-                RingingCommand::Conversation(ConversationCommand::ConversationCompact { turn_id: None }),
+                RingingCommand::Conversation(ConversationCommand::ConversationCompact {
+                    turn_id: None,
+                }),
             )
             .with_seed(seed.clone());
             let result = client.command(&cmd).await.map_err(|e| e.to_string());
@@ -97,8 +116,13 @@ impl App {
     }
 
     pub fn undo_turn(&mut self) {
-        let Some(seed) = self.active_seed() else { return };
-        let Some(turn_id) = self.sessions.get(&seed).and_then(|s| s.timeline.last_turn_id().map(str::to_owned))
+        let Some(seed) = self.active_seed() else {
+            return;
+        };
+        let Some(turn_id) = self
+            .sessions
+            .get(&seed)
+            .and_then(|s| s.timeline.last_turn_id().map(str::to_owned))
         else {
             return;
         };
@@ -117,10 +141,11 @@ impl App {
                     for _ in 0..30 {
                         tokio::time::sleep(Duration::from_millis(100)).await;
                         if let Ok(status) = client.command_status(&command_id).await
-                            && status.state.is_terminal() {
-                                state = Some(status);
-                                break;
-                            }
+                            && status.state.is_terminal()
+                        {
+                            state = Some(status);
+                            break;
+                        }
                     }
                     let _ = tx.send(AppMsg::Action(ActionResult::Receipt {
                         label: "撤销回合",
@@ -157,8 +182,13 @@ impl App {
     }
 
     pub fn load_older(&mut self) {
-        let Some(seed) = self.active_seed() else { return };
-        let loading = self.sessions.get(&seed).is_some_and(|s| s.loading_older || !s.timeline.has_more);
+        let Some(seed) = self.active_seed() else {
+            return;
+        };
+        let loading = self
+            .sessions
+            .get(&seed)
+            .is_some_and(|s| s.loading_older || !s.timeline.has_more);
         if loading {
             return;
         }
@@ -181,9 +211,15 @@ impl App {
 
     // ───────────────────────── 交互响应命令 ─────────────────────────
 
-    pub(super) fn send_control_command(&mut self, seed: String, command: ControlCommand, label: &'static str) {
+    pub(super) fn send_control_command(
+        &mut self,
+        seed: String,
+        command: ControlCommand,
+        label: &'static str,
+    ) {
         self.spawn_api(move |client, tx| async move {
-            let env = build_envelope(&client, RingingCommand::Control(command)).with_seed(seed.clone());
+            let env =
+                build_envelope(&client, RingingCommand::Control(command)).with_seed(seed.clone());
             let result = client.command(&env).await.map_err(|e| e.to_string());
             let _ = tx.send(AppMsg::Action(ActionResult::CommandAck {
                 seed: Some(seed),
@@ -196,15 +232,23 @@ impl App {
     // ───────────────────────── 服务面 ─────────────────────────
 
     pub fn scroll_up(&mut self, lines: usize) {
-        let Some(seed) = self.active_seed() else { return };
-        let Some(sess) = self.sessions.get_mut(&seed) else { return };
+        let Some(seed) = self.active_seed() else {
+            return;
+        };
+        let Some(sess) = self.sessions.get_mut(&seed) else {
+            return;
+        };
         sess.scroll.follow = false;
         sess.scroll.offset = sess.scroll.offset.saturating_add(lines);
     }
 
     pub fn scroll_down(&mut self, lines: usize) {
-        let Some(seed) = self.active_seed() else { return };
-        let Some(sess) = self.sessions.get_mut(&seed) else { return };
+        let Some(seed) = self.active_seed() else {
+            return;
+        };
+        let Some(sess) = self.sessions.get_mut(&seed) else {
+            return;
+        };
         if sess.scroll.offset <= lines {
             sess.scroll.offset = 0;
             sess.scroll.follow = true;
@@ -214,7 +258,9 @@ impl App {
     }
 
     pub fn scroll_top(&mut self) {
-        let Some(seed) = self.active_seed() else { return };
+        let Some(seed) = self.active_seed() else {
+            return;
+        };
         if let Some(sess) = self.sessions.get_mut(&seed) {
             sess.scroll.follow = false;
             sess.scroll.offset = usize::MAX / 2; // 渲染时 clamp
@@ -222,7 +268,9 @@ impl App {
     }
 
     pub fn scroll_bottom(&mut self) {
-        let Some(seed) = self.active_seed() else { return };
+        let Some(seed) = self.active_seed() else {
+            return;
+        };
         if let Some(sess) = self.sessions.get_mut(&seed) {
             sess.scroll.follow = true;
             sess.scroll.offset = 0;
@@ -234,9 +282,16 @@ impl App {
     /// PageUp：滚动；到顶且还有更早回合 → 触发分页加载。
     pub(super) fn page_up(&mut self) {
         let (total, at_limit, has_more, loading) = {
-            let Some(sess) = self.active_session() else { return };
+            let Some(sess) = self.active_session() else {
+                return;
+            };
             let total = sess.rendered.as_ref().map(|r| r.lines.len()).unwrap_or(0);
-            (total, sess.scroll.offset >= total.saturating_sub(1), sess.timeline.has_more, sess.loading_older)
+            (
+                total,
+                sess.scroll.offset >= total.saturating_sub(1),
+                sess.timeline.has_more,
+                sess.loading_older,
+            )
         };
         self.scroll_up(20);
         if at_limit && has_more && !loading {
@@ -246,17 +301,22 @@ impl App {
     }
 
     pub(super) fn toggle_tool_expand(&mut self) {
-        let Some(seed) = self.active_seed() else { return };
-        let Some(sess) = self.sessions.get_mut(&seed) else { return };
+        let Some(seed) = self.active_seed() else {
+            return;
+        };
+        let Some(sess) = self.sessions.get_mut(&seed) else {
+            return;
+        };
         // 收集所有可折叠工具（有输出或 diff），按时间逆序；携带 name 以计算视觉展开态
         let mut candidates: Vec<(String, String)> = Vec::new();
         for turn in sess.timeline.turns.iter().rev() {
             for round in turn.rounds.iter().rev() {
                 for block in round.blocks.iter().rev() {
                     if let Some(tool) = &block.tool {
-                        let has_content = tool.output.as_deref().is_some_and(|s| !s.trim().is_empty())
-                            || !tool.progress.trim().is_empty()
-                            || tool.diff.as_deref().is_some_and(|d| !d.trim().is_empty());
+                        let has_content =
+                            tool.output.as_deref().is_some_and(|s| !s.trim().is_empty())
+                                || !tool.progress.trim().is_empty()
+                                || tool.diff.as_deref().is_some_and(|d| !d.trim().is_empty());
                         if has_content {
                             candidates.push((tool.tool_call_id.clone(), tool.name.clone()));
                         }
@@ -264,7 +324,9 @@ impl App {
                 }
             }
         }
-        if candidates.is_empty() { return; }
+        if candidates.is_empty() {
+            return;
+        }
         // 视觉展开态 = expanded_raw ^ is_default_expanded(name)，F7 在此视觉上切换
         let is_visual_expanded = |id: &str, name: &str| {
             let raw = sess.expanded_tools.contains(id);
@@ -291,5 +353,4 @@ impl App {
             sess.rendered = None;
         }
     }
-
 }

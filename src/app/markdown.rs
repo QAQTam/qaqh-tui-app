@@ -13,7 +13,7 @@ use syntect::highlighting::{FontStyle, ThemeSet};
 use syntect::parsing::SyntaxSet;
 use syntect::util::LinesWithEndings;
 
-use crate::app::render_line::{wrap_text, RenderLine, SpanStyle};
+use crate::app::render_line::{RenderLine, SpanStyle, wrap_text};
 use unicode_width::UnicodeWidthChar;
 
 const CODE_INDENT: &str = "  ";
@@ -61,7 +61,10 @@ fn render_highlighted_code_block(text: &str, lang: Option<&str>, width: usize) -
         // 去掉 LinesWithEndings 自带的换行符，保留空行
         let line = line.trim_end_matches("\r\n").trim_end_matches('\n');
         if line.is_empty() {
-            out.push(RenderLine::new().span_direct(CODE_INDENT, RatStyle::new().bg(RatColor::Indexed(236))));
+            out.push(
+                RenderLine::new()
+                    .span_direct(CODE_INDENT, RatStyle::new().bg(RatColor::Indexed(236))),
+            );
             continue;
         }
         let ranges = match h.highlight_line(line, ps) {
@@ -69,14 +72,26 @@ fn render_highlighted_code_block(text: &str, lang: Option<&str>, width: usize) -
             Err(_) => {
                 // 降级：纯色块
                 for seg in wrap_text(line, max_w) {
-                    out.push(RenderLine::new().span_direct(format!("{CODE_INDENT}{seg}"), RatStyle::new().fg(RatColor::White).bg(RatColor::Indexed(236))));
+                    out.push(
+                        RenderLine::new().span_direct(
+                            format!("{CODE_INDENT}{seg}"),
+                            RatStyle::new()
+                                .fg(RatColor::White)
+                                .bg(RatColor::Indexed(236)),
+                        ),
+                    );
                 }
                 continue;
             }
         };
         // 将高亮 ranges 转为单个 RenderLine（可能需硬截）
         let mut cur_line = RenderLine::new();
-        cur_line.spans.push(crate::app::render_line::RenderSpan::with_style(CODE_INDENT, RatStyle::new().bg(RatColor::Indexed(236))));
+        cur_line
+            .spans
+            .push(crate::app::render_line::RenderSpan::with_style(
+                CODE_INDENT,
+                RatStyle::new().bg(RatColor::Indexed(236)),
+            ));
         let mut line_w: usize = 0;
         for (style, txt) in ranges {
             let rat_style = syntect_to_ratatui(style);
@@ -86,19 +101,36 @@ fn render_highlighted_code_block(text: &str, lang: Option<&str>, width: usize) -
                 let avail = max_w.saturating_sub(line_w);
                 if avail == 0 {
                     out.push(std::mem::take(&mut cur_line));
-                    cur_line.spans.push(crate::app::render_line::RenderSpan::with_style(CODE_INDENT, RatStyle::new().bg(RatColor::Indexed(236))));
+                    cur_line
+                        .spans
+                        .push(crate::app::render_line::RenderSpan::with_style(
+                            CODE_INDENT,
+                            RatStyle::new().bg(RatColor::Indexed(236)),
+                        ));
                     line_w = 0;
                     continue;
                 }
                 // 按显示宽度截取
                 let take = take_width(remaining, avail);
                 let (head, tail) = remaining.split_at(take);
-                cur_line.spans.push(crate::app::render_line::RenderSpan::with_style(head, rat_style));
-                line_w += head.chars().map(|c| unicode_width::UnicodeWidthChar::width(c).unwrap_or(0)).sum::<usize>();
+                cur_line
+                    .spans
+                    .push(crate::app::render_line::RenderSpan::with_style(
+                        head, rat_style,
+                    ));
+                line_w += head
+                    .chars()
+                    .map(|c| unicode_width::UnicodeWidthChar::width(c).unwrap_or(0))
+                    .sum::<usize>();
                 remaining = tail;
                 if !remaining.is_empty() {
                     out.push(std::mem::take(&mut cur_line));
-                    cur_line.spans.push(crate::app::render_line::RenderSpan::with_style(CODE_INDENT, RatStyle::new().bg(RatColor::Indexed(236))));
+                    cur_line
+                        .spans
+                        .push(crate::app::render_line::RenderSpan::with_style(
+                            CODE_INDENT,
+                            RatStyle::new().bg(RatColor::Indexed(236)),
+                        ));
                     line_w = 0;
                 }
             }
@@ -107,7 +139,9 @@ fn render_highlighted_code_block(text: &str, lang: Option<&str>, width: usize) -
         // 流式保护：单块超 500 行截断由调用方处理，此处不再截
     }
     if out.is_empty() {
-        out.push(RenderLine::new().span_direct(CODE_INDENT, RatStyle::new().bg(RatColor::Indexed(236))));
+        out.push(
+            RenderLine::new().span_direct(CODE_INDENT, RatStyle::new().bg(RatColor::Indexed(236))),
+        );
     }
     out
 }
@@ -136,10 +170,17 @@ fn wrap_code_block(text: &str, width: usize) -> Vec<String> {
     let w = width.saturating_sub(CODE_INDENT.len()).max(10);
     let mut out = Vec::new();
     for line in text.lines() {
-        if line.is_empty() { out.push(String::new()); continue; }
-        for seg in wrap_text(line, w) { out.push(seg); }
+        if line.is_empty() {
+            out.push(String::new());
+            continue;
+        }
+        for seg in wrap_text(line, w) {
+            out.push(seg);
+        }
     }
-    if out.is_empty() { out.push(String::new()); }
+    if out.is_empty() {
+        out.push(String::new());
+    }
     out
 }
 
@@ -191,17 +232,23 @@ fn has_single_emphasis(text: &str) -> bool {
             if after_open == ' ' || after_open == '\n' || after_open == '\r' || after_open == '\t' {
                 break;
             }
-            if before_close == ' ' || before_close == '\n' || before_close == '\r' || before_close == '\t' {
+            if before_close == ' '
+                || before_close == '\n'
+                || before_close == '\r'
+                || before_close == '\t'
+            {
                 break;
             }
             if c == '_' {
                 let before_open = if i > 0 { Some(chars[i - 1]) } else { None };
                 let after_close = if j + 1 < n { Some(chars[j + 1]) } else { None };
                 if let (Some(bo), Some(ac)) = (before_open, after_close)
-                    && is_word_char(bo) && is_word_char(ac) {
-                        // 词内下划线如 foo_bar_baz，按 CommonMark 不视为强调，继续找下一闭合
-                        continue;
-                    }
+                    && is_word_char(bo)
+                    && is_word_char(ac)
+                {
+                    // 词内下划线如 foo_bar_baz，按 CommonMark 不视为强调，继续找下一闭合
+                    continue;
+                }
             }
             return true;
         }
@@ -213,7 +260,13 @@ fn has_single_emphasis(text: &str) -> bool {
 /// 已放宽至单 `*`/`_` 强调与 `~~` 删除线，解决符号残留与 konsole SGR3 不可见问题。
 pub fn is_markdown(text: &str) -> bool {
     // 快速路径：围栏/行内码/粗斜双字符/删除线
-    if text.contains("```") || text.contains("``") || text.contains("**") || text.contains("__") || text.contains('`') || text.contains("~~") {
+    if text.contains("```")
+        || text.contains("``")
+        || text.contains("**")
+        || text.contains("__")
+        || text.contains('`')
+        || text.contains("~~")
+    {
         return true;
     }
     // 表格：含 | 且含分隔线，或 | >=3
@@ -224,9 +277,15 @@ pub fn is_markdown(text: &str) -> bool {
     // 块级标记：标题/列表/引用/分割线
     if text.lines().any(|l| {
         let t = l.trim_start();
-        t.starts_with("# ") || t.starts_with("## ") || t.starts_with("### ")
-            || t.starts_with("- ") || t.starts_with("* ") || t.starts_with("1. ")
-            || t.starts_with("> ") || t.starts_with("---") || t.starts_with("***")
+        t.starts_with("# ")
+            || t.starts_with("## ")
+            || t.starts_with("### ")
+            || t.starts_with("- ")
+            || t.starts_with("* ")
+            || t.starts_with("1. ")
+            || t.starts_with("> ")
+            || t.starts_with("---")
+            || t.starts_with("***")
     }) {
         return true;
     }
@@ -255,14 +314,23 @@ struct TableState {
 
 impl TableState {
     fn new(alignments: Vec<Alignment>) -> Self {
-        Self { alignments, headers: Vec::new(), rows: Vec::new(), in_head: false, cur_row: Vec::new(), cur_cell: String::new() }
+        Self {
+            alignments,
+            headers: Vec::new(),
+            rows: Vec::new(),
+            in_head: false,
+            cur_row: Vec::new(),
+            cur_cell: String::new(),
+        }
     }
     fn flush_cell(&mut self) {
         let cell = std::mem::take(&mut self.cur_cell).trim().to_string();
         self.cur_row.push(cell);
     }
     fn flush_row(&mut self) {
-        if self.cur_row.is_empty() { return; }
+        if self.cur_row.is_empty() {
+            return;
+        }
         let row = std::mem::take(&mut self.cur_row);
         if self.in_head && self.headers.is_empty() {
             self.headers = row;
@@ -399,11 +467,18 @@ pub fn render_markdown(text: &str, width: usize) -> Vec<RenderLine> {
 
     // 段落整体落盘：跨 run 协同折行（修复样式 run 各自 wrap 导致的碎片行）。
     // quote=true 时每行加引用前缀，折行可用宽度相应扣除前缀。
-    let flush_para = |spans: &mut Vec<(String, SpanStyle)>, out: &mut Vec<RenderLine>, width: usize, quote: bool| {
+    let flush_para = |spans: &mut Vec<(String, SpanStyle)>,
+                      out: &mut Vec<RenderLine>,
+                      width: usize,
+                      quote: bool| {
         if spans.is_empty() {
             return;
         }
-        let avail = if quote { width.saturating_sub(QUOTE_PREFIX.len()) } else { width };
+        let avail = if quote {
+            width.saturating_sub(QUOTE_PREFIX.len())
+        } else {
+            width
+        };
         let rows = wrap_spans(spans, avail);
         spans.clear();
         for row in rows {
@@ -419,9 +494,16 @@ pub fn render_markdown(text: &str, width: usize) -> Vec<RenderLine> {
     };
 
     let flush_table = |tbl: TableState, out: &mut Vec<RenderLine>, width: usize| {
-        if tbl.headers.is_empty() && tbl.rows.is_empty() { return; }
-        let cols = tbl.headers.len().max(tbl.rows.iter().map(|r| r.len()).max().unwrap_or(0));
-        if cols == 0 { return; }
+        if tbl.headers.is_empty() && tbl.rows.is_empty() {
+            return;
+        }
+        let cols = tbl
+            .headers
+            .len()
+            .max(tbl.rows.iter().map(|r| r.len()).max().unwrap_or(0));
+        if cols == 0 {
+            return;
+        }
         // 列宽：等分，可用 width 减边框( cols+1 )
         let border_w = cols + 1;
         let avail = width.saturating_sub(border_w).max(cols * 3);
@@ -430,14 +512,20 @@ pub fn render_markdown(text: &str, width: usize) -> Vec<RenderLine> {
         // 若剩余空间，按最长单元格微调（限幅）
         let rem = avail.saturating_sub(col_w * cols);
         if rem > 0 {
-            for w in col_widths.iter_mut().take(rem.min(cols)) { *w += 1; }
+            for w in col_widths.iter_mut().take(rem.min(cols)) {
+                *w += 1;
+            }
         }
 
         let hline = |widths: &[usize]| -> String {
             let mut s = String::from("┌");
             for (i, w) in widths.iter().enumerate() {
                 s.push_str(&"─".repeat(*w));
-                if i + 1 < widths.len() { s.push('┬'); } else { s.push('┐'); }
+                if i + 1 < widths.len() {
+                    s.push('┬');
+                } else {
+                    s.push('┐');
+                }
             }
             s
         };
@@ -445,7 +533,11 @@ pub fn render_markdown(text: &str, width: usize) -> Vec<RenderLine> {
             let mut s = String::from("├");
             for (i, w) in widths.iter().enumerate() {
                 s.push_str(&"─".repeat(*w));
-                if i + 1 < widths.len() { s.push('┼'); } else { s.push('┤'); }
+                if i + 1 < widths.len() {
+                    s.push('┼');
+                } else {
+                    s.push('┤');
+                }
             }
             s
         };
@@ -453,7 +545,11 @@ pub fn render_markdown(text: &str, width: usize) -> Vec<RenderLine> {
             let mut s = String::from("└");
             for (i, w) in widths.iter().enumerate() {
                 s.push_str(&"─".repeat(*w));
-                if i + 1 < widths.len() { s.push('┴'); } else { s.push('┘'); }
+                if i + 1 < widths.len() {
+                    s.push('┴');
+                } else {
+                    s.push('┘');
+                }
             }
             s
         };
@@ -465,7 +561,9 @@ pub fn render_markdown(text: &str, width: usize) -> Vec<RenderLine> {
             for (i, h) in tbl.headers.iter().enumerate() {
                 let w = col_widths[i];
                 let cell = format_cell(h, w, tbl.alignments.get(i).copied());
-                line = line.span(cell, SpanStyle::MdTableHead).span("│", SpanStyle::MdRuler);
+                line = line
+                    .span(cell, SpanStyle::MdTableHead)
+                    .span("│", SpanStyle::MdRuler);
             }
             out.push(line);
             out.push(RenderLine::new().span(mline(&col_widths), SpanStyle::MdRuler));
@@ -477,12 +575,16 @@ pub fn render_markdown(text: &str, width: usize) -> Vec<RenderLine> {
             for (i, &w) in col_widths.iter().enumerate() {
                 let raw = row.get(i).map(|s| s.as_str()).unwrap_or("");
                 let cell = format_cell(raw, w, tbl.alignments.get(i).copied());
-                line = line.span(cell, SpanStyle::MdTableCell).span("│", SpanStyle::MdRuler);
+                line = line
+                    .span(cell, SpanStyle::MdTableCell)
+                    .span("│", SpanStyle::MdRuler);
             }
             out.push(line);
         }
         if omitted > 0 {
-            out.push(RenderLine::new().span(format!("  （表格省略 {omitted} 行）"), SpanStyle::Dim));
+            out.push(
+                RenderLine::new().span(format!("  （表格省略 {omitted} 行）"), SpanStyle::Dim),
+            );
         }
         out.push(RenderLine::new().span(bline(&col_widths), SpanStyle::MdRuler));
     };
@@ -491,8 +593,13 @@ pub fn render_markdown(text: &str, width: usize) -> Vec<RenderLine> {
         // 表格内：只收集字符，忽略样式栈
         if let Some(tbl) = table.as_mut() {
             match ev {
-                Event::Start(Tag::TableHead) => { tbl.in_head = true; },
-                Event::End(TagEnd::TableHead) => { tbl.flush_row(); tbl.in_head = false; },
+                Event::Start(Tag::TableHead) => {
+                    tbl.in_head = true;
+                }
+                Event::End(TagEnd::TableHead) => {
+                    tbl.flush_row();
+                    tbl.in_head = false;
+                }
                 Event::Start(Tag::TableRow) => tbl.cur_row.clear(),
                 Event::End(TagEnd::TableRow) => tbl.flush_row(),
                 Event::Start(Tag::TableCell) => tbl.cur_cell.clear(),
@@ -521,7 +628,11 @@ pub fn render_markdown(text: &str, width: usize) -> Vec<RenderLine> {
                     style_stack.push(st);
                 }
                 Tag::Strong | Tag::Emphasis => {
-                    let st = if matches!(tag, Tag::Strong) { SpanStyle::Bold } else { SpanStyle::Italic };
+                    let st = if matches!(tag, Tag::Strong) {
+                        SpanStyle::Bold
+                    } else {
+                        SpanStyle::Italic
+                    };
                     style_stack.push(st);
                 }
                 Tag::Strikethrough => style_stack.push(SpanStyle::Dim),
@@ -557,12 +668,17 @@ pub fn render_markdown(text: &str, width: usize) -> Vec<RenderLine> {
                 _ => {}
             },
             Event::End(tag) => match tag {
-                TagEnd::Heading(_) | TagEnd::Strong | TagEnd::Emphasis | TagEnd::Strikethrough | TagEnd::Link => {
+                TagEnd::Heading(_)
+                | TagEnd::Strong
+                | TagEnd::Emphasis
+                | TagEnd::Strikethrough
+                | TagEnd::Link => {
                     style_stack.pop();
                     if matches!(tag, TagEnd::Link)
-                        && let Some(dest) = link_dest.take() {
-                            cur_spans.push((format!(" ({dest})"), SpanStyle::Dim));
-                        }
+                        && let Some(dest) = link_dest.take()
+                    {
+                        cur_spans.push((format!(" ({dest})"), SpanStyle::Dim));
+                    }
                 }
                 TagEnd::Paragraph => {
                     // 段落结束：落盘并空行
@@ -580,16 +696,26 @@ pub fn render_markdown(text: &str, width: usize) -> Vec<RenderLine> {
                 }
                 TagEnd::Item => {
                     // 列表项前缀（• 或 [x]/[ ]）宽度从折行可用宽度中扣除，防超宽截断
-                    let prefix_w = if cur_spans.iter().any(|(t, _)| t.starts_with("[ ] ") || t.starts_with("[x] ")) {
+                    let prefix_w = if cur_spans
+                        .iter()
+                        .any(|(t, _)| t.starts_with("[ ] ") || t.starts_with("[x] "))
+                    {
                         4
                     } else {
                         2
                     };
-                    flush_para(&mut cur_spans, &mut out, width.saturating_sub(prefix_w), false);
+                    flush_para(
+                        &mut cur_spans,
+                        &mut out,
+                        width.saturating_sub(prefix_w),
+                        false,
+                    );
                 }
                 TagEnd::List(_) => {
                     list_depth = list_depth.saturating_sub(1);
-                    if list_depth == 0 { out.push(RenderLine::new()); }
+                    if list_depth == 0 {
+                        out.push(RenderLine::new());
+                    }
                 }
                 TagEnd::CodeBlock => {
                     in_code_block = false;
@@ -640,12 +766,19 @@ pub fn render_markdown(text: &str, width: usize) -> Vec<RenderLine> {
         }
     }
     flush_para(&mut cur_spans, &mut out, width, quote_depth > 0);
-    if let Some(tbl) = table.take() { flush_table(tbl, &mut out, width); }
+    if let Some(tbl) = table.take() {
+        flush_table(tbl, &mut out, width);
+    }
     // 去重尾部多空行
-    while out.len() >= 2 && out[out.len()-1].spans.is_empty() && out[out.len()-2].spans.is_empty() {
+    while out.len() >= 2
+        && out[out.len() - 1].spans.is_empty()
+        && out[out.len() - 2].spans.is_empty()
+    {
         out.pop();
     }
-    if out.is_empty() { out.push(RenderLine::plain("")); }
+    if out.is_empty() {
+        out.push(RenderLine::plain(""));
+    }
     out
 }
 
@@ -659,8 +792,11 @@ fn format_cell(raw: &str, width: usize, align: Option<Alignment>) -> String {
         let mut used = 0usize;
         for c in raw.chars() {
             let w = unicode_width::UnicodeWidthChar::width(c).unwrap_or(0);
-            if used + w + 1 > width { break; }
-            out.push(c); used += w;
+            if used + w + 1 > width {
+                break;
+            }
+            out.push(c);
+            used += w;
         }
         let pad = width.saturating_sub(out.width() + 1);
         return format!("{out}…{}", " ".repeat(pad));
@@ -702,14 +838,25 @@ mod tests {
             ("[a](u1) [b](u2) middle", 40, 1),
         ];
         let line_width = |l: &RenderLine| -> usize {
-            l.spans.iter()
-                .map(|s| s.text.chars().map(UnicodeWidthChar::width).map(|w| w.unwrap_or(0) as usize).sum::<usize>())
+            l.spans
+                .iter()
+                .map(|s| {
+                    s.text
+                        .chars()
+                        .map(UnicodeWidthChar::width)
+                        .map(|w| w.unwrap_or(0) as usize)
+                        .sum::<usize>()
+                })
                 .sum()
         };
         for (md, w, expect_lines) in cases {
             let lines = render_markdown(md, *w);
             let content: Vec<&RenderLine> = lines.iter().filter(|l| !l.spans.is_empty()).collect();
-            assert_eq!(content.len(), *expect_lines, "md={md:?} 内容行数应为 {expect_lines}");
+            assert_eq!(
+                content.len(),
+                *expect_lines,
+                "md={md:?} 内容行数应为 {expect_lines}"
+            );
             for l in &content {
                 let dw = line_width(l);
                 assert!(dw <= *w, "md={md:?} 行宽 {dw} 超限 {w}");
@@ -717,8 +864,14 @@ mod tests {
         }
         // 引用前缀必须完整保留
         let quote = render_markdown("> quote **bold** inside", 40);
-        let text: String = quote.iter().flat_map(|l| l.spans.iter().map(|s| s.text.as_str())).collect();
-        assert!(text.starts_with("▎ quote bold inside"), "引用行应保留 ▎ 前缀且不拆行，got: {text:?}");
+        let text: String = quote
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.text.as_str()))
+            .collect();
+        assert!(
+            text.starts_with("▎ quote bold inside"),
+            "引用行应保留 ▎ 前缀且不拆行，got: {text:?}"
+        );
     }
 
     #[test]
@@ -731,32 +884,69 @@ mod tests {
         let list = render_markdown("- first **bold** item text\n- second item", 30);
         let content: Vec<&RenderLine> = list.iter().filter(|l| !l.spans.is_empty()).collect();
         assert_eq!(content.len(), 2, "两个列表项应各为 1 行");
-        let merged: String = content.iter().flat_map(|l| l.spans.iter().map(|s| s.text.as_str())).collect();
-        assert!(merged.starts_with("• first bold item text"), "列表项不得拆分，got: {merged:?}");
-        let dw_map: Vec<usize> = content.iter().map(|l| {
-            l.spans.iter()
-                .map(|s| s.text.chars().map(UnicodeWidthChar::width).map(|w| w.unwrap_or(0) as usize).sum::<usize>())
-                .sum()
-        }).collect();
-        assert!(dw_map.iter().all(|w| *w <= 30), "列表行宽不得超 30，got {dw_map:?}");
+        let merged: String = content
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.text.as_str()))
+            .collect();
+        assert!(
+            merged.starts_with("• first bold item text"),
+            "列表项不得拆分，got: {merged:?}"
+        );
+        let dw_map: Vec<usize> = content
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| {
+                        s.text
+                            .chars()
+                            .map(UnicodeWidthChar::width)
+                            .map(|w| w.unwrap_or(0) as usize)
+                            .sum::<usize>()
+                    })
+                    .sum()
+            })
+            .collect();
+        assert!(
+            dw_map.iter().all(|w| *w <= 30),
+            "列表行宽不得超 30，got {dw_map:?}"
+        );
     }
-
-
 
     #[test]
     fn renders_heading_and_bold() {
         let lines = render_markdown("# Title\n\n**bold** and *italic* `code`", 40);
-        assert!(lines.iter().any(|l| l.spans.iter().any(|s| s.style == RenderStyle::Semantic(SpanStyle::MdH1))));
-        assert!(lines.iter().any(|l| l.spans.iter().any(|s| s.style == RenderStyle::Semantic(SpanStyle::Bold))));
-        assert!(lines.iter().any(|l| l.spans.iter().any(|s| s.style == RenderStyle::Semantic(SpanStyle::MdInlineCode))));
+        assert!(lines.iter().any(|l| {
+            l.spans
+                .iter()
+                .any(|s| s.style == RenderStyle::Semantic(SpanStyle::MdH1))
+        }));
+        assert!(lines.iter().any(|l| {
+            l.spans
+                .iter()
+                .any(|s| s.style == RenderStyle::Semantic(SpanStyle::Bold))
+        }));
+        assert!(lines.iter().any(|l| {
+            l.spans
+                .iter()
+                .any(|s| s.style == RenderStyle::Semantic(SpanStyle::MdInlineCode))
+        }));
     }
 
     #[test]
     fn renders_table() {
         let md = "| a | b |\n|---|---|\n| 1 | 2 |\n| 3 | 4 |";
         let lines = render_markdown(md, 20);
-        assert!(lines.iter().any(|l| l.spans.iter().any(|s| s.text.contains('┌'))));
-        assert!(lines.iter().any(|l| l.spans.iter().any(|s| s.style == RenderStyle::Semantic(SpanStyle::MdTableHead))));
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.spans.iter().any(|s| s.text.contains('┌')))
+        );
+        assert!(lines.iter().any(|l| {
+            l.spans
+                .iter()
+                .any(|s| s.style == RenderStyle::Semantic(SpanStyle::MdTableHead))
+        }));
     }
 
     #[test]
@@ -764,8 +954,16 @@ mod tests {
         let md = "```rs\nfn main() {}\n```";
         let lines = render_markdown(md, 30);
         // 高亮后为 Direct(Rgb) 风格，不再是 Semantic MdCodeBlock，检查 Direct 存在且含代码
-        assert!(lines.iter().any(|l| l.spans.iter().any(|s| matches!(s.style, RenderStyle::Direct(_)))));
-        assert!(lines.iter().any(|l| l.spans.iter().any(|s| s.text.contains("fn"))));
+        assert!(lines.iter().any(|l| {
+            l.spans
+                .iter()
+                .any(|s| matches!(s.style, RenderStyle::Direct(_)))
+        }));
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.spans.iter().any(|s| s.text.contains("fn")))
+        );
     }
 
     #[test]
@@ -778,15 +976,30 @@ mod tests {
             let _ = render_markdown(&md, 80);
         }
         let elapsed = start.elapsed();
-        eprintln!("perf markdown 5k x100: {:?} avg {:?}", elapsed, elapsed/100);
-        assert!(elapsed.as_millis() < 2000, "markdown 5k x100 should be <2s, got {:?}", elapsed);
+        eprintln!(
+            "perf markdown 5k x100: {:?} avg {:?}",
+            elapsed,
+            elapsed / 100
+        );
+        assert!(
+            elapsed.as_millis() < 2000,
+            "markdown 5k x100 should be <2s, got {:?}",
+            elapsed
+        );
 
         // 大表格 50 行
-        let big_table = (0..50).map(|i| format!("| {} | {} | {} |", i, i*2, i*3)).collect::<Vec<_>>().join("\n");
+        let big_table = (0..50)
+            .map(|i| format!("| {} | {} | {} |", i, i * 2, i * 3))
+            .collect::<Vec<_>>()
+            .join("\n");
         let md_table = format!("| a | b | c |\n|---|---|---|\n{}", big_table);
         let start = Instant::now();
         let lines = render_markdown(&md_table, 80);
-        eprintln!("big table 50 rows -> {} lines in {:?}", lines.len(), start.elapsed());
+        eprintln!(
+            "big table 50 rows -> {} lines in {:?}",
+            lines.len(),
+            start.elapsed()
+        );
         assert!(lines.len() < 600);
         assert!(start.elapsed().as_millis() < 500);
 
@@ -796,7 +1009,9 @@ mod tests {
         for i in 0..1000 {
             s.push('a');
             let _ = crate::app::render_line::wrap_text(&format!("{}▌", s), 80);
-            if i % 100 == 0 { let _ = render_markdown(&s, 80); }
+            if i % 100 == 0 {
+                let _ = render_markdown(&s, 80);
+            }
         }
         eprintln!("streaming 1000 inc: {:?}", start.elapsed());
         assert!(start.elapsed().as_millis() < 1000);
@@ -806,7 +1021,24 @@ mod tests {
     fn perf_cjk_150tps() {
         use std::time::Instant;
         // 150 tokens/s ~ 225 CJK chars/s（1 token≈1.5 CJK），5s 模拟 750 tokens ≈1125 chars
-        let cjk_tokens = ["自动", "压缩", "阈值", "配置", "子代理", "工具", "模型", "思考", "强度", "表格", "代码", "高亮", "流式", "批处理", "内存", "控制"];
+        let cjk_tokens = [
+            "自动",
+            "压缩",
+            "阈值",
+            "配置",
+            "子代理",
+            "工具",
+            "模型",
+            "思考",
+            "强度",
+            "表格",
+            "代码",
+            "高亮",
+            "流式",
+            "批处理",
+            "内存",
+            "控制",
+        ];
         let mut s = String::new();
         let start = Instant::now();
         for i in 0..750 {
@@ -818,7 +1050,18 @@ mod tests {
                 let lines = render_markdown(&s, 80);
                 // CJK 切片必须按 width 2 且不 panic，且行宽 ≤80
                 for l in &lines {
-                    let w: usize = l.spans.iter().map(|sp| sp.text.chars().map(|c| unicode_width::UnicodeWidthChar::width(c).unwrap_or(0) as usize).sum::<usize>()).sum();
+                    let w: usize = l
+                        .spans
+                        .iter()
+                        .map(|sp| {
+                            sp.text
+                                .chars()
+                                .map(|c| {
+                                    unicode_width::UnicodeWidthChar::width(c).unwrap_or(0) as usize
+                                })
+                                .sum::<usize>()
+                        })
+                        .sum();
                     assert!(w <= 80, "CJK line width overflow: {} vs 80", w);
                 }
                 assert!(lines.len() < 500, "CJK 150tps batch should be <500 lines");
@@ -827,12 +1070,25 @@ mod tests {
             let _ = take_width(&s, 80);
         }
         let elapsed = start.elapsed();
-        eprintln!("CJK 150tps 750 tokens (5s) in {:?} ({:.0} tokens/s)", elapsed, 750.0 / elapsed.as_secs_f64());
-        assert!(elapsed.as_millis() < 1000, "CJK 150tps 5s should be <1s, got {:?}", elapsed);
+        eprintln!(
+            "CJK 150tps 750 tokens (5s) in {:?} ({:.0} tokens/s)",
+            elapsed,
+            750.0 / elapsed.as_secs_f64()
+        );
+        assert!(
+            elapsed.as_millis() < 1000,
+            "CJK 150tps 5s should be <1s, got {:?}",
+            elapsed
+        );
         // 表格 CJK 混合
-        let cjk_table = "| 模型 | 描述 |\n|---|---|\n| 自动压缩 | 阈值配置 |\n| 子代理工具 | 全部工具 |\n";
+        let cjk_table =
+            "| 模型 | 描述 |\n|---|---|\n| 自动压缩 | 阈值配置 |\n| 子代理工具 | 全部工具 |\n";
         let lines = render_markdown(cjk_table, 40);
-        assert!(lines.iter().any(|l| l.spans.iter().any(|sp| sp.text.contains('┌'))));
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.spans.iter().any(|sp| sp.text.contains('┌')))
+        );
         eprintln!("CJK table lines: {}", lines.len());
     }
 
@@ -847,9 +1103,28 @@ mod tests {
         let chunk = "# H1\n\nBold **text** `code`  ".repeat(10); // ~200 chars per turn
         for i in 0..400 {
             let text = format!("回合 {i} {}", chunk);
-            let block = Block { block_id: format!("b{i}"), block_order: 0, kind: TimelineBlockKind::Text, state: TimelineBlockState::Sealed, text, tool: None, last_fragment: 0 };
-            let round = Round { round_num: 0, sealed: true, is_final: true, blocks: vec![block] };
-            let turn = Turn { turn_id: format!("t{i}"), user_text: format!("user {i}"), state: TimelineTurnState::Completed, failure: None, rounds: vec![round] };
+            let block = Block {
+                block_id: format!("b{i}"),
+                block_order: 0,
+                kind: TimelineBlockKind::Text,
+                state: TimelineBlockState::Sealed,
+                text,
+                tool: None,
+                last_fragment: 0,
+            };
+            let round = Round {
+                round_num: 0,
+                sealed: true,
+                is_final: true,
+                blocks: vec![block],
+            };
+            let turn = Turn {
+                turn_id: format!("t{i}"),
+                user_text: format!("user {i}"),
+                state: TimelineTurnState::Completed,
+                failure: None,
+                rounds: vec![round],
+            };
             model.turns.push(turn);
         }
         let mut sess = SessionState::new("perf".into());
@@ -858,10 +1133,22 @@ mod tests {
         let start = Instant::now();
         let lines = render_transcript(&sess, 80);
         let elapsed = start.elapsed();
-        eprintln!("transcript 400 turns -> {} lines in {:?}", lines.len(), elapsed);
+        eprintln!(
+            "transcript 400 turns -> {} lines in {:?}",
+            lines.len(),
+            elapsed
+        );
         // 预估内存：每行平均 ~80 chars + 2 spans ~100B => 25600*100B ~2.5MB，远 <100MB
-        assert!(lines.len() < 40000, "400 turns should be <40000 lines, got {}", lines.len());
-        assert!(elapsed.as_millis() < 500, "400 turns render should be <500ms, got {:?}", elapsed);
+        assert!(
+            lines.len() < 40000,
+            "400 turns should be <40000 lines, got {}",
+            lines.len()
+        );
+        assert!(
+            elapsed.as_millis() < 500,
+            "400 turns render should be <500ms, got {:?}",
+            elapsed
+        );
         // 模拟流式增量：单回合追加 100 次，每次仅重算 active（缓存命中 width 相同则快）
         // 注：直接 render_transcript 无 App 缓存，每次 38ms，100x ~3.8s 仍 <5s；若走 ensure_render_caches 则 <100ms
         let start = Instant::now();

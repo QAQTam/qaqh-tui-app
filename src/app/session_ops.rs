@@ -9,7 +9,8 @@ impl App {
             return;
         }
         self.tabs.push(seed.to_owned());
-        self.sessions.insert(seed.to_owned(), SessionState::new(seed.to_owned()));
+        self.sessions
+            .insert(seed.to_owned(), SessionState::new(seed.to_owned()));
         self.active = self.tabs.len() - 1;
         self.sync_tracked();
         // attach + bootstrap（timeline 流由 runtime 自动建立）。
@@ -59,7 +60,8 @@ impl App {
         if let Some(cur) = self.initial_cwd.as_deref().filter(|s| !s.trim().is_empty()) {
             return Some(cur.to_string());
         }
-        self.active_session().and_then(|s| s.meta.as_ref().and_then(|m| m.cwd.clone()))
+        self.active_session()
+            .and_then(|s| s.meta.as_ref().and_then(|m| m.cwd.clone()))
     }
 
     pub fn new_session_with_cwd(&mut self, cwd: Option<String>) {
@@ -75,7 +77,8 @@ impl App {
             }),
         );
         let command_id = cmd.command_id.clone();
-        self.pending_creates.insert(command_id.clone(), Instant::now());
+        self.pending_creates
+            .insert(command_id.clone(), Instant::now());
         self.spawn_api(move |client, tx| async move {
             let result = client.command(&cmd).await.map_err(|e| e.to_string());
             let _ = tx.send(AppMsg::Action(ActionResult::CommandAck {
@@ -107,7 +110,9 @@ impl App {
     }
 
     pub fn active_session(&self) -> Option<&SessionState> {
-        self.tabs.get(self.active).and_then(|s| self.sessions.get(s))
+        self.tabs
+            .get(self.active)
+            .and_then(|s| self.sessions.get(s))
     }
 
     pub(super) fn active_session_mut(&mut self) -> Option<&mut SessionState> {
@@ -130,11 +135,19 @@ impl App {
     }
 
     pub fn archive_session(&mut self, seed: String) {
-        self.send_control_command(seed.clone(), ControlCommand::SessionArchive { seed }, "归档");
+        self.send_control_command(
+            seed.clone(),
+            ControlCommand::SessionArchive { seed },
+            "归档",
+        );
     }
 
     pub fn unarchive_session(&mut self, seed: String) {
-        self.send_control_command(seed.clone(), ControlCommand::SessionUnarchive { seed }, "取消归档");
+        self.send_control_command(
+            seed.clone(),
+            ControlCommand::SessionUnarchive { seed },
+            "取消归档",
+        );
     }
 
     pub fn delete_session(&mut self, seed: String) {
@@ -148,7 +161,10 @@ impl App {
         self.dashboard_fetching.insert(seed.clone());
         self.spawn_api(move |client, tx| async move {
             let value = client
-                .service(methods::SESSION_DASHBOARD, &serde_json::json!({ "seed": seed.clone() }))
+                .service(
+                    methods::SESSION_DASHBOARD,
+                    &serde_json::json!({ "seed": seed.clone() }),
+                )
                 .await;
             let parsed: Result<crate::protocol::event::DashboardSnapshot, String> = match value {
                 Ok(v) => {
@@ -160,9 +176,20 @@ impl App {
                                 Some(crate::protocol::event::DashboardTask {
                                     id: item.get("id")?.as_str()?.to_owned(),
                                     subject: item.get("subject")?.as_str().unwrap_or("").to_owned(),
-                                    description: item.get("description")?.as_str().unwrap_or("").to_owned(),
-                                    status: item.get("status")?.as_str().unwrap_or("idle").to_owned(),
-                                    evidence: item.get("evidence").and_then(|e| e.as_str()).map(str::to_owned),
+                                    description: item
+                                        .get("description")?
+                                        .as_str()
+                                        .unwrap_or("")
+                                        .to_owned(),
+                                    status: item
+                                        .get("status")?
+                                        .as_str()
+                                        .unwrap_or("idle")
+                                        .to_owned(),
+                                    evidence: item
+                                        .get("evidence")
+                                        .and_then(|e| e.as_str())
+                                        .map(str::to_owned),
                                 })
                             })
                             .collect::<Vec<_>>()
@@ -172,35 +199,68 @@ impl App {
                     let recent_edits = v
                         .get("recent_edits")
                         .and_then(|x| x.as_array())
-                        .map(|arr| arr.iter().filter_map(|s| s.as_str().map(str::to_owned)).collect())
+                        .map(|arr| {
+                            arr.iter()
+                                .filter_map(|s| s.as_str().map(str::to_owned))
+                                .collect()
+                        })
                         .unwrap_or_default();
-                    let seed_out = v.get("seed").and_then(|x| x.as_str()).unwrap_or(&seed).to_owned();
+                    let seed_out = v
+                        .get("seed")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or(&seed)
+                        .to_owned();
                     Ok(crate::protocol::event::DashboardSnapshot {
                         seed: seed_out,
                         documents: Vec::new(),
                         recent_edits,
                         tasks,
-                        current_todo_id: v.get("current_todo_id").and_then(|x| x.as_str()).map(str::to_owned),
+                        current_todo_id: v
+                            .get("current_todo_id")
+                            .and_then(|x| x.as_str())
+                            .map(str::to_owned),
                     })
                 }
                 Err(e) => {
                     let msg = e.to_string();
                     // fallback: todo.status 是同一数据源的另一视图
                     let v2 = client
-                        .service(methods::TODO_STATUS, &serde_json::json!({ "seed": seed.clone() }))
+                        .service(
+                            methods::TODO_STATUS,
+                            &serde_json::json!({ "seed": seed.clone() }),
+                        )
                         .await;
                     match v2 {
                         Ok(v) => {
-                            let items = v.get("items").and_then(|x| x.as_array()).cloned().unwrap_or_default();
+                            let items = v
+                                .get("items")
+                                .and_then(|x| x.as_array())
+                                .cloned()
+                                .unwrap_or_default();
                             let tasks = items
                                 .iter()
                                 .filter_map(|item| {
                                     Some(crate::protocol::event::DashboardTask {
                                         id: item.get("id")?.as_str()?.to_owned(),
-                                        subject: item.get("title").or(item.get("subject"))?.as_str()?.to_owned(),
-                                        description: item.get("description")?.as_str().unwrap_or("").to_owned(),
-                                        status: item.get("status")?.as_str().unwrap_or("idle").to_owned(),
-                                        evidence: item.get("evidence").and_then(|e| e.as_str()).map(str::to_owned),
+                                        subject: item
+                                            .get("title")
+                                            .or(item.get("subject"))?
+                                            .as_str()?
+                                            .to_owned(),
+                                        description: item
+                                            .get("description")?
+                                            .as_str()
+                                            .unwrap_or("")
+                                            .to_owned(),
+                                        status: item
+                                            .get("status")?
+                                            .as_str()
+                                            .unwrap_or("idle")
+                                            .to_owned(),
+                                        evidence: item
+                                            .get("evidence")
+                                            .and_then(|e| e.as_str())
+                                            .map(str::to_owned),
                                     })
                                 })
                                 .collect::<Vec<_>>();
@@ -212,7 +272,10 @@ impl App {
                                     documents: Vec::new(),
                                     recent_edits: Vec::new(),
                                     tasks,
-                                    current_todo_id: v.get("current_id").and_then(|x| x.as_str()).map(str::to_owned),
+                                    current_todo_id: v
+                                        .get("current_id")
+                                        .and_then(|x| x.as_str())
+                                        .map(str::to_owned),
                                 })
                             }
                         }
@@ -220,7 +283,10 @@ impl App {
                     }
                 }
             };
-            let _ = tx.send(AppMsg::Action(ActionResult::Dashboard { seed, result: parsed }));
+            let _ = tx.send(AppMsg::Action(ActionResult::Dashboard {
+                seed,
+                result: parsed,
+            }));
         });
     }
 
@@ -229,9 +295,14 @@ impl App {
         // " [n] title " 的宽度；仅处理前 9 个。
         let mut col: u16 = 10;
         for (idx, seed) in self.tabs.iter().enumerate().take(9) {
-            let title = self.sessions.get(seed).map(|s| s.title()).unwrap_or_default();
-            let label_w =
-                format!(" {} {} ", idx + 1, truncate_str(&title, 18)).chars().count() as u16;
+            let title = self
+                .sessions
+                .get(seed)
+                .map(|s| s.title())
+                .unwrap_or_default();
+            let label_w = format!(" {} {} ", idx + 1, truncate_str(&title, 18))
+                .chars()
+                .count() as u16;
             if column >= col && column < col + label_w {
                 self.active = idx;
                 return;
@@ -254,8 +325,12 @@ impl App {
             }
         }
 
-        let keep: HashSet<String> =
-            self.focus_order.iter().take(ACTIVE_MODELS).cloned().collect();
+        let keep: HashSet<String> = self
+            .focus_order
+            .iter()
+            .take(ACTIVE_MODELS)
+            .cloned()
+            .collect();
         for (seed, s) in self.sessions.iter_mut() {
             if !keep.contains(seed) && s.ready && !s.needs_rebaseline {
                 s.timeline = timeline_model::TimelineModel::default();
@@ -267,9 +342,12 @@ impl App {
             }
         }
 
-        if self.sessions.get(active).is_some_and(|s| s.needs_rebaseline && !s.loading_older) {
+        if self
+            .sessions
+            .get(active)
+            .is_some_and(|s| s.needs_rebaseline && !s.loading_older)
+        {
             self.request_rebaseline(active);
         }
     }
-
 }

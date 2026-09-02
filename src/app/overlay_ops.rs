@@ -4,7 +4,11 @@ use super::*;
 
 impl App {
     pub fn open_session_list(&mut self) {
-        if self.overlays.last().is_some_and(|o| matches!(o, Overlay::SessionList { .. })) {
+        if self
+            .overlays
+            .last()
+            .is_some_and(|o| matches!(o, Overlay::SessionList { .. }))
+        {
             self.overlays.pop();
             return;
         }
@@ -15,7 +19,10 @@ impl App {
         if stale {
             self.fetch_session_list();
         }
-        self.overlays.push(Overlay::SessionList { selected: 0, show_archived: false });
+        self.overlays.push(Overlay::SessionList {
+            selected: 0,
+            show_archived: false,
+        });
     }
 
     /// 会话列表的过滤谓词（与渲染一致）。
@@ -74,7 +81,9 @@ impl App {
             KeyCode::Char('x') => {
                 if let Some(&idx) = items.get(self.home_selected) {
                     let seed = self.session_list_cache[idx].seed.clone();
-                    self.overlays.push(Overlay::Confirm { action: ConfirmAction::ArchiveSession(seed) });
+                    self.overlays.push(Overlay::Confirm {
+                        action: ConfirmAction::ArchiveSession(seed),
+                    });
                 }
                 return true;
             }
@@ -88,19 +97,36 @@ impl App {
             KeyCode::Char('D') => {
                 if let Some(&idx) = items.get(self.home_selected) {
                     let seed = self.session_list_cache[idx].seed.clone();
-                    self.overlays.push(Overlay::Confirm { action: ConfirmAction::DeleteSession(seed) });
+                    self.overlays.push(Overlay::Confirm {
+                        action: ConfirmAction::DeleteSession(seed),
+                    });
                 }
                 return true;
             }
             _ => {}
         }
         // 首页下也允许 j/k 翻页等，防止落入 composer
-        matches!(key.code, KeyCode::Up | KeyCode::Down | KeyCode::Char('j') | KeyCode::Char('k') | KeyCode::Enter | KeyCode::Char('n') | KeyCode::Char('r') | KeyCode::Char('a') | KeyCode::Char('x') | KeyCode::Char('u') | KeyCode::Char('D'))
+        matches!(
+            key.code,
+            KeyCode::Up
+                | KeyCode::Down
+                | KeyCode::Char('j')
+                | KeyCode::Char('k')
+                | KeyCode::Enter
+                | KeyCode::Char('n')
+                | KeyCode::Char('r')
+                | KeyCode::Char('a')
+                | KeyCode::Char('x')
+                | KeyCode::Char('u')
+                | KeyCode::Char('D')
+        )
     }
 
     pub(super) fn overlay_key(&mut self, key: KeyEvent) -> bool {
         use ratatui::crossterm::event::{KeyCode, KeyModifiers};
-        let Some(top) = self.overlays.last().cloned() else { return false };
+        let Some(top) = self.overlays.last().cloned() else {
+            return false;
+        };
 
         match top {
             Overlay::Help => {
@@ -175,7 +201,10 @@ impl App {
                     KeyCode::PageUp => st.move_focus(-8),
                     KeyCode::PageDown => st.move_focus(8),
                     KeyCode::Enter => match kind {
-                        FieldKind::Text | FieldKind::Secret | FieldKind::Number | FieldKind::Float => {
+                        FieldKind::Text
+                        | FieldKind::Secret
+                        | FieldKind::Number
+                        | FieldKind::Float => {
                             st.editing = st.start_edit(self.config.as_ref());
                         }
                         FieldKind::Enum => {
@@ -215,7 +244,11 @@ impl App {
                 self.replace_overlay(Overlay::Settings(st));
                 true
             }
-            Overlay::AttachPath { mut input, mut cursor, seed } => {
+            Overlay::AttachPath {
+                mut input,
+                mut cursor,
+                seed,
+            } => {
                 match key.code {
                     KeyCode::Esc => {
                         self.overlays.pop();
@@ -234,35 +267,63 @@ impl App {
                             input.remove(cursor - 1);
                             cursor -= 1;
                         }
-                        self.replace_overlay(Overlay::AttachPath { input, cursor, seed });
+                        self.replace_overlay(Overlay::AttachPath {
+                            input,
+                            cursor,
+                            seed,
+                        });
                     }
                     KeyCode::Delete => {
                         if cursor < input.len() {
                             input.remove(cursor);
                         }
-                        self.replace_overlay(Overlay::AttachPath { input, cursor, seed });
+                        self.replace_overlay(Overlay::AttachPath {
+                            input,
+                            cursor,
+                            seed,
+                        });
                     }
                     KeyCode::Left => {
                         cursor = cursor.saturating_sub(1);
-                        self.replace_overlay(Overlay::AttachPath { input, cursor, seed });
+                        self.replace_overlay(Overlay::AttachPath {
+                            input,
+                            cursor,
+                            seed,
+                        });
                     }
                     KeyCode::Right => {
                         if cursor < input.len() {
                             cursor += 1;
                         }
-                        self.replace_overlay(Overlay::AttachPath { input, cursor, seed });
+                        self.replace_overlay(Overlay::AttachPath {
+                            input,
+                            cursor,
+                            seed,
+                        });
                     }
                     KeyCode::Home => {
-                        self.replace_overlay(Overlay::AttachPath { input, cursor: 0, seed });
+                        self.replace_overlay(Overlay::AttachPath {
+                            input,
+                            cursor: 0,
+                            seed,
+                        });
                     }
                     KeyCode::End => {
                         let n = input.len();
-                        self.replace_overlay(Overlay::AttachPath { input, cursor: n, seed });
+                        self.replace_overlay(Overlay::AttachPath {
+                            input,
+                            cursor: n,
+                            seed,
+                        });
                     }
                     KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
                         input.insert(cursor.min(input.len()), c);
                         cursor += 1;
-                        self.replace_overlay(Overlay::AttachPath { input, cursor, seed });
+                        self.replace_overlay(Overlay::AttachPath {
+                            input,
+                            cursor,
+                            seed,
+                        });
                     }
                     _ => {}
                 }
@@ -283,7 +344,10 @@ impl App {
                 self.overlays.pop();
                 true
             }
-            Overlay::SessionList { selected, show_archived } => {
+            Overlay::SessionList {
+                selected,
+                show_archived,
+            } => {
                 let items = self.filtered_sessions(show_archived);
                 let count = items.len();
                 match key.code {
@@ -292,14 +356,23 @@ impl App {
                     }
                     KeyCode::Up | KeyCode::Char('k') => {
                         let next = selected.saturating_sub(1);
-                        self.replace_overlay(Overlay::SessionList { selected: next, show_archived });
+                        self.replace_overlay(Overlay::SessionList {
+                            selected: next,
+                            show_archived,
+                        });
                     }
                     KeyCode::Down | KeyCode::Char('j') => {
                         let next = (selected + 1).min(count.saturating_sub(1));
-                        self.replace_overlay(Overlay::SessionList { selected: next, show_archived });
+                        self.replace_overlay(Overlay::SessionList {
+                            selected: next,
+                            show_archived,
+                        });
                     }
                     KeyCode::Char('a') => {
-                        self.replace_overlay(Overlay::SessionList { selected, show_archived: !show_archived });
+                        self.replace_overlay(Overlay::SessionList {
+                            selected,
+                            show_archived: !show_archived,
+                        });
                     }
                     KeyCode::Char('r') => self.fetch_session_list(),
                     KeyCode::Char('n') => {
@@ -316,7 +389,9 @@ impl App {
                     KeyCode::Char('x') => {
                         if let Some(&meta_idx) = items.get(selected) {
                             let seed = self.session_list_cache[meta_idx].seed.clone();
-                            self.overlays.push(Overlay::Confirm { action: ConfirmAction::ArchiveSession(seed) });
+                            self.overlays.push(Overlay::Confirm {
+                                action: ConfirmAction::ArchiveSession(seed),
+                            });
                         }
                     }
                     KeyCode::Char('u') => {
@@ -328,36 +403,62 @@ impl App {
                     KeyCode::Char('D') => {
                         if let Some(&meta_idx) = items.get(selected) {
                             let seed = self.session_list_cache[meta_idx].seed.clone();
-                            self.overlays.push(Overlay::Confirm { action: ConfirmAction::DeleteSession(seed) });
+                            self.overlays.push(Overlay::Confirm {
+                                action: ConfirmAction::DeleteSession(seed),
+                            });
                         }
                     }
                     _ => {}
                 }
                 true
             }
-            Overlay::CwdInput { mut input, mut cursor } => {
+            Overlay::CwdInput {
+                mut input,
+                mut cursor,
+            } => {
                 match key.code {
-                    KeyCode::Esc => { self.overlays.pop(); }
+                    KeyCode::Esc => {
+                        self.overlays.pop();
+                    }
                     KeyCode::Enter => {
                         let raw: String = input.iter().collect();
                         self.overlays.pop();
                         self.confirm_cwd_input(raw);
                     }
                     KeyCode::Backspace => {
-                        if cursor > 0 { input.remove(cursor-1); cursor-=1; }
-                        self.replace_overlay(Overlay::CwdInput{ input, cursor });
+                        if cursor > 0 {
+                            input.remove(cursor - 1);
+                            cursor -= 1;
+                        }
+                        self.replace_overlay(Overlay::CwdInput { input, cursor });
                     }
                     KeyCode::Delete => {
-                        if cursor < input.len() { input.remove(cursor); }
-                        self.replace_overlay(Overlay::CwdInput{ input, cursor });
+                        if cursor < input.len() {
+                            input.remove(cursor);
+                        }
+                        self.replace_overlay(Overlay::CwdInput { input, cursor });
                     }
-                    KeyCode::Left => { cursor = cursor.saturating_sub(1); self.replace_overlay(Overlay::CwdInput{ input, cursor }); }
-                    KeyCode::Right => { if cursor < input.len() { cursor+=1; } self.replace_overlay(Overlay::CwdInput{ input, cursor }); }
-                    KeyCode::Home => { self.replace_overlay(Overlay::CwdInput{ input, cursor: 0 }); }
-                    KeyCode::End => { let n = input.len(); self.replace_overlay(Overlay::CwdInput{ input, cursor: n }); }
+                    KeyCode::Left => {
+                        cursor = cursor.saturating_sub(1);
+                        self.replace_overlay(Overlay::CwdInput { input, cursor });
+                    }
+                    KeyCode::Right => {
+                        if cursor < input.len() {
+                            cursor += 1;
+                        }
+                        self.replace_overlay(Overlay::CwdInput { input, cursor });
+                    }
+                    KeyCode::Home => {
+                        self.replace_overlay(Overlay::CwdInput { input, cursor: 0 });
+                    }
+                    KeyCode::End => {
+                        let n = input.len();
+                        self.replace_overlay(Overlay::CwdInput { input, cursor: n });
+                    }
                     KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        input.insert(cursor.min(input.len()), c); cursor+=1;
-                        self.replace_overlay(Overlay::CwdInput{ input, cursor });
+                        input.insert(cursor.min(input.len()), c);
+                        cursor += 1;
+                        self.replace_overlay(Overlay::CwdInput { input, cursor });
                     }
                     _ => {}
                 }
@@ -372,5 +473,4 @@ impl App {
             self.overlays[n - 1] = overlay;
         }
     }
-
 }

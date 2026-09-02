@@ -18,46 +18,65 @@ use futures::StreamExt;
 use serde::Deserialize;
 use tokio::sync::{mpsc, watch};
 
+use crate::protocol::Channel;
 use crate::protocol::envelope::RingingEventEnvelope;
 use crate::protocol::timeline::{TimelineEntry, TimelinePage};
-use crate::protocol::Channel;
 use crate::transport::http::{ApiError, HttpClient, SSE_IDLE_TIMEOUT};
-use crate::transport::sse::{backoff_delay, frame_seq, last_event_id, SseDecoder};
+use crate::transport::sse::{SseDecoder, backoff_delay, frame_seq, last_event_id};
 
 /// 快照窗口大小（timeline 尾页）。
 pub const TIMELINE_PAGE_LIMIT: u32 = 60;
 const MAX_RENEW_FAILURES: u32 = 2;
 
 /// 连接信息（SSE 流通过 watch 感知 epoch/session 变化）。
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[derive(Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ConnInfo {
     pub epoch: String,
     pub generation: u64,
 }
-
 
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub enum ConnEvent {
     Opening,
     /// open 成功。`epoch_changed = true` 表示 daemon 重启过（app 需 re-baseline）。
-    Ready { epoch: String, epoch_changed: bool },
+    Ready {
+        epoch: String,
+        epoch_changed: bool,
+    },
     /// 致命错误（token 被拒 / 协议代差）——停止重试。
     Lost(String),
     /// 非致命问题提示（renew 失败、流断开等）。
-    StreamIssue { channel: Option<Channel>, error: String },
+    StreamIssue {
+        channel: Option<Channel>,
+        error: String,
+    },
 }
 
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub enum RuntimeMsg {
     Conn(ConnEvent),
-    Ringing { channel: Channel, env: Box<RingingEventEnvelope> },
-    ResetRequired { channel: Channel, seed: String },
-    Timeline { seed: String, entry: Box<TimelineEntry> },
-    TimelineRebaseline { seed: String, page: Box<TimelinePage> },
-    TimelineLost { seed: String, error: String },
+    Ringing {
+        channel: Channel,
+        env: Box<RingingEventEnvelope>,
+    },
+    ResetRequired {
+        channel: Channel,
+        seed: String,
+    },
+    Timeline {
+        seed: String,
+        entry: Box<TimelineEntry>,
+    },
+    TimelineRebaseline {
+        seed: String,
+        page: Box<TimelinePage>,
+    },
+    TimelineLost {
+        seed: String,
+        error: String,
+    },
 }
 
 /// 运行时编排器：拥有全部后台任务的生命周期。
@@ -76,7 +95,12 @@ impl Runtime {
         let (seeds_tx, seeds_rx) = watch::channel(Vec::new());
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
-        tokio::spawn(supervisor(client.clone(), conn_tx.clone(), msg_tx.clone(), shutdown_rx.clone()));
+        tokio::spawn(supervisor(
+            client.clone(),
+            conn_tx.clone(),
+            msg_tx.clone(),
+            shutdown_rx.clone(),
+        ));
         for channel in Channel::ALL {
             tokio::spawn(channel_stream(
                 client.clone(),
@@ -94,7 +118,13 @@ impl Runtime {
             shutdown_rx.clone(),
         ));
 
-        Self { client, msg_tx, conn_tx, seeds_tx, shutdown_tx }
+        Self {
+            client,
+            msg_tx,
+            conn_tx,
+            seeds_tx,
+            shutdown_tx,
+        }
     }
 
     /// app 维护的 open 标签页 seed 集合（驱动 per-seed timeline 流 + 重连后重 attach）。
@@ -102,12 +132,12 @@ impl Runtime {
         let _ = self.seeds_tx.send(seeds);
     }
 
-#[allow(dead_code)]
+    #[allow(dead_code)]
     pub fn conn_info(&self) -> ConnInfo {
         self.conn_tx.borrow().clone()
     }
 
-#[allow(dead_code)]
+    #[allow(dead_code)]
     pub fn msg_sender(&self) -> mpsc::UnboundedSender<RuntimeMsg> {
         self.msg_tx.clone()
     }
@@ -148,7 +178,10 @@ async fn supervisor(
                 attempt = 0;
                 let epoch_changed = known_epoch.as_deref() != Some(open.server_epoch.as_str());
                 generation += 1;
-                let _ = conn_tx.send(ConnInfo { epoch: open.server_epoch.clone(), generation });
+                let _ = conn_tx.send(ConnInfo {
+                    epoch: open.server_epoch.clone(),
+                    generation,
+                });
                 let _ = msg_tx.send(RuntimeMsg::Conn(ConnEvent::Ready {
                     epoch: open.server_epoch.clone(),
                     epoch_changed,
@@ -181,7 +214,9 @@ async fn supervisor(
                             failures += 1;
                             let _ = msg_tx.send(RuntimeMsg::Conn(ConnEvent::StreamIssue {
                                 channel: None,
-                                error: format!("renew 失败（{failures}/{MAX_RENEW_FAILURES}）：{e}"),
+                                error: format!(
+                                    "renew 失败（{failures}/{MAX_RENEW_FAILURES}）：{e}"
+                                ),
                             }));
                             if failures >= MAX_RENEW_FAILURES {
                                 break;
@@ -216,7 +251,10 @@ fn handle_channel_frame(
 ) -> bool {
     if frame.event_type == "ringing.reset_required" {
         if let Some(reset) = HttpClient::parse_reset(&frame.data) {
-            let _ = msg_tx.send(RuntimeMsg::ResetRequired { channel: reset.channel, seed: reset.seed });
+            let _ = msg_tx.send(RuntimeMsg::ResetRequired {
+                channel: reset.channel,
+                seed: reset.seed,
+            });
         }
         return true;
     }
@@ -234,7 +272,10 @@ fn handle_channel_frame(
         Some(seq) if env.stream_seq == seq => *cursor = seq,
         _ => return false,
     }
-    let _ = msg_tx.send(RuntimeMsg::Ringing { channel, env: Box::new(env) });
+    let _ = msg_tx.send(RuntimeMsg::Ringing {
+        channel,
+        env: Box::new(env),
+    });
     true
 }
 
@@ -438,7 +479,10 @@ async fn timeline_stream(
                 continue;
             }
             Err(e @ ApiError::Http { status: 404, .. }) => {
-                let _ = msg_tx.send(RuntimeMsg::TimelineLost { seed, error: e.to_string() });
+                let _ = msg_tx.send(RuntimeMsg::TimelineLost {
+                    seed,
+                    error: e.to_string(),
+                });
                 return; // seed 已不存在
             }
             Err(e) => {
@@ -452,7 +496,10 @@ async fn timeline_stream(
         };
         attempt = 0;
         let mut cursor = page.snapshot.watermark;
-        let _ = msg_tx.send(RuntimeMsg::TimelineRebaseline { seed: seed.clone(), page: Box::new(page) });
+        let _ = msg_tx.send(RuntimeMsg::TimelineRebaseline {
+            seed: seed.clone(),
+            page: Box::new(page),
+        });
 
         // 2) SSE 追加。
         let path = format!("/ringing/v1/sessions/{seed}/timeline/events");

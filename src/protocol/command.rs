@@ -2,8 +2,8 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::event::ContentRef;
 use super::Channel;
+use super::event::ContentRef;
 
 /// 用户消息中的图片附件（multimodal）。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -56,11 +56,21 @@ pub enum ControlCommand {
         custom_tools: Vec<String>,
     },
     /// 恢复已保存会话；daemon 会把 seed attach 到当前 lease。
-    SessionResume { seed: String },
-    SessionClose { seed: String },
-    SessionArchive { seed: String },
-    SessionUnarchive { seed: String },
-    SessionDelete { seed: String },
+    SessionResume {
+        seed: String,
+    },
+    SessionClose {
+        seed: String,
+    },
+    SessionArchive {
+        seed: String,
+    },
+    SessionUnarchive {
+        seed: String,
+    },
+    SessionDelete {
+        seed: String,
+    },
     SessionShutdown,
     AgentReloadConfig,
     SetToolMode {
@@ -73,7 +83,9 @@ pub enum ControlCommand {
         interaction_id: String,
         answers: Vec<AskAnswer>,
     },
-    InteractionAskDismiss { interaction_id: String },
+    InteractionAskDismiss {
+        interaction_id: String,
+    },
     PlanReviewRespond {
         interaction_id: String,
         approved: bool,
@@ -82,7 +94,9 @@ pub enum ControlCommand {
         #[serde(default)]
         autonomous: bool,
     },
-    SkillsActivate { name: String },
+    SkillsActivate {
+        name: String,
+    },
     SkillsReload,
     SkillsOperation {
         operation_id: String,
@@ -111,7 +125,9 @@ pub enum ConversationCommand {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         turn_id: Option<String>,
     },
-    ConversationUndoTurn { turn_id: String },
+    ConversationUndoTurn {
+        turn_id: String,
+    },
     ConversationCompact {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         turn_id: Option<String>,
@@ -122,7 +138,9 @@ pub enum ConversationCommand {
         #[serde(default = "default_load_count")]
         count: u32,
     },
-    ConversationSetMode { mode: ConversationMode },
+    ConversationSetMode {
+        mode: ConversationMode,
+    },
 }
 
 fn default_load_count() -> u32 {
@@ -166,7 +184,10 @@ impl RingingCommand {
     }
 
     pub fn is_session_create(&self) -> bool {
-        matches!(self, RingingCommand::Control(ControlCommand::SessionCreate { .. }))
+        matches!(
+            self,
+            RingingCommand::Control(ControlCommand::SessionCreate { .. })
+        )
     }
 }
 

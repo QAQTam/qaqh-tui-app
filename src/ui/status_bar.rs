@@ -1,8 +1,8 @@
 //! 底部状态栏：连接相位 / epoch / toast / 用量 / 时钟。
 
+use ratatui::Frame;
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
-use ratatui::Frame;
 
 use crate::app::{App, ConnPhase};
 use crate::protocol::event::NoticeLevel;
@@ -15,7 +15,11 @@ pub fn draw(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
     match app.conn_phase {
         ConnPhase::Ready => {
             left.push(Span::styled(" ● ready", theme::ok()));
-            let ep = if app.epoch.len() > 8 { &app.epoch[..8] } else { &app.epoch };
+            let ep = if app.epoch.len() > 8 {
+                &app.epoch[..8]
+            } else {
+                &app.epoch
+            };
             left.push(Span::styled(format!(" {ep}"), theme::dim()));
         }
         ConnPhase::Opening => {
@@ -24,7 +28,10 @@ pub fn draw(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
         ConnPhase::Lost => {
             left.push(Span::styled(" ✗ lost", theme::err()));
             if let Some(err) = &app.conn_error {
-                left.push(Span::styled(format!(" {}", crate::app::truncate_str(err, 30)), theme::err()));
+                left.push(Span::styled(
+                    format!(" {}", crate::app::truncate_str(err, 30)),
+                    theme::err(),
+                ));
             }
         }
     }
@@ -49,7 +56,11 @@ pub fn draw(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
     if let Some(sess) = app.active_session() {
         if let Some(usage) = sess.usage.as_ref() {
             right.push(Span::styled(
-                format!(" ↑{}k ↓{}k", usage.prompt_tokens / 1000, usage.completion_tokens / 1000),
+                format!(
+                    " ↑{}k ↓{}k",
+                    usage.prompt_tokens / 1000,
+                    usage.completion_tokens / 1000
+                ),
                 theme::dim(),
             ));
             if let Some(limit) = sess.context_limit {
@@ -61,7 +72,10 @@ pub fn draw(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
                 right.push(Span::styled(format!(" ({pct}%)"), theme::dim()));
             }
         }
-        right.push(Span::styled(format!(" · {}", sess.activity_label()), theme::accent()));
+        right.push(Span::styled(
+            format!(" · {}", sess.activity_label()),
+            theme::accent(),
+        ));
     }
     let now = chrono::Local::now().format("%H:%M");
     right.push(Span::styled(format!(" · {now} "), theme::dim()));
@@ -75,9 +89,15 @@ pub fn draw(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
     }
 
     let mut spans = left;
-    let used = spans.iter().map(|s| s.content.chars().count()).sum::<usize>()
+    let used = spans
+        .iter()
+        .map(|s| s.content.chars().count())
+        .sum::<usize>()
         + right_w
-        + middle.iter().map(|s| s.content.chars().count()).sum::<usize>();
+        + middle
+            .iter()
+            .map(|s| s.content.chars().count())
+            .sum::<usize>();
     if used < width {
         spans.push(Span::styled(" ".repeat(width - used), Style::new()));
     }

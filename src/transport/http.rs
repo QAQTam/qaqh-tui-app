@@ -39,7 +39,11 @@ pub enum ApiError {
     #[error("协议版本不被接受：{0}")]
     UnsupportedVersion(String),
     #[error("服务错误 {status} {code}: {message}")]
-    Http { status: u16, code: String, message: String },
+    Http {
+        status: u16,
+        code: String,
+        message: String,
+    },
     #[error("网络错误：{0}")]
     Network(String),
     #[error("协议错误：{0}")]
@@ -145,7 +149,11 @@ impl HttpClient {
             Ok(err) => (err.code, err.message),
             Err(_) => (format!("http_{}", status.as_u16()), truncate(&text, 200)),
         };
-        Err(ApiError::Http { status: status.as_u16(), code, message })
+        Err(ApiError::Http {
+            status: status.as_u16(),
+            code,
+            message,
+        })
     }
 
     async fn send_json<T: DeserializeOwned>(
@@ -153,9 +161,16 @@ impl HttpClient {
         rb: reqwest::RequestBuilder,
         timeout: Duration,
     ) -> Result<T, ApiError> {
-        let resp = rb.timeout(timeout).send().await.map_err(|e| ApiError::Network(e.to_string()))?;
+        let resp = rb
+            .timeout(timeout)
+            .send()
+            .await
+            .map_err(|e| ApiError::Network(e.to_string()))?;
         let status = resp.status();
-        let body = resp.text().await.map_err(|e| ApiError::Network(e.to_string()))?;
+        let body = resp
+            .text()
+            .await
+            .map_err(|e| ApiError::Network(e.to_string()))?;
         self.classify(status, body, |text| {
             serde_json::from_str(&text)
                 .map_err(|e| ApiError::Protocol(format!("响应解析失败: {e}")))
@@ -177,7 +192,10 @@ impl HttpClient {
             .await
             .map_err(|e| ApiError::Network(e.to_string()))?;
         let status = resp.status();
-        let body = resp.text().await.map_err(|e| ApiError::Network(e.to_string()))?;
+        let body = resp
+            .text()
+            .await
+            .map_err(|e| ApiError::Network(e.to_string()))?;
         let open: ClientOpenResponse = self
             .classify(status, body, |text| {
                 serde_json::from_str(&text)
@@ -206,9 +224,16 @@ impl HttpClient {
 
     pub async fn health(&self) -> Result<String, ApiError> {
         let rb = self.http.get(self.url("/health"));
-        let resp = rb.timeout(OPEN_TIMEOUT).send().await.map_err(|e| ApiError::Network(e.to_string()))?;
+        let resp = rb
+            .timeout(OPEN_TIMEOUT)
+            .send()
+            .await
+            .map_err(|e| ApiError::Network(e.to_string()))?;
         let status = resp.status();
-        let body = resp.text().await.map_err(|e| ApiError::Network(e.to_string()))?;
+        let body = resp
+            .text()
+            .await
+            .map_err(|e| ApiError::Network(e.to_string()))?;
         self.classify(status, body, Ok).await
     }
 
@@ -217,7 +242,9 @@ impl HttpClient {
         &self,
         envelope: &RingingCommandEnvelope,
     ) -> Result<RingingCommandAck, ApiError> {
-        envelope.validate().map_err(|code| ApiError::Protocol(code.to_string()))?;
+        envelope
+            .validate()
+            .map_err(|code| ApiError::Protocol(code.to_string()))?;
         let path = format!("/ringing/v1/commands/{}", envelope.channel.as_str());
         self.send_json(
             self.request(reqwest::Method::POST, &path).json(envelope),
@@ -229,7 +256,8 @@ impl HttpClient {
     /// 命令 receipt（ack 丢失或需要终态确认时使用）。
     pub async fn command_status(&self, command_id: &str) -> Result<RingingCommandStatus, ApiError> {
         let path = format!("/ringing/v1/commands/{command_id}");
-        self.send_json(self.request(reqwest::Method::GET, &path), COMMAND_TIMEOUT).await
+        self.send_json(self.request(reqwest::Method::GET, &path), COMMAND_TIMEOUT)
+            .await
     }
 
     /// 服务面 RPC（方法名必须来自 protocol::methods 常量）。
@@ -240,17 +268,30 @@ impl HttpClient {
     ) -> Result<serde_json::Value, ApiError> {
         let path = format!("/ringing/v1/service/{method}");
         let rb = self.request(reqwest::Method::POST, &path).json(params);
-        let resp = rb.timeout(SERVICE_TIMEOUT).send().await.map_err(|e| ApiError::Network(e.to_string()))?;
+        let resp = rb
+            .timeout(SERVICE_TIMEOUT)
+            .send()
+            .await
+            .map_err(|e| ApiError::Network(e.to_string()))?;
         let status = resp.status();
-        let body = resp.text().await.map_err(|e| ApiError::Network(e.to_string()))?;
-        self.classify(status, body, |text| serde_json::from_str(&text).map_err(|e| {
-            ApiError::Protocol(format!("service {method} 响应解析失败: {e}"))
-        }))
+        let body = resp
+            .text()
+            .await
+            .map_err(|e| ApiError::Network(e.to_string()))?;
+        self.classify(status, body, |text| {
+            serde_json::from_str(&text)
+                .map_err(|e| ApiError::Protocol(format!("service {method} 响应解析失败: {e}")))
+        })
         .await
     }
 
     pub async fn session_list(&self) -> Result<Vec<SessionMetaView>, ApiError> {
-        let value = self.service(crate::protocol::methods::SESSION_LIST, &serde_json::json!({})).await?;
+        let value = self
+            .service(
+                crate::protocol::methods::SESSION_LIST,
+                &serde_json::json!({}),
+            )
+            .await?;
         let arr = value
             .as_array()
             .ok_or_else(|| ApiError::Protocol("session.list 应返回数组".into()))?;
@@ -260,7 +301,8 @@ impl HttpClient {
     /// bootstrap：三频道快照原子恢复。
     pub async fn bootstrap(&self, seed: &str) -> Result<RingingSessionBootstrap, ApiError> {
         let path = format!("/ringing/v1/sessions/{seed}/bootstrap");
-        self.send_json(self.request(reqwest::Method::GET, &path), SNAPSHOT_TIMEOUT).await
+        self.send_json(self.request(reqwest::Method::GET, &path), SNAPSHOT_TIMEOUT)
+            .await
     }
 
     /// timeline 快照分页：无 before_turn = 尾窗（默认 30，最大 200）。
@@ -275,7 +317,8 @@ impl HttpClient {
             path.push_str("&before_turn=");
             path.push_str(&urlencode(turn));
         }
-        self.send_json(self.request(reqwest::Method::GET, &path), SNAPSHOT_TIMEOUT).await
+        self.send_json(self.request(reqwest::Method::GET, &path), SNAPSHOT_TIMEOUT)
+            .await
     }
 
     /// SSE 连接（无整体超时；调用方负责逐字节判活）。
@@ -291,11 +334,18 @@ impl HttpClient {
             Some(id) => rb.header(crate::protocol::LAST_EVENT_ID_HEADER, id),
             None => rb,
         };
-        let resp = rb.send().await.map_err(|e| ApiError::Network(e.to_string()))?;
+        let resp = rb
+            .send()
+            .await
+            .map_err(|e| ApiError::Network(e.to_string()))?;
         let status = resp.status();
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
-            return self.classify(status, body, |text| Err(ApiError::Protocol(truncate(&text, 200)))).await;
+            return self
+                .classify(status, body, |text| {
+                    Err(ApiError::Protocol(truncate(&text, 200)))
+                })
+                .await;
         }
         Ok(resp)
     }
@@ -318,7 +368,9 @@ impl HttpClient {
         let mut body: Vec<u8> = Vec::with_capacity(bytes.len() + 256);
         let push_field = |name: &str, value: &[u8], body: &mut Vec<u8>| {
             body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
-            body.extend_from_slice(format!("Content-Disposition: form-data; name=\"{name}\"\r\n\r\n").as_bytes());
+            body.extend_from_slice(
+                format!("Content-Disposition: form-data; name=\"{name}\"\r\n\r\n").as_bytes(),
+            );
             body.extend_from_slice(value);
             body.extend_from_slice(b"\r\n");
         };
@@ -329,23 +381,45 @@ impl HttpClient {
 
         let rb = self
             .request(reqwest::Method::POST, "/ringing/v1/content")
-            .header(reqwest::header::CONTENT_TYPE, format!("multipart/form-data; boundary={boundary}"))
+            .header(
+                reqwest::header::CONTENT_TYPE,
+                format!("multipart/form-data; boundary={boundary}"),
+            )
             .body(body);
         self.send_json(rb, UPLOAD_TIMEOUT).await
     }
 
     /// 内容下载（校验 sha256 与引用一致）。
     #[allow(dead_code)]
-    pub async fn download_content(&self, content: &ContentRef, seed: &str) -> Result<Vec<u8>, ApiError> {
-        let path = format!("/ringing/v1/content/{}?seed={}", content.content_id, urlencode(seed));
+    pub async fn download_content(
+        &self,
+        content: &ContentRef,
+        seed: &str,
+    ) -> Result<Vec<u8>, ApiError> {
+        let path = format!(
+            "/ringing/v1/content/{}?seed={}",
+            content.content_id,
+            urlencode(seed)
+        );
         let rb = self.request(reqwest::Method::GET, &path);
-        let resp = rb.timeout(UPLOAD_TIMEOUT).send().await.map_err(|e| ApiError::Network(e.to_string()))?;
+        let resp = rb
+            .timeout(UPLOAD_TIMEOUT)
+            .send()
+            .await
+            .map_err(|e| ApiError::Network(e.to_string()))?;
         let status = resp.status();
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
-            return self.classify(status, body, |text| Err(ApiError::Protocol(truncate(&text, 200)))).await;
+            return self
+                .classify(status, body, |text| {
+                    Err(ApiError::Protocol(truncate(&text, 200)))
+                })
+                .await;
         }
-        let bytes = resp.bytes().await.map_err(|e| ApiError::Network(e.to_string()))?;
+        let bytes = resp
+            .bytes()
+            .await
+            .map_err(|e| ApiError::Network(e.to_string()))?;
         let digest = sha256_hex(&bytes);
         if digest != content.sha256 {
             return Err(ApiError::Protocol(format!(
@@ -393,6 +467,10 @@ pub fn new_instance_id() -> String {
 
 /// 组装命令信封（uuid v4 command_id；seed/期望修订由调用方注入）。
 pub fn build_envelope(client: &HttpClient, command: RingingCommand) -> RingingCommandEnvelope {
-    RingingCommandEnvelope::new(uuid::Uuid::new_v4().to_string(), client.instance_id.clone(), command)
-        .with_client_session_id(client.session_id())
+    RingingCommandEnvelope::new(
+        uuid::Uuid::new_v4().to_string(),
+        client.instance_id.clone(),
+        command,
+    )
+    .with_client_session_id(client.session_id())
 }

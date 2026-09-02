@@ -1,15 +1,15 @@
 //! 交互弹窗：工具权限（tool 频道）、ask_user / plan review（control 频道）。
 //! 优先级 permission > ask > plan（与 winui 一致）。
 
+use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
-use ratatui::Frame;
 use unicode_width::UnicodeWidthStr;
 
-use crate::app::session::{AskPanel, PermissionPanel, PlanPanel};
 use crate::app::App;
+use crate::app::session::{AskPanel, PermissionPanel, PlanPanel};
 use crate::ui::theme;
 
 pub fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
@@ -24,7 +24,9 @@ pub fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
 }
 
 pub fn draw(f: &mut Frame, app: &App, area: Rect) {
-    let Some(sess) = app.active_session() else { return };
+    let Some(sess) = app.active_session() else {
+        return;
+    };
     if let Some(perm) = sess.active_permission() {
         draw_permission(f, perm, area);
     } else if let Some(ask) = &sess.pending_ask {
@@ -40,17 +42,35 @@ pub fn footer_line(keys: &[(&str, &str)]) -> Line<'static> {
         if i > 0 {
             spans.push(Span::styled(" · ", theme::dim()));
         }
-        spans.push(Span::styled((*key).to_owned(), Style::new().fg(ratatui::style::Color::Cyan).add_modifier(Modifier::BOLD)));
+        spans.push(Span::styled(
+            (*key).to_owned(),
+            Style::new()
+                .fg(ratatui::style::Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ));
         spans.push(Span::styled(format!(" {desc}"), theme::dim()));
     }
     Line::from(spans)
 }
 
-fn push_wrapped(out: &mut Vec<Line<'static>>, prefix: &str, text: &str, width: usize, style: Style) {
+fn push_wrapped(
+    out: &mut Vec<Line<'static>>,
+    prefix: &str,
+    text: &str,
+    width: usize,
+    style: Style,
+) {
     let wrapped = crate::app::render_line::wrap_text(text, width.saturating_sub(prefix.width()));
     for (i, seg) in wrapped.into_iter().enumerate() {
-        let pfx = if i == 0 { prefix.to_owned() } else { " ".repeat(prefix.width()) };
-        out.push(Line::from(vec![Span::styled(pfx, theme::dim()), Span::styled(seg, style)]));
+        let pfx = if i == 0 {
+            prefix.to_owned()
+        } else {
+            " ".repeat(prefix.width())
+        };
+        out.push(Line::from(vec![
+            Span::styled(pfx, theme::dim()),
+            Span::styled(seg, style),
+        ]));
     }
 }
 
@@ -63,18 +83,39 @@ fn draw_permission(f: &mut Frame, perm: &PermissionPanel, area: Rect) {
     let block = Block::new()
         .borders(Borders::ALL)
         .border_style(theme::warn())
-        .title(format!(" ⚠ 工具权限请求 · risk {:?} · level {} ", perm.risk, perm.level));
+        .title(format!(
+            " ⚠ 工具权限请求 · risk {:?} · level {} ",
+            perm.risk, perm.level
+        ));
     f.render_widget(block, rect);
 
     let inner_w = rect.width.saturating_sub(2) as usize;
     let mut lines: Vec<Line> = Vec::new();
-    push_wrapped(&mut lines, "工具: ", &perm.tool_name, inner_w, theme::accent());
+    push_wrapped(
+        &mut lines,
+        "工具: ",
+        &perm.tool_name,
+        inner_w,
+        theme::accent(),
+    );
     if !perm.reason.is_empty() {
         push_wrapped(&mut lines, "原因: ", &perm.reason, inner_w, Style::new());
     }
-    push_wrapped(&mut lines, "类别: ", &format!("{:?} (影响等级 {})", perm.category, perm.level), inner_w, Style::new());
+    push_wrapped(
+        &mut lines,
+        "类别: ",
+        &format!("{:?} (影响等级 {})", perm.category, perm.level),
+        inner_w,
+        Style::new(),
+    );
     if !perm.consequence.is_empty() {
-        push_wrapped(&mut lines, "后果: ", &perm.consequence, inner_w, Style::new());
+        push_wrapped(
+            &mut lines,
+            "后果: ",
+            &perm.consequence,
+            inner_w,
+            Style::new(),
+        );
     }
     for p in perm.paths.iter().take(6) {
         push_wrapped(&mut lines, "路径: ", p, inner_w, Style::new());
@@ -82,11 +123,18 @@ fn draw_permission(f: &mut Frame, perm: &PermissionPanel, area: Rect) {
     lines.push(Line::from(""));
     let trust = if perm.trust_folder { "[x]" } else { "[ ]" };
     lines.push(Line::from(vec![
-        Span::styled(format!("  {trust} 信任此目录"), Style::new().fg(ratatui::style::Color::Cyan)),
+        Span::styled(
+            format!("  {trust} 信任此目录"),
+            Style::new().fg(ratatui::style::Color::Cyan),
+        ),
         Span::styled("  （高风险且涉及路径时可用）", theme::dim()),
     ]));
     lines.push(Line::from(""));
-    lines.push(footer_line(&[("a", "批准执行"), ("d", "拒绝"), ("t", "切换信任目录")]));
+    lines.push(footer_line(&[
+        ("a", "批准执行"),
+        ("d", "拒绝"),
+        ("t", "切换信任目录"),
+    ]));
 
     f.render_widget(
         Paragraph::new(lines).wrap(Wrap { trim: false }),
@@ -108,7 +156,11 @@ fn draw_ask(f: &mut Frame, panel: &AskPanel, area: Rect) {
         .enumerate()
         .map(|(i, q)| {
             let opts = q.options.len().min(6);
-            let custom = if panel.editing_custom == Some(i) { 2 } else { 0 };
+            let custom = if panel.editing_custom == Some(i) {
+                2
+            } else {
+                0
+            };
             3 + opts + custom
         })
         .sum::<usize>()
@@ -130,13 +182,21 @@ fn draw_ask(f: &mut Frame, panel: &AskPanel, area: Rect) {
     let mut lines: Vec<Line> = Vec::new();
     for (qi, q) in panel.questions.iter().enumerate() {
         let focus_mark = if qi == panel.focus { "▶" } else { " " };
-        push_wrapped(&mut lines, &format!("{focus_mark} Q{}: ", qi + 1), &q.question, inner_w, Style::new().add_modifier(Modifier::BOLD));
+        push_wrapped(
+            &mut lines,
+            &format!("{focus_mark} Q{}: ", qi + 1),
+            &q.question,
+            inner_w,
+            Style::new().add_modifier(Modifier::BOLD),
+        );
         if !q.options.is_empty() {
             for (oi, opt) in q.options.iter().enumerate() {
                 let selected = panel.selections[qi] == Some(oi);
                 let mark = if selected { "◉" } else { "○" };
                 let style = if selected {
-                    Style::new().fg(ratatui::style::Color::Cyan).add_modifier(Modifier::BOLD)
+                    Style::new()
+                        .fg(ratatui::style::Color::Cyan)
+                        .add_modifier(Modifier::BOLD)
                 } else {
                     Style::new()
                 };
@@ -152,7 +212,10 @@ fn draw_ask(f: &mut Frame, panel: &AskPanel, area: Rect) {
         if !custom.is_empty() {
             lines.push(Line::from(vec![
                 Span::styled("    ✎ ", theme::accent()),
-                Span::styled(custom.to_owned(), Style::new().fg(ratatui::style::Color::Cyan)),
+                Span::styled(
+                    custom.to_owned(),
+                    Style::new().fg(ratatui::style::Color::Cyan),
+                ),
             ]));
         }
         if panel.editing_custom == Some(qi) {
@@ -197,7 +260,11 @@ fn draw_plan(f: &mut Frame, panel: &PlanPanel, area: Rect) {
     let h = area.height.saturating_sub(4);
     let rect = centered_rect(w, h, area);
     f.render_widget(Clear, rect);
-    let review_tag = if panel.review_type.is_empty() { "plan" } else { &panel.review_type };
+    let review_tag = if panel.review_type.is_empty() {
+        "plan"
+    } else {
+        &panel.review_type
+    };
     let block = Block::new()
         .borders(Borders::ALL)
         .border_style(theme::modal_border())
@@ -211,18 +278,26 @@ fn draw_plan(f: &mut Frame, panel: &PlanPanel, area: Rect) {
         width: rect.width.saturating_sub(2),
         height: rect.height.saturating_sub(2),
     };
-    let cols = Layout::horizontal([Constraint::Percentage(100), Constraint::Length(0)]).split(inner);
+    let cols =
+        Layout::horizontal([Constraint::Percentage(100), Constraint::Length(0)]).split(inner);
 
     let content_w = cols[0].width as usize;
     let mut lines: Vec<Line> = Vec::new();
     let plan_lines = crate::app::render_line::wrap_text(&panel.plan_content, content_w);
     let scroll = panel.scroll.min(plan_lines.len().saturating_sub(1));
-    for seg in plan_lines.iter().skip(scroll).take(inner.height.saturating_sub(4) as usize) {
+    for seg in plan_lines
+        .iter()
+        .skip(scroll)
+        .take(inner.height.saturating_sub(4) as usize)
+    {
         lines.push(Line::from(Span::raw(seg.clone())));
     }
     if !panel.todo_items.is_empty() {
         lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled("Todo:", Style::new().add_modifier(Modifier::BOLD))));
+        lines.push(Line::from(Span::styled(
+            "Todo:",
+            Style::new().add_modifier(Modifier::BOLD),
+        )));
         for item in &panel.todo_items {
             lines.push(Line::from(vec![
                 Span::styled(format!("  [{:?}] ", item.complexity), theme::dim()),
@@ -234,7 +309,10 @@ fn draw_plan(f: &mut Frame, panel: &PlanPanel, area: Rect) {
     if panel.entering_message {
         lines.push(Line::from(vec![
             Span::styled("  拒绝理由> ", theme::warn()),
-            Span::styled(format!("{}_", panel.message), Style::new().add_modifier(Modifier::REVERSED)),
+            Span::styled(
+                format!("{}_", panel.message),
+                Style::new().add_modifier(Modifier::REVERSED),
+            ),
         ]));
         lines.push(footer_line(&[("Enter", "提交拒绝"), ("Esc", "取消")]));
     } else {

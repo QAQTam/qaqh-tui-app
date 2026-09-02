@@ -6,9 +6,9 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use super::Channel;
 use super::event::{ActivityState, SkillsStatus, UsageInfo};
 use super::timeline::TimelineTurn;
-use super::Channel;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RingingChannelSnapshot {
@@ -64,20 +64,35 @@ impl ConversationStateView {
         let turns = state
             .get("turns")
             .and_then(|v| v.as_array())
-            .map(|a| a.iter().filter_map(|t| serde_json::from_value(t.clone()).ok()).collect())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|t| serde_json::from_value(t.clone()).ok())
+                    .collect()
+            })
             .unwrap_or_default();
         Self {
-            usage: state.get("usage").and_then(|v| serde_json::from_value(v.clone()).ok()),
+            usage: state
+                .get("usage")
+                .and_then(|v| serde_json::from_value(v.clone()).ok()),
             usage_totals: state
                 .get("usage_totals")
                 .and_then(|v| serde_json::from_value(v.clone()).ok()),
-            usage_requests: state.get("usage_requests").and_then(Value::as_u64).map(|v| v as u32),
+            usage_requests: state
+                .get("usage_requests")
+                .and_then(Value::as_u64)
+                .map(|v| v as u32),
             cache_reported_requests: state
                 .get("cache_reported_requests")
                 .and_then(Value::as_u64)
                 .map(|v| v as u32),
-            model: state.get("model").and_then(Value::as_str).map(str::to_owned),
-            context_limit: state.get("context_limit").and_then(Value::as_u64).map(|v| v as u32),
+            model: state
+                .get("model")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            context_limit: state
+                .get("context_limit")
+                .and_then(Value::as_u64)
+                .map(|v| v as u32),
             turns,
         }
     }
@@ -116,7 +131,10 @@ pub struct ChannelStateView {
 impl ChannelStateView {
     pub fn parse_control(state: &Value) -> Self {
         Self {
-            session_state: state.get("session_state").and_then(Value::as_str).map(str::to_owned),
+            session_state: state
+                .get("session_state")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
             activity: state.get("activity").and_then(|v| {
                 // activity 可能是 {state: "..."} 或直接字符串。
                 v.as_str()
@@ -135,10 +153,16 @@ impl ChannelStateView {
                 }
                 Some(PendingInteractionView {
                     id: v.get("id").and_then(Value::as_str)?.to_owned(),
-                    kind: v.get("kind").and_then(Value::as_str).unwrap_or("ask").to_owned(),
+                    kind: v
+                        .get("kind")
+                        .and_then(Value::as_str)
+                        .unwrap_or("ask")
+                        .to_owned(),
                 })
             }),
-            skills: state.get("skills").and_then(|v| serde_json::from_value(v.clone()).ok()),
+            skills: state
+                .get("skills")
+                .and_then(|v| serde_json::from_value(v.clone()).ok()),
             dashboard: state
                 .get("dashboard_snapshot")
                 .and_then(|v| serde_json::from_value(v.clone()).ok()),
@@ -151,7 +175,9 @@ impl ChannelStateView {
             pending_permission: state.get("pending_permission").and_then(|v| {
                 v.as_str()
                     .filter(|s| !s.is_empty())
-                    .map(|id| PendingPermissionView { tool_call_id: id.to_owned() })
+                    .map(|id| PendingPermissionView {
+                        tool_call_id: id.to_owned(),
+                    })
             }),
             ..Default::default()
         }

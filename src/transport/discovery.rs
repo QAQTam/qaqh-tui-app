@@ -55,7 +55,9 @@ pub fn data_dir() -> std::path::PathBuf {
     } else {
         let base = std::env::var_os("XDG_CONFIG_HOME")
             .map(std::path::PathBuf::from)
-            .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".config")))
+            .or_else(|| {
+                std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".config"))
+            })
             .unwrap_or_else(|| std::path::PathBuf::from("."));
         base.join("qaqh")
     }
@@ -123,19 +125,28 @@ fn lock_holder_alive() -> bool {
 
 /// 尝试拉起 `qaqh-daemon run`（detached）。候选顺序与 `discovery.rs:148-186` 一致。
 fn spawn_daemon_detached() -> Result<()> {
-    let exe_names = if cfg!(windows) { "qaqh-daemon.exe" } else { "qaqh-daemon" };
+    let exe_names = if cfg!(windows) {
+        "qaqh-daemon.exe"
+    } else {
+        "qaqh-daemon"
+    };
     let mut candidates: Vec<std::path::PathBuf> = Vec::new();
     if let Some(root) = std::env::var_os("QAQH_BACKEND_ROOT") {
-        candidates.push(std::path::PathBuf::from(root).join("target/debug").join(exe_names));
+        candidates.push(
+            std::path::PathBuf::from(root)
+                .join("target/debug")
+                .join(exe_names),
+        );
     }
     if let Ok(cwd) = std::env::current_dir() {
         candidates.push(cwd.join("target/debug").join(exe_names));
     }
     if let Ok(exe) = std::env::current_exe()
-        && let Some(dir) = exe.parent() {
-            candidates.push(dir.join("resources").join(exe_names));
-            candidates.push(dir.join(exe_names));
-        }
+        && let Some(dir) = exe.parent()
+    {
+        candidates.push(dir.join("resources").join(exe_names));
+        candidates.push(dir.join(exe_names));
+    }
 
     let found = candidates.iter().find(|p| p.is_file()).cloned();
     let Some(daemon_exe) = found else {
@@ -143,7 +154,9 @@ fn spawn_daemon_detached() -> Result<()> {
     };
 
     let mut cmd = std::process::Command::new(&daemon_exe);
-    cmd.arg("run").stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null());
+    cmd.arg("run")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null());
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
@@ -151,7 +164,8 @@ fn spawn_daemon_detached() -> Result<()> {
         cmd.creation_flags(0x0800_0000 | 0x0000_0200);
     }
     cmd.stderr(std::process::Stdio::null());
-    cmd.spawn().with_context(|| format!("启动 {} 失败", daemon_exe.display()))?;
+    cmd.spawn()
+        .with_context(|| format!("启动 {} 失败", daemon_exe.display()))?;
     Ok(())
 }
 
@@ -159,9 +173,10 @@ fn spawn_daemon_detached() -> Result<()> {
 /// 失败且允许时尝试拉起 daemon 并轮询 discovery 就绪。
 pub async fn ensure_daemon(spawn_if_missing: bool) -> Result<DaemonDiscovery> {
     if let Some(d) = read_discovery()
-        && pid_alive(d.pid) {
-            return Ok(d);
-        }
+        && pid_alive(d.pid)
+    {
+        return Ok(d);
+    }
     if !spawn_if_missing {
         bail!("daemon.json 缺失或已失效（daemon 未运行）");
     }
@@ -172,9 +187,10 @@ pub async fn ensure_daemon(spawn_if_missing: bool) -> Result<DaemonDiscovery> {
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(25);
     loop {
         if let Some(d) = read_discovery()
-            && pid_alive(d.pid) {
-                return Ok(d);
-            }
+            && pid_alive(d.pid)
+        {
+            return Ok(d);
+        }
         if tokio::time::Instant::now() >= deadline {
             bail!("等待 daemon 就绪超时（25s）");
         }
@@ -199,8 +215,14 @@ mod tests {
             channel: String::new(),
             executable: String::new(),
         };
-        assert_eq!(d("http://127.0.0.1:64413").base_url(), "http://127.0.0.1:64413");
-        assert_eq!(d("ws://127.0.0.1:64413/control/v1").base_url(), "http://127.0.0.1:64413");
+        assert_eq!(
+            d("http://127.0.0.1:64413").base_url(),
+            "http://127.0.0.1:64413"
+        );
+        assert_eq!(
+            d("ws://127.0.0.1:64413/control/v1").base_url(),
+            "http://127.0.0.1:64413"
+        );
         assert_eq!(d("http://localhost:1/").base_url(), "http://localhost:1");
     }
 }

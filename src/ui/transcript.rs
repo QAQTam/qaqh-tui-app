@@ -1,18 +1,22 @@
 //! transcript 视图：读取渲染缓存（App 在每帧前统一重建）+ 精确滚动 + 滚动条。
 
+use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState};
-use ratatui::Frame;
 
-use crate::app::render_line::{RenderStyle, SpanStyle};
 use crate::app::App;
+use crate::app::render_line::{RenderStyle, SpanStyle};
 use crate::ui::theme;
 
 pub fn draw(f: &mut Frame, app: &App, area: Rect) {
-    let Some(seed) = app.active_seed() else { return };
-    let Some(sess) = app.sessions.get(&seed) else { return };
+    let Some(seed) = app.active_seed() else {
+        return;
+    };
+    let Some(sess) = app.sessions.get(&seed) else {
+        return;
+    };
 
     let width = area.width.saturating_sub(1); // 右侧滚动条留 1 列
     // 只借用 IR，不做全量深拷贝：每帧成本 O(可视行数) 而非 O(全量 IR)。
@@ -21,7 +25,11 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) {
     let lines: &[crate::app::render_line::RenderLine] = match &sess.rendered {
         Some(cached) if cached.width == width => &cached.lines,
         _ => {
-            fresh = crate::app::render_transcript::render_transcript_with_opts(sess, width, app.show_reasoning);
+            fresh = crate::app::render_transcript::render_transcript_with_opts(
+                sess,
+                width,
+                app.show_reasoning,
+            );
             &fresh
         }
     };
@@ -72,7 +80,9 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) {
 
 /// 会话信息行（转成 ratatui）。
 pub fn draw_session_info(f: &mut Frame, app: &App, area: Rect) {
-    let Some(sess) = app.active_session() else { return };
+    let Some(sess) = app.active_session() else {
+        return;
+    };
     let lines = crate::app::render_transcript::render_session_info(sess, area.width);
     let rat: Vec<Line> = lines
         .iter()

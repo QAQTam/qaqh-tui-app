@@ -11,8 +11,8 @@ pub mod tab_bar;
 pub mod theme;
 pub mod transcript;
 
-use ratatui::layout::{Constraint, Layout};
 use ratatui::Frame;
+use ratatui::layout::{Constraint, Layout};
 
 use crate::app::App;
 
@@ -62,11 +62,9 @@ pub fn draw(f: &mut Frame, app: &App) {
     status_bar::draw(f, app, status_area);
 
     // 会话交互弹窗（active 会话的挂起交互）。
-    let has_pending = app
-        .active_session()
-        .is_some_and(|s| {
-            s.active_permission().is_some() || s.pending_ask.is_some() || s.pending_plan.is_some()
-        });
+    let has_pending = app.active_session().is_some_and(|s| {
+        s.active_permission().is_some() || s.pending_ask.is_some() || s.pending_plan.is_some()
+    });
     if has_pending {
         modal::draw(f, app, area);
     }

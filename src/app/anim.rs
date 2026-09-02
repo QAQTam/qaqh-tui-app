@@ -135,7 +135,11 @@ mod tests {
             for width in [1, 5, 10, 23] {
                 for frame in [0u64, 3, 17, 100, 10_000] {
                     let out = marquee(text, width, frame);
-                    assert_eq!(display_width(&out), width, "text={text:?} w={width} f={frame}");
+                    assert_eq!(
+                        display_width(&out),
+                        width,
+                        "text={text:?} w={width} f={frame}"
+                    );
                 }
             }
         }

@@ -9,9 +9,21 @@ pub struct SlashDef {
 }
 
 pub const SLASH_COMMANDS: &[SlashDef] = &[
-    SlashDef { name: "new", desc: "新建会话", hint: "/new [cwd]  在指定目录新建会话（cwd 为绝对路径，留空则按 环境变量>启动目录>当前会话 回退）" },
-    SlashDef { name: "help", desc: "帮助", hint: "/help  打开帮助" },
-    SlashDef { name: "clear", desc: "清空输入", hint: "/clear  清空当前输入" },
+    SlashDef {
+        name: "new",
+        desc: "新建会话",
+        hint: "/new [cwd]  在指定目录新建会话（cwd 为绝对路径，留空则按 环境变量>启动目录>当前会话 回退）",
+    },
+    SlashDef {
+        name: "help",
+        desc: "帮助",
+        hint: "/help  打开帮助",
+    },
+    SlashDef {
+        name: "clear",
+        desc: "清空输入",
+        hint: "/clear  清空当前输入",
+    },
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -57,7 +69,11 @@ pub fn parse(input: &str) -> Option<SlashCmd> {
         "clear" => Some(SlashCmd::Clear),
         // 保留缩写：/n -> /new
         "n" => {
-            let cwd = if raw_args.is_empty() { None } else { Some(unquote(raw_args).trim().to_string()) };
+            let cwd = if raw_args.is_empty() {
+                None
+            } else {
+                Some(unquote(raw_args).trim().to_string())
+            };
             let cwd = cwd.filter(|s| !s.is_empty());
             Some(SlashCmd::New { cwd })
         }
@@ -70,7 +86,7 @@ fn unquote(s: &str) -> String {
     if (t.starts_with('"') && t.ends_with('"') && t.len() >= 2)
         || (t.starts_with('\'') && t.ends_with('\'') && t.len() >= 2)
     {
-        t[1..t.len()-1].to_string()
+        t[1..t.len() - 1].to_string()
     } else {
         t.to_string()
     }
@@ -91,37 +107,57 @@ pub fn completions_for(input: &str) -> Vec<&'static SlashDef> {
     if filter.is_empty() {
         return SLASH_COMMANDS.iter().collect();
     }
-    SLASH_COMMANDS.iter().filter(|d| d.name.starts_with(filter.as_str())).collect()
+    SLASH_COMMANDS
+        .iter()
+        .filter(|d| d.name.starts_with(filter.as_str()))
+        .collect()
 }
 
 /// ~ 展开：~/foo -> $HOME/foo；~user 不处理原样返回
 pub fn expand_tilde(p: &str) -> String {
-    if !p.starts_with('~') { return p.to_string(); }
+    if !p.starts_with('~') {
+        return p.to_string();
+    }
     // ~/ 或仅 ~
     if (p == "~" || p.starts_with("~/") || p.starts_with("~\\"))
-        && let Some(home) = dirs_home() {
-            return format!("{}{}", home, &p[1..]);
-        }
+        && let Some(home) = dirs_home()
+    {
+        return format!("{}{}", home, &p[1..]);
+    }
     p.to_string()
 }
 
 fn dirs_home() -> Option<String> {
-    if let Ok(h) = std::env::var("HOME") && !h.is_empty() { return Some(h); }
-    if let Ok(h) = std::env::var("USERPROFILE") && !h.is_empty() { return Some(h); }
+    if let Ok(h) = std::env::var("HOME")
+        && !h.is_empty()
+    {
+        return Some(h);
+    }
+    if let Ok(h) = std::env::var("USERPROFILE")
+        && !h.is_empty()
+    {
+        return Some(h);
+    }
     None
 }
 
 pub fn is_absolute_path(p: &str) -> bool {
     let s = p.trim();
-    if s.is_empty() { return false; }
+    if s.is_empty() {
+        return false;
+    }
     let path = std::path::Path::new(s);
-    if path.is_absolute() { return true; }
+    if path.is_absolute() {
+        return true;
+    }
     // Windows 绝对路径兼容：C:\ / C:/ / \\server\share
     if s.len() >= 2 && s.as_bytes()[1] == b':' && s.as_bytes()[0].is_ascii_alphabetic() {
         let rest = &s[2..];
         return rest.starts_with('\\') || rest.starts_with('/');
     }
-    if s.starts_with("\\\\") { return true; }
+    if s.starts_with("\\\\") {
+        return true;
+    }
     false
 }
 
@@ -131,16 +167,31 @@ mod tests {
 
     #[test]
     fn parse_new_no_arg() {
-        assert_eq!(parse("/new"), Some(SlashCmd::New{ cwd: None }));
-        assert_eq!(parse("/new  "), Some(SlashCmd::New{ cwd: None }));
-        assert_eq!(parse("/n"), Some(SlashCmd::New{ cwd: None }));
+        assert_eq!(parse("/new"), Some(SlashCmd::New { cwd: None }));
+        assert_eq!(parse("/new  "), Some(SlashCmd::New { cwd: None }));
+        assert_eq!(parse("/n"), Some(SlashCmd::New { cwd: None }));
     }
 
     #[test]
     fn parse_new_with_cwd() {
-        assert_eq!(parse("/new C:\\code\\foo"), Some(SlashCmd::New{ cwd: Some("C:\\code\\foo".into()) }));
-        assert_eq!(parse("/new \"/tmp/my project\""), Some(SlashCmd::New{ cwd: Some("/tmp/my project".into()) }));
-        assert_eq!(parse("/new 'C:\\a b'"), Some(SlashCmd::New{ cwd: Some("C:\\a b".into()) }));
+        assert_eq!(
+            parse("/new C:\\code\\foo"),
+            Some(SlashCmd::New {
+                cwd: Some("C:\\code\\foo".into())
+            })
+        );
+        assert_eq!(
+            parse("/new \"/tmp/my project\""),
+            Some(SlashCmd::New {
+                cwd: Some("/tmp/my project".into())
+            })
+        );
+        assert_eq!(
+            parse("/new 'C:\\a b'"),
+            Some(SlashCmd::New {
+                cwd: Some("C:\\a b".into())
+            })
+        );
     }
 
     #[test]
@@ -148,7 +199,7 @@ mod tests {
         let all = completions_for("/");
         assert_eq!(all.len(), SLASH_COMMANDS.len());
         let filtered = completions_for("/n");
-        assert!(filtered.iter().any(|d| d.name=="new"));
+        assert!(filtered.iter().any(|d| d.name == "new"));
         let none = completions_for("/xyz");
         assert!(none.is_empty());
         let no_space = completions_for("/new C:\\");
@@ -168,7 +219,14 @@ mod tests {
     #[test]
     fn expand_tilde_prefix() {
         assert_eq!(expand_tilde("relative"), "relative");
-        assert_eq!(expand_tilde("~"), if std::env::var("HOME").is_ok() || std::env::var("USERPROFILE").is_ok() { expand_tilde("~") } else { "~".into() });
+        assert_eq!(
+            expand_tilde("~"),
+            if std::env::var("HOME").is_ok() || std::env::var("USERPROFILE").is_ok() {
+                expand_tilde("~")
+            } else {
+                "~".into()
+            }
+        );
         // ~/foo 必须被展开或保持原样但含分隔符
         let e = expand_tilde("~/foo");
         assert!(e.contains("foo"));

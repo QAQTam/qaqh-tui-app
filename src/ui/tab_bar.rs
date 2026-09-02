@@ -1,10 +1,10 @@
 //! 标签栏（多会话 tab 条）。
 
+use ratatui::Frame;
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
-use ratatui::Frame;
 
-use crate::app::{truncate_str, App};
+use crate::app::{App, truncate_str};
 use crate::ui::theme;
 
 pub fn draw(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
@@ -13,13 +13,18 @@ pub fn draw(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
     let mut used: usize = 9;
     let mut overflow = false;
     for (idx, seed) in app.tabs.iter().enumerate() {
-        let Some(sess) = app.sessions.get(seed) else { continue };
+        let Some(sess) = app.sessions.get(seed) else {
+            continue;
+        };
         let is_active = idx == app.active;
         let title = truncate_str(&sess.title(), 18);
         let mut label = format!(" {} {} ", idx + 1, title);
         if !is_active {
             // 挂起交互徽标。
-            if !sess.pending_permissions.is_empty() || sess.pending_ask.is_some() || sess.pending_plan.is_some() {
+            if !sess.pending_permissions.is_empty()
+                || sess.pending_ask.is_some()
+                || sess.pending_plan.is_some()
+            {
                 label = format!(" {} {} !", idx + 1, title);
             } else if sess.streaming.is_some() {
                 label = format!(" {} {} …", idx + 1, title);

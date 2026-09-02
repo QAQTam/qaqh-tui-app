@@ -3,11 +3,11 @@
 //! 视觉复刻 opencode Home 的“弹性留白 + 最大宽居中”手法，适配 ratatui 0.30。
 
 use chrono::DateTime;
+use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
-use ratatui::Frame;
 use unicode_width::UnicodeWidthStr;
 
 use crate::app::App;
@@ -47,10 +47,16 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) {
         .border_style(Style::new().fg(Color::Indexed(236)))
         .title(Line::from(vec![
             Span::styled(" qaqh-tui ", theme::active_tab()),
-            Span::styled(format!(" Ringing v{} ", crate::protocol::RINGING_VERSION), theme::dim()),
+            Span::styled(
+                format!(" Ringing v{} ", crate::protocol::RINGING_VERSION),
+                theme::dim(),
+            ),
         ]))
         .title_bottom(Line::from(vec![
-            Span::styled(" Ctrl+T 新建 ", Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                " Ctrl+T 新建 ",
+                Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            ),
             Span::styled("·", theme::dim()),
             Span::styled(" Ctrl+L 列表 ", theme::dim()),
             Span::styled("·", theme::dim()),
@@ -106,12 +112,23 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) {
                 theme::warn()
             },
         ),
-        Span::styled(format!("  ·  {} ", app.epoch.chars().take(8).collect::<String>()), theme::dim()),
+        Span::styled(
+            format!("  ·  {} ", app.epoch.chars().take(8).collect::<String>()),
+            theme::dim(),
+        ),
     ]);
     // 居中副标题
     let sub_w = subtitle.width() as u16;
     let sub_x = logo_area.x + inner.width.saturating_sub(sub_w) / 2;
-    f.render_widget(Paragraph::new(subtitle), Rect { x: sub_x, y: sub_area.y, width: sub_w, height: 1 });
+    f.render_widget(
+        Paragraph::new(subtitle),
+        Rect {
+            x: sub_x,
+            y: sub_area.y,
+            width: sub_w,
+            height: 1,
+        },
+    );
 
     // ── 会话列表（复用 session_list 渲染，但更紧凑好看）
     let mut items: Vec<&crate::protocol::methods::SessionMetaView> = app
@@ -129,15 +146,25 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) {
 
     // 列表标题栏
     let list_title = Line::from(vec![
-        Span::styled(" 最近会话 ", Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
         Span::styled(
-            if app.home_show_archived { "（含归档）" } else { "" },
+            " 最近会话 ",
+            Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            if app.home_show_archived {
+                "（含归档）"
+            } else {
+                ""
+            },
             theme::dim(),
         ),
         Span::styled(format!(" — {} 个 ", total), theme::dim()),
     ]);
     lines.push(list_title);
-    lines.push(Line::from(Span::styled("─".repeat(list_area.width as usize), Style::new().fg(Color::Indexed(236)))));
+    lines.push(Line::from(Span::styled(
+        "─".repeat(list_area.width as usize),
+        Style::new().fg(Color::Indexed(236)),
+    )));
 
     if app.session_list_at.is_none() {
         lines.push(Line::from(Span::styled("  加载中…", theme::dim())));
@@ -145,12 +172,18 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) {
         lines.push(Line::from(Span::styled("  暂无会话", theme::dim())));
         lines.push(Line::from(vec![
             Span::styled("  按 ", theme::dim()),
-            Span::styled("n", Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                "n",
+                Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            ),
             Span::styled(" 新建首个会话，或 ", theme::dim()),
             Span::styled("Ctrl+T", theme::accent()),
             Span::styled(" 亦可", theme::dim()),
         ]));
-        lines.push(Line::from(Span::styled("  Tip: 归档会话按 a 显示", theme::dim())));
+        lines.push(Line::from(Span::styled(
+            "  Tip: 归档会话按 a 显示",
+            theme::dim(),
+        )));
     } else {
         // 计算选中可见窗口（居中）
         let sel = app.home_selected.min(total.saturating_sub(1));
@@ -168,27 +201,64 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) {
             let real_idx = start + idx;
             let is_sel = real_idx == sel;
             let open = app.tabs.contains(&m.seed);
-            let flag = if m.archived { "▤" } else if open { "▣" } else { " " };
+            let flag = if m.archived {
+                "▤"
+            } else if open {
+                "▣"
+            } else {
+                " "
+            };
             let title = crate::app::truncate_str(&m.display_title(), 32);
-            let activity = app.activity_cache.get(&m.seed).map(|a| format!("{a:?}")).unwrap_or_default();
+            let activity = app
+                .activity_cache
+                .get(&m.seed)
+                .map(|a| format!("{a:?}"))
+                .unwrap_or_default();
             let updated = m
                 .updated_at
                 .and_then(|ms| DateTime::from_timestamp_millis(ms as i64))
-                .map(|t| t.with_timezone(&chrono::Local).format("%m-%d %H:%M").to_string())
+                .map(|t| {
+                    t.with_timezone(&chrono::Local)
+                        .format("%m-%d %H:%M")
+                        .to_string()
+                })
                 .unwrap_or_default();
 
             let bg = if is_sel {
-                Style::new().bg(Color::Cyan).fg(Color::Black).add_modifier(Modifier::BOLD)
+                Style::new()
+                    .bg(Color::Cyan)
+                    .fg(Color::Black)
+                    .add_modifier(Modifier::BOLD)
             } else if open {
                 Style::new().bg(Color::Indexed(236))
             } else {
                 Style::new()
             };
-            let dim = if is_sel { Style::new().bg(Color::Cyan).fg(Color::Black) } else { theme::dim() };
+            let dim = if is_sel {
+                Style::new().bg(Color::Cyan).fg(Color::Black)
+            } else {
+                theme::dim()
+            };
 
             let mut spans = vec![
-                Span::styled(format!(" {flag} "), if is_sel { bg } else if open { theme::accent() } else { theme::dim() }),
-                Span::styled(format!("{title:<32}"), if is_sel { bg } else { Style::new().add_modifier(Modifier::BOLD) }),
+                Span::styled(
+                    format!(" {flag} "),
+                    if is_sel {
+                        bg
+                    } else if open {
+                        theme::accent()
+                    } else {
+                        theme::dim()
+                    },
+                ),
+                Span::styled(
+                    format!("{title:<32}"),
+                    if is_sel {
+                        bg
+                    } else {
+                        Style::new().add_modifier(Modifier::BOLD)
+                    },
+                ),
                 Span::styled(format!("{activity:<10}"), if is_sel { bg } else { dim }),
                 Span::styled(format!("{updated:<11}"), dim),
             ];

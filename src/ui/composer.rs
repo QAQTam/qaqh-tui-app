@@ -1,16 +1,16 @@
 //! Composer：输入行 + 附件标记 + 流式相位。
 
+use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
-use ratatui::Frame;
 use unicode_width::UnicodeWidthStr;
 
 use unicode_width::UnicodeWidthChar;
 
-use crate::app::render_line::edit_window;
 use crate::app::App;
+use crate::app::render_line::edit_window;
 use crate::ui::theme;
 
 /// composer 显示行数上限（超出后以尾部窗口展示，光标行恒可见）。
@@ -45,16 +45,35 @@ pub fn draw_slash_menu(f: &mut Frame, app: &App, composer_area: Rect) {
         return;
     }
     f.render_widget(Clear, menu_area);
-    let block = Block::new().borders(Borders::ALL).border_style(theme::accent()).title(" / 命令 · Tab 补全 · ↑↓ 选择 · Enter 执行 · Esc 关闭 ");
-    let inner = Rect { x: menu_area.x+1, y: menu_area.y+1, width: menu_area.width.saturating_sub(2), height: menu_area.height.saturating_sub(2) };
+    let block = Block::new()
+        .borders(Borders::ALL)
+        .border_style(theme::accent())
+        .title(" / 命令 · Tab 补全 · ↑↓ 选择 · Enter 执行 · Esc 关闭 ");
+    let inner = Rect {
+        x: menu_area.x + 1,
+        y: menu_area.y + 1,
+        width: menu_area.width.saturating_sub(2),
+        height: menu_area.height.saturating_sub(2),
+    };
     f.render_widget(block, menu_area);
     let mut lines: Vec<Line> = Vec::new();
     for (idx, def) in visible.iter().enumerate() {
         let is_sel = idx == selected;
         let marker = if is_sel { "▸" } else { " " };
-        let style = if is_sel { Style::new().add_modifier(Modifier::REVERSED) } else { Style::new() };
+        let style = if is_sel {
+            Style::new().add_modifier(Modifier::REVERSED)
+        } else {
+            Style::new()
+        };
         lines.push(Line::from(vec![
-            Span::styled(format!(" {marker} "), if is_sel { theme::accent() } else { theme::dim() }),
+            Span::styled(
+                format!(" {marker} "),
+                if is_sel {
+                    theme::accent()
+                } else {
+                    theme::dim()
+                },
+            ),
             Span::styled(format!("/{:<10}", def.name), style),
             Span::styled(def.desc.to_string(), theme::dim()),
         ]));
@@ -77,8 +96,12 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) {
 
     let mut title = String::new();
     if !sess.composer.attachments.is_empty() {
-        let names: Vec<String> =
-            sess.composer.attachments.iter().map(|a| a.path.clone()).collect();
+        let names: Vec<String> = sess
+            .composer
+            .attachments
+            .iter()
+            .map(|a| a.path.clone())
+            .collect();
         title.push_str(&format!("✎ [{}] ", names.join(",")));
     }
     // slash 时给出更精确的标题提示：按回退链预告最终 cwd
@@ -86,7 +109,10 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) {
     if val.trim_start().starts_with('/') {
         title.push_str(" / 命令（Tab 补全 · ↑↓ 选择 · Enter 执行）· ");
         if val.trim() == "/new" || val.trim() == "/n" {
-            let hint = app.effective_cwd(None).map(|c| format!("[{}] ", truncate_cwd(&c))).unwrap_or_default();
+            let hint = app
+                .effective_cwd(None)
+                .map(|c| format!("[{}] ", truncate_cwd(&c)))
+                .unwrap_or_default();
             title.push_str(&hint);
         }
     }
@@ -96,11 +122,18 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) {
     // 边框呼吸：流式中 warn ↔ warn+DIM 交替（200ms 帧），静默时恒 dim。
     let frame = crate::app::anim::frame_now();
     let border_style = if streaming {
-        if frame.is_multiple_of(2) { theme::warn() } else { theme::warn().add_modifier(Modifier::DIM) }
+        if frame.is_multiple_of(2) {
+            theme::warn()
+        } else {
+            theme::warn().add_modifier(Modifier::DIM)
+        }
     } else {
         theme::dim()
     };
-    let block = Block::new().borders(Borders::ALL).border_style(border_style).title(title);
+    let block = Block::new()
+        .borders(Borders::ALL)
+        .border_style(border_style)
+        .title(title);
     f.render_widget(block, area);
 
     let inner = Rect {
@@ -125,13 +158,19 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) {
         let (ls, le) = sess.composer.line_bounds(line_no);
         let line_slice = &sess.composer.input[ls..le];
         let is_cursor_line = line_no == cursor_line;
-        let col = if is_cursor_line { cursor_col.min(line_slice.len()) } else { line_slice.len() };
+        let col = if is_cursor_line {
+            cursor_col.min(line_slice.len())
+        } else {
+            line_slice.len()
+        };
         let (window, cursor_off) = edit_window(line_slice, col, avail_w.max(1));
 
         let wchars: Vec<char> = window.chars().collect();
         let before: String = wchars[..cursor_off.min(wchars.len())].iter().collect();
         let at: Option<char> = wchars.get(cursor_off).copied();
-        let after: String = wchars[(cursor_off + usize::from(at.is_some())).min(wchars.len())..].iter().collect();
+        let after: String = wchars[(cursor_off + usize::from(at.is_some())).min(wchars.len())..]
+            .iter()
+            .collect();
 
         let row_prompt = if line_no == 0 { prompt } else { "  " };
         let row_prompt_w = if line_no == 0 { prompt_w } else { 2 };
@@ -147,33 +186,34 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) {
 
         // 流式状态标签：仅画在光标行的行尾。
         let mut used = row_prompt_w + before_w + at_w + after_w;
-        if is_cursor_line
-            && let Some(st) = &sess.streaming
-        {
-                let phase = match &st.tool_name {
-                    Some(t) => format!("{}({t})", st.phase.label()),
-                    None => st.phase.label().to_string(),
-                };
-                let label = format!("工作中 · {phase} · Esc 中止");
-                // 空间充足时跑马灯滚动；局促时退化为静态截断标签。
-                let animate = inner.width as usize > used + 16;
-                let show = if animate {
-                    crate::app::anim::marquee(&label, (inner.width as usize - used - 1).min(40), frame)
-                } else {
-                    label
-                };
-                let show_w = show.width();
-                if used + show_w <= inner.width as usize {
-                    let pad = inner.width as usize - used - show_w;
-                    spans.push(Span::styled(" ".repeat(pad), Style::new()));
-                    spans.push(Span::styled(show, theme::warn()));
-                }
+        if is_cursor_line && let Some(st) = &sess.streaming {
+            let phase = match &st.tool_name {
+                Some(t) => format!("{}({t})", st.phase.label()),
+                None => st.phase.label().to_string(),
+            };
+            let label = format!("工作中 · {phase} · Esc 中止");
+            // 空间充足时跑马灯滚动；局促时退化为静态截断标签。
+            let animate = inner.width as usize > used + 16;
+            let show = if animate {
+                crate::app::anim::marquee(&label, (inner.width as usize - used - 1).min(40), frame)
+            } else {
+                label
+            };
+            let show_w = show.width();
+            if used + show_w <= inner.width as usize {
+                let pad = inner.width as usize - used - show_w;
+                spans.push(Span::styled(" ".repeat(pad), Style::new()));
+                spans.push(Span::styled(show, theme::warn()));
+            }
             used = inner.width as usize;
         }
 
         if is_cursor_line {
             // edit_window 保证 off + 1 <= avail_w → 终端光标恒在界内。
-            cursor_pos = Some((inner.x + row_prompt_w as u16 + cursor_off as u16, inner.y + i as u16));
+            cursor_pos = Some((
+                inner.x + row_prompt_w as u16 + cursor_off as u16,
+                inner.y + i as u16,
+            ));
         }
         let _ = used;
         rows.push(Line::from(spans));
@@ -191,8 +231,17 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) {
 
 fn truncate_cwd(cwd: &str) -> String {
     let s = cwd.trim();
-    if s.chars().count() <= 36 { return s.to_string(); }
+    if s.chars().count() <= 36 {
+        return s.to_string();
+    }
     // 保留尾段
-    let tail: String = s.chars().rev().take(33).collect::<String>().chars().rev().collect();
+    let tail: String = s
+        .chars()
+        .rev()
+        .take(33)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect();
     format!("…{tail}")
 }

@@ -97,7 +97,10 @@ mod tests {
     #[test]
     fn channel_round_trip() {
         for c in Channel::ALL {
-            assert_eq!(c.as_str(), serde_json::to_string(&c).unwrap().trim_matches('"'));
+            assert_eq!(
+                c.as_str(),
+                serde_json::to_string(&c).unwrap().trim_matches('"')
+            );
             assert_eq!(Channel::from_path_segment(c.as_str()), Some(c));
         }
         assert_eq!(Channel::from_path_segment("bogus"), None);

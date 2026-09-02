@@ -1,6 +1,6 @@
 //! transcript 渲染器：TimelineModel → Vec<RenderLine>（预折行，缓存友好）。
 
-use crate::app::render_line::{wrap_text, RenderLine, SpanStyle};
+use crate::app::render_line::{RenderLine, SpanStyle, wrap_text};
 use crate::app::session::SessionState;
 use crate::protocol::timeline::{TimelineBlockKind, TimelineToolState, TimelineTurnState};
 
@@ -15,14 +15,26 @@ const ARG_PREVIEW: usize = 96;
 fn parse_hunk_header(header: &str) -> Option<(u32, u32)> {
     // 形如 @@ -1,3 +1,4 @@ 可选 ,b
     let header = header.trim();
-    if !header.starts_with("@@") { return None; }
+    if !header.starts_with("@@") {
+        return None;
+    }
     let inner = header.trim_start_matches('@').trim();
     // 取两段
     let mut parts = inner.split_whitespace();
     let old = parts.next()?;
     let new = parts.next()?;
-    let old_num = old.trim_start_matches('-').split(',').next()?.parse::<u32>().ok()?;
-    let new_num = new.trim_start_matches('+').split(',').next()?.parse::<u32>().ok()?;
+    let old_num = old
+        .trim_start_matches('-')
+        .split(',')
+        .next()?
+        .parse::<u32>()
+        .ok()?;
+    let new_num = new
+        .trim_start_matches('+')
+        .split(',')
+        .next()?
+        .parse::<u32>()
+        .ok()?;
     Some((old_num, new_num))
 }
 fn fmt_ln(n: u32, w: usize) -> String {
@@ -151,7 +163,10 @@ fn looks_like_reasoning_summary(text: &str) -> bool {
     if t.contains('。') {
         return sentences.len() >= 2;
     }
-    let gerund_cnt = sentences.iter().filter(|s| sentence_starts_with_gerund(s)).count();
+    let gerund_cnt = sentences
+        .iter()
+        .filter(|s| sentence_starts_with_gerund(s))
+        .count();
     gerund_cnt >= 1 && gerund_cnt * 2 >= sentences.len()
 }
 
@@ -194,7 +209,11 @@ pub fn render_transcript(session: &SessionState, width: u16) -> Vec<RenderLine> 
     render_transcript_with_opts(session, width, true)
 }
 
-pub fn render_transcript_with_opts(session: &SessionState, width: u16, show_reasoning: bool) -> Vec<RenderLine> {
+pub fn render_transcript_with_opts(
+    session: &SessionState,
+    width: u16,
+    show_reasoning: bool,
+) -> Vec<RenderLine> {
     let width = width.max(20) as usize;
     let mut lines: Vec<RenderLine> = Vec::new();
     let total = session.timeline.turns.len();
@@ -239,10 +258,16 @@ pub fn render_transcript_with_opts(session: &SessionState, width: u16, show_reas
         for round in &turn.rounds {
             for block in &round.blocks {
                 match block.kind {
-                    TimelineBlockKind::Text => push_text_block(&mut lines, &block.text, width, block.is_streaming()),
-                    TimelineBlockKind::Reasoning => {
-                        push_reasoning_block(&mut lines, &block.text, width, block.is_streaming(), show_reasoning)
+                    TimelineBlockKind::Text => {
+                        push_text_block(&mut lines, &block.text, width, block.is_streaming())
                     }
+                    TimelineBlockKind::Reasoning => push_reasoning_block(
+                        &mut lines,
+                        &block.text,
+                        width,
+                        block.is_streaming(),
+                        show_reasoning,
+                    ),
                     TimelineBlockKind::Tool => {
                         if let Some(tool) = &block.tool {
                             let expanded = session.expanded_tools.contains(&tool.tool_call_id);
@@ -251,7 +276,11 @@ pub fn render_transcript_with_opts(session: &SessionState, width: u16, show_reas
                     }
                     TimelineBlockKind::Notice => {
                         for seg in wrap_text(&block.text, width.saturating_sub(2)) {
-                            lines.push(RenderLine::new().span("· ", SpanStyle::Dim).span(seg, SpanStyle::Dim));
+                            lines.push(
+                                RenderLine::new()
+                                    .span("· ", SpanStyle::Dim)
+                                    .span(seg, SpanStyle::Dim),
+                            );
                         }
                     }
                 }
@@ -260,8 +289,15 @@ pub fn render_transcript_with_opts(session: &SessionState, width: u16, show_reas
 
         // 回合失败详情。
         if let Some(f) = &turn.failure {
-            for seg in wrap_text(&format!("{}: {}", f.code, f.message), width.saturating_sub(4)) {
-                lines.push(RenderLine::new().span("  ✗ ", SpanStyle::Error).span(seg, SpanStyle::Error));
+            for seg in wrap_text(
+                &format!("{}: {}", f.code, f.message),
+                width.saturating_sub(4),
+            ) {
+                lines.push(
+                    RenderLine::new()
+                        .span("  ✗ ", SpanStyle::Error)
+                        .span(seg, SpanStyle::Error),
+                );
             }
         }
         lines.push(RenderLine::new());
@@ -271,7 +307,10 @@ pub fn render_transcript_with_opts(session: &SessionState, width: u16, show_reas
         lines.push(RenderLine::new().span("（暂无回合——输入消息开始对话）", SpanStyle::Dim));
     }
     if session.timeline.has_more {
-        lines.insert(0, RenderLine::new().span("↑ 更早回合已折叠（PgUp 加载）", SpanStyle::Dim));
+        lines.insert(
+            0,
+            RenderLine::new().span("↑ 更早回合已折叠（PgUp 加载）", SpanStyle::Dim),
+        );
     }
     lines
 }
@@ -292,7 +331,9 @@ fn push_text_block(lines: &mut Vec<RenderLine>, text: &str, width: usize, stream
         if md_lines.len() > 500 {
             let omitted = md_lines.len() - 500;
             md_lines.truncate(500);
-            md_lines.push(RenderLine::new().span(format!("  （内容省略 {omitted} 行）"), SpanStyle::Dim));
+            md_lines.push(
+                RenderLine::new().span(format!("  （内容省略 {omitted} 行）"), SpanStyle::Dim),
+            );
         }
         lines.extend(md_lines);
         return;
@@ -302,7 +343,13 @@ fn push_text_block(lines: &mut Vec<RenderLine>, text: &str, width: usize, stream
     }
 }
 
-fn push_reasoning_block(lines: &mut Vec<RenderLine>, text: &str, width: usize, streaming: bool, show_reasoning: bool) {
+fn push_reasoning_block(
+    lines: &mut Vec<RenderLine>,
+    text: &str,
+    width: usize,
+    streaming: bool,
+    show_reasoning: bool,
+) {
     if text.trim().is_empty() {
         return;
     }
@@ -315,24 +362,48 @@ fn push_reasoning_block(lines: &mut Vec<RenderLine>, text: &str, width: usize, s
     let (title, body) = if let Some(stripped) = trimmed.strip_prefix("**") {
         if let Some(end) = stripped.find("**") {
             let t = stripped[..end].trim();
-            let b = stripped[end+2..].trim().trim_start_matches('\n').trim();
-            (if t.is_empty() { None } else { Some(t.to_owned()) }, b.to_owned())
-        } else { (None, trimmed.to_owned()) }
+            let b = stripped[end + 2..].trim().trim_start_matches('\n').trim();
+            (
+                if t.is_empty() {
+                    None
+                } else {
+                    Some(t.to_owned())
+                },
+                b.to_owned(),
+            )
+        } else {
+            (None, trimmed.to_owned())
+        }
     } else {
         // 取首行作标题（≤48ch）
         let mut parts = trimmed.splitn(2, '\n');
         let first = parts.next().unwrap_or("").trim();
         let rest = parts.next().unwrap_or("").trim();
-        if rest.is_empty() { (None, trimmed.to_owned()) }
-        else if first.chars().count() <= 48 { (Some(first.to_owned()), rest.to_owned()) }
-        else { (None, trimmed.to_owned()) }
+        if rest.is_empty() {
+            (None, trimmed.to_owned())
+        } else if first.chars().count() <= 48 {
+            (Some(first.to_owned()), rest.to_owned())
+        } else {
+            (None, trimmed.to_owned())
+        }
     };
     if streaming {
-        let frames = ["◐","◑","◒","◓"];
-        let ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0);
-        let icon = frames[((ms/200) % frames.len() as u128) as usize];
-        let header = if let Some(t) = &title { format!("{icon} Thinking: {t}") } else { format!("{icon} Thinking") };
-        lines.push(RenderLine::new().span("  ", SpanStyle::Dim).span(header, SpanStyle::Warn));
+        let frames = ["◐", "◑", "◒", "◓"];
+        let ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        let icon = frames[((ms / 200) % frames.len() as u128) as usize];
+        let header = if let Some(t) = &title {
+            format!("{icon} Thinking: {t}")
+        } else {
+            format!("{icon} Thinking")
+        };
+        lines.push(
+            RenderLine::new()
+                .span("  ", SpanStyle::Dim)
+                .span(header, SpanStyle::Warn),
+        );
         if !show_reasoning {
             // hide 模式流式仅保留标题行，不展 body（与 opencode hide 对齐）
             return;
@@ -341,18 +412,34 @@ fn push_reasoning_block(lines: &mut Vec<RenderLine>, text: &str, width: usize, s
         let wrapped = wrap_text(&body, width.saturating_sub(4));
         for (i, seg) in wrapped.iter().enumerate() {
             let is_last = i == wrapped.len() - 1;
-            let shown = if is_last { format!("{seg}▌") } else { seg.clone() };
-            lines.push(RenderLine::new().span("    ", SpanStyle::Dim).span(shown, SpanStyle::Reasoning));
+            let shown = if is_last {
+                format!("{seg}▌")
+            } else {
+                seg.clone()
+            };
+            lines.push(
+                RenderLine::new()
+                    .span("    ", SpanStyle::Dim)
+                    .span(shown, SpanStyle::Reasoning),
+            );
         }
         return;
     }
     // 非流式：hide 时单行 `+ Thought: title`（可 F3 展开）
     if !show_reasoning {
         if let Some(t) = title {
-            lines.push(RenderLine::new().span("  ", SpanStyle::Dim).span(format!("+ Thought: {t} (F3 展开)"), SpanStyle::Warn));
+            lines.push(
+                RenderLine::new()
+                    .span("  ", SpanStyle::Dim)
+                    .span(format!("+ Thought: {t} (F3 展开)"), SpanStyle::Warn),
+            );
         } else {
             let preview = body.chars().take(48).collect::<String>();
-            lines.push(RenderLine::new().span("  ", SpanStyle::Dim).span(format!("+ Thought: {preview}… (F3 展开)"), SpanStyle::Warn));
+            lines.push(
+                RenderLine::new()
+                    .span("  ", SpanStyle::Dim)
+                    .span(format!("+ Thought: {preview}… (F3 展开)"), SpanStyle::Warn),
+            );
         }
         return;
     }
@@ -362,18 +449,31 @@ fn push_reasoning_block(lines: &mut Vec<RenderLine>, text: &str, width: usize, s
     } else {
         "Thought".to_string()
     };
-    lines.push(RenderLine::new().span("  ", SpanStyle::Dim).span(header, SpanStyle::Warn));
-    if body.is_empty() { return; }
+    lines.push(
+        RenderLine::new()
+            .span("  ", SpanStyle::Dim)
+            .span(header, SpanStyle::Warn),
+    );
+    if body.is_empty() {
+        return;
+    }
     let wrapped = wrap_text(&body, width.saturating_sub(4));
     for seg in wrapped {
-        lines.push(RenderLine::new().span("    ", SpanStyle::Dim).span(seg, SpanStyle::Reasoning));
+        lines.push(
+            RenderLine::new()
+                .span("    ", SpanStyle::Dim)
+                .span(seg, SpanStyle::Reasoning),
+        );
     }
 }
 
 /// 默认直接展开的工具（不再折叠）。bash 系 + read：输出即结果，必须直观可见。
 /// 其它工具（grep/glob/edit/write 等）保持折叠以控屏；F7 仍可手动切换。
 pub(crate) fn is_default_expanded(name: &str) -> bool {
-    matches!(name, "bash" | "exec" | "shell" | "pwsh" | "powershell" | "read")
+    matches!(
+        name,
+        "bash" | "exec" | "shell" | "pwsh" | "powershell" | "read"
+    )
 }
 
 /// opencode 式工具图标（对齐 `toolDisplay` 集合） `packages/tui/src/routes/session/index.tsx:2638`
@@ -417,7 +517,9 @@ fn format_args_preview(args_json: &str) -> String {
         let one = args_json.replace('\n', " ");
         return if one.chars().count() > ARG_PREVIEW {
             format!("{}…", one.chars().take(ARG_PREVIEW).collect::<String>())
-        } else { one };
+        } else {
+            one
+        };
     };
     if let serde_json::Value::Object(map) = v {
         let mut parts: Vec<String> = Vec::new();
@@ -427,19 +529,31 @@ fn format_args_preview(args_json: &str) -> String {
             }
             match val {
                 serde_json::Value::String(s) if !s.is_empty() => {
-                    let short = if s.chars().count() > 40 { format!("{}…", s.chars().take(40).collect::<String>()) } else { s.clone() };
+                    let short = if s.chars().count() > 40 {
+                        format!("{}…", s.chars().take(40).collect::<String>())
+                    } else {
+                        s.clone()
+                    };
                     parts.push(format!("{k}={short}"));
                 }
-                serde_json::Value::Number(_) | serde_json::Value::Bool(_) => parts.push(format!("{k}={val}")),
+                serde_json::Value::Number(_) | serde_json::Value::Bool(_) => {
+                    parts.push(format!("{k}={val}"))
+                }
                 _ => {}
             }
-            if parts.len() >= 3 { break; }
+            if parts.len() >= 3 {
+                break;
+            }
         }
         if parts.is_empty() {
             return String::new();
         }
         let joined = format!("[{}]", parts.join(", "));
-        if joined.chars().count() > ARG_PREVIEW { format!("{}…", joined.chars().take(ARG_PREVIEW).collect::<String>()) } else { joined }
+        if joined.chars().count() > ARG_PREVIEW {
+            format!("{}…", joined.chars().take(ARG_PREVIEW).collect::<String>())
+        } else {
+            joined
+        }
     } else {
         String::new()
     }
@@ -451,11 +565,12 @@ fn extract_path(args_json: Option<&str>) -> Option<String> {
     let v: serde_json::Value = serde_json::from_str(s).ok()?;
     let obj = v.as_object()?;
     for key in ["filePath", "path", "file_path"] {
-        if let Some(serde_json::Value::String(p)) = obj.get(key) { return Some(p.clone()); }
+        if let Some(serde_json::Value::String(p)) = obj.get(key) {
+            return Some(p.clone());
+        }
     }
     None
 }
-
 
 fn is_shell_tool(name: &str) -> bool {
     matches!(name, "bash" | "exec" | "shell" | "pwsh" | "powershell")
@@ -477,14 +592,15 @@ fn extract_shell_output_text(raw: &str) -> Option<String> {
     }
     // 非字符串 output（如意外对象）则序列化回文本
     if let Some(out) = obj.get("output")
-        && !out.is_null() {
-            // 保持可读：若是对象则 pretty-free json
-            if out.is_string() {
-                return Some(out.as_str().unwrap_or("").to_string());
-            } else {
-                return Some(out.to_string());
-            }
+        && !out.is_null()
+    {
+        // 保持可读：若是对象则 pretty-free json
+        if out.is_string() {
+            return Some(out.as_str().unwrap_or("").to_string());
+        } else {
+            return Some(out.to_string());
         }
+    }
     None
 }
 
@@ -494,21 +610,38 @@ fn shell_meta_from_raw(raw: &str) -> Option<(Option<i32>, bool, String)> {
     if !obj.contains_key("output") {
         return None;
     }
-    let exit_code = obj.get("exit_code").and_then(|x| x.as_i64()).map(|x| x as i32);
-    let truncated = obj.get("truncated").and_then(|x| x.as_bool()).unwrap_or(false);
-    let status = obj.get("status").and_then(|x| x.as_str()).unwrap_or("").to_string();
+    let exit_code = obj
+        .get("exit_code")
+        .and_then(|x| x.as_i64())
+        .map(|x| x as i32);
+    let truncated = obj
+        .get("truncated")
+        .and_then(|x| x.as_bool())
+        .unwrap_or(false);
+    let status = obj
+        .get("status")
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .to_string();
     Some((exit_code, truncated, status))
 }
 
-fn push_tool_card(lines: &mut Vec<RenderLine>, tool: &crate::app::timeline_model::ToolCard, width: usize, expanded_raw: bool) {
+fn push_tool_card(
+    lines: &mut Vec<RenderLine>,
+    tool: &crate::app::timeline_model::ToolCard,
+    width: usize,
+    expanded_raw: bool,
+) {
     // 默认展开的工具：expanded_raw 的语义做 xor，使 F7 仍可“收起”
     let expanded = expanded_raw ^ is_default_expanded(&tool.name);
     // 动画帧：Running 时用八帧 braille 转轮（200ms/帧，Tick 驱动重绘；帧源=墙钟，无状态）
     let (icon_raw, base_style, is_running) = match tool.state {
         TimelineToolState::Prepared => (tool_icon(&tool.name), SpanStyle::Dim, false),
-        TimelineToolState::Running => {
-            (crate::app::anim::spinner_glyph(crate::app::anim::frame_now()), SpanStyle::ToolRun, true)
-        }
+        TimelineToolState::Running => (
+            crate::app::anim::spinner_glyph(crate::app::anim::frame_now()),
+            SpanStyle::ToolRun,
+            true,
+        ),
         TimelineToolState::Succeeded => ("●", SpanStyle::ToolOk, false),
         TimelineToolState::Failed => ("✗", SpanStyle::ToolFail, false),
     };
@@ -517,7 +650,9 @@ fn push_tool_card(lines: &mut Vec<RenderLine>, tool: &crate::app::timeline_model
         (icon_raw, SpanStyle::Warn)
     } else if tool.failure.is_some() && tool.state == TimelineToolState::Failed {
         (icon_raw, SpanStyle::ToolFail)
-    } else { (icon_raw, base_style) };
+    } else {
+        (icon_raw, base_style)
+    };
 
     // ── 标题行：InlineTool 形态（单行 icon + name + 路径/摘要） `opencode InlineToolRow:1967`
     let path = extract_path(tool.args_json.as_deref());
@@ -525,14 +660,27 @@ fn push_tool_card(lines: &mut Vec<RenderLine>, tool: &crate::app::timeline_model
         let short = crate::app::truncate_str(p, 36);
         format!(" {short}")
     } else if let Some(summary) = tool.summary.as_deref().filter(|s| !s.is_empty()) {
-        let one = summary.replace('\n', " ").chars().take(48).collect::<String>();
+        let one = summary
+            .replace('\n', " ")
+            .chars()
+            .take(48)
+            .collect::<String>();
         format!(" {one}")
-    } else { String::new() };
+    } else {
+        String::new()
+    };
 
     // Block 判定：含 diff / 长输出 / 诊断即用 BlockTool 左线
     let has_diff = tool.diff.as_deref().is_some_and(|d| !d.trim().is_empty());
-    let output_len = tool.output.as_deref().map(|s| s.lines().count()).unwrap_or(0) + tool.progress.lines().count();
-    let is_block = has_diff || output_len > 4 || tool.state == TimelineToolState::Running && !tool.progress.is_empty();
+    let output_len = tool
+        .output
+        .as_deref()
+        .map(|s| s.lines().count())
+        .unwrap_or(0)
+        + tool.progress.lines().count();
+    let is_block = has_diff
+        || output_len > 4
+        || tool.state == TimelineToolState::Running && !tool.progress.is_empty();
 
     if is_block {
         // BlockTool 标题：`# name path` 灰底左线（复刻 `BlockTool 1995 border left ┃ bg panel`）
@@ -572,9 +720,23 @@ fn push_tool_card(lines: &mut Vec<RenderLine>, tool: &crate::app::timeline_model
         let mut header = RenderLine::new()
             .span("  ", SpanStyle::Dim)
             .span(format!("{icon} "), style)
-            .span(tool.name.clone(), if tool.permission.is_some() { SpanStyle::Warn } else { SpanStyle::Accent });
+            .span(
+                tool.name.clone(),
+                if tool.permission.is_some() {
+                    SpanStyle::Warn
+                } else {
+                    SpanStyle::Accent
+                },
+            );
         if !header_extra.trim().is_empty() {
-            header = header.span(header_extra.clone(), if tool.state == TimelineToolState::Succeeded { SpanStyle::Dim } else { SpanStyle::Plain });
+            header = header.span(
+                header_extra.clone(),
+                if tool.state == TimelineToolState::Succeeded {
+                    SpanStyle::Dim
+                } else {
+                    SpanStyle::Plain
+                },
+            );
         }
         header = header.span(state_suffix, SpanStyle::Dim);
         // 权限/失败的额外内联提示
@@ -592,21 +754,35 @@ fn push_tool_card(lines: &mut Vec<RenderLine>, tool: &crate::app::timeline_model
     }
 
     // ── 参预览（非路径部分）─ 对齐 opencode `input()` 过滤
-    if let Some(args) = tool.args_json.as_deref().filter(|s| !s.is_empty() && *s != "{}") {
+    if let Some(args) = tool
+        .args_json
+        .as_deref()
+        .filter(|s| !s.is_empty() && *s != "{}")
+    {
         let preview = format_args_preview(args);
         if !preview.is_empty() {
             let one_line = preview.replace('\n', " ");
             for seg in wrap_text(&one_line, width.saturating_sub(6)) {
                 let prefix = if is_block { " ┃ ⌗ " } else { "    ⌗ " };
-                lines.push(RenderLine::new().span(prefix, SpanStyle::Dim).span(seg, SpanStyle::Dim));
+                lines.push(
+                    RenderLine::new()
+                        .span(prefix, SpanStyle::Dim)
+                        .span(seg, SpanStyle::Dim),
+                );
             }
         }
     }
 
     // ── Diff 块：行级着色 + 自适应 split/unified + 行号 gutter（opencode 2401/2595）
     if let Some(diff) = &tool.diff {
-        let added = diff.lines().filter(|l| l.starts_with('+') && !l.starts_with("+++")).count();
-        let removed = diff.lines().filter(|l| l.starts_with('-') && !l.starts_with("---")).count();
+        let added = diff
+            .lines()
+            .filter(|l| l.starts_with('+') && !l.starts_with("+++"))
+            .count();
+        let removed = diff
+            .lines()
+            .filter(|l| l.starts_with('-') && !l.starts_with("---"))
+            .count();
         let prefix = if is_block { " ┃ Δ " } else { "    Δ " };
         lines.push(
             RenderLine::new()
@@ -614,7 +790,14 @@ fn push_tool_card(lines: &mut Vec<RenderLine>, tool: &crate::app::timeline_model
                 .span(format!("+{added}"), SpanStyle::DiffAdd)
                 .span(" ", SpanStyle::Dim)
                 .span(format!("−{removed}"), SpanStyle::DiffDel)
-                .span(if width > 120 && is_block { "  (split)" } else { "" }, SpanStyle::Dim),
+                .span(
+                    if width > 120 && is_block {
+                        "  (split)"
+                    } else {
+                        ""
+                    },
+                    SpanStyle::Dim,
+                ),
         );
         if width > 120 && is_block {
             // split 双栏：左旧/右新 各含 3宽行号 + 内容
@@ -635,51 +818,126 @@ fn push_tool_card(lines: &mut Vec<RenderLine>, tool: &crate::app::timeline_model
                     {
                         let max = pending_removed.len().max(pending_added.len());
                         for i in 0..max {
-                            if shown >= 60 { break; }
-                            let (l_txt, l_no) = pending_removed.get(i).map(|(s, n)| (crate::app::truncate_str(s, left_content_w), *n)).unwrap_or((String::new(), 0));
-                            let (r_txt, r_no) = pending_added.get(i).map(|(s, n)| (crate::app::truncate_str(s, right_content_w), *n)).unwrap_or((String::new(), 0));
-                            let l_num = if l_no != 0 { fmt_ln(l_no, ln_w) } else { "   ".into() };
-                            let r_num = if r_no != 0 { fmt_ln(r_no, ln_w) } else { "   ".into() };
+                            if shown >= 60 {
+                                break;
+                            }
+                            let (l_txt, l_no) = pending_removed
+                                .get(i)
+                                .map(|(s, n)| (crate::app::truncate_str(s, left_content_w), *n))
+                                .unwrap_or((String::new(), 0));
+                            let (r_txt, r_no) = pending_added
+                                .get(i)
+                                .map(|(s, n)| (crate::app::truncate_str(s, right_content_w), *n))
+                                .unwrap_or((String::new(), 0));
+                            let l_num = if l_no != 0 {
+                                fmt_ln(l_no, ln_w)
+                            } else {
+                                "   ".into()
+                            };
+                            let r_num = if r_no != 0 {
+                                fmt_ln(r_no, ln_w)
+                            } else {
+                                "   ".into()
+                            };
                             lines.push(
                                 RenderLine::new()
                                     .span(" ┃ ", SpanStyle::Dim)
-                                    .span(l_num, SpanStyle::Dim).span(" ", SpanStyle::Dim)
-                                    .span(format!("{:<width$}", l_txt, width = left_content_w), if pending_removed.get(i).is_some() { SpanStyle::DiffDel } else { SpanStyle::Dim })
+                                    .span(l_num, SpanStyle::Dim)
+                                    .span(" ", SpanStyle::Dim)
+                                    .span(
+                                        format!("{:<width$}", l_txt, width = left_content_w),
+                                        if pending_removed.get(i).is_some() {
+                                            SpanStyle::DiffDel
+                                        } else {
+                                            SpanStyle::Dim
+                                        },
+                                    )
                                     .span(" │ ", SpanStyle::Dim)
-                                    .span(r_num, SpanStyle::Dim).span(" ", SpanStyle::Dim)
-                                    .span(r_txt, if pending_added.get(i).is_some() { SpanStyle::DiffAdd } else { SpanStyle::Dim }),
+                                    .span(r_num, SpanStyle::Dim)
+                                    .span(" ", SpanStyle::Dim)
+                                    .span(
+                                        r_txt,
+                                        if pending_added.get(i).is_some() {
+                                            SpanStyle::DiffAdd
+                                        } else {
+                                            SpanStyle::Dim
+                                        },
+                                    ),
                             );
                             shown += 1;
                         }
                         pending_removed.clear();
                         pending_added.clear();
                     }
-                    lines.push(RenderLine::new().span(" ┃ ", SpanStyle::Dim).span(raw.to_owned(), SpanStyle::Dim));
+                    lines.push(
+                        RenderLine::new()
+                            .span(" ┃ ", SpanStyle::Dim)
+                            .span(raw.to_owned(), SpanStyle::Dim),
+                    );
                 } else if raw.starts_with("@@") {
-                    if let Some((o, n)) = parse_hunk_header(raw) { old_ln = o; new_ln = n; }
+                    if let Some((o, n)) = parse_hunk_header(raw) {
+                        old_ln = o;
+                        new_ln = n;
+                    }
                     {
                         let max = pending_removed.len().max(pending_added.len());
                         for i in 0..max {
-                            if shown >= 60 { break; }
-                            let (l_txt, l_no) = pending_removed.get(i).map(|(s, n)| (crate::app::truncate_str(s, left_content_w), *n)).unwrap_or((String::new(), 0));
-                            let (r_txt, r_no) = pending_added.get(i).map(|(s, n)| (crate::app::truncate_str(s, right_content_w), *n)).unwrap_or((String::new(), 0));
-                            let l_num = if l_no != 0 { fmt_ln(l_no, ln_w) } else { "   ".into() };
-                            let r_num = if r_no != 0 { fmt_ln(r_no, ln_w) } else { "   ".into() };
+                            if shown >= 60 {
+                                break;
+                            }
+                            let (l_txt, l_no) = pending_removed
+                                .get(i)
+                                .map(|(s, n)| (crate::app::truncate_str(s, left_content_w), *n))
+                                .unwrap_or((String::new(), 0));
+                            let (r_txt, r_no) = pending_added
+                                .get(i)
+                                .map(|(s, n)| (crate::app::truncate_str(s, right_content_w), *n))
+                                .unwrap_or((String::new(), 0));
+                            let l_num = if l_no != 0 {
+                                fmt_ln(l_no, ln_w)
+                            } else {
+                                "   ".into()
+                            };
+                            let r_num = if r_no != 0 {
+                                fmt_ln(r_no, ln_w)
+                            } else {
+                                "   ".into()
+                            };
                             lines.push(
                                 RenderLine::new()
                                     .span(" ┃ ", SpanStyle::Dim)
-                                    .span(l_num, SpanStyle::Dim).span(" ", SpanStyle::Dim)
-                                    .span(format!("{:<width$}", l_txt, width = left_content_w), if pending_removed.get(i).is_some() { SpanStyle::DiffDel } else { SpanStyle::Dim })
+                                    .span(l_num, SpanStyle::Dim)
+                                    .span(" ", SpanStyle::Dim)
+                                    .span(
+                                        format!("{:<width$}", l_txt, width = left_content_w),
+                                        if pending_removed.get(i).is_some() {
+                                            SpanStyle::DiffDel
+                                        } else {
+                                            SpanStyle::Dim
+                                        },
+                                    )
                                     .span(" │ ", SpanStyle::Dim)
-                                    .span(r_num, SpanStyle::Dim).span(" ", SpanStyle::Dim)
-                                    .span(r_txt, if pending_added.get(i).is_some() { SpanStyle::DiffAdd } else { SpanStyle::Dim }),
+                                    .span(r_num, SpanStyle::Dim)
+                                    .span(" ", SpanStyle::Dim)
+                                    .span(
+                                        r_txt,
+                                        if pending_added.get(i).is_some() {
+                                            SpanStyle::DiffAdd
+                                        } else {
+                                            SpanStyle::Dim
+                                        },
+                                    ),
                             );
                             shown += 1;
                         }
                         pending_removed.clear();
                         pending_added.clear();
                     }
-                    lines.push(RenderLine::new().span(" ┃ ", SpanStyle::Dim).span(raw.to_owned(), SpanStyle::Dim));
+                    lines.push(
+                        RenderLine::new()
+                            .span(" ┃ ", SpanStyle::Dim)
+                            .span(raw.to_owned(), SpanStyle::Dim),
+                    );
                 } else if let Some(body) = raw.strip_prefix('-') {
                     pending_removed.push((body.to_owned(), old_ln));
                     old_ln += 1;
@@ -690,67 +948,149 @@ fn push_tool_card(lines: &mut Vec<RenderLine>, tool: &crate::app::timeline_model
                     {
                         let max = pending_removed.len().max(pending_added.len());
                         for i in 0..max {
-                            if shown >= 60 { break; }
-                            let (l_txt, l_no) = pending_removed.get(i).map(|(s, n)| (crate::app::truncate_str(s, left_content_w), *n)).unwrap_or((String::new(), 0));
-                            let (r_txt, r_no) = pending_added.get(i).map(|(s, n)| (crate::app::truncate_str(s, right_content_w), *n)).unwrap_or((String::new(), 0));
-                            let l_num = if l_no != 0 { fmt_ln(l_no, ln_w) } else { "   ".into() };
-                            let r_num = if r_no != 0 { fmt_ln(r_no, ln_w) } else { "   ".into() };
+                            if shown >= 60 {
+                                break;
+                            }
+                            let (l_txt, l_no) = pending_removed
+                                .get(i)
+                                .map(|(s, n)| (crate::app::truncate_str(s, left_content_w), *n))
+                                .unwrap_or((String::new(), 0));
+                            let (r_txt, r_no) = pending_added
+                                .get(i)
+                                .map(|(s, n)| (crate::app::truncate_str(s, right_content_w), *n))
+                                .unwrap_or((String::new(), 0));
+                            let l_num = if l_no != 0 {
+                                fmt_ln(l_no, ln_w)
+                            } else {
+                                "   ".into()
+                            };
+                            let r_num = if r_no != 0 {
+                                fmt_ln(r_no, ln_w)
+                            } else {
+                                "   ".into()
+                            };
                             lines.push(
                                 RenderLine::new()
                                     .span(" ┃ ", SpanStyle::Dim)
-                                    .span(l_num, SpanStyle::Dim).span(" ", SpanStyle::Dim)
-                                    .span(format!("{:<width$}", l_txt, width = left_content_w), if pending_removed.get(i).is_some() { SpanStyle::DiffDel } else { SpanStyle::Dim })
+                                    .span(l_num, SpanStyle::Dim)
+                                    .span(" ", SpanStyle::Dim)
+                                    .span(
+                                        format!("{:<width$}", l_txt, width = left_content_w),
+                                        if pending_removed.get(i).is_some() {
+                                            SpanStyle::DiffDel
+                                        } else {
+                                            SpanStyle::Dim
+                                        },
+                                    )
                                     .span(" │ ", SpanStyle::Dim)
-                                    .span(r_num, SpanStyle::Dim).span(" ", SpanStyle::Dim)
-                                    .span(r_txt, if pending_added.get(i).is_some() { SpanStyle::DiffAdd } else { SpanStyle::Dim }),
+                                    .span(r_num, SpanStyle::Dim)
+                                    .span(" ", SpanStyle::Dim)
+                                    .span(
+                                        r_txt,
+                                        if pending_added.get(i).is_some() {
+                                            SpanStyle::DiffAdd
+                                        } else {
+                                            SpanStyle::Dim
+                                        },
+                                    ),
                             );
                             shown += 1;
                         }
                         pending_removed.clear();
                         pending_added.clear();
                     }
-                    if raw.trim().is_empty() { old_ln += 1; new_ln += 1; continue; }
+                    if raw.trim().is_empty() {
+                        old_ln += 1;
+                        new_ln += 1;
+                        continue;
+                    }
                     let txt = raw.strip_prefix(' ').unwrap_or(raw);
-                    let l_no = old_ln; let r_no = new_ln;
-                    old_ln += 1; new_ln += 1;
+                    let l_no = old_ln;
+                    let r_no = new_ln;
+                    old_ln += 1;
+                    new_ln += 1;
                     let l = crate::app::truncate_str(txt, left_content_w);
                     let r = crate::app::truncate_str(txt, right_content_w);
                     lines.push(
                         RenderLine::new()
                             .span(" ┃ ", SpanStyle::Dim)
-                            .span(fmt_ln(l_no, ln_w), SpanStyle::Dim).span(" ", SpanStyle::Dim)
-                            .span(format!("{:<width$}", l, width = left_content_w), SpanStyle::Dim)
+                            .span(fmt_ln(l_no, ln_w), SpanStyle::Dim)
+                            .span(" ", SpanStyle::Dim)
+                            .span(
+                                format!("{:<width$}", l, width = left_content_w),
+                                SpanStyle::Dim,
+                            )
                             .span(" │ ", SpanStyle::Dim)
-                            .span(fmt_ln(r_no, ln_w), SpanStyle::Dim).span(" ", SpanStyle::Dim)
+                            .span(fmt_ln(r_no, ln_w), SpanStyle::Dim)
+                            .span(" ", SpanStyle::Dim)
                             .span(r, SpanStyle::Dim),
                     );
                     shown += 1;
-                    if shown >= 60 { break; }
+                    if shown >= 60 {
+                        break;
+                    }
                 }
-                if shown >= 60 { break; }
+                if shown >= 60 {
+                    break;
+                }
             }
             {
                 let max = pending_removed.len().max(pending_added.len());
                 for i in 0..max {
-                    if shown >= 60 { break; }
-                    let (l_txt, l_no) = pending_removed.get(i).map(|(s, n)| (crate::app::truncate_str(s, left_content_w), *n)).unwrap_or((String::new(), 0));
-                    let (r_txt, r_no) = pending_added.get(i).map(|(s, n)| (crate::app::truncate_str(s, right_content_w), *n)).unwrap_or((String::new(), 0));
-                    let l_num = if l_no != 0 { fmt_ln(l_no, ln_w) } else { "   ".into() };
-                    let r_num = if r_no != 0 { fmt_ln(r_no, ln_w) } else { "   ".into() };
+                    if shown >= 60 {
+                        break;
+                    }
+                    let (l_txt, l_no) = pending_removed
+                        .get(i)
+                        .map(|(s, n)| (crate::app::truncate_str(s, left_content_w), *n))
+                        .unwrap_or((String::new(), 0));
+                    let (r_txt, r_no) = pending_added
+                        .get(i)
+                        .map(|(s, n)| (crate::app::truncate_str(s, right_content_w), *n))
+                        .unwrap_or((String::new(), 0));
+                    let l_num = if l_no != 0 {
+                        fmt_ln(l_no, ln_w)
+                    } else {
+                        "   ".into()
+                    };
+                    let r_num = if r_no != 0 {
+                        fmt_ln(r_no, ln_w)
+                    } else {
+                        "   ".into()
+                    };
                     lines.push(
                         RenderLine::new()
                             .span(" ┃ ", SpanStyle::Dim)
-                            .span(l_num, SpanStyle::Dim).span(" ", SpanStyle::Dim)
-                            .span(format!("{:<width$}", l_txt, width = left_content_w), if pending_removed.get(i).is_some() { SpanStyle::DiffDel } else { SpanStyle::Dim })
+                            .span(l_num, SpanStyle::Dim)
+                            .span(" ", SpanStyle::Dim)
+                            .span(
+                                format!("{:<width$}", l_txt, width = left_content_w),
+                                if pending_removed.get(i).is_some() {
+                                    SpanStyle::DiffDel
+                                } else {
+                                    SpanStyle::Dim
+                                },
+                            )
                             .span(" │ ", SpanStyle::Dim)
-                            .span(r_num, SpanStyle::Dim).span(" ", SpanStyle::Dim)
-                            .span(r_txt, if pending_added.get(i).is_some() { SpanStyle::DiffAdd } else { SpanStyle::Dim }),
+                            .span(r_num, SpanStyle::Dim)
+                            .span(" ", SpanStyle::Dim)
+                            .span(
+                                r_txt,
+                                if pending_added.get(i).is_some() {
+                                    SpanStyle::DiffAdd
+                                } else {
+                                    SpanStyle::Dim
+                                },
+                            ),
                     );
                     shown += 1;
                 }
             }
             if diff.lines().count() > 80 {
-                lines.push(RenderLine::new().span(format!(" ┃   … {} 行未展示", diff.lines().count() - 80), SpanStyle::Dim));
+                lines.push(RenderLine::new().span(
+                    format!(" ┃   … {} 行未展示", diff.lines().count() - 80),
+                    SpanStyle::Dim,
+                ));
             }
         } else {
             // unified + 行号 gutter 3宽
@@ -759,34 +1099,74 @@ fn push_tool_card(lines: &mut Vec<RenderLine>, tool: &crate::app::timeline_model
             let mut new_ln: u32 = 1;
             for raw in diff.lines().take(80) {
                 if raw.starts_with("---") || raw.starts_with("+++") {
-                    lines.push(RenderLine::new().span(if is_block { " ┃ " } else { "    " }, SpanStyle::Dim).span(raw.to_owned(), SpanStyle::Dim));
+                    lines.push(
+                        RenderLine::new()
+                            .span(if is_block { " ┃ " } else { "    " }, SpanStyle::Dim)
+                            .span(raw.to_owned(), SpanStyle::Dim),
+                    );
                 } else if raw.starts_with("@@") {
-                    if let Some((o, n)) = parse_hunk_header(raw) { old_ln = o; new_ln = n; }
-                    lines.push(RenderLine::new().span(if is_block { " ┃ " } else { "    " }, SpanStyle::Dim).span(raw.to_owned(), SpanStyle::Dim));
+                    if let Some((o, n)) = parse_hunk_header(raw) {
+                        old_ln = o;
+                        new_ln = n;
+                    }
+                    lines.push(
+                        RenderLine::new()
+                            .span(if is_block { " ┃ " } else { "    " }, SpanStyle::Dim)
+                            .span(raw.to_owned(), SpanStyle::Dim),
+                    );
                 } else if let Some(txt) = raw.strip_prefix('+') {
                     let ln = fmt_ln(new_ln, 3);
                     new_ln += 1;
                     let seg = crate::app::truncate_str(txt, width.saturating_sub(10));
-                    lines.push(RenderLine::new().span(if is_block { " ┃ " } else { "    " }, SpanStyle::Dim).span(ln, SpanStyle::Dim).span(" +", SpanStyle::DiffAdd).span(seg, SpanStyle::DiffAdd));
+                    lines.push(
+                        RenderLine::new()
+                            .span(if is_block { " ┃ " } else { "    " }, SpanStyle::Dim)
+                            .span(ln, SpanStyle::Dim)
+                            .span(" +", SpanStyle::DiffAdd)
+                            .span(seg, SpanStyle::DiffAdd),
+                    );
                 } else if let Some(txt) = raw.strip_prefix('-') {
                     let ln = fmt_ln(old_ln, 3);
                     old_ln += 1;
                     let seg = crate::app::truncate_str(txt, width.saturating_sub(10));
-                    lines.push(RenderLine::new().span(if is_block { " ┃ " } else { "    " }, SpanStyle::Dim).span(ln, SpanStyle::Dim).span(" -", SpanStyle::DiffDel).span(seg, SpanStyle::DiffDel));
+                    lines.push(
+                        RenderLine::new()
+                            .span(if is_block { " ┃ " } else { "    " }, SpanStyle::Dim)
+                            .span(ln, SpanStyle::Dim)
+                            .span(" -", SpanStyle::DiffDel)
+                            .span(seg, SpanStyle::DiffDel),
+                    );
                 } else if !raw.trim().is_empty() {
                     let ln = fmt_ln(new_ln, 3);
-                    old_ln += 1; new_ln += 1;
+                    old_ln += 1;
+                    new_ln += 1;
                     let txt = raw.strip_prefix(' ').unwrap_or(raw);
                     let seg = crate::app::truncate_str(txt, width.saturating_sub(10));
-                    lines.push(RenderLine::new().span(if is_block { " ┃ " } else { "    " }, SpanStyle::Dim).span(ln, SpanStyle::Dim).span("  ", SpanStyle::Dim).span(seg, SpanStyle::Dim));
+                    lines.push(
+                        RenderLine::new()
+                            .span(if is_block { " ┃ " } else { "    " }, SpanStyle::Dim)
+                            .span(ln, SpanStyle::Dim)
+                            .span("  ", SpanStyle::Dim)
+                            .span(seg, SpanStyle::Dim),
+                    );
                 } else {
-                    old_ln += 1; new_ln += 1;
+                    old_ln += 1;
+                    new_ln += 1;
                 }
                 shown += 1;
-                if shown >= 60 { break; }
+                if shown >= 60 {
+                    break;
+                }
             }
             if diff.lines().count() > 80 {
-                lines.push(RenderLine::new().span(format!("{}   … {} 行未展示", if is_block { " ┃ " } else { "    " }, diff.lines().count() - 80), SpanStyle::Dim));
+                lines.push(RenderLine::new().span(
+                    format!(
+                        "{}   … {} 行未展示",
+                        if is_block { " ┃ " } else { "    " },
+                        diff.lines().count() - 80
+                    ),
+                    SpanStyle::Dim,
+                ));
             }
         }
     }
@@ -825,20 +1205,30 @@ fn push_tool_card(lines: &mut Vec<RenderLine>, tool: &crate::app::timeline_model
             let needs_collapse = total_raw_lines > max_lines || src.chars().count() > max_chars;
             let display_text = if tool.state == TimelineToolState::Running {
                 if total_raw_lines > max_lines {
-                    src.lines().skip(total_raw_lines - max_lines).collect::<Vec<_>>().join("\n")
+                    src.lines()
+                        .skip(total_raw_lines - max_lines)
+                        .collect::<Vec<_>>()
+                        .join("\n")
                 } else {
                     src.clone()
                 }
             } else if needs_collapse && !expanded {
                 if total_raw_lines > max_lines {
-                    src.lines().skip(total_raw_lines - max_lines).collect::<Vec<_>>().join("\n")
+                    src.lines()
+                        .skip(total_raw_lines - max_lines)
+                        .collect::<Vec<_>>()
+                        .join("\n")
                 } else {
-                    let mut truncated: String = src.chars().take(max_chars.saturating_sub(1)).collect();
+                    let mut truncated: String =
+                        src.chars().take(max_chars.saturating_sub(1)).collect();
                     truncated.push('…');
                     truncated
                 }
             } else if src.lines().count() > expanded_limit && !expanded {
-                src.lines().take(expanded_limit).collect::<Vec<_>>().join("\n")
+                src.lines()
+                    .take(expanded_limit)
+                    .collect::<Vec<_>>()
+                    .join("\n")
             } else {
                 src.clone()
             };
@@ -847,75 +1237,131 @@ fn push_tool_card(lines: &mut Vec<RenderLine>, tool: &crate::app::timeline_model
             let mut shown_lines = 0usize;
             for out in display_text.lines() {
                 if out.is_empty() {
-                    lines.push(RenderLine::new().span(line_prefix, SpanStyle::Dim).span("", SpanStyle::Dim));
+                    lines.push(
+                        RenderLine::new()
+                            .span(line_prefix, SpanStyle::Dim)
+                            .span("", SpanStyle::Dim),
+                    );
                     shown_lines += 1;
                     continue;
                 }
                 for seg in wrap_text(out, width.saturating_sub(6)) {
-                    lines.push(RenderLine::new().span(line_prefix, SpanStyle::Dim).span(seg, SpanStyle::Dim));
+                    lines.push(
+                        RenderLine::new()
+                            .span(line_prefix, SpanStyle::Dim)
+                            .span(seg, SpanStyle::Dim),
+                    );
                     shown_lines += 1;
-                    if shown_lines >= expanded_limit { break; }
+                    if shown_lines >= expanded_limit {
+                        break;
+                    }
                 }
-                if shown_lines >= expanded_limit { break; }
+                if shown_lines >= expanded_limit {
+                    break;
+                }
             }
             if overflow {
-                let mut hint_text = if expanded { "F7 收起".to_string() } else { "F7 展开".to_string() };
-                if !is_running
-                    && let Some((exit, truncated, _)) = shell_meta {
-                        if let Some(code) = exit
-                            && code != 0 { hint_text.push_str(&format!(" · exit {code}")); }
-                        if truncated { hint_text.push_str(" · 截断"); }
+                let mut hint_text = if expanded {
+                    "F7 收起".to_string()
+                } else {
+                    "F7 展开".to_string()
+                };
+                if !is_running && let Some((exit, truncated, _)) = shell_meta {
+                    if let Some(code) = exit
+                        && code != 0
+                    {
+                        hint_text.push_str(&format!(" · exit {code}"));
                     }
-                lines.push(RenderLine::new().span(format!("{}  ", line_prefix), SpanStyle::Dim).span(hint_text, SpanStyle::Dim));
+                    if truncated {
+                        hint_text.push_str(" · 截断");
+                    }
+                }
+                lines.push(
+                    RenderLine::new()
+                        .span(format!("{}  ", line_prefix), SpanStyle::Dim)
+                        .span(hint_text, SpanStyle::Dim),
+                );
             }
             if is_running
                 && let Some(last) = lines.last_mut()
-                    && let Some(span) = last.spans.last_mut() { span.text.push('▌'); }
+                && let Some(span) = last.spans.last_mut()
+            {
+                span.text.push('▌');
+            }
         }
     } else {
         let mut combined = String::new();
         if let Some(output) = tool.output.as_deref().filter(|s| !s.is_empty()) {
             combined.push_str(output);
-            if !tool.progress.is_empty() { combined.push('\n'); }
+            if !tool.progress.is_empty() {
+                combined.push('\n');
+            }
         }
         combined.push_str(&tool.progress);
         if !combined.trim().is_empty() {
             let max_lines = 4usize;
             let max_chars = max_lines * width.saturating_sub(6).max(20);
             let (shown_text, overflow) = collapse_output(&combined, max_lines, max_chars);
-            let display = if overflow && !expanded { shown_text } else { combined };
+            let display = if overflow && !expanded {
+                shown_text
+            } else {
+                combined
+            };
             let line_prefix = if is_block { " ┃ │ " } else { "    │ " };
             let mut shown_lines = 0usize;
-            for out in display.lines().take(if overflow && !expanded { max_lines } else { 24 }) {
+            for out in display
+                .lines()
+                .take(if overflow && !expanded { max_lines } else { 24 })
+            {
                 for seg in wrap_text(out, width.saturating_sub(6)) {
-                    lines.push(RenderLine::new().span(line_prefix, SpanStyle::Dim).span(seg, SpanStyle::Dim));
+                    lines.push(
+                        RenderLine::new()
+                            .span(line_prefix, SpanStyle::Dim)
+                            .span(seg, SpanStyle::Dim),
+                    );
                     shown_lines += 1;
-                    if shown_lines > 24 { break; }
+                    if shown_lines > 24 {
+                        break;
+                    }
                 }
             }
             if overflow {
                 let hint = if expanded { "F7 收起" } else { "F7 展开" };
-                lines.push(RenderLine::new().span(format!("{}  ", line_prefix), SpanStyle::Dim).span(hint, SpanStyle::Dim));
+                lines.push(
+                    RenderLine::new()
+                        .span(format!("{}  ", line_prefix), SpanStyle::Dim)
+                        .span(hint, SpanStyle::Dim),
+                );
             }
-            if is_running && !overflow
+            if is_running
+                && !overflow
                 && let Some(last) = lines.last_mut()
-                    && let Some(span) = last.spans.last_mut() { span.text.push('▌'); }
+                && let Some(span) = last.spans.last_mut()
+            {
+                span.text.push('▌');
+            }
         }
     }
 
     if let Some(err) = &tool.failure {
-        for seg in wrap_text(&format!("{}: {}", err.code, err.message), width.saturating_sub(6)) {
+        for seg in wrap_text(
+            &format!("{}: {}", err.code, err.message),
+            width.saturating_sub(6),
+        ) {
             let pfx = if is_block { " ┃ ✗ " } else { "    ✗ " };
-            lines.push(RenderLine::new().span(pfx, SpanStyle::Error).span(seg, SpanStyle::Error));
+            lines.push(
+                RenderLine::new()
+                    .span(pfx, SpanStyle::Error)
+                    .span(seg, SpanStyle::Error),
+            );
         }
     }
     if let Some(perm) = &tool.permission {
         let pfx = if is_block { " ┃ ⚠ " } else { "    ⚠ " };
-        lines.push(
-            RenderLine::new()
-                .span(pfx, SpanStyle::Warn)
-                .span(format!("等待权限：{}（risk {}）", perm.category, perm.risk), SpanStyle::Warn),
-        );
+        lines.push(RenderLine::new().span(pfx, SpanStyle::Warn).span(
+            format!("等待权限：{}（risk {}）", perm.category, perm.risk),
+            SpanStyle::Warn,
+        ));
     }
     // Block 底部收口留白（对齐 BlockTool paddingBottom 1）
     if is_block {
@@ -947,7 +1393,10 @@ pub fn render_session_info(session: &SessionState, width: u16) -> Vec<RenderLine
         let bar = crate::app::anim::bar(Some(ratio), 10, crate::app::anim::frame_now());
         let delta = anim.last_delta.as_deref().unwrap_or("估算");
         spans.push((
-            format!("≈{bar} 压缩中 {}/{} · {delta}", anim.turns_keeping, anim.turns_total),
+            format!(
+                "≈{bar} 压缩中 {}/{} · {delta}",
+                anim.turns_keeping, anim.turns_total
+            ),
             SpanStyle::Warn,
         ));
     }
@@ -978,8 +1427,10 @@ pub fn render_session_info(session: &SessionState, width: u16) -> Vec<RenderLine
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::timeline_model::{Block, Round, Turn, ToolCard};
-    use crate::protocol::timeline::{TimelineBlockKind, TimelineBlockState, TimelineToolState, TimelineTurnState};
+    use crate::app::timeline_model::{Block, Round, ToolCard, Turn};
+    use crate::protocol::timeline::{
+        TimelineBlockKind, TimelineBlockState, TimelineToolState, TimelineTurnState,
+    };
 
     #[test]
     fn collapse_output_truncates_by_lines_and_chars() {
@@ -1016,7 +1467,11 @@ mod tests {
         };
         let mut lines = Vec::new();
         push_tool_card(&mut lines, &tool_inline, 80, false);
-        assert!(lines.iter().any(|l| l.spans.iter().any(|s| s.text.contains("read"))));
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.spans.iter().any(|s| s.text.contains("read")))
+        );
 
         let diff = "--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1,2 +1,2 @@\n-old\n+new\n";
         let tool_block = ToolCard {
@@ -1033,11 +1488,23 @@ mod tests {
         };
         let mut lines2 = Vec::new();
         push_tool_card(&mut lines2, &tool_block, 130, false); // wide -> split
-        assert!(lines2.iter().any(|l| l.spans.iter().any(|s| s.text.contains("Δ"))));
-        assert!(lines2.iter().any(|l| l.spans.iter().any(|s| s.text.contains("split"))));
+        assert!(
+            lines2
+                .iter()
+                .any(|l| l.spans.iter().any(|s| s.text.contains("Δ")))
+        );
+        assert!(
+            lines2
+                .iter()
+                .any(|l| l.spans.iter().any(|s| s.text.contains("split")))
+        );
         let mut lines3 = Vec::new();
         push_tool_card(&mut lines3, &tool_block, 80, false); // narrow -> unified
-        assert!(lines3.iter().any(|l| l.spans.iter().any(|s| s.text.contains("Δ"))));
+        assert!(
+            lines3
+                .iter()
+                .any(|l| l.spans.iter().any(|s| s.text.contains("Δ")))
+        );
     }
 
     #[test]
@@ -1051,16 +1518,35 @@ mod tests {
             tool: None,
             last_fragment: 0,
         };
-        let round = Round { round_num: 0, sealed: true, is_final: true, blocks: vec![block] };
-        let turn = Turn { turn_id: "t1".into(), user_text: "hi".into(), state: TimelineTurnState::Completed, failure: None, rounds: vec![round] };
+        let round = Round {
+            round_num: 0,
+            sealed: true,
+            is_final: true,
+            blocks: vec![block],
+        };
+        let turn = Turn {
+            turn_id: "t1".into(),
+            user_text: "hi".into(),
+            state: TimelineTurnState::Completed,
+            failure: None,
+            rounds: vec![round],
+        };
         let mut sess = crate::app::session::SessionState::new("s".into());
         sess.timeline.turns.push(turn);
         sess.timeline.version = 1;
         let lines_hide = render_transcript_with_opts(&sess, 80, false);
         let lines_show = render_transcript_with_opts(&sess, 80, true);
         // hide 应折叠为单行 + 提示
-        assert!(lines_hide.iter().any(|l| l.spans.iter().any(|s| s.text.contains("F3"))));
-        assert!(lines_show.iter().any(|l| l.spans.iter().any(|s| s.text.contains("Body"))));
+        assert!(
+            lines_hide
+                .iter()
+                .any(|l| l.spans.iter().any(|s| s.text.contains("F3")))
+        );
+        assert!(
+            lines_show
+                .iter()
+                .any(|l| l.spans.iter().any(|s| s.text.contains("Body")))
+        );
     }
 
     #[test]
@@ -1074,11 +1560,37 @@ mod tests {
         assert!(parts[1].starts_with("Synthesizing"));
         // 渲染后应产生多行 Reasoning
         let mut sess = crate::app::session::SessionState::new("s".into());
-        let block = Block { block_id: "b1".into(), block_order: 0, kind: TimelineBlockKind::Reasoning, state: TimelineBlockState::Sealed, text: text.to_string(), tool: None, last_fragment: 0 };
-        sess.timeline.turns.push(Turn { turn_id: "t1".into(), user_text: "".into(), state: TimelineTurnState::Completed, failure: None, rounds: vec![Round { round_num: 0, sealed: true, is_final: true, blocks: vec![block]}]});
+        let block = Block {
+            block_id: "b1".into(),
+            block_order: 0,
+            kind: TimelineBlockKind::Reasoning,
+            state: TimelineBlockState::Sealed,
+            text: text.to_string(),
+            tool: None,
+            last_fragment: 0,
+        };
+        sess.timeline.turns.push(Turn {
+            turn_id: "t1".into(),
+            user_text: "".into(),
+            state: TimelineTurnState::Completed,
+            failure: None,
+            rounds: vec![Round {
+                round_num: 0,
+                sealed: true,
+                is_final: true,
+                blocks: vec![block],
+            }],
+        });
         let lines = render_transcript_with_opts(&sess, 120, true);
         // 至少 Thought 标题 + 2 行 body
-        let reasoning_lines = lines.iter().filter(|l| l.spans.iter().any(|s| s.text.contains("Gathering") || s.text.contains("Synthesizing"))).count();
+        let reasoning_lines = lines
+            .iter()
+            .filter(|l| {
+                l.spans
+                    .iter()
+                    .any(|s| s.text.contains("Gathering") || s.text.contains("Synthesizing"))
+            })
+            .count();
         assert!(reasoning_lines >= 2);
     }
 
@@ -1146,9 +1658,21 @@ mod tests {
         let mut lines = Vec::new();
         push_tool_card(&mut lines, &tool, 80, false);
         // 应包含尾行 line20，且不含 JSON 外壳
-        assert!(lines.iter().any(|l| l.spans.iter().any(|s| s.text.contains("line20"))));
-        assert!(!lines.iter().any(|l| l.spans.iter().any(|s| s.text.contains("\"command\""))));
-        assert!(lines.iter().any(|l| l.spans.iter().any(|s| s.text.contains("▌"))));
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.spans.iter().any(|s| s.text.contains("line20")))
+        );
+        assert!(
+            !lines
+                .iter()
+                .any(|l| l.spans.iter().any(|s| s.text.contains("\"command\"")))
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.spans.iter().any(|s| s.text.contains("▌")))
+        );
     }
 
     #[test]
@@ -1168,7 +1692,11 @@ mod tests {
         };
         let mut lines = Vec::new();
         push_tool_card(&mut lines, &tool, 80, false);
-        let flat: String = lines.iter().flat_map(|l| l.spans.iter().map(|s| s.text.clone())).collect::<Vec<_>>().join("\n");
+        let flat: String = lines
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.text.clone()))
+            .collect::<Vec<_>>()
+            .join("\n");
         assert!(flat.contains("out line"));
         assert!(flat.contains("err line"));
         assert!(!flat.contains("[stderr]"));
@@ -1178,11 +1706,36 @@ mod tests {
     #[test]
     fn reasoning_streaming_full_expand_by_default() {
         let mut sess = crate::app::session::SessionState::new("s".into());
-        let text = (1..=8).map(|i| format!("line {i}")).collect::<Vec<_>>().join("\n");
-        let block = Block { block_id: "b1".into(), block_order: 0, kind: TimelineBlockKind::Reasoning, state: TimelineBlockState::Open, text: text.clone(), tool: None, last_fragment: 0 };
-        sess.timeline.turns.push(Turn { turn_id: "t1".into(), user_text: "".into(), state: TimelineTurnState::Running, failure: None, rounds: vec![Round { round_num: 0, sealed: false, is_final: false, blocks: vec![block]}]});
+        let text = (1..=8)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let block = Block {
+            block_id: "b1".into(),
+            block_order: 0,
+            kind: TimelineBlockKind::Reasoning,
+            state: TimelineBlockState::Open,
+            text: text.clone(),
+            tool: None,
+            last_fragment: 0,
+        };
+        sess.timeline.turns.push(Turn {
+            turn_id: "t1".into(),
+            user_text: "".into(),
+            state: TimelineTurnState::Running,
+            failure: None,
+            rounds: vec![Round {
+                round_num: 0,
+                sealed: false,
+                is_final: false,
+                blocks: vec![block],
+            }],
+        });
         let lines = render_transcript_with_opts(&sess, 120, true);
-        let reasoning_cnt = lines.iter().filter(|l| l.spans.iter().any(|s| s.text.contains("line"))).count();
+        let reasoning_cnt = lines
+            .iter()
+            .filter(|l| l.spans.iter().any(|s| s.text.contains("line")))
+            .count();
         assert!(reasoning_cnt >= 8, "streaming 默认全显 {reasoning_cnt}");
     }
 
@@ -1199,8 +1752,14 @@ mod tests {
         assert!(!is_default_expanded("edit"));
 
         // bash: 20 行输出，默认（raw=false）应直展全部（提示为“F7 收起”）
-        let long = (1..=20).map(|i| format!("ROW{i:02}")).collect::<Vec<_>>().join("\n");
-        let raw = format!(r#"{{"status":"completed","output":{:?},"exit_code":0}}"#, long);
+        let long = (1..=20)
+            .map(|i| format!("ROW{i:02}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let raw = format!(
+            r#"{{"status":"completed","output":{:?},"exit_code":0}}"#,
+            long
+        );
         let bash_tool = ToolCard {
             tool_call_id: "c-bash".into(),
             name: "bash".into(),
@@ -1215,20 +1774,31 @@ mod tests {
         };
         let mut lines = Vec::new();
         push_tool_card(&mut lines, &bash_tool, 80, false); // raw false -> visual true
-        let flat: String = lines.iter().flat_map(|l| l.spans.iter().map(|s| s.text.clone())).collect::<Vec<_>>().join("\n");
+        let flat: String = lines
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.text.clone()))
+            .collect::<Vec<_>>()
+            .join("\n");
         assert!(flat.contains("ROW01"), "bash 默认展开应可见首行");
         assert!(flat.contains("ROW20"), "bash 默认展开应可见尾行");
         assert!(flat.contains("F7 收起"), "bash 默认展开提示应为收起");
         // raw=true 时应对视觉收起（仅尾 8 行）
         let mut lines2 = Vec::new();
         push_tool_card(&mut lines2, &bash_tool, 80, true);
-        let flat2: String = lines2.iter().flat_map(|l| l.spans.iter().map(|s| s.text.clone())).collect::<Vec<_>>().join("\n");
+        let flat2: String = lines2
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.text.clone()))
+            .collect::<Vec<_>>()
+            .join("\n");
         assert!(!flat2.contains("ROW01"), "bash 收起态不应含首行");
         assert!(flat2.contains("ROW20"));
         assert!(flat2.contains("F7 展开"));
 
         // read: 非 shell 分支，10 行输出默认展开应全显（>4 行折叠阈）
-        let read_out = (1..=10).map(|i| format!("r{i}")).collect::<Vec<_>>().join("\n");
+        let read_out = (1..=10)
+            .map(|i| format!("r{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
         let read_tool = ToolCard {
             tool_call_id: "c-read".into(),
             name: "read".into(),
@@ -1243,14 +1813,26 @@ mod tests {
         };
         let mut rl = Vec::new();
         push_tool_card(&mut rl, &read_tool, 80, false);
-        let rf: String = rl.iter().flat_map(|l| l.spans.iter().map(|s| s.text.clone())).collect::<Vec<_>>().join("\n");
+        let rf: String = rl
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.text.clone()))
+            .collect::<Vec<_>>()
+            .join("\n");
         assert!(rf.contains("r1"));
         assert!(rf.contains("r10"));
         // grep 默认仍折叠（raw false 即视觉收起，10 行应只显 4 行）
-        let grep_tool = ToolCard { name: "grep".into(), tool_call_id: "c-grep".into(), ..read_tool.clone() };
+        let grep_tool = ToolCard {
+            name: "grep".into(),
+            tool_call_id: "c-grep".into(),
+            ..read_tool.clone()
+        };
         let mut gl = Vec::new();
         push_tool_card(&mut gl, &grep_tool, 80, false);
-        let gf: String = gl.iter().flat_map(|l| l.spans.iter().map(|s| s.text.clone())).collect::<Vec<_>>().join("\n");
+        let gf: String = gl
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.text.clone()))
+            .collect::<Vec<_>>()
+            .join("\n");
         assert!(gf.contains("r1"));
         assert!(!gf.contains("r10"), "grep 默认折叠不应含尾行");
         assert!(gf.contains("F7 展开"));

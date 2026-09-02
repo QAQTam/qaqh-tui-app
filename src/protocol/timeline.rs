@@ -120,8 +120,12 @@ pub struct TimelineSnapshot {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum TimelineEvent {
-    TurnOpened { user_text: String },
-    BlockOpened { block: TimelineBlock },
+    TurnOpened {
+        user_text: String,
+    },
+    BlockOpened {
+        block: TimelineBlock,
+    },
     /// `fragment_seq` 在单个文本/推理块内单调。
     TextDelta {
         block_id: String,
@@ -129,11 +133,24 @@ pub enum TimelineEvent {
         delta: String,
     },
     /// 块的周期完整值（replaceable，覆盖语义，自愈丢失/乱序增量）。
-    BlockCheckpoint { block_id: String, text: String },
-    ToolUpdated { block_id: String, tool: TimelineTool },
-    ToolProgress { block_id: String, chunk: String },
-    BlockSealed { block_id: String },
-    RoundSealed { is_final: bool },
+    BlockCheckpoint {
+        block_id: String,
+        text: String,
+    },
+    ToolUpdated {
+        block_id: String,
+        tool: TimelineTool,
+    },
+    ToolProgress {
+        block_id: String,
+        chunk: String,
+    },
+    BlockSealed {
+        block_id: String,
+    },
+    RoundSealed {
+        is_final: bool,
+    },
     TurnSealed {
         state: TimelineTurnState,
         #[serde(default, skip_serializing_if = "Option::is_none")]

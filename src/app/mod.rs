@@ -3,22 +3,22 @@
 //! 事件驱动（无轮询泵）：所有后端状态变化经 runtime 消息到达后立即生效，
 //! UI 在同一帧内重绘。
 
-pub(crate) mod keymap;
 pub(crate) mod anim;
 mod composer_ops;
-mod paste_guard;
 mod interaction;
-mod overlay_ops;
-mod session_ops;
-mod settings_ops;
-mod transcript_ops;
+pub(crate) mod keymap;
 pub mod markdown;
+mod overlay_ops;
+mod paste_guard;
 pub mod render_line;
 pub mod render_transcript;
 pub mod session;
+mod session_ops;
 pub mod settings;
+mod settings_ops;
 pub mod slash;
 pub mod timeline_model;
+mod transcript_ops;
 
 use self::keymap::{GlobalKey, ModalRoute};
 use self::paste_guard::PasteGuard;
@@ -29,23 +29,21 @@ use std::time::{Duration, Instant};
 
 use ratatui::crossterm::event::{KeyEvent, MouseEvent};
 
-use crate::protocol::command::{
-    ConversationCommand, ControlCommand, RingingCommand, ToolCommand,
-};
 use crate::app::slash::SlashCmd;
+use crate::protocol::command::{ControlCommand, ConversationCommand, RingingCommand, ToolCommand};
 use crate::protocol::config::ConfigDto;
 use crate::protocol::envelope::{CommandState, RingingCommandStatus};
 use crate::protocol::event::{
-    ActivityState, AskResolution, ContentRef, ConversationEvent, ControlEvent, NoticeLevel,
+    ActivityState, AskResolution, ContentRef, ControlEvent, ConversationEvent, NoticeLevel,
     PermissionCategory, PermissionRisk, SessionState as SessionStateEvent, ToolEvent,
 };
 use crate::protocol::methods::{self, SessionMetaView};
 use crate::protocol::timeline::TimelinePage;
 use crate::runtime::{ConnEvent, Runtime, RuntimeMsg};
-use crate::transport::http::{build_envelope, HttpClient};
+use crate::transport::http::{HttpClient, build_envelope};
 use session::{
-    streaming_done, sync_streaming_from_timeline, AskPanel, PermissionPanel, PlanPanel,
-    SessionState, StreamPhase,
+    AskPanel, PermissionPanel, PlanPanel, SessionState, StreamPhase, streaming_done,
+    sync_streaming_from_timeline,
 };
 
 /// 保留 timeline 模型的最近焦点标签数（LRU；超出者仅存轻状态，
@@ -60,17 +58,44 @@ const TURNS_CAP: usize = 400;
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
 pub enum ActionResult {
-    Bootstrap { seed: String, result: Result<crate::protocol::snapshot::RingingSessionBootstrap, String> },
-    CommandAck { seed: Option<String>, label: &'static str, result: Result<crate::protocol::envelope::RingingCommandAck, String> },
+    Bootstrap {
+        seed: String,
+        result: Result<crate::protocol::snapshot::RingingSessionBootstrap, String>,
+    },
+    CommandAck {
+        seed: Option<String>,
+        label: &'static str,
+        result: Result<crate::protocol::envelope::RingingCommandAck, String>,
+    },
     SessionList(Result<Vec<SessionMetaView>, String>),
     SessionActivity(Result<serde_json::Value, String>),
     ConfigLoaded(Result<serde_json::Value, String>),
-    ConfigWrite { label: &'static str, result: Result<serde_json::Value, String> },
-    Uploaded { seed: String, path: String, result: Result<ContentRef, String> },
-    Rebaseline { seed: String, result: Result<TimelinePage, String> },
-    LoadOlder { seed: String, result: Result<TimelinePage, String> },
-    Receipt { label: &'static str, seed: Option<String>, result: Result<RingingCommandStatus, String> },
-    Dashboard { seed: String, result: Result<crate::protocol::event::DashboardSnapshot, String> },
+    ConfigWrite {
+        label: &'static str,
+        result: Result<serde_json::Value, String>,
+    },
+    Uploaded {
+        seed: String,
+        path: String,
+        result: Result<ContentRef, String>,
+    },
+    Rebaseline {
+        seed: String,
+        result: Result<TimelinePage, String>,
+    },
+    LoadOlder {
+        seed: String,
+        result: Result<TimelinePage, String>,
+    },
+    Receipt {
+        label: &'static str,
+        seed: Option<String>,
+        result: Result<RingingCommandStatus, String>,
+    },
+    Dashboard {
+        seed: String,
+        result: Result<crate::protocol::event::DashboardSnapshot, String>,
+    },
 }
 
 // 小变体（Key/Mouse/Tick）与大负载变体混排；Box 化推迟到独立性能任务。
@@ -111,13 +136,25 @@ pub enum ConfirmAction {
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone)]
 pub enum Overlay {
-    SessionList { selected: usize, show_archived: bool },
+    SessionList {
+        selected: usize,
+        show_archived: bool,
+    },
     Settings(settings::SettingsState),
     Help,
-    AttachPath { input: Vec<char>, cursor: usize, seed: String },
-    Confirm { action: ConfirmAction },
+    AttachPath {
+        input: Vec<char>,
+        cursor: usize,
+        seed: String,
+    },
+    Confirm {
+        action: ConfirmAction,
+    },
     /// 二级：/new 的 cwd 输入（/ 本身的一级菜单为 inline 浮层，非 overlay）
-    CwdInput { input: Vec<char>, cursor: usize },
+    CwdInput {
+        input: Vec<char>,
+        cursor: usize,
+    },
 }
 
 use self::settings::{FieldKind, SettingsState};
@@ -177,7 +214,14 @@ impl App {
         runtime: Arc<Runtime>,
         msg_tx: tokio::sync::mpsc::UnboundedSender<AppMsg>,
     ) -> Self {
-        Self::new_with_cwd(client, runtime, msg_tx, std::env::current_dir().ok().map(|p| p.to_string_lossy().into_owned()))
+        Self::new_with_cwd(
+            client,
+            runtime,
+            msg_tx,
+            std::env::current_dir()
+                .ok()
+                .map(|p| p.to_string_lossy().into_owned()),
+        )
     }
 
     pub fn new_with_cwd(
@@ -251,11 +295,13 @@ impl App {
                 break;
             }
         }
-        self.pending_creates.retain(|_, at| at.elapsed() < Duration::from_secs(15));
+        self.pending_creates
+            .retain(|_, at| at.elapsed() < Duration::from_secs(15));
         if let Some(armed) = self.quit_armed
-            && armed.elapsed() > Duration::from_secs(3) {
-                self.quit_armed = None;
-            }
+            && armed.elapsed() > Duration::from_secs(3)
+        {
+            self.quit_armed = None;
+        }
         // 首页自动刷新：无 tab 时保持列表新鲜（对齐 opencode Home 的常驻列表感）
         if self.tabs.is_empty() {
             let stale = self
@@ -278,10 +324,11 @@ impl App {
         match m.kind {
             MouseEventKind::ScrollUp => self.scroll_up(3),
             MouseEventKind::ScrollDown => self.scroll_down(3),
-            MouseEventKind::Down(kind) if kind == ratatui::crossterm::event::MouseButton::Left
-                && m.row == 0 => {
-                    self.click_tab(m.column);
-                }
+            MouseEventKind::Down(kind)
+                if kind == ratatui::crossterm::event::MouseButton::Left && m.row == 0 =>
+            {
+                self.click_tab(m.column);
+            }
             _ => {}
         }
     }
@@ -298,26 +345,31 @@ impl App {
         }
         // 设置页编辑态：粘贴进当前字段缓冲。
         if let Some(Overlay::Settings(st)) = self.overlays.last_mut()
-            && let Some(buf) = st.editing.as_mut() {
-                for ch in text.chars() {
-                    if ch != '\n' && ch != '\r' {
-                        buf.buf.insert(buf.cursor.min(buf.buf.len()), ch);
-                        buf.cursor += 1;
-                    }
+            && let Some(buf) = st.editing.as_mut()
+        {
+            for ch in text.chars() {
+                if ch != '\n' && ch != '\r' {
+                    buf.buf.insert(buf.cursor.min(buf.buf.len()), ch);
+                    buf.cursor += 1;
                 }
-                return;
             }
-        let Some(sess) = self.active_session_mut() else { return };
+            return;
+        }
+        let Some(sess) = self.active_session_mut() else {
+            return;
+        };
         if let Some(panel) = sess.pending_ask.as_mut()
-            && panel.editing_custom.is_some() {
-                panel.input.push_str(&text);
-                return;
-            }
+            && panel.editing_custom.is_some()
+        {
+            panel.input.push_str(&text);
+            return;
+        }
         if let Some(panel) = sess.pending_plan.as_mut()
-            && panel.entering_message {
-                panel.message.push_str(&text);
-                return;
-            }
+            && panel.entering_message
+        {
+            panel.message.push_str(&text);
+            return;
+        }
         sess.composer.insert_str(&text);
     }
 
@@ -330,11 +382,16 @@ impl App {
                 let seed2 = seed.clone();
                 self.spawn_api(move |client, tx| async move {
                     let result = client.bootstrap(&seed2).await.map_err(|e| e.to_string());
-                    let _ = tx.send(AppMsg::Action(ActionResult::Bootstrap { seed: seed2, result }));
+                    let _ = tx.send(AppMsg::Action(ActionResult::Bootstrap {
+                        seed: seed2,
+                        result,
+                    }));
                 });
             }
             RuntimeMsg::Timeline { seed, entry } => {
-                let Some(sess) = self.sessions.get_mut(&seed) else { return };
+                let Some(sess) = self.sessions.get_mut(&seed) else {
+                    return;
+                };
                 sess.timeline.apply(&entry);
                 sess.timeline.cap_turns(TURNS_CAP);
                 sync_streaming_from_timeline(sess);
@@ -344,7 +401,9 @@ impl App {
                 }
             }
             RuntimeMsg::TimelineRebaseline { seed, page } => {
-                let Some(sess) = self.sessions.get_mut(&seed) else { return };
+                let Some(sess) = self.sessions.get_mut(&seed) else {
+                    return;
+                };
                 // 重基线 = 权威时间线已就绪：压缩动画兜底清除。
                 sess.compact_anim = None;
                 let was_follow = sess.scroll.follow;
@@ -361,7 +420,10 @@ impl App {
                 sess.rendered = None;
             }
             RuntimeMsg::TimelineLost { seed, error } => {
-                self.toast(NoticeLevel::Error, format!("timeline 断开[{seed}]: {error}"));
+                self.toast(
+                    NoticeLevel::Error,
+                    format!("timeline 断开[{seed}]: {error}"),
+                );
             }
         }
     }
@@ -371,7 +433,10 @@ impl App {
             ConnEvent::Opening => {
                 self.conn_phase = ConnPhase::Opening;
             }
-            ConnEvent::Ready { epoch, epoch_changed } => {
+            ConnEvent::Ready {
+                epoch,
+                epoch_changed,
+            } => {
                 self.conn_phase = ConnPhase::Ready;
                 if self.epoch != epoch {
                     self.epoch = epoch.clone();
@@ -385,7 +450,9 @@ impl App {
                         for seed in seeds {
                             let cmd = build_envelope(
                                 &client,
-                                RingingCommand::Control(ControlCommand::SessionResume { seed: seed.clone() }),
+                                RingingCommand::Control(ControlCommand::SessionResume {
+                                    seed: seed.clone(),
+                                }),
                             )
                             .with_seed(seed.clone());
                             if let Err(e) = client.command(&cmd).await {
@@ -397,7 +464,8 @@ impl App {
                                 continue;
                             }
                             let result = client.bootstrap(&seed).await.map_err(|e| e.to_string());
-                            let _ = tx.send(AppMsg::Action(ActionResult::Bootstrap { seed, result }));
+                            let _ =
+                                tx.send(AppMsg::Action(ActionResult::Bootstrap { seed, result }));
                         }
                     });
                 }
@@ -415,12 +483,20 @@ impl App {
         }
     }
 
-    fn handle_envelope(&mut self, _channel: crate::protocol::Channel, env: crate::protocol::envelope::RingingEventEnvelope) {
+    fn handle_envelope(
+        &mut self,
+        _channel: crate::protocol::Channel,
+        env: crate::protocol::envelope::RingingEventEnvelope,
+    ) {
         let seed = env.seed.clone();
         let causation_id = env.causation_id.clone();
         match env.event {
-            crate::protocol::event::RingingEvent::Control(ev) => self.handle_control(seed, causation_id, ev),
-            crate::protocol::event::RingingEvent::Conversation(ev) => self.handle_conversation(seed, ev),
+            crate::protocol::event::RingingEvent::Control(ev) => {
+                self.handle_control(seed, causation_id, ev)
+            }
+            crate::protocol::event::RingingEvent::Conversation(ev) => {
+                self.handle_conversation(seed, ev)
+            }
             crate::protocol::event::RingingEvent::Tool(ev) => self.handle_tool(seed, ev),
         }
     }
@@ -434,13 +510,16 @@ impl App {
                     SessionStateEvent::Created => {
                         // 新会话经信封 causation_id == command_id 关联（不轮询列表）。
                         if let Some(cid) = causation_id
-                            && self.pending_creates.remove(&cid).is_some() {
-                                self.open_session_tab(&seed);
-                                self.toast(NoticeLevel::Info, format!("新会话已创建 {seed}"));
-                            }
+                            && self.pending_creates.remove(&cid).is_some()
+                        {
+                            self.open_session_tab(&seed);
+                            self.toast(NoticeLevel::Info, format!("新会话已创建 {seed}"));
+                        }
                     }
                     SessionStateEvent::Resumed => {}
-                    SessionStateEvent::Closed | SessionStateEvent::Archived | SessionStateEvent::Deleted => {
+                    SessionStateEvent::Closed
+                    | SessionStateEvent::Archived
+                    | SessionStateEvent::Deleted => {
                         if self.tabs.contains(&seed) {
                             let verb = match state {
                                 SessionStateEvent::Archived => "已归档",
@@ -466,9 +545,10 @@ impl App {
             }
             ControlEvent::SessionMetaChanged { title, .. } => {
                 if let Some(sess) = self.sessions.get_mut(&seed)
-                    && let Some(t) = title.clone() {
-                        sess.title = Some(t);
-                    }
+                    && let Some(t) = title.clone()
+                {
+                    sess.title = Some(t);
+                }
                 self.session_list_at = None;
             }
             ControlEvent::ConfigChanged { .. } => {
@@ -479,27 +559,50 @@ impl App {
                     st.profile_sel = None;
                     st.ws_sel = None;
                 }
-                if self.overlays.iter().any(|o| matches!(o, Overlay::Settings(_))) {
+                if self
+                    .overlays
+                    .iter()
+                    .any(|o| matches!(o, Overlay::Settings(_)))
+                {
                     self.fetch_config();
                 }
             }
-            ControlEvent::InteractionRequested { interaction_id, turn_id, mode, questions } => {
+            ControlEvent::InteractionRequested {
+                interaction_id,
+                turn_id,
+                mode,
+                questions,
+            } => {
                 if let Some(sess) = self.sessions.get_mut(&seed) {
-                    sess.pending_ask = Some(AskPanel::new(interaction_id, turn_id, mode, questions));
+                    sess.pending_ask =
+                        Some(AskPanel::new(interaction_id, turn_id, mode, questions));
                     sess.scroll.follow = true;
                 }
             }
-            ControlEvent::InteractionResolved { resolution, interaction_id } => {
+            ControlEvent::InteractionResolved {
+                resolution,
+                interaction_id,
+            } => {
                 if let Some(sess) = self.sessions.get_mut(&seed)
-                    && sess.pending_ask.as_ref().is_some_and(|p| p.interaction_id == interaction_id) {
-                        sess.pending_ask = None;
-                        let _ = resolution;
-                    }
+                    && sess
+                        .pending_ask
+                        .as_ref()
+                        .is_some_and(|p| p.interaction_id == interaction_id)
+                {
+                    sess.pending_ask = None;
+                    let _ = resolution;
+                }
                 if resolution == AskResolution::Dismissed {
                     self.toast(NoticeLevel::Warn, format!("ask 已跳过 [{seed}]"));
                 }
             }
-            ControlEvent::PlanReviewRequested { interaction_id, turn_id, plan_content, review_type, todo_items } => {
+            ControlEvent::PlanReviewRequested {
+                interaction_id,
+                turn_id,
+                plan_content,
+                review_type,
+                todo_items,
+            } => {
                 if let Some(sess) = self.sessions.get_mut(&seed) {
                     sess.pending_plan = Some(PlanPanel {
                         interaction_id,
@@ -513,17 +616,33 @@ impl App {
                     });
                 }
             }
-            ControlEvent::PlanReviewResolved { interaction_id, approved } => {
+            ControlEvent::PlanReviewResolved {
+                interaction_id,
+                approved,
+            } => {
                 if let Some(sess) = self.sessions.get_mut(&seed)
-                    && sess.pending_plan.as_ref().is_some_and(|p| p.interaction_id == interaction_id) {
-                        sess.pending_plan = None;
-                    }
+                    && sess
+                        .pending_plan
+                        .as_ref()
+                        .is_some_and(|p| p.interaction_id == interaction_id)
+                {
+                    sess.pending_plan = None;
+                }
                 self.toast(
-                    if approved { NoticeLevel::Info } else { NoticeLevel::Warn },
+                    if approved {
+                        NoticeLevel::Info
+                    } else {
+                        NoticeLevel::Warn
+                    },
                     format!("plan review {}", if approved { "已批准" } else { "已拒绝" }),
                 );
             }
-            ControlEvent::SkillsUpdated { available, active, runtime, .. } => {
+            ControlEvent::SkillsUpdated {
+                available,
+                active,
+                runtime,
+                ..
+            } => {
                 if let Some(sess) = self.sessions.get_mut(&seed) {
                     sess.skills = Some(crate::protocol::event::SkillsStatus {
                         available,
@@ -551,26 +670,36 @@ impl App {
                     sess.dashboard = Some(snapshot);
                     sess.rendered = None;
                 } else if self.sessions.contains_key(&snapshot.seed)
-                    && let Some(sess) = self.sessions.get_mut(&snapshot.seed) {
-                        sess.dashboard = Some(snapshot);
-                        sess.rendered = None;
-                    }
+                    && let Some(sess) = self.sessions.get_mut(&snapshot.seed)
+                {
+                    sess.dashboard = Some(snapshot);
+                    sess.rendered = None;
+                }
                 // replaceable 空快照（tasks=[]）时：老 daemon/丢帧后仍为空，主动回退 service 拉取。
                 let needs_fallback = self
                     .sessions
                     .get(&target)
                     .and_then(|s| s.dashboard.as_ref())
-                    .is_some_and(|d| d.tasks.is_empty() && d.recent_edits.is_empty() && d.documents.is_empty());
+                    .is_some_and(|d| {
+                        d.tasks.is_empty() && d.recent_edits.is_empty() && d.documents.is_empty()
+                    });
                 if needs_fallback {
                     self.fetch_dashboard(target.clone());
                 }
             }
             ControlEvent::DashboardUpdated { session_seed, .. } => {
-                let target = if session_seed.is_empty() { seed.clone() } else { session_seed.clone() };
+                let target = if session_seed.is_empty() {
+                    seed.clone()
+                } else {
+                    session_seed.clone()
+                };
                 let needs_fetch = if self.sessions.contains_key(&target) {
                     let sess = &self.sessions[&target];
                     sess.dashboard.is_none()
-                        || sess.dashboard.as_ref().is_some_and(|d| d.tasks.is_empty() && d.documents.is_empty())
+                        || sess
+                            .dashboard
+                            .as_ref()
+                            .is_some_and(|d| d.tasks.is_empty() && d.documents.is_empty())
                 } else {
                     false
                 };
@@ -582,13 +711,19 @@ impl App {
                 self.toast(NoticeLevel::Info, format!("子代理 {name}: {state}"));
             }
             ControlEvent::OperationFailed { scope, error, .. } => {
-                self.toast(NoticeLevel::Error, format!("失败[{:?}] {}: {}", scope, error.code, error.message));
+                self.toast(
+                    NoticeLevel::Error,
+                    format!("失败[{:?}] {}: {}", scope, error.code, error.message),
+                );
                 // 鬼影清理（winui 教训）：ask 被拒/交互不存在 → 清挂起面板。
-                if matches!(error.code.as_str(), "ask_rejected" | "interaction_not_found")
-                    && let Some(sess) = self.sessions.get_mut(&seed) {
-                        sess.pending_ask = None;
-                        sess.pending_plan = None;
-                    }
+                if matches!(
+                    error.code.as_str(),
+                    "ask_rejected" | "interaction_not_found"
+                ) && let Some(sess) = self.sessions.get_mut(&seed)
+                {
+                    sess.pending_ask = None;
+                    sess.pending_plan = None;
+                }
             }
             ControlEvent::OperationCompleted { .. } => {}
         }
@@ -597,7 +732,9 @@ impl App {
     // ───────────────────────── 对话频道事件 ─────────────────────────
 
     fn handle_conversation(&mut self, seed: String, ev: ConversationEvent) {
-        let Some(sess) = self.sessions.get_mut(&seed) else { return };
+        let Some(sess) = self.sessions.get_mut(&seed) else {
+            return;
+        };
         match ev {
             ConversationEvent::TurnStarted { turn_id, .. } => {
                 sess.streaming = Some(session::StreamingState {
@@ -613,45 +750,72 @@ impl App {
             ConversationEvent::TurnCompleted { usage, turn_id, .. } => {
                 streaming_done(sess, Some(&turn_id));
                 if let Some(u) = usage
-                    && let Some(conv) = sess.conversation.as_mut() {
-                        conv.usage = Some(u);
-                    }
+                    && let Some(conv) = sess.conversation.as_mut()
+                {
+                    conv.usage = Some(u);
+                }
             }
             ConversationEvent::TurnFailed { turn_id, error } => {
                 streaming_done(sess, Some(&turn_id));
                 sess.last_error = Some(error.clone());
-                self.toast(NoticeLevel::Error, format!("回合失败: {}: {}", error.code, error.message));
+                self.toast(
+                    NoticeLevel::Error,
+                    format!("回合失败: {}: {}", error.code, error.message),
+                );
             }
-            ConversationEvent::RoundDelta { round_num, kind, .. } => {
+            ConversationEvent::RoundDelta {
+                round_num, kind, ..
+            } => {
                 if let Some(s) = sess.streaming.as_mut() {
                     s.round_num = round_num;
                     s.phase = match kind {
                         crate::protocol::event::RoundDeltaKind::Thinking => StreamPhase::Thinking,
-                        crate::protocol::event::RoundDeltaKind::ToolCalling => StreamPhase::ToolCalling,
+                        crate::protocol::event::RoundDeltaKind::ToolCalling => {
+                            StreamPhase::ToolCalling
+                        }
                         crate::protocol::event::RoundDeltaKind::Answering => StreamPhase::Answering,
                     };
                 }
             }
             ConversationEvent::BlockCheckpoint { .. } => {}
             ConversationEvent::RoundCompleted { .. } => {}
-            ConversationEvent::ProviderRetrying { attempt, max_retries, error_message, .. } => {
+            ConversationEvent::ProviderRetrying {
+                attempt,
+                max_retries,
+                error_message,
+                ..
+            } => {
                 self.toast(
                     NoticeLevel::Warn,
-                    format!("provider 重试 {attempt}/{max_retries}: {}", truncate_str(&error_message, 60)),
+                    format!(
+                        "provider 重试 {attempt}/{max_retries}: {}",
+                        truncate_str(&error_message, 60)
+                    ),
                 );
             }
             ConversationEvent::ProviderToolStatus { state, .. } => {
                 if let Some(s) = sess.streaming.as_mut() {
                     s.phase = match state {
-                        crate::protocol::event::ProviderToolState::Completed => StreamPhase::Answering,
+                        crate::protocol::event::ProviderToolState::Completed => {
+                            StreamPhase::Answering
+                        }
                         _ => StreamPhase::ToolCalling,
                     };
                 }
             }
-            ConversationEvent::UsageUpdated { usage, context_limit, model, .. } => {
+            ConversationEvent::UsageUpdated {
+                usage,
+                context_limit,
+                model,
+                ..
+            } => {
                 sess.apply_usage(usage, context_limit, model);
             }
-            ConversationEvent::CompactStarted { turns_total, turns_keeping, .. } => {
+            ConversationEvent::CompactStarted {
+                turns_total,
+                turns_keeping,
+                ..
+            } => {
                 sess.compact_anim = Some(crate::app::session::CompactionAnim {
                     started_at: Instant::now(),
                     turns_total,
@@ -664,16 +828,26 @@ impl App {
                     anim.last_delta = Some(delta);
                 }
             }
-            ConversationEvent::CompactFinished { status, turns_compacted, .. } => {
+            ConversationEvent::CompactFinished {
+                status,
+                turns_compacted,
+                ..
+            } => {
                 sess.compact_anim = None;
                 self.toast(
                     match status {
                         crate::protocol::event::CompactStatus::Completed => NoticeLevel::Info,
                         _ => NoticeLevel::Warn,
                     },
-                    format!("compact {}: {:?}", 
-                        if status == crate::protocol::event::CompactStatus::Completed { "完成" } else { "未完成" },
-                        turns_compacted),
+                    format!(
+                        "compact {}: {:?}",
+                        if status == crate::protocol::event::CompactStatus::Completed {
+                            "完成"
+                        } else {
+                            "未完成"
+                        },
+                        turns_compacted
+                    ),
                 );
             }
             ConversationEvent::ConversationCancelled { turn_id } => {
@@ -686,13 +860,24 @@ impl App {
     // ───────────────────────── 工具频道事件 ─────────────────────────
 
     fn handle_tool(&mut self, seed: String, ev: ToolEvent) {
-        let Some(sess) = self.sessions.get_mut(&seed) else { return };
+        let Some(sess) = self.sessions.get_mut(&seed) else {
+            return;
+        };
         match ev {
             ToolEvent::ToolPermissionRequested {
-                tool_call_id, tool_name, reason, paths, category, level, risk, consequence, ..
+                tool_call_id,
+                tool_name,
+                reason,
+                paths,
+                category,
+                level,
+                risk,
+                consequence,
+                ..
             } => {
                 // 去重：同一 tool_call 只保留一个面板。
-                sess.pending_permissions.retain(|p| p.tool_call_id != tool_call_id);
+                sess.pending_permissions
+                    .retain(|p| p.tool_call_id != tool_call_id);
                 sess.pending_permissions.push(PermissionPanel {
                     tool_call_id,
                     tool_name,
@@ -706,20 +891,28 @@ impl App {
                 });
             }
             // daemon 无独立 permission-resolved 事件：以 Started/Finished 兜底清除。
-            ToolEvent::ToolStarted { tool_call_id, name, .. } => {
-                sess.pending_permissions.retain(|p| p.tool_call_id != tool_call_id);
+            ToolEvent::ToolStarted {
+                tool_call_id, name, ..
+            } => {
+                sess.pending_permissions
+                    .retain(|p| p.tool_call_id != tool_call_id);
                 if let Some(s) = sess.streaming.as_mut() {
                     s.phase = StreamPhase::ToolCalling;
                     s.tool_name = Some(name);
                 }
             }
             ToolEvent::ToolFinished { tool_call_id, .. } => {
-                sess.pending_permissions.retain(|p| p.tool_call_id != tool_call_id);
+                sess.pending_permissions
+                    .retain(|p| p.tool_call_id != tool_call_id);
             }
             ToolEvent::ToolNotice { level, message, .. } => {
                 self.toast(level, format!("[tool] {message}"));
             }
-            ToolEvent::CodeChanged { lines_added, lines_removed, .. } => {
+            ToolEvent::CodeChanged {
+                lines_added,
+                lines_removed,
+                ..
+            } => {
                 sess.code_added += lines_added;
                 sess.code_removed += lines_removed;
             }
@@ -736,21 +929,28 @@ impl App {
                     let bootstrap_seed = seed.clone();
                     let mut needs_fetch = false;
                     if let Some(sess) = self.sessions.get_mut(&bootstrap_seed) {
-                        let conv = crate::protocol::snapshot::ConversationStateView::parse(&b.conversation.state);
+                        let conv = crate::protocol::snapshot::ConversationStateView::parse(
+                            &b.conversation.state,
+                        );
                         sess.usage = conv.usage.clone();
                         sess.usage_totals = conv.usage_totals.clone();
                         sess.context_limit = conv.context_limit;
                         let model = conv.model.clone();
                         sess.conversation = Some(conv);
-                        let ctl = crate::protocol::snapshot::ChannelStateView::parse_control(&b.control.state);
+                        let ctl = crate::protocol::snapshot::ChannelStateView::parse_control(
+                            &b.control.state,
+                        );
                         sess.activity = ctl.activity.or(sess.activity);
                         if sess.mode == crate::protocol::command::ConversationMode::Code
-                            && let Some(meta) = &sess.meta {
-                                sess.mode = meta.conversation_mode();
-                            }
+                            && let Some(meta) = &sess.meta
+                        {
+                            sess.mode = meta.conversation_mode();
+                        }
                         match ctl.dashboard {
                             Some(dash) => {
-                                let is_empty = dash.tasks.is_empty() && dash.documents.is_empty() && dash.recent_edits.is_empty();
+                                let is_empty = dash.tasks.is_empty()
+                                    && dash.documents.is_empty()
+                                    && dash.recent_edits.is_empty();
                                 sess.dashboard = Some(dash);
                                 sess.rendered = None;
                                 needs_fetch = is_empty;
@@ -759,7 +959,8 @@ impl App {
                                 needs_fetch = true;
                             }
                         }
-                        let tool = crate::protocol::snapshot::ChannelStateView::parse_tool(&b.tool.state);
+                        let tool =
+                            crate::protocol::snapshot::ChannelStateView::parse_tool(&b.tool.state);
                         if let Some(perm) = tool.pending_permission {
                             // bootstrap 恢复挂起权限（详情等 tool 事件补全）。
                             sess.pending_permissions.push(PermissionPanel {
@@ -785,7 +986,11 @@ impl App {
                 }
                 Err(e) => self.toast(NoticeLevel::Error, format!("bootstrap 失败[{seed}]: {e}")),
             },
-            ActionResult::CommandAck { seed, label, result } => match result {
+            ActionResult::CommandAck {
+                seed,
+                label,
+                result,
+            } => match result {
                 Ok(ack) => {
                     if ack.status == crate::protocol::envelope::AckStatus::Rejected {
                         let msg = format!(
@@ -796,10 +1001,11 @@ impl App {
                         );
                         self.toast(NoticeLevel::Error, msg.clone());
                         if let Some(seed) = seed
-                            && let Some(sess) = self.sessions.get_mut(&seed) {
-                                sess.composer.input = msg.chars().collect(); // 不丢内容
-                                sess.composer.cursor = sess.composer.input.len();
-                            }
+                            && let Some(sess) = self.sessions.get_mut(&seed)
+                        {
+                            sess.composer.input = msg.chars().collect(); // 不丢内容
+                            sess.composer.cursor = sess.composer.input.len();
+                        }
                     }
                 }
                 Err(e) => {
@@ -827,9 +1033,11 @@ impl App {
                     for item in arr {
                         if let (Some(seed), Some(state)) =
                             (item.get("seed").and_then(|s| s.as_str()), item.get("state"))
-                            && let Ok(state) = serde_json::from_value::<ActivityState>(state.clone()) {
-                                self.activity_cache.insert(seed.to_owned(), state);
-                            }
+                            && let Ok(state) =
+                                serde_json::from_value::<ActivityState>(state.clone())
+                        {
+                            self.activity_cache.insert(seed.to_owned(), state);
+                        }
                     }
                 }
             }
@@ -900,7 +1108,12 @@ impl App {
                     sess.loading_older = false;
                 }
             }
-            ActionResult::Receipt { label, seed, result, .. } => match result {
+            ActionResult::Receipt {
+                label,
+                seed,
+                result,
+                ..
+            } => match result {
                 Ok(status) if status.state == CommandState::Succeeded => {
                     self.toast(NoticeLevel::Info, format!("{label} 完成"));
                     if let Some(seed) = seed {
@@ -908,10 +1121,7 @@ impl App {
                     }
                 }
                 Ok(status) => {
-                    self.toast(
-                        NoticeLevel::Warn,
-                        format!("{label}: {:?}", status.state),
-                    );
+                    self.toast(NoticeLevel::Warn, format!("{label}: {:?}", status.state));
                 }
                 Err(e) => self.toast(NoticeLevel::Error, format!("{label}: {e}")),
             },
@@ -920,10 +1130,13 @@ impl App {
                 match result {
                     Ok(dash) => {
                         if let Some(sess) = self.sessions.get_mut(&seed)
-                            && (!dash.tasks.is_empty() || !dash.recent_edits.is_empty() || !dash.documents.is_empty()) {
-                                sess.dashboard = Some(dash);
-                                sess.rendered = None;
-                            }
+                            && (!dash.tasks.is_empty()
+                                || !dash.recent_edits.is_empty()
+                                || !dash.documents.is_empty())
+                        {
+                            sess.dashboard = Some(dash);
+                            sess.rendered = None;
+                        }
                     }
                     Err(_e) => {}
                 }
@@ -940,7 +1153,11 @@ impl App {
     }
 
     pub fn toast(&mut self, level: NoticeLevel, text: impl Into<String>) {
-        self.toasts.push_back(Toast { level, text: text.into(), at: Instant::now() });
+        self.toasts.push_back(Toast {
+            level,
+            text: text.into(),
+            at: Instant::now(),
+        });
         while self.toasts.len() > 8 {
             self.toasts.pop_front();
         }
@@ -952,7 +1169,9 @@ impl App {
     /// 今后如需统一超时/退避/取消/指标，只需叠加在此处。
     pub(super) fn spawn_api<F, Fut>(&self, task: F)
     where
-        F: FnOnce(Arc<HttpClient>, tokio::sync::mpsc::UnboundedSender<AppMsg>) -> Fut + Send + 'static,
+        F: FnOnce(Arc<HttpClient>, tokio::sync::mpsc::UnboundedSender<AppMsg>) -> Fut
+            + Send
+            + 'static,
         Fut: std::future::Future<Output = ()> + Send,
     {
         let client = self.client.clone();
@@ -987,7 +1206,9 @@ impl App {
             }
             Some(GlobalKey::CloseTab) => {
                 if let Some(seed) = self.active_seed() {
-                    self.overlays.push(Overlay::Confirm { action: ConfirmAction::CloseTab(seed) });
+                    self.overlays.push(Overlay::Confirm {
+                        action: ConfirmAction::CloseTab(seed),
+                    });
                 }
                 return;
             }
@@ -1027,10 +1248,11 @@ impl App {
 
         // Alt+数字 / Alt+方向：标签切换（目标计算为纯函数，见 keymap）。
         if key.modifiers.contains(KeyModifiers::ALT)
-            && let Some(next) = keymap::alt_tab_target(self.active, self.tabs.len(), key.code) {
-                self.active = next;
-                return;
-            }
+            && let Some(next) = keymap::alt_tab_target(self.active, self.tabs.len(), key.code)
+        {
+            self.active = next;
+            return;
+        }
 
         // 交互弹窗（permission > ask > plan）吃掉全部按键。
         if self.modal_key(key) {
@@ -1043,10 +1265,9 @@ impl App {
         }
 
         // 首页（无 tab 且无覆盖层时，会话列表即首页）
-        if self.tabs.is_empty()
-            && self.home_key(key) {
-                return;
-            }
+        if self.tabs.is_empty() && self.home_key(key) {
+            return;
+        }
 
         // Composer。
         self.composer_key(key);
@@ -1068,23 +1289,36 @@ impl App {
     /// 每帧前维护：焦点变化时执行 LRU 内存回收；只为 active 会话重建
     /// 渲染缓存（后台标签的缓存已被丢弃，聚焦时按需重建一次）。
     pub fn ensure_render_caches(&mut self, width: u16) {
-        let Some(active) = self.active_seed() else { return };
+        let Some(active) = self.active_seed() else {
+            return;
+        };
         if self.last_focused.as_deref() != Some(active.as_str()) {
             self.touch_focus(&active);
             self.last_focused = Some(active.clone());
         }
-        let Some(sess) = self.sessions.get_mut(&active) else { return };
+        let Some(sess) = self.sessions.get_mut(&active) else {
+            return;
+        };
         // 流式/运行中工具需动画：即使 version 未变也定期重绘（对齐 opencode Spinner 60fps，tui 侧 500ms Tick 驱动）
         let streaming = sess.timeline.is_streaming()
-            || sess.timeline.turns.iter().any(|t| t.rounds.iter().any(|r| r.blocks.iter().any(|b| {
-                b.tool.as_ref().is_some_and(|tl| tl.state == crate::protocol::timeline::TimelineToolState::Running)
-            })));
+            || sess.timeline.turns.iter().any(|t| {
+                t.rounds.iter().any(|r| {
+                    r.blocks.iter().any(|b| {
+                        b.tool.as_ref().is_some_and(|tl| {
+                            tl.state == crate::protocol::timeline::TimelineToolState::Running
+                        })
+                    })
+                })
+            });
         let need = match &sess.rendered {
-            Some(cached) => cached.version != sess.timeline.version || cached.width != width || streaming,
+            Some(cached) => {
+                cached.version != sess.timeline.version || cached.width != width || streaming
+            }
             None => true,
         };
         if need {
-            let lines = render_transcript::render_transcript_with_opts(sess, width, self.show_reasoning);
+            let lines =
+                render_transcript::render_transcript_with_opts(sess, width, self.show_reasoning);
             sess.rendered = Some(session::RenderedTranscript {
                 version: sess.timeline.version,
                 width,
@@ -1092,14 +1326,16 @@ impl App {
             });
         }
     }
-
 }
 
 pub fn truncate_str(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
         s.to_owned()
     } else {
-        format!("{}…", s.chars().take(max.saturating_sub(1)).collect::<String>())
+        format!(
+            "{}…",
+            s.chars().take(max.saturating_sub(1)).collect::<String>()
+        )
     }
 }
 

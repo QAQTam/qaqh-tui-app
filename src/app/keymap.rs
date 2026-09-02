@@ -46,7 +46,9 @@ pub(crate) fn map_global_key(key: &KeyEvent) -> Option<GlobalKey> {
         KeyCode::Char('t') if ctrl => Some(GlobalKey::NewSession),
         KeyCode::Char('l') if ctrl => Some(GlobalKey::SessionList),
         KeyCode::Char(',') if ctrl => Some(GlobalKey::ToggleSettings),
-        KeyCode::Char('w') if key.modifiers.contains(KeyModifiers::ALT) => Some(GlobalKey::CloseTab),
+        KeyCode::Char('w') if key.modifiers.contains(KeyModifiers::ALT) => {
+            Some(GlobalKey::CloseTab)
+        }
         KeyCode::F(1) => Some(GlobalKey::Help),
         KeyCode::F(3) => Some(GlobalKey::ToggleReasoning),
         KeyCode::F(4) => Some(GlobalKey::ToggleWorkspace),
@@ -119,26 +121,59 @@ mod tests {
     #[test]
     fn global_keys_map_to_intents() {
         let ctrl = KeyModifiers::CONTROL;
-        assert_eq!(map_global_key(&key(KeyCode::Char('c'), ctrl)), Some(GlobalKey::QuitArmed));
-        assert_eq!(map_global_key(&key(KeyCode::Char('q'), ctrl)), Some(GlobalKey::QuitNow));
-        assert_eq!(map_global_key(&key(KeyCode::Char('t'), ctrl)), Some(GlobalKey::NewSession));
-        assert_eq!(map_global_key(&key(KeyCode::Char('l'), ctrl)), Some(GlobalKey::SessionList));
-        assert_eq!(map_global_key(&key(KeyCode::Char(','), ctrl)), Some(GlobalKey::ToggleSettings));
-        assert_eq!(map_global_key(&key(KeyCode::F(10), KeyModifiers::NONE)), Some(GlobalKey::ToggleSettings));
+        assert_eq!(
+            map_global_key(&key(KeyCode::Char('c'), ctrl)),
+            Some(GlobalKey::QuitArmed)
+        );
+        assert_eq!(
+            map_global_key(&key(KeyCode::Char('q'), ctrl)),
+            Some(GlobalKey::QuitNow)
+        );
+        assert_eq!(
+            map_global_key(&key(KeyCode::Char('t'), ctrl)),
+            Some(GlobalKey::NewSession)
+        );
+        assert_eq!(
+            map_global_key(&key(KeyCode::Char('l'), ctrl)),
+            Some(GlobalKey::SessionList)
+        );
+        assert_eq!(
+            map_global_key(&key(KeyCode::Char(','), ctrl)),
+            Some(GlobalKey::ToggleSettings)
+        );
+        assert_eq!(
+            map_global_key(&key(KeyCode::F(10), KeyModifiers::NONE)),
+            Some(GlobalKey::ToggleSettings)
+        );
     }
 
     #[test]
     fn alt_w_requires_alt_not_ctrl() {
         // Ctrl+W 不是全局键（避免与终端习惯冲突），Alt+W 才是。
-        assert_eq!(map_global_key(&key(KeyCode::Char('w'), KeyModifiers::ALT)), Some(GlobalKey::CloseTab));
-        assert_eq!(map_global_key(&key(KeyCode::Char('w'), KeyModifiers::CONTROL)), None);
+        assert_eq!(
+            map_global_key(&key(KeyCode::Char('w'), KeyModifiers::ALT)),
+            Some(GlobalKey::CloseTab)
+        );
+        assert_eq!(
+            map_global_key(&key(KeyCode::Char('w'), KeyModifiers::CONTROL)),
+            None
+        );
     }
 
     #[test]
     fn plain_and_unknown_keys_are_not_global() {
-        assert_eq!(map_global_key(&key(KeyCode::Char('t'), KeyModifiers::NONE)), None);
-        assert_eq!(map_global_key(&key(KeyCode::F(2), KeyModifiers::NONE)), None);
-        assert_eq!(map_global_key(&key(KeyCode::Char('x'), KeyModifiers::CONTROL)), None);
+        assert_eq!(
+            map_global_key(&key(KeyCode::Char('t'), KeyModifiers::NONE)),
+            None
+        );
+        assert_eq!(
+            map_global_key(&key(KeyCode::F(2), KeyModifiers::NONE)),
+            None
+        );
+        assert_eq!(
+            map_global_key(&key(KeyCode::Char('x'), KeyModifiers::CONTROL)),
+            None
+        );
     }
 
     #[test]

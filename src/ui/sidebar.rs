@@ -6,15 +6,15 @@
 //!
 //! 失败路径：若 SSE 丢帧，`DashboardUpdated` 为空实现，未来可走 `session.dashboard` 拉取兜底。
 
+use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
-use ratatui::Frame;
 use unicode_width::UnicodeWidthStr;
 
 use crate::app::render_line::wrap_text;
-use crate::app::{truncate_str, App};
+use crate::app::{App, truncate_str};
 use crate::protocol::event::DashboardTask;
 use crate::ui::theme;
 
@@ -26,10 +26,20 @@ pub const MIN_MAIN_WIDTH: u16 = 85;
 fn glyph_and_style(status: &str, current: bool, frame: u64, phase: u64) -> (&'static str, Style) {
     match status {
         // in_progress：braille 八帧转轮；task_id 相位偏移避免所有行同步闪动。
-        "in_progress" => (crate::app::anim::spinner_glyph(frame + phase), theme::warn()),
+        "in_progress" => (
+            crate::app::anim::spinner_glyph(frame + phase),
+            theme::warn(),
+        ),
         "completed" => ("●", theme::ok()),
         "cancelled" => ("✕", theme::dim()),
-        _ => ("○", if current { theme::accent() } else { theme::dim() }),
+        _ => (
+            "○",
+            if current {
+                theme::accent()
+            } else {
+                theme::dim()
+            },
+        ),
     }
 }
 
@@ -43,15 +53,28 @@ fn progress_bar(done: usize, total: usize, _width: usize) -> (String, Style) {
     let empty = 10usize.saturating_sub(filled);
     let bar = format!("{}{}", "▰".repeat(filled), "▱".repeat(empty));
     let pct = (ratio * 100.0) as usize;
-    (format!("{bar} {pct}%"), if done == total { theme::ok() } else { theme::accent() })
+    (
+        format!("{bar} {pct}%"),
+        if done == total {
+            theme::ok()
+        } else {
+            theme::accent()
+        },
+    )
 }
 
 pub fn draw(f: &mut Frame, app: &App, area: Rect) {
-    let Some(sess) = app.active_session() else { return };
+    let Some(sess) = app.active_session() else {
+        return;
+    };
     // 标题计数：done/total
     let title_extra = if let Some(dash) = sess.dashboard.as_ref() {
         let total = dash.tasks.len();
-        let done = dash.tasks.iter().filter(|t| t.status == "completed").count();
+        let done = dash
+            .tasks
+            .iter()
+            .filter(|t| t.status == "completed")
+            .count();
         if total > 0 {
             format!(" {done}/{total} ")
         } else {
@@ -66,16 +89,21 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) {
         .border_style(theme::dim())
         .title(Line::from(vec![
             Span::styled(" workspace ", Style::new().add_modifier(Modifier::BOLD)),
-            Span::styled(title_extra.clone(), if sess.dashboard.is_some() { theme::accent() } else { theme::dim() }),
+            Span::styled(
+                title_extra.clone(),
+                if sess.dashboard.is_some() {
+                    theme::accent()
+                } else {
+                    theme::dim()
+                },
+            ),
             Span::styled("· F4 隐藏 ", theme::dim()),
             Span::styled("F6 详情", theme::dim()),
         ]))
-        .title_bottom(Line::from(vec![
-            Span::styled(
-                sess.display_model().unwrap_or_else(|| "no model".into()),
-                theme::dim(),
-            ),
-        ]));
+        .title_bottom(Line::from(vec![Span::styled(
+            sess.display_model().unwrap_or_else(|| "no model".into()),
+            theme::dim(),
+        )]));
     f.render_widget(block, area);
     let inner = Rect {
         x: area.x + 1,
@@ -94,7 +122,10 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) {
                 Line::from(Span::styled("  ◯  尚无 todo", theme::dim())),
                 Line::from(""),
                 Line::from(Span::styled("  agent 用", theme::dim())),
-                Line::from(Span::styled("  todo 工具维护的", Style::new().add_modifier(Modifier::BOLD))),
+                Line::from(Span::styled(
+                    "  todo 工具维护的",
+                    Style::new().add_modifier(Modifier::BOLD),
+                )),
                 Line::from(Span::styled("  任务会在这里", theme::dim())),
                 Line::from(Span::styled("  实时更新。", theme::dim())),
                 Line::from(""),
@@ -127,26 +158,44 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) {
         }
     }
     let all_settled = !dash.tasks.is_empty()
-        && dash.tasks.iter().all(|t| t.status == "completed" || t.status == "cancelled");
+        && dash
+            .tasks
+            .iter()
+            .all(|t| t.status == "completed" || t.status == "cancelled");
 
     // ── 顶部摘要 + 进度条 ──
     if total > 0 {
         // 计数行：更紧凑且带色点
         lines.push(Line::from(vec![
-            Span::styled(format!(" ○{idle} "), if idle > 0 { Style::new() } else { theme::dim() }),
-            Span::styled(format!("◐{doing} "), if doing > 0 { theme::warn() } else { theme::dim() }),
-            Span::styled(format!("●{done} "), if done > 0 { theme::ok() } else { theme::dim() }),
             Span::styled(
-                if cancelled > 0 { format!("✕{cancelled} ") } else { String::new() },
+                format!(" ○{idle} "),
+                if idle > 0 { Style::new() } else { theme::dim() },
+            ),
+            Span::styled(
+                format!("◐{doing} "),
+                if doing > 0 {
+                    theme::warn()
+                } else {
+                    theme::dim()
+                },
+            ),
+            Span::styled(
+                format!("●{done} "),
+                if done > 0 { theme::ok() } else { theme::dim() },
+            ),
+            Span::styled(
+                if cancelled > 0 {
+                    format!("✕{cancelled} ")
+                } else {
+                    String::new()
+                },
                 theme::dim(),
             ),
             Span::styled(format!("/{total}"), theme::dim()),
         ]));
         if !all_settled {
             let (bar, bar_style) = progress_bar(done, total, width);
-            lines.push(Line::from(vec![
-                Span::styled(bar, bar_style),
-            ]));
+            lines.push(Line::from(vec![Span::styled(bar, bar_style)]));
         } else {
             lines.push(Line::from(Span::styled(
                 format!(" ✓ {done}/{total} 全部完成"),
@@ -155,12 +204,17 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) {
         }
         // 当前聚焦
         if let Some(cur) = dash.current_todo_id.as_deref()
-            && let Some(task) = dash.tasks.iter().find(|t| t.id == cur) {
-                let tag = format!(" ▶ {} ", truncate_str(&task.subject, width.saturating_sub(6)));
-                lines.push(Line::from(vec![
-                    Span::styled(tag, Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-                ]));
-            }
+            && let Some(task) = dash.tasks.iter().find(|t| t.id == cur)
+        {
+            let tag = format!(
+                " ▶ {} ",
+                truncate_str(&task.subject, width.saturating_sub(6))
+            );
+            lines.push(Line::from(vec![Span::styled(
+                tag,
+                Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            )]));
+        }
         lines.push(Line::from(Span::styled(
             "─".repeat(width.min(28)),
             Style::new().fg(Color::Indexed(236)),
@@ -171,7 +225,10 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) {
             "─".repeat(width.min(28)),
             Style::new().fg(Color::Indexed(236)),
         )));
-        lines.push(Line::from(Span::styled(" 让 agent 创建首个 todo", theme::dim())));
+        lines.push(Line::from(Span::styled(
+            " 让 agent 创建首个 todo",
+            theme::dim(),
+        )));
         lines.push(Line::from(vec![
             Span::styled("  ", theme::dim()),
             Span::styled("todo:create", Style::new().fg(Color::Cyan)),
@@ -181,7 +238,8 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) {
     if all_settled {
         for task in &dash.tasks {
             let phase = task.id.bytes().map(|b| b as u64).sum::<u64>();
-            let (glyph, glyph_style) = glyph_and_style(&task.status, false, crate::app::anim::frame_now(), phase);
+            let (glyph, glyph_style) =
+                glyph_and_style(&task.status, false, crate::app::anim::frame_now(), phase);
             let subject = truncate_str(&task.subject, width.saturating_sub(7));
             lines.push(Line::from(vec![
                 Span::styled(format!(" {glyph} "), glyph_style),
@@ -191,10 +249,19 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) {
     } else {
         // 保持服务端原始顺序（计划顺序），突出 in_progress
         for task in &dash.tasks {
-            push_task(&mut lines, task, dash.current_todo_id.as_deref(), width, app.show_todo_detail);
+            push_task(
+                &mut lines,
+                task,
+                dash.current_todo_id.as_deref(),
+                width,
+                app.show_todo_detail,
+            );
         }
         if !app.show_todo_detail && !dash.tasks.is_empty() {
-            lines.push(Line::from(Span::styled("  … F6 展开描述/证据", theme::dim())));
+            lines.push(Line::from(Span::styled(
+                "  … F6 展开描述/证据",
+                theme::dim(),
+            )));
         }
     }
 
@@ -262,7 +329,8 @@ fn push_task(
 ) {
     let current = current_id == Some(task.id.as_str());
     let phase = task.id.bytes().map(|b| b as u64).sum::<u64>();
-    let (glyph, glyph_style) = glyph_and_style(&task.status, current, crate::app::anim::frame_now(), phase);
+    let (glyph, glyph_style) =
+        glyph_and_style(&task.status, current, crate::app::anim::frame_now(), phase);
     let mark = if current { "▸" } else { " " };
     // ID 徽标更易扫视（T1 / T12）
     let id_tag = format!("{} ", task.id);
@@ -274,7 +342,9 @@ fn push_task(
     } else if task.status == "completed" {
         theme::dim()
     } else if task.status == "cancelled" {
-        Style::new().fg(Color::DarkGray).add_modifier(Modifier::CROSSED_OUT)
+        Style::new()
+            .fg(Color::DarkGray)
+            .add_modifier(Modifier::CROSSED_OUT)
     } else {
         Style::new().add_modifier(Modifier::BOLD)
     };
@@ -303,7 +373,12 @@ fn push_task(
             Span::styled(format!("↳ {desc}"), theme::dim()),
         ]));
     }
-    if let Some(evidence) = task.evidence.as_deref().filter(|s| !s.is_empty()).filter(|_| show_detail) {
+    if let Some(evidence) = task
+        .evidence
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .filter(|_| show_detail)
+    {
         let one = evidence.replace('\n', " ");
         let ev = truncate_str(&one, width.saturating_sub(prefix_w + 3));
         lines.push(Line::from(vec![

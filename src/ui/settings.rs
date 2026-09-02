@@ -4,18 +4,18 @@
 //! 光标必须每帧 `set_cursor_position` 才可见（只在编辑行设置，避免多覆盖层争抢）；
 //! 中文对齐用 unicode_width 而非 chars().count()。
 
+use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Margin, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
     Block, Borders, Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap,
 };
-use ratatui::Frame;
 
 use crate::app::render_line::edit_window;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use crate::app::settings::{FieldKind, SettingsState, Row, ROWS};
+use crate::app::settings::{FieldKind, ROWS, Row, SettingsState};
 use crate::app::{App, Overlay};
 use crate::protocol::config::ConfigDto;
 use crate::ui::{modal, theme};
@@ -26,7 +26,9 @@ const MARKER_W: usize = 2;
 const SEP_W: usize = 2;
 
 pub fn draw(f: &mut Frame, app: &App, area: Rect) {
-    let Some(Overlay::Settings(st)) = app.overlays.last() else { return };
+    let Some(Overlay::Settings(st)) = app.overlays.last() else {
+        return;
+    };
     let loaded = app.config.as_ref();
 
     let width = 96u16.min(area.width.saturating_sub(2));
@@ -42,7 +44,11 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) {
     };
     let block = Block::new()
         .borders(Borders::ALL)
-        .border_style(if dirty { theme::warn() } else { theme::accent() })
+        .border_style(if dirty {
+            theme::warn()
+        } else {
+            theme::accent()
+        })
         .title(title);
     f.render_widget(block, outer);
 
@@ -56,7 +62,10 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) {
     // 底部页脚一行 + 滚动条一列。
     let [body, footer] = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(inner);
     let body_w = body.width.saturating_sub(1); // 右侧一列留给滚动条
-    let body_area = Rect { width: body_w, ..body };
+    let body_area = Rect {
+        width: body_w,
+        ..body
+    };
 
     // ── 行构造（滚动与光标定位共用同一份几何数据） ──
     let value_w = body_w
@@ -118,11 +127,7 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) {
 
     // 页脚。
     let footer_line = if st.editing.is_some() {
-        modal::footer_line(&[
-            ("Enter", "确认"),
-            ("Esc", "取消"),
-            ("←→/Home/End", "光标"),
-        ])
+        modal::footer_line(&[("Enter", "确认"), ("Esc", "取消"), ("←→/Home/End", "光标")])
     } else {
         modal::footer_line(&[
             ("↑↓", "选择"),
@@ -187,7 +192,11 @@ fn row_line(
     Line::from(vec![
         Span::styled(
             format!("{marker} "),
-            if focused { theme::accent() } else { theme::dim() },
+            if focused {
+                theme::accent()
+            } else {
+                theme::dim()
+            },
         ),
         Span::styled(
             label,
@@ -244,5 +253,4 @@ mod tests {
         assert_eq!(fit_width("自动压缩阈值", 8), "自动压…");
         assert_eq!(fit_width("ok", 10), "ok");
     }
-
 }

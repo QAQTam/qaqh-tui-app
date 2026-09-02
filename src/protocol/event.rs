@@ -311,7 +311,10 @@ pub struct SkillsStatus {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ConversationEvent {
     /// 新回合开始的权威事件。
-    TurnStarted { turn_id: String, user_text: String },
+    TurnStarted {
+        turn_id: String,
+        user_text: String,
+    },
     TurnCompleted {
         turn_id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -319,7 +322,10 @@ pub enum ConversationEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         usage: Option<UsageInfo>,
     },
-    TurnFailed { turn_id: String, error: DomainError },
+    TurnFailed {
+        turn_id: String,
+        error: DomainError,
+    },
     /// 流式增量（reliable：追加语义）。
     RoundDelta {
         turn_id: String,
@@ -374,7 +380,10 @@ pub enum ConversationEvent {
         turns_total: u32,
         turns_keeping: u32,
     },
-    CompactProgress { compact_id: String, delta: String },
+    CompactProgress {
+        compact_id: String,
+        delta: String,
+    },
     CompactFinished {
         compact_id: String,
         status: CompactStatus,
@@ -485,9 +494,14 @@ impl ToolEvent {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ControlEvent {
-    SessionStateChanged { seed: String, state: SessionState },
+    SessionStateChanged {
+        seed: String,
+        state: SessionState,
+    },
     /// seed 惯例为空串（全局广播）；消费后重拉 config.load。
-    ConfigChanged { rev: u64 },
+    ConfigChanged {
+        rev: u64,
+    },
     SessionActivityChanged {
         seed: String,
         state: ActivityState,
@@ -501,7 +515,9 @@ pub enum ControlEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         title: Option<String>,
     },
-    AgentLifecycleChanged { state: AgentLifecycleState },
+    AgentLifecycleChanged {
+        state: AgentLifecycleState,
+    },
     DashboardUpdated {
         hp_connected: bool,
         session_seed: String,
@@ -510,7 +526,9 @@ pub enum ControlEvent {
         current_phase: String,
         streaming: bool,
     },
-    DashboardSnapshot { snapshot: DashboardSnapshot },
+    DashboardSnapshot {
+        snapshot: DashboardSnapshot,
+    },
     /// ask_user 请求（ask/plan 归 Control，permission 归 Tool）。
     InteractionRequested {
         interaction_id: String,

@@ -44,7 +44,10 @@ pub struct ConfigDto {
     pub font_family: String,
     /// None/空 = 跟随系统。
     pub theme: Option<String>,
-    #[serde(default = "default_notifications_enabled", alias = "notifications_enabled")]
+    #[serde(
+        default = "default_notifications_enabled",
+        alias = "notifications_enabled"
+    )]
     pub notifications_enabled: bool,
     #[serde(alias = "active_profile")]
     pub active_profile: String,
@@ -135,7 +138,10 @@ pub struct ConfigPatch {
     #[serde(skip_serializing_if = "Option::is_none", alias = "reasoning_effort")]
     pub reasoning_effort: Option<String>,
     /// 值域 [0,1]；0 = 关闭自动压缩。
-    #[serde(skip_serializing_if = "Option::is_none", alias = "auto_compact_threshold")]
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        alias = "auto_compact_threshold"
+    )]
     pub auto_compact_threshold: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none", alias = "compliance_enabled")]
     pub compliance_enabled: Option<bool>,
@@ -147,7 +153,10 @@ pub struct ConfigPatch {
     /// Some("") = 跟随系统。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub theme: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none", alias = "notifications_enabled")]
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        alias = "notifications_enabled"
+    )]
     pub notifications_enabled: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none", alias = "tokenizer_path")]
     pub tokenizer_path: Option<String>,
@@ -180,7 +189,9 @@ impl ConfigPatch {
         if let Some(t) = self.auto_compact_threshold
             && (t.is_nan() || !(0.0..=1.0).contains(&t))
         {
-            return Err(format!("autoCompactThreshold 必须在 [0, 1] 区间（0=关闭），收到 {t}"));
+            return Err(format!(
+                "autoCompactThreshold 必须在 [0, 1] 区间（0=关闭），收到 {t}"
+            ));
         }
         if let Some(v) = self.max_tokens
             && v == 0
@@ -195,7 +206,9 @@ impl ConfigPatch {
         if let Some(e) = &self.reasoning_effort
             && !matches!(e.as_str(), "low" | "medium" | "high" | "xhigh" | "max")
         {
-            return Err(format!("reasoningEffort 仅允许 low|medium|high|xhigh|max，收到 {e}"));
+            return Err(format!(
+                "reasoningEffort 仅允许 low|medium|high|xhigh|max，收到 {e}"
+            ));
         }
         if let Some(sub) = &self.subagent {
             if let Some(v) = sub.max_tokens
@@ -326,18 +339,36 @@ mod tests {
 
     #[test]
     fn patch_validate_rejects_out_of_range() {
-        let bad = ConfigPatch { auto_compact_threshold: Some(1.5), ..Default::default() };
+        let bad = ConfigPatch {
+            auto_compact_threshold: Some(1.5),
+            ..Default::default()
+        };
         assert!(bad.validate().is_err());
-        let nan = ConfigPatch { auto_compact_threshold: Some(f64::NAN), ..Default::default() };
+        let nan = ConfigPatch {
+            auto_compact_threshold: Some(f64::NAN),
+            ..Default::default()
+        };
         assert!(nan.validate().is_err());
-        let disabled = ConfigPatch { auto_compact_threshold: Some(0.0), ..Default::default() };
+        let disabled = ConfigPatch {
+            auto_compact_threshold: Some(0.0),
+            ..Default::default()
+        };
         assert!(disabled.validate().is_ok(), "0 = 关闭自动压缩，合法");
-        let zero = ConfigPatch { max_tokens: Some(0), ..Default::default() };
+        let zero = ConfigPatch {
+            max_tokens: Some(0),
+            ..Default::default()
+        };
         assert!(zero.validate().is_err());
-        let effort = ConfigPatch { reasoning_effort: Some("ultra".into()), ..Default::default() };
+        let effort = ConfigPatch {
+            reasoning_effort: Some("ultra".into()),
+            ..Default::default()
+        };
         assert!(effort.validate().is_err());
         let sub = ConfigPatch {
-            subagent: Some(SubagentPatch { timeout_secs: Some(0), ..Default::default() }),
+            subagent: Some(SubagentPatch {
+                timeout_secs: Some(0),
+                ..Default::default()
+            }),
             ..Default::default()
         };
         assert!(sub.validate().is_err());

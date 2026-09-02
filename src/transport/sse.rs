@@ -217,8 +217,18 @@ mod tests {
             }
         }
         let elapsed = start.elapsed();
-        eprintln!("sse {} frames in {:?} ({:.0} frames/s, {:.2} MB/s)", n, elapsed, n as f64 / elapsed.as_secs_f64(), buf.len() as f64 / elapsed.as_secs_f64() / 1e6);
+        eprintln!(
+            "sse {} frames in {:?} ({:.0} frames/s, {:.2} MB/s)",
+            n,
+            elapsed,
+            n as f64 / elapsed.as_secs_f64(),
+            buf.len() as f64 / elapsed.as_secs_f64() / 1e6
+        );
         assert_eq!(produced, n);
-        assert!(elapsed.as_millis() < 500, "10k SSE frames should be <500ms, got {:?}", elapsed);
+        assert!(
+            elapsed.as_millis() < 500,
+            "10k SSE frames should be <500ms, got {:?}",
+            elapsed
+        );
     }
 }

@@ -2,13 +2,13 @@
 
 use std::collections::VecDeque;
 
+use crate::app::timeline_model::TimelineModel;
 use crate::protocol::command::ConversationMode;
 use crate::protocol::event::{
     ActivityState, AskMode, AskQuestion, ContentRef, DomainError, PermissionCategory,
     PermissionRisk, SkillsStatus, UsageInfo,
 };
 use crate::protocol::methods::SessionMetaView;
-use crate::app::timeline_model::TimelineModel;
 use crate::protocol::snapshot::ConversationStateView;
 
 // ───────────────────────── 流式相位 ─────────────────────────
@@ -91,10 +91,11 @@ impl AskPanel {
                 continue;
             }
             if let Some(sel) = self.selections[idx]
-                && let Some(opt) = q.options.get(sel) {
-                    out.push((q.id.clone(), opt.clone()));
-                    continue;
-                }
+                && let Some(opt) = q.options.get(sel)
+            {
+                out.push((q.id.clone(), opt.clone()));
+                continue;
+            }
             if q.options.is_empty() && q.allow_custom {
                 // 仅自由文本的问题。
                 return Err(format!("问题 {} 需要输入", idx + 1));
@@ -430,7 +431,10 @@ impl SessionState {
             code_removed: 0,
             last_error: None,
             composer: Composer::default(),
-            scroll: ScrollState { follow: true, offset: 0 },
+            scroll: ScrollState {
+                follow: true,
+                offset: 0,
+            },
             rendered: None,
             ready: false,
             needs_rebaseline: false,
@@ -544,9 +548,13 @@ mod tests {
         let mut c = Composer::default();
         assert_eq!(c.rows(), 1);
         assert_eq!(c.line_col(), (0, 0));
-        for ch in "ab".chars() { c.insert(ch); }
+        for ch in "ab".chars() {
+            c.insert(ch);
+        }
         c.insert('\n');
-        for ch in "cd".chars() { c.insert(ch); }
+        for ch in "cd".chars() {
+            c.insert(ch);
+        }
         assert_eq!(c.value(), "ab\ncd");
         assert_eq!(c.rows(), 2);
         assert_eq!(c.line_col(), (1, 2));
@@ -558,7 +566,9 @@ mod tests {
     #[test]
     fn line_bounds_split_multiline() {
         let mut c = Composer::default();
-        for ch in "ab\ncd\n\n".chars() { c.insert(ch); }
+        for ch in "ab\ncd\n\n".chars() {
+            c.insert(ch);
+        }
         let (s0, e0) = c.line_bounds(0);
         assert_eq!(c.input[s0..e0], ['a', 'b']);
         let (s1, e1) = c.line_bounds(1);

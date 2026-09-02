@@ -69,30 +69,150 @@ pub struct Row {
 }
 
 pub const ROWS: &[Row] = &[
-    Row { id: FieldId::Model, label: "模型", kind: FieldKind::Text, section: "模型与提供商" },
-    Row { id: FieldId::Provider, label: "提供商", kind: FieldKind::Enum, section: "模型与提供商" },
-    Row { id: FieldId::Endpoint, label: "端点", kind: FieldKind::Enum, section: "模型与提供商" },
-    Row { id: FieldId::BaseUrl, label: "Base URL", kind: FieldKind::Text, section: "模型与提供商" },
-    Row { id: FieldId::ApiKey, label: "API Key", kind: FieldKind::Secret, section: "模型与提供商" },
-    Row { id: FieldId::MaxTokens, label: "maxTokens", kind: FieldKind::Number, section: "生成参数" },
-    Row { id: FieldId::ContextLimit, label: "contextLimit", kind: FieldKind::Number, section: "生成参数" },
-    Row { id: FieldId::ReasoningEffort, label: "思考强度", kind: FieldKind::Enum, section: "生成参数" },
-    Row { id: FieldId::AutoCompactThreshold, label: "自动压缩阈值", kind: FieldKind::Float, section: "生成参数" },
-    Row { id: FieldId::PermissionLevel, label: "权限级别", kind: FieldKind::Port, section: "运行时" },
-    Row { id: FieldId::ActiveProfile, label: "Profile", kind: FieldKind::Port, section: "运行时" },
-    Row { id: FieldId::WorkspaceMode, label: "workspace 模式", kind: FieldKind::Port, section: "运行时" },
-    Row { id: FieldId::SubModel, label: "子代理模型", kind: FieldKind::Text, section: "子代理" },
-    Row { id: FieldId::SubBaseUrl, label: "子代理 URL", kind: FieldKind::Text, section: "子代理" },
-    Row { id: FieldId::SubMaxTokens, label: "子代理 maxTokens", kind: FieldKind::Number, section: "子代理" },
-    Row { id: FieldId::SubTimeoutSecs, label: "子代理超时(s)", kind: FieldKind::Number, section: "子代理" },
-    Row { id: FieldId::SubApiKey, label: "子代理 Key", kind: FieldKind::Secret, section: "子代理" },
-    Row { id: FieldId::SubDefaultTools, label: "子代理工具", kind: FieldKind::Text, section: "子代理" },
-    Row { id: FieldId::Lang, label: "语言", kind: FieldKind::Text, section: "通用" },
-    Row { id: FieldId::Theme, label: "主题", kind: FieldKind::Text, section: "通用" },
-    Row { id: FieldId::FontFamily, label: "字体", kind: FieldKind::Text, section: "通用" },
-    Row { id: FieldId::NotificationsEnabled, label: "桌面通知", kind: FieldKind::Toggle, section: "通用" },
-    Row { id: FieldId::ComplianceEnabled, label: "合规模式", kind: FieldKind::Toggle, section: "通用" },
-    Row { id: FieldId::TokenizerPath, label: "tokenizer 路径", kind: FieldKind::Text, section: "通用" },
+    Row {
+        id: FieldId::Model,
+        label: "模型",
+        kind: FieldKind::Text,
+        section: "模型与提供商",
+    },
+    Row {
+        id: FieldId::Provider,
+        label: "提供商",
+        kind: FieldKind::Enum,
+        section: "模型与提供商",
+    },
+    Row {
+        id: FieldId::Endpoint,
+        label: "端点",
+        kind: FieldKind::Enum,
+        section: "模型与提供商",
+    },
+    Row {
+        id: FieldId::BaseUrl,
+        label: "Base URL",
+        kind: FieldKind::Text,
+        section: "模型与提供商",
+    },
+    Row {
+        id: FieldId::ApiKey,
+        label: "API Key",
+        kind: FieldKind::Secret,
+        section: "模型与提供商",
+    },
+    Row {
+        id: FieldId::MaxTokens,
+        label: "maxTokens",
+        kind: FieldKind::Number,
+        section: "生成参数",
+    },
+    Row {
+        id: FieldId::ContextLimit,
+        label: "contextLimit",
+        kind: FieldKind::Number,
+        section: "生成参数",
+    },
+    Row {
+        id: FieldId::ReasoningEffort,
+        label: "思考强度",
+        kind: FieldKind::Enum,
+        section: "生成参数",
+    },
+    Row {
+        id: FieldId::AutoCompactThreshold,
+        label: "自动压缩阈值",
+        kind: FieldKind::Float,
+        section: "生成参数",
+    },
+    Row {
+        id: FieldId::PermissionLevel,
+        label: "权限级别",
+        kind: FieldKind::Port,
+        section: "运行时",
+    },
+    Row {
+        id: FieldId::ActiveProfile,
+        label: "Profile",
+        kind: FieldKind::Port,
+        section: "运行时",
+    },
+    Row {
+        id: FieldId::WorkspaceMode,
+        label: "workspace 模式",
+        kind: FieldKind::Port,
+        section: "运行时",
+    },
+    Row {
+        id: FieldId::SubModel,
+        label: "子代理模型",
+        kind: FieldKind::Text,
+        section: "子代理",
+    },
+    Row {
+        id: FieldId::SubBaseUrl,
+        label: "子代理 URL",
+        kind: FieldKind::Text,
+        section: "子代理",
+    },
+    Row {
+        id: FieldId::SubMaxTokens,
+        label: "子代理 maxTokens",
+        kind: FieldKind::Number,
+        section: "子代理",
+    },
+    Row {
+        id: FieldId::SubTimeoutSecs,
+        label: "子代理超时(s)",
+        kind: FieldKind::Number,
+        section: "子代理",
+    },
+    Row {
+        id: FieldId::SubApiKey,
+        label: "子代理 Key",
+        kind: FieldKind::Secret,
+        section: "子代理",
+    },
+    Row {
+        id: FieldId::SubDefaultTools,
+        label: "子代理工具",
+        kind: FieldKind::Text,
+        section: "子代理",
+    },
+    Row {
+        id: FieldId::Lang,
+        label: "语言",
+        kind: FieldKind::Text,
+        section: "通用",
+    },
+    Row {
+        id: FieldId::Theme,
+        label: "主题",
+        kind: FieldKind::Text,
+        section: "通用",
+    },
+    Row {
+        id: FieldId::FontFamily,
+        label: "字体",
+        kind: FieldKind::Text,
+        section: "通用",
+    },
+    Row {
+        id: FieldId::NotificationsEnabled,
+        label: "桌面通知",
+        kind: FieldKind::Toggle,
+        section: "通用",
+    },
+    Row {
+        id: FieldId::ComplianceEnabled,
+        label: "合规模式",
+        kind: FieldKind::Toggle,
+        section: "通用",
+    },
+    Row {
+        id: FieldId::TokenizerPath,
+        label: "tokenizer 路径",
+        kind: FieldKind::Text,
+        section: "通用",
+    },
 ];
 
 /// 单行文本编辑缓冲（沿用 AttachPath 的 Vec<char> + cursor 模式）。
@@ -144,8 +264,15 @@ impl SettingsState {
             FieldId::NotificationsEnabled => self.draft.notifications_enabled.is_some(),
             FieldId::ComplianceEnabled => self.draft.compliance_enabled.is_some(),
             FieldId::TokenizerPath => self.draft.tokenizer_path.is_some(),
-            FieldId::SubModel | FieldId::SubBaseUrl | FieldId::SubApiKey | FieldId::SubMaxTokens | FieldId::SubTimeoutSecs | FieldId::SubDefaultTools => {
-                let Some(sub) = &self.draft.subagent else { return false };
+            FieldId::SubModel
+            | FieldId::SubBaseUrl
+            | FieldId::SubApiKey
+            | FieldId::SubMaxTokens
+            | FieldId::SubTimeoutSecs
+            | FieldId::SubDefaultTools => {
+                let Some(sub) = &self.draft.subagent else {
+                    return false;
+                };
                 match id {
                     FieldId::SubModel => sub.model.is_some(),
                     FieldId::SubBaseUrl => sub.base_url.is_some(),
@@ -166,9 +293,17 @@ impl SettingsState {
         let d = &self.draft;
         match id {
             FieldId::Model => owned_or(d.model.clone(), loaded.map(|c| c.model.as_str()), "—"),
-            FieldId::Provider => owned_or(d.provider_id.clone(), loaded.map(|c| c.provider_id.as_str()), "—"),
-            FieldId::Endpoint => owned_or(d.endpoint.clone(), loaded.map(|c| c.endpoint.as_str()), "—"),
-            FieldId::BaseUrl => owned_or(d.base_url.clone(), loaded.map(|c| c.base_url.as_str()), "—"),
+            FieldId::Provider => owned_or(
+                d.provider_id.clone(),
+                loaded.map(|c| c.provider_id.as_str()),
+                "—",
+            ),
+            FieldId::Endpoint => {
+                owned_or(d.endpoint.clone(), loaded.map(|c| c.endpoint.as_str()), "—")
+            }
+            FieldId::BaseUrl => {
+                owned_or(d.base_url.clone(), loaded.map(|c| c.base_url.as_str()), "—")
+            }
             FieldId::ApiKey => match (&d.api_key, loaded) {
                 (Some(_), _) => "●●●●（待保存）".into(),
                 (None, Some(c)) if c.api_key == "****" => "(已配置 ****)".into(),
@@ -178,11 +313,15 @@ impl SettingsState {
             FieldId::ContextLimit => num_or(d.context_limit, loaded.map(|c| c.context_limit)),
             FieldId::ReasoningEffort => owned_or(
                 d.reasoning_effort.clone(),
-                loaded.map(|c| c.reasoning_effort.as_str()).filter(|s| !s.is_empty()),
+                loaded
+                    .map(|c| c.reasoning_effort.as_str())
+                    .filter(|s| !s.is_empty()),
                 "—",
             ),
             FieldId::AutoCompactThreshold => {
-                let v = d.auto_compact_threshold.or(loaded.map(|c| c.auto_compact_threshold));
+                let v = d
+                    .auto_compact_threshold
+                    .or(loaded.map(|c| c.auto_compact_threshold));
                 match v {
                     None => "—".into(),
                     Some(0.0) => "0（关闭）".into(),
@@ -199,37 +338,65 @@ impl SettingsState {
                     .or_else(|| loaded.map(|c| c.active_profile.clone()));
                 match cur {
                     Some(name) => {
-                        let active = loaded.map(|c| c.active_profile.as_str() == name.as_str()).unwrap_or(true);
-                        if active { name } else { format!("{name}（回车应用）") }
+                        let active = loaded
+                            .map(|c| c.active_profile.as_str() == name.as_str())
+                            .unwrap_or(true);
+                        if active {
+                            name
+                        } else {
+                            format!("{name}（回车应用）")
+                        }
                     }
                     None => "…".into(),
                 }
             }
             FieldId::WorkspaceMode => {
-                let cur = self.ws_sel.clone().or_else(|| loaded.map(|c| c.workspace.mode.clone()));
+                let cur = self
+                    .ws_sel
+                    .clone()
+                    .or_else(|| loaded.map(|c| c.workspace.mode.clone()));
                 match cur {
                     Some(mode) => {
                         let active = loaded.map(|c| c.workspace.mode == mode).unwrap_or(true);
-                        if active { mode } else { format!("{mode}（回车应用）") }
+                        if active {
+                            mode
+                        } else {
+                            format!("{mode}（回车应用）")
+                        }
                     }
                     None => "…".into(),
                 }
             }
             FieldId::SubModel => sub_or(d, loaded, |s, c| (s.model.clone(), c.model.clone()), "—"),
-            FieldId::SubBaseUrl => sub_or(d, loaded, |s, c| (s.base_url.clone(), c.base_url.clone()), "—"),
+            FieldId::SubBaseUrl => sub_or(
+                d,
+                loaded,
+                |s, c| (s.base_url.clone(), c.base_url.clone()),
+                "—",
+            ),
             FieldId::SubMaxTokens => {
-                let v = d.subagent.as_ref().and_then(|s| s.max_tokens).or(loaded.map(|c| c.subagent.max_tokens));
+                let v = d
+                    .subagent
+                    .as_ref()
+                    .and_then(|s| s.max_tokens)
+                    .or(loaded.map(|c| c.subagent.max_tokens));
                 num_or(v, v)
             }
             FieldId::SubTimeoutSecs => {
-                let v = d.subagent.as_ref().and_then(|s| s.timeout_secs).or(loaded.map(|c| c.subagent.timeout_secs));
+                let v = d
+                    .subagent
+                    .as_ref()
+                    .and_then(|s| s.timeout_secs)
+                    .or(loaded.map(|c| c.subagent.timeout_secs));
                 num_or(v, v)
             }
-            FieldId::SubApiKey => match (d.subagent.as_ref().and_then(|s| s.api_key.clone()), loaded) {
-                (Some(_), _) => "●●●●（待保存）".into(),
-                (None, Some(c)) if c.subagent.api_key_set => "(已配置 ****)".into(),
-                (None, _) => "(未配置)".into(),
-            },
+            FieldId::SubApiKey => {
+                match (d.subagent.as_ref().and_then(|s| s.api_key.clone()), loaded) {
+                    (Some(_), _) => "●●●●（待保存）".into(),
+                    (None, Some(c)) if c.subagent.api_key_set => "(已配置 ****)".into(),
+                    (None, _) => "(未配置)".into(),
+                }
+            }
             FieldId::SubDefaultTools => {
                 let draft_val = d.subagent.as_ref().and_then(|s| s.default_tools.clone());
                 let loaded_val = loaded.map(|c| c.subagent.default_tools.clone());
@@ -242,10 +409,24 @@ impl SettingsState {
             }
             FieldId::Lang => opt_str(d.lang.clone(), loaded.and_then(|c| c.lang.clone())),
             FieldId::Theme => opt_str(d.theme.clone(), loaded.and_then(|c| c.theme.clone())),
-            FieldId::FontFamily => owned_or(d.font_family.clone(), loaded.map(|c| c.font_family.as_str()).filter(|s| !s.is_empty()), "—"),
-            FieldId::NotificationsEnabled => toggle_str(d.notifications_enabled, loaded.map(|c| c.notifications_enabled)),
-            FieldId::ComplianceEnabled => toggle_str(d.compliance_enabled, loaded.map(|c| c.compliance_enabled)),
-            FieldId::TokenizerPath => opt_str(d.tokenizer_path.clone(), loaded.and_then(|c| c.tokenizer_path.clone())),
+            FieldId::FontFamily => owned_or(
+                d.font_family.clone(),
+                loaded
+                    .map(|c| c.font_family.as_str())
+                    .filter(|s| !s.is_empty()),
+                "—",
+            ),
+            FieldId::NotificationsEnabled => toggle_str(
+                d.notifications_enabled,
+                loaded.map(|c| c.notifications_enabled),
+            ),
+            FieldId::ComplianceEnabled => {
+                toggle_str(d.compliance_enabled, loaded.map(|c| c.compliance_enabled))
+            }
+            FieldId::TokenizerPath => opt_str(
+                d.tokenizer_path.clone(),
+                loaded.and_then(|c| c.tokenizer_path.clone()),
+            ),
         }
     }
 
@@ -253,51 +434,112 @@ impl SettingsState {
     /// Enum/Toggle/Port 返回 None（由 cycle/端口逻辑处理）。
     pub fn start_edit(&self, loaded: Option<&ConfigDto>) -> Option<EditBuffer> {
         let seed = match self.row().id {
-            FieldId::Model => self.effective(loaded, |d, c| d.model.clone().unwrap_or_else(|| c.model.clone())),
-            FieldId::BaseUrl => self.effective(loaded, |d, c| d.base_url.clone().unwrap_or_else(|| c.base_url.clone())),
+            FieldId::Model => self.effective(loaded, |d, c| {
+                d.model.clone().unwrap_or_else(|| c.model.clone())
+            }),
+            FieldId::BaseUrl => self.effective(loaded, |d, c| {
+                d.base_url.clone().unwrap_or_else(|| c.base_url.clone())
+            }),
             FieldId::SubModel => self.effective(loaded, |d, c| {
-                d.subagent.as_ref().and_then(|s| s.model.clone()).unwrap_or_else(|| c.subagent.model.clone())
+                d.subagent
+                    .as_ref()
+                    .and_then(|s| s.model.clone())
+                    .unwrap_or_else(|| c.subagent.model.clone())
             }),
             FieldId::SubBaseUrl => self.effective(loaded, |d, c| {
-                d.subagent.as_ref().and_then(|s| s.base_url.clone()).unwrap_or_else(|| c.subagent.base_url.clone())
+                d.subagent
+                    .as_ref()
+                    .and_then(|s| s.base_url.clone())
+                    .unwrap_or_else(|| c.subagent.base_url.clone())
             }),
-            FieldId::Lang => self.effective(loaded, |d, c| d.lang.clone().unwrap_or_else(|| c.lang.clone().unwrap_or_default())),
-            FieldId::Theme => self.effective(loaded, |d, c| d.theme.clone().unwrap_or_else(|| c.theme.clone().unwrap_or_default())),
-            FieldId::FontFamily => self.effective(loaded, |d, c| d.font_family.clone().unwrap_or_else(|| c.font_family.clone())),
+            FieldId::Lang => self.effective(loaded, |d, c| {
+                d.lang
+                    .clone()
+                    .unwrap_or_else(|| c.lang.clone().unwrap_or_default())
+            }),
+            FieldId::Theme => self.effective(loaded, |d, c| {
+                d.theme
+                    .clone()
+                    .unwrap_or_else(|| c.theme.clone().unwrap_or_default())
+            }),
+            FieldId::FontFamily => self.effective(loaded, |d, c| {
+                d.font_family
+                    .clone()
+                    .unwrap_or_else(|| c.font_family.clone())
+            }),
             FieldId::TokenizerPath => self.effective(loaded, |d, c| {
-                d.tokenizer_path.clone().unwrap_or_else(|| c.tokenizer_path.clone().unwrap_or_default())
+                d.tokenizer_path
+                    .clone()
+                    .unwrap_or_else(|| c.tokenizer_path.clone().unwrap_or_default())
             }),
-            FieldId::MaxTokens => self.effective(loaded, |d, c| d.max_tokens.unwrap_or(c.max_tokens).to_string()),
-            FieldId::ContextLimit => self.effective(loaded, |d, c| d.context_limit.unwrap_or(c.context_limit).to_string()),
+            FieldId::MaxTokens => self.effective(loaded, |d, c| {
+                d.max_tokens.unwrap_or(c.max_tokens).to_string()
+            }),
+            FieldId::ContextLimit => self.effective(loaded, |d, c| {
+                d.context_limit.unwrap_or(c.context_limit).to_string()
+            }),
             FieldId::SubMaxTokens => self.effective(loaded, |d, c| {
-                d.subagent.as_ref().and_then(|s| s.max_tokens).unwrap_or(c.subagent.max_tokens).to_string()
+                d.subagent
+                    .as_ref()
+                    .and_then(|s| s.max_tokens)
+                    .unwrap_or(c.subagent.max_tokens)
+                    .to_string()
             }),
             FieldId::SubTimeoutSecs => self.effective(loaded, |d, c| {
-                d.subagent.as_ref().and_then(|s| s.timeout_secs).unwrap_or(c.subagent.timeout_secs).to_string()
+                d.subagent
+                    .as_ref()
+                    .and_then(|s| s.timeout_secs)
+                    .unwrap_or(c.subagent.timeout_secs)
+                    .to_string()
             }),
-            FieldId::AutoCompactThreshold => {
-                self.effective(loaded, |d, c| d.auto_compact_threshold.unwrap_or(c.auto_compact_threshold).to_string())
-            }
+            FieldId::AutoCompactThreshold => self.effective(loaded, |d, c| {
+                d.auto_compact_threshold
+                    .unwrap_or(c.auto_compact_threshold)
+                    .to_string()
+            }),
             FieldId::SubDefaultTools => self.effective(loaded, |d, c| {
-                let v = d.subagent.as_ref().and_then(|s| s.default_tools.clone()).unwrap_or_else(|| c.subagent.default_tools.clone());
-                if v.is_empty() { String::new() } else { v.join(", ") }
+                let v = d
+                    .subagent
+                    .as_ref()
+                    .and_then(|s| s.default_tools.clone())
+                    .unwrap_or_else(|| c.subagent.default_tools.clone());
+                if v.is_empty() {
+                    String::new()
+                } else {
+                    v.join(", ")
+                }
             }),
             FieldId::ApiKey | FieldId::SubApiKey => String::new(),
-            FieldId::Provider | FieldId::Endpoint | FieldId::ReasoningEffort
-            | FieldId::NotificationsEnabled | FieldId::ComplianceEnabled
-            | FieldId::PermissionLevel | FieldId::ActiveProfile | FieldId::WorkspaceMode => return None,
+            FieldId::Provider
+            | FieldId::Endpoint
+            | FieldId::ReasoningEffort
+            | FieldId::NotificationsEnabled
+            | FieldId::ComplianceEnabled
+            | FieldId::PermissionLevel
+            | FieldId::ActiveProfile
+            | FieldId::WorkspaceMode => return None,
         };
         let cursor = seed.chars().count();
-        Some(EditBuffer { buf: seed.chars().collect(), cursor })
+        Some(EditBuffer {
+            buf: seed.chars().collect(),
+            cursor,
+        })
     }
 
     /// 提交编辑缓冲到草稿（逐字段校验；失败返回 Err 且不落地）。
-    pub fn commit_edit(&mut self, loaded: Option<&ConfigDto>, buf: EditBuffer) -> Result<(), String> {
+    pub fn commit_edit(
+        &mut self,
+        loaded: Option<&ConfigDto>,
+        buf: EditBuffer,
+    ) -> Result<(), String> {
         let id = self.row().id;
         let raw: String = buf.buf.iter().collect();
         let text = raw.trim().to_string();
         match id {
-            FieldId::MaxTokens | FieldId::ContextLimit | FieldId::SubMaxTokens | FieldId::SubTimeoutSecs => {
+            FieldId::MaxTokens
+            | FieldId::ContextLimit
+            | FieldId::SubMaxTokens
+            | FieldId::SubTimeoutSecs => {
                 let v: u64 = text.parse().map_err(|_| format!("{text:?} 不是有效整数"))?;
                 if v == 0 {
                     return Err("数值必须大于 0".into());
@@ -319,7 +561,10 @@ impl SettingsState {
             }
             FieldId::SubApiKey => {
                 if !text.is_empty() {
-                    self.draft.subagent.get_or_insert_with(SubagentPatch::default).api_key = Some(text);
+                    self.draft
+                        .subagent
+                        .get_or_insert_with(SubagentPatch::default)
+                        .api_key = Some(text);
                 }
             }
             FieldId::Lang | FieldId::Theme => {
@@ -335,8 +580,18 @@ impl SettingsState {
             FieldId::BaseUrl => self.draft.base_url = Some(text),
             FieldId::FontFamily => self.draft.font_family = Some(text),
             FieldId::TokenizerPath => self.draft.tokenizer_path = Some(text),
-            FieldId::SubModel => self.draft.subagent.get_or_insert_with(SubagentPatch::default).model = Some(text),
-            FieldId::SubBaseUrl => self.draft.subagent.get_or_insert_with(SubagentPatch::default).base_url = Some(text),
+            FieldId::SubModel => {
+                self.draft
+                    .subagent
+                    .get_or_insert_with(SubagentPatch::default)
+                    .model = Some(text)
+            }
+            FieldId::SubBaseUrl => {
+                self.draft
+                    .subagent
+                    .get_or_insert_with(SubagentPatch::default)
+                    .base_url = Some(text)
+            }
             FieldId::SubDefaultTools => {
                 // 空输入 = 全部工具（Some([])），逗号分隔，非空则按逗号切分去空白。
                 let tools = if text.is_empty() {
@@ -347,12 +602,20 @@ impl SettingsState {
                         .filter(|s| !s.is_empty())
                         .collect()
                 };
-                self.draft.subagent.get_or_insert_with(SubagentPatch::default).default_tools = Some(tools);
+                self.draft
+                    .subagent
+                    .get_or_insert_with(SubagentPatch::default)
+                    .default_tools = Some(tools);
             }
             // 不可编辑字段：静默忽略（理论上不会到达）。
-            FieldId::Provider | FieldId::Endpoint | FieldId::ReasoningEffort
-            | FieldId::NotificationsEnabled | FieldId::ComplianceEnabled
-            | FieldId::PermissionLevel | FieldId::ActiveProfile | FieldId::WorkspaceMode => {
+            FieldId::Provider
+            | FieldId::Endpoint
+            | FieldId::ReasoningEffort
+            | FieldId::NotificationsEnabled
+            | FieldId::ComplianceEnabled
+            | FieldId::PermissionLevel
+            | FieldId::ActiveProfile
+            | FieldId::WorkspaceMode => {
                 let _ = loaded;
             }
         }
@@ -371,18 +634,29 @@ impl SettingsState {
                     .clone()
                     .or_else(|| loaded.map(|c| c.reasoning_effort.clone()))
                     .unwrap_or_else(|| "medium".into());
-                let idx = REASONING_EFFORTS.iter().position(|e| *e == cur).unwrap_or(1);
+                let idx = REASONING_EFFORTS
+                    .iter()
+                    .position(|e| *e == cur)
+                    .unwrap_or(1);
                 let next = (idx as i32 + delta).rem_euclid(REASONING_EFFORTS.len() as i32) as usize;
                 self.draft.reasoning_effort = Some(REASONING_EFFORTS[next].to_string());
                 Ok(true)
             }
             FieldId::NotificationsEnabled => {
-                let cur = self.draft.notifications_enabled.or(loaded.map(|c| c.notifications_enabled)).unwrap_or(true);
+                let cur = self
+                    .draft
+                    .notifications_enabled
+                    .or(loaded.map(|c| c.notifications_enabled))
+                    .unwrap_or(true);
                 self.draft.notifications_enabled = Some(!cur);
                 Ok(true)
             }
             FieldId::ComplianceEnabled => {
-                let cur = self.draft.compliance_enabled.or(loaded.map(|c| c.compliance_enabled)).unwrap_or(false);
+                let cur = self
+                    .draft
+                    .compliance_enabled
+                    .or(loaded.map(|c| c.compliance_enabled))
+                    .unwrap_or(false);
                 self.draft.compliance_enabled = Some(!cur);
                 Ok(true)
             }
@@ -391,7 +665,11 @@ impl SettingsState {
                 if cfg.providers.is_empty() {
                     return Err("daemon 未提供 provider 目录".into());
                 }
-                let cur = self.draft.provider_id.as_deref().unwrap_or(cfg.provider_id.as_str());
+                let cur = self
+                    .draft
+                    .provider_id
+                    .as_deref()
+                    .unwrap_or(cfg.provider_id.as_str());
                 let idx = cfg.providers.iter().position(|p| p.id == cur).unwrap_or(0);
                 let next = (idx as i32 + delta).rem_euclid(cfg.providers.len() as i32) as usize;
                 let p = &cfg.providers[next];
@@ -413,7 +691,11 @@ impl SettingsState {
                 if p.endpoints.is_empty() {
                     return Err("该 provider 无端点预设".into());
                 }
-                let cur = self.draft.endpoint.as_deref().unwrap_or(cfg.endpoint.as_str());
+                let cur = self
+                    .draft
+                    .endpoint
+                    .as_deref()
+                    .unwrap_or(cfg.endpoint.as_str());
                 let idx = p.endpoints.iter().position(|e| e.id == cur).unwrap_or(0);
                 let next = (idx as i32 + delta).rem_euclid(p.endpoints.len() as i32) as usize;
                 let ep = &p.endpoints[next];
@@ -427,8 +709,16 @@ impl SettingsState {
                 // ←→ 在当前端点的 models 列表里循环；Enter 自由输入。
                 let cfg = loaded.ok_or_else(|| "配置未加载".to_string())?;
                 let models = self.effective_provider(cfg).and_then(|p| {
-                    let eid = self.draft.endpoint.as_deref().unwrap_or(cfg.endpoint.as_str());
-                    p.endpoints.iter().find(|e| e.id == eid).or_else(|| p.endpoints.first()).map(|e| &e.models)
+                    let eid = self
+                        .draft
+                        .endpoint
+                        .as_deref()
+                        .unwrap_or(cfg.endpoint.as_str());
+                    p.endpoints
+                        .iter()
+                        .find(|e| e.id == eid)
+                        .or_else(|| p.endpoints.first())
+                        .map(|e| &e.models)
                 });
                 match models.filter(|m| !m.is_empty()) {
                     Some(models) => {
@@ -446,15 +736,26 @@ impl SettingsState {
         }
     }
 
-    fn effective_provider<'a>(&self, cfg: &'a ConfigDto) -> Option<&'a crate::protocol::config::ProviderDto> {
-        let pid = self.draft.provider_id.as_deref().unwrap_or(cfg.provider_id.as_str());
+    fn effective_provider<'a>(
+        &self,
+        cfg: &'a ConfigDto,
+    ) -> Option<&'a crate::protocol::config::ProviderDto> {
+        let pid = self
+            .draft
+            .provider_id
+            .as_deref()
+            .unwrap_or(cfg.provider_id.as_str());
         cfg.providers
             .iter()
             .find(|p| p.id == pid)
             .or_else(|| cfg.providers.first())
     }
 
-    fn effective<T>(&self, loaded: Option<&ConfigDto>, f: impl Fn(&ConfigPatch, &ConfigDto) -> T) -> T {
+    fn effective<T>(
+        &self,
+        loaded: Option<&ConfigDto>,
+        f: impl Fn(&ConfigPatch, &ConfigDto) -> T,
+    ) -> T {
         match loaded {
             Some(c) => f(&self.draft, c),
             None => {
@@ -469,8 +770,18 @@ impl SettingsState {
         match id {
             FieldId::MaxTokens => self.draft.max_tokens = Some(v),
             FieldId::ContextLimit => self.draft.context_limit = Some(v),
-            FieldId::SubMaxTokens => self.draft.subagent.get_or_insert_with(SubagentPatch::default).max_tokens = Some(v),
-            FieldId::SubTimeoutSecs => self.draft.subagent.get_or_insert_with(SubagentPatch::default).timeout_secs = Some(v),
+            FieldId::SubMaxTokens => {
+                self.draft
+                    .subagent
+                    .get_or_insert_with(SubagentPatch::default)
+                    .max_tokens = Some(v)
+            }
+            FieldId::SubTimeoutSecs => {
+                self.draft
+                    .subagent
+                    .get_or_insert_with(SubagentPatch::default)
+                    .timeout_secs = Some(v)
+            }
             _ => {}
         }
     }
@@ -504,7 +815,11 @@ fn opt_str(draft: Option<String>, loaded: Option<String>) -> String {
 
 fn toggle_str(draft: Option<bool>, loaded: Option<bool>) -> String {
     let on = draft.or(loaded).unwrap_or(false);
-    if on { "[x] 开".into() } else { "[ ] 关".into() }
+    if on {
+        "[x] 开".into()
+    } else {
+        "[ ] 关".into()
+    }
 }
 
 fn sub_or(
@@ -590,7 +905,10 @@ mod tests {
         assert_eq!(st.display(Some(&c), FieldId::ApiKey), "●●●●（待保存）");
         assert_eq!(st.display(Some(&c), FieldId::AutoCompactThreshold), "0.95");
         st.draft.auto_compact_threshold = Some(0.0);
-        assert_eq!(st.display(Some(&c), FieldId::AutoCompactThreshold), "0（关闭）");
+        assert_eq!(
+            st.display(Some(&c), FieldId::AutoCompactThreshold),
+            "0（关闭）"
+        );
     }
 
     #[test]
@@ -598,7 +916,10 @@ mod tests {
         let c = cfg();
         let mut st = SettingsState::default();
         st.focus = row_index(FieldId::MaxTokens);
-        let buf = |s: &str| EditBuffer { buf: s.chars().collect(), cursor: s.len() };
+        let buf = |s: &str| EditBuffer {
+            buf: s.chars().collect(),
+            cursor: s.len(),
+        };
         assert!(st.commit_edit(Some(&c), buf("0")).is_err());
         assert!(st.commit_edit(Some(&c), buf("abc")).is_err());
         st.commit_edit(Some(&c), buf("128000")).unwrap();
@@ -641,7 +962,10 @@ mod tests {
         st.cycle(Some(&c), 1).unwrap();
         assert_eq!(st.draft.provider_id.as_deref(), Some("prov-b"));
         assert_eq!(st.draft.endpoint.as_deref(), Some("ep-b1"));
-        assert_eq!(st.draft.base_url.as_deref(), Some("https://b.example.com/v1"));
+        assert_eq!(
+            st.draft.base_url.as_deref(),
+            Some("https://b.example.com/v1")
+        );
         st.cycle(Some(&c), -1).unwrap();
         assert_eq!(st.draft.provider_id.as_deref(), Some("prov-a"));
 
@@ -659,7 +983,14 @@ mod tests {
         let c = cfg();
         let mut st = SettingsState::default();
         st.focus = row_index(FieldId::ContextLimit);
-        st.commit_edit(Some(&c), EditBuffer { buf: "2000000".chars().collect(), cursor: 7 }).unwrap();
+        st.commit_edit(
+            Some(&c),
+            EditBuffer {
+                buf: "2000000".chars().collect(),
+                cursor: 7,
+            },
+        )
+        .unwrap();
         assert!(!st.draft.is_empty());
         st.draft.validate().unwrap();
         let v = st.draft.to_json();

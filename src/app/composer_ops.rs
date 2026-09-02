@@ -70,13 +70,20 @@ impl App {
                     Some(p) => {
                         let raw = p.trim().to_string();
                         if raw.is_empty() {
-                            if let Some(sess) = self.active_session_mut() { sess.composer.clear(); }
+                            if let Some(sess) = self.active_session_mut() {
+                                sess.composer.clear();
+                            }
                             self.slash_selected = 0;
                             self.new_session_with_cwd(None);
                         } else if raw == "?" || raw.eq_ignore_ascii_case("edit") {
                             let initial = self.effective_cwd(None).unwrap_or_default();
-                            self.overlays.push(Overlay::CwdInput { input: initial.chars().collect(), cursor: initial.len() });
-                            if let Some(sess) = self.active_session_mut() { sess.composer.clear(); }
+                            self.overlays.push(Overlay::CwdInput {
+                                input: initial.chars().collect(),
+                                cursor: initial.len(),
+                            });
+                            if let Some(sess) = self.active_session_mut() {
+                                sess.composer.clear();
+                            }
                             self.slash_selected = 0;
                         } else {
                             let expanded = crate::app::slash::expand_tilde(&raw);
@@ -84,13 +91,17 @@ impl App {
                                 self.toast(NoticeLevel::Error, format!("cwd 需为绝对路径：{raw}"));
                                 return true;
                             }
-                            if let Some(sess) = self.active_session_mut() { sess.composer.clear(); }
+                            if let Some(sess) = self.active_session_mut() {
+                                sess.composer.clear();
+                            }
                             self.slash_selected = 0;
                             self.new_session_with_cwd(Some(expanded));
                         }
                     }
                     None => {
-                        if let Some(sess) = self.active_session_mut() { sess.composer.clear(); }
+                        if let Some(sess) = self.active_session_mut() {
+                            sess.composer.clear();
+                        }
                         self.slash_selected = 0;
                         self.new_session_with_cwd(None);
                     }
@@ -98,13 +109,17 @@ impl App {
                 true
             }
             SlashCmd::Help => {
-                if let Some(sess) = self.active_session_mut() { sess.composer.clear(); }
+                if let Some(sess) = self.active_session_mut() {
+                    sess.composer.clear();
+                }
                 self.slash_selected = 0;
                 self.toggle_overlay(Overlay::Help);
                 true
             }
             SlashCmd::Clear => {
-                if let Some(sess) = self.active_session_mut() { sess.composer.clear(); }
+                if let Some(sess) = self.active_session_mut() {
+                    sess.composer.clear();
+                }
                 self.slash_selected = 0;
                 true
             }
@@ -113,7 +128,9 @@ impl App {
                     false
                 } else {
                     self.toast(NoticeLevel::Error, format!("未知命令：/{s}"));
-                    if let Some(sess) = self.active_session_mut() { sess.composer.clear(); }
+                    if let Some(sess) = self.active_session_mut() {
+                        sess.composer.clear();
+                    }
                     true
                 }
             }
@@ -164,17 +181,28 @@ impl App {
             }
             KeyCode::Tab => {
                 // composer 为 /new 或 /n 且无参时，Tab 打开二级编辑（显式 CwdInput）
-                let val = self.active_session().map(|s| s.composer.value()).unwrap_or_default();
+                let val = self
+                    .active_session()
+                    .map(|s| s.composer.value())
+                    .unwrap_or_default();
                 let trimmed = val.trim().to_string();
                 if trimmed == "/new" || trimmed == "/n" {
                     let initial = self.effective_cwd(None).unwrap_or_default();
-                    self.overlays.push(Overlay::CwdInput { input: initial.chars().collect(), cursor: initial.len() });
-                    if let Some(sess) = self.active_session_mut() { sess.composer.clear(); }
+                    self.overlays.push(Overlay::CwdInput {
+                        input: initial.chars().collect(),
+                        cursor: initial.len(),
+                    });
+                    if let Some(sess) = self.active_session_mut() {
+                        sess.composer.clear();
+                    }
                     self.slash_selected = 0;
                 }
             }
             // 多行输入：Alt+Enter / Ctrl+J 插入换行（Enter 仍为发送）。
-            KeyCode::Enter if key.modifiers.contains(KeyModifiers::ALT) || (ctrl && key.code == KeyCode::Char('j')) => {
+            KeyCode::Enter
+                if key.modifiers.contains(KeyModifiers::ALT)
+                    || (ctrl && key.code == KeyCode::Char('j')) =>
+            {
                 if let Some(sess) = self.active_session_mut() {
                     sess.composer.insert('\n');
                 }
@@ -184,9 +212,13 @@ impl App {
                     || self.active_session().is_some_and(|s| {
                         !s.composer.value().contains('\n')
                             && s.composer.value().trim_start().starts_with('/')
-                    }) => {
+                    }) =>
+            {
                 // 若为 slash 输入，优先走 slash 执行或补全
-                let val = self.active_session().map(|s| s.composer.value()).unwrap_or_default();
+                let val = self
+                    .active_session()
+                    .map(|s| s.composer.value())
+                    .unwrap_or_default();
                 let trimmed = val.trim().to_string();
                 if trimmed.starts_with('/') {
                     if trimmed == "/" {
@@ -197,10 +229,17 @@ impl App {
                     let has_space = trimmed.contains(char::is_whitespace);
                     if slash_vis && !has_space {
                         // 若输入已是完整命令（如 "/new"），直接执行；否则补全
-                        let without = trimmed.strip_prefix('/').unwrap_or(trimmed.as_str()).to_ascii_lowercase();
-                        let exact = crate::app::slash::SLASH_COMMANDS.iter().any(|d| d.name == without || (d.name == "new" && without == "n"));
+                        let without = trimmed
+                            .strip_prefix('/')
+                            .unwrap_or(trimmed.as_str())
+                            .to_ascii_lowercase();
+                        let exact = crate::app::slash::SLASH_COMMANDS
+                            .iter()
+                            .any(|d| d.name == without || (d.name == "new" && without == "n"));
                         if exact {
-                            if self.execute_slash_text(&trimmed) { return; }
+                            if self.execute_slash_text(&trimmed) {
+                                return;
+                            }
                         } else {
                             self.autocomplete_slash();
                             return;
@@ -214,7 +253,9 @@ impl App {
                 }
                 self.send_message();
             }
-            KeyCode::Enter => { self.send_message();},
+            KeyCode::Enter => {
+                self.send_message();
+            }
             KeyCode::Esc => self.cancel_turn(),
             KeyCode::Backspace => {
                 let need_clamp = if let Some(s) = self.active_session_mut() {
@@ -228,15 +269,23 @@ impl App {
                         s.composer.backspace();
                     }
                     true
-                } else { false };
-                if need_clamp { self.clamp_slash_selected(); }
+                } else {
+                    false
+                };
+                if need_clamp {
+                    self.clamp_slash_selected();
+                }
             }
             KeyCode::Delete => {
                 let need_clamp = if let Some(s) = self.active_session_mut() {
                     s.composer.delete();
                     true
-                } else { false };
-                if need_clamp { self.clamp_slash_selected(); }
+                } else {
+                    false
+                };
+                if need_clamp {
+                    self.clamp_slash_selected();
+                }
             }
             KeyCode::Left => {
                 if let Some(s) = self.active_session_mut() {
@@ -274,7 +323,11 @@ impl App {
                 if slash_vis {
                     let n = self.slash_candidates().len();
                     if n > 0 {
-                        if self.slash_selected == 0 { self.slash_selected = n - 1; } else { self.slash_selected -= 1; }
+                        if self.slash_selected == 0 {
+                            self.slash_selected = n - 1;
+                        } else {
+                            self.slash_selected -= 1;
+                        }
                     }
                 } else if let Some(s) = self.active_session_mut() {
                     s.composer.history_up();
@@ -283,7 +336,9 @@ impl App {
             KeyCode::Down => {
                 if slash_vis {
                     let n = self.slash_candidates().len();
-                    if n > 0 { self.slash_selected = (self.slash_selected + 1) % n; }
+                    if n > 0 {
+                        self.slash_selected = (self.slash_selected + 1) % n;
+                    }
                 } else if let Some(s) = self.active_session_mut() {
                     s.composer.history_down();
                 }
@@ -326,29 +381,43 @@ impl App {
                 let need_clamp = if let Some(s) = self.active_session_mut() {
                     s.composer.insert(c);
                     true
-                } else { false };
-                if need_clamp { self.clamp_slash_selected(); }
+                } else {
+                    false
+                };
+                if need_clamp {
+                    self.clamp_slash_selected();
+                }
             }
             _ => {}
         }
     }
 
     pub fn upload_attachment(&mut self, path: String) {
-        let Some(seed) = self.active_seed() else { return };
+        let Some(seed) = self.active_seed() else {
+            return;
+        };
         self.spawn_api(move |client, tx| async move {
             let read_path = path.clone();
-            let result = tokio::task::spawn_blocking(move || -> Result<(Vec<u8>, String), String> {
-                let bytes = std::fs::read(&read_path).map_err(|e| e.to_string())?;
-                let media = guess_media_type(&read_path);
-                Ok((bytes, media))
-            })
-            .await
-            .map_err(|e| e.to_string())
-            .and_then(|r| r);
+            let result =
+                tokio::task::spawn_blocking(move || -> Result<(Vec<u8>, String), String> {
+                    let bytes = std::fs::read(&read_path).map_err(|e| e.to_string())?;
+                    let media = guess_media_type(&read_path);
+                    Ok((bytes, media))
+                })
+                .await
+                .map_err(|e| e.to_string())
+                .and_then(|r| r);
             match result {
                 Ok((bytes, media)) => {
-                    let uploaded = client.upload_content(&seed, &media, bytes).await.map_err(|e| e.to_string());
-                    let _ = tx.send(AppMsg::Action(ActionResult::Uploaded { seed, path, result: uploaded }));
+                    let uploaded = client
+                        .upload_content(&seed, &media, bytes)
+                        .await
+                        .map_err(|e| e.to_string());
+                    let _ = tx.send(AppMsg::Action(ActionResult::Uploaded {
+                        seed,
+                        path,
+                        result: uploaded,
+                    }));
                 }
                 Err(e) => {
                     let _ = tx.send(AppMsg::Action(ActionResult::Uploaded {
@@ -362,5 +431,4 @@ impl App {
     }
 
     // ───────────────────────── toast / 滚动 ─────────────────────────
-
 }

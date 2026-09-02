@@ -4,17 +4,24 @@ use super::*;
 
 impl App {
     pub fn submit_ask(&mut self) {
-        let Some(seed) = self.active_seed() else { return };
-        let Some(panel) = self.sessions.get_mut(&seed).and_then(|s| s.pending_ask.as_ref()) else {
+        let Some(seed) = self.active_seed() else {
+            return;
+        };
+        let Some(panel) = self
+            .sessions
+            .get_mut(&seed)
+            .and_then(|s| s.pending_ask.as_ref())
+        else {
             return;
         };
         let answers = match panel.collect_answers() {
             Ok(a) => a,
             Err(e) => {
                 if let Some(sess) = self.sessions.get_mut(&seed)
-                    && let Some(p) = sess.pending_ask.as_mut() {
-                        p.error = Some(e);
-                    }
+                    && let Some(p) = sess.pending_ask.as_mut()
+                {
+                    p.error = Some(e);
+                }
                 return;
             }
         };
@@ -29,17 +36,27 @@ impl App {
         }
         let answers = answers
             .into_iter()
-            .map(|(question_id, answer)| crate::protocol::command::AskAnswer { question_id, answer })
+            .map(
+                |(question_id, answer)| crate::protocol::command::AskAnswer {
+                    question_id,
+                    answer,
+                },
+            )
             .collect();
         self.send_control_command(
             seed,
-            ControlCommand::InteractionAskRespond { interaction_id, answers },
+            ControlCommand::InteractionAskRespond {
+                interaction_id,
+                answers,
+            },
             "提交回答",
         );
     }
 
     pub fn dismiss_ask(&mut self) {
-        let Some(seed) = self.active_seed() else { return };
+        let Some(seed) = self.active_seed() else {
+            return;
+        };
         let Some(interaction_id) = self
             .sessions
             .get(&seed)
@@ -51,15 +68,26 @@ impl App {
         if let Some(sess) = self.sessions.get_mut(&seed) {
             sess.pending_ask = None;
         }
-        self.send_control_command(seed, ControlCommand::InteractionAskDismiss { interaction_id }, "跳过 ask");
+        self.send_control_command(
+            seed,
+            ControlCommand::InteractionAskDismiss { interaction_id },
+            "跳过 ask",
+        );
     }
 
     pub fn respond_plan(&mut self, approved: bool, autonomous: bool) {
-        let Some(seed) = self.active_seed() else { return };
-        let panel = self.sessions.get(&seed).and_then(|s| s.pending_plan.as_ref());
+        let Some(seed) = self.active_seed() else {
+            return;
+        };
+        let panel = self
+            .sessions
+            .get(&seed)
+            .and_then(|s| s.pending_plan.as_ref());
         let Some(panel) = panel else { return };
         let interaction_id = panel.interaction_id.clone();
-        let message = if approved { None } else {
+        let message = if approved {
+            None
+        } else {
             let m = panel.message.trim().to_owned();
             (!m.is_empty()).then_some(m)
         };
@@ -68,13 +96,20 @@ impl App {
         }
         self.send_control_command(
             seed,
-            ControlCommand::PlanReviewRespond { interaction_id, approved, message, autonomous },
+            ControlCommand::PlanReviewRespond {
+                interaction_id,
+                approved,
+                message,
+                autonomous,
+            },
             "plan review",
         );
     }
 
     pub fn respond_permission(&mut self, approved: bool) {
-        let Some(seed) = self.active_seed() else { return };
+        let Some(seed) = self.active_seed() else {
+            return;
+        };
         let Some(panel) = self
             .sessions
             .get(&seed)
@@ -83,7 +118,8 @@ impl App {
             return;
         };
         if let Some(sess) = self.sessions.get_mut(&seed) {
-            sess.pending_permissions.retain(|p| p.tool_call_id != panel.tool_call_id);
+            sess.pending_permissions
+                .retain(|p| p.tool_call_id != panel.tool_call_id);
         }
         let cmd = RingingCommand::Tool(ToolCommand::ToolPermissionRespond {
             tool_call_id: panel.tool_call_id,
@@ -103,9 +139,13 @@ impl App {
 
     /// 交互弹窗按键。返回 true = 已消费。优先级 permission > ask > plan。
     pub(super) fn modal_key(&mut self, key: KeyEvent) -> bool {
-        let Some(seed) = self.active_seed() else { return false };
+        let Some(seed) = self.active_seed() else {
+            return false;
+        };
         let route = {
-            let Some(sess) = self.sessions.get(&seed) else { return false };
+            let Some(sess) = self.sessions.get(&seed) else {
+                return false;
+            };
             keymap::modal_route(
                 sess.active_permission().is_some(),
                 sess.pending_ask.is_some(),
@@ -129,8 +169,12 @@ impl App {
             None,
         }
         let decision = {
-            let Some(sess) = self.sessions.get(seed) else { return true };
-            let Some(perm) = sess.active_permission() else { return true };
+            let Some(sess) = self.sessions.get(seed) else {
+                return true;
+            };
+            let Some(perm) = sess.active_permission() else {
+                return true;
+            };
             match key.code {
                 KeyCode::Char('a') => D::Approve,
                 KeyCode::Char('d') | KeyCode::Esc => D::Deny,
@@ -147,9 +191,10 @@ impl App {
             D::Deny => self.respond_permission(false),
             D::ToggleTrust => {
                 if let Some(s) = self.sessions.get_mut(seed)
-                    && let Some(p) = s.pending_permissions.first_mut() {
-                        p.trust_folder = !p.trust_folder;
-                    }
+                    && let Some(p) = s.pending_permissions.first_mut()
+                {
+                    p.trust_folder = !p.trust_folder;
+                }
             }
             D::None => {}
         }
@@ -172,8 +217,12 @@ impl App {
             None,
         }
         let decision = {
-            let Some(sess) = self.sessions.get(seed) else { return true };
-            let Some(ask) = sess.pending_ask.as_ref() else { return true };
+            let Some(sess) = self.sessions.get(seed) else {
+                return true;
+            };
+            let Some(ask) = sess.pending_ask.as_ref() else {
+                return true;
+            };
             let focus = ask.focus.min(ask.questions.len().saturating_sub(1));
             if ask.editing_custom.is_some() {
                 match key.code {
@@ -187,11 +236,16 @@ impl App {
                 match key.code {
                     KeyCode::Up => D::FocusUp,
                     KeyCode::Down | KeyCode::Tab => D::FocusDown,
-                    KeyCode::Char(c @ '1'..='9') => {
-                        D::Select { focus, option: (c as u8 - b'1') as usize }
-                    }
+                    KeyCode::Char(c @ '1'..='9') => D::Select {
+                        focus,
+                        option: (c as u8 - b'1') as usize,
+                    },
                     KeyCode::Char('e')
-                        if ask.questions.get(focus).map(|q| q.allow_custom).unwrap_or(false) =>
+                        if ask
+                            .questions
+                            .get(focus)
+                            .map(|q| q.allow_custom)
+                            .unwrap_or(false) =>
                     {
                         D::StartEdit { focus }
                     }
@@ -204,67 +258,74 @@ impl App {
         match decision {
             D::FocusUp => {
                 if let Some(s) = self.sessions.get_mut(seed)
-                    && let Some(p) = s.pending_ask.as_mut() {
-                        p.focus = p.focus.saturating_sub(1);
-                    }
+                    && let Some(p) = s.pending_ask.as_mut()
+                {
+                    p.focus = p.focus.saturating_sub(1);
+                }
             }
             D::FocusDown => {
                 if let Some(s) = self.sessions.get_mut(seed)
                     && let Some(p) = s.pending_ask.as_mut()
-                        && p.focus + 1 < p.questions.len() {
-                            p.focus += 1;
-                        }
+                    && p.focus + 1 < p.questions.len()
+                {
+                    p.focus += 1;
+                }
             }
             D::Select { focus, option } => {
                 if let Some(s) = self.sessions.get_mut(seed)
                     && let Some(p) = s.pending_ask.as_mut()
-                        && p.questions
-                            .get(focus)
-                            .map(|q| option < q.options.len())
-                            .unwrap_or(false)
-                        {
-                            p.selections[focus] = Some(option);
-                            p.error = None;
-                        }
+                    && p.questions
+                        .get(focus)
+                        .map(|q| option < q.options.len())
+                        .unwrap_or(false)
+                {
+                    p.selections[focus] = Some(option);
+                    p.error = None;
+                }
             }
             D::StartEdit { focus } => {
                 if let Some(s) = self.sessions.get_mut(seed)
-                    && let Some(p) = s.pending_ask.as_mut() {
-                        p.editing_custom = Some(focus);
-                        p.input = p.customs[focus].clone();
-                    }
+                    && let Some(p) = s.pending_ask.as_mut()
+                {
+                    p.editing_custom = Some(focus);
+                    p.input = p.customs[focus].clone();
+                }
             }
             D::EditChar(c) => {
                 if let Some(s) = self.sessions.get_mut(seed)
-                    && let Some(p) = s.pending_ask.as_mut() {
-                        p.input.push(c);
-                    }
+                    && let Some(p) = s.pending_ask.as_mut()
+                {
+                    p.input.push(c);
+                }
             }
             D::EditBackspace => {
                 if let Some(s) = self.sessions.get_mut(seed)
-                    && let Some(p) = s.pending_ask.as_mut() {
-                        p.input.pop();
-                    }
+                    && let Some(p) = s.pending_ask.as_mut()
+                {
+                    p.input.pop();
+                }
             }
             D::EditCommit => {
                 if let Some(s) = self.sessions.get_mut(seed)
-                    && let Some(p) = s.pending_ask.as_mut() {
-                        let qi = p.editing_custom.take().unwrap_or(0);
-                        if p.input.trim().is_empty() {
-                            p.customs[qi].clear();
-                        } else {
-                            p.customs[qi] = p.input.trim().to_owned();
-                        }
-                        p.input.clear();
-                        p.error = None;
+                    && let Some(p) = s.pending_ask.as_mut()
+                {
+                    let qi = p.editing_custom.take().unwrap_or(0);
+                    if p.input.trim().is_empty() {
+                        p.customs[qi].clear();
+                    } else {
+                        p.customs[qi] = p.input.trim().to_owned();
                     }
+                    p.input.clear();
+                    p.error = None;
+                }
             }
             D::EditCancel => {
                 if let Some(s) = self.sessions.get_mut(seed)
-                    && let Some(p) = s.pending_ask.as_mut() {
-                        p.editing_custom = None;
-                        p.input.clear();
-                    }
+                    && let Some(p) = s.pending_ask.as_mut()
+                {
+                    p.editing_custom = None;
+                    p.input.clear();
+                }
             }
             D::Submit => self.submit_ask(),
             D::Dismiss => self.dismiss_ask(),
@@ -287,7 +348,9 @@ impl App {
             None,
         }
         let decision = {
-            let Some(sess) = self.sessions.get(seed) else { return true };
+            let Some(sess) = self.sessions.get(seed) else {
+                return true;
+            };
             let entering = sess
                 .pending_plan
                 .as_ref()
@@ -321,44 +384,47 @@ impl App {
             D::ApproveAuto => self.respond_plan(true, true),
             D::StartReject => {
                 if let Some(s) = self.sessions.get_mut(seed)
-                    && let Some(p) = s.pending_plan.as_mut() {
-                        p.entering_message = true;
-                    }
+                    && let Some(p) = s.pending_plan.as_mut()
+                {
+                    p.entering_message = true;
+                }
             }
             D::Scroll(delta) => {
                 if let Some(s) = self.sessions.get_mut(seed)
-                    && let Some(p) = s.pending_plan.as_mut() {
-                        if delta > 0 {
-                            p.scroll = p.scroll.saturating_add(delta as usize);
-                        } else {
-                            p.scroll = p.scroll.saturating_sub((-delta) as usize);
-                        }
+                    && let Some(p) = s.pending_plan.as_mut()
+                {
+                    if delta > 0 {
+                        p.scroll = p.scroll.saturating_add(delta as usize);
+                    } else {
+                        p.scroll = p.scroll.saturating_sub((-delta) as usize);
                     }
+                }
             }
             D::EditChar(c) => {
                 if let Some(s) = self.sessions.get_mut(seed)
-                    && let Some(p) = s.pending_plan.as_mut() {
-                        p.message.push(c);
-                    }
+                    && let Some(p) = s.pending_plan.as_mut()
+                {
+                    p.message.push(c);
+                }
             }
             D::EditBackspace => {
                 if let Some(s) = self.sessions.get_mut(seed)
-                    && let Some(p) = s.pending_plan.as_mut() {
-                        p.message.pop();
-                    }
+                    && let Some(p) = s.pending_plan.as_mut()
+                {
+                    p.message.pop();
+                }
             }
             D::SubmitReject => self.respond_plan(false, false),
             D::CancelEdit => {
                 if let Some(s) = self.sessions.get_mut(seed)
-                    && let Some(p) = s.pending_plan.as_mut() {
-                        p.entering_message = false;
-                        p.message.clear();
-                    }
+                    && let Some(p) = s.pending_plan.as_mut()
+                {
+                    p.entering_message = false;
+                    p.message.clear();
+                }
             }
             D::None => {}
         }
         true
     }
-
-
 }

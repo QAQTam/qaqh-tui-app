@@ -177,7 +177,10 @@ pub struct ToolCard {
 impl From<TimelineTool> for ToolCard {
     fn from(t: TimelineTool) -> Self {
         let progress = {
-            let is_bash = matches!(t.name.as_str(), "bash" | "exec" | "shell" | "pwsh" | "powershell");
+            let is_bash = matches!(
+                t.name.as_str(),
+                "bash" | "exec" | "shell" | "pwsh" | "powershell"
+            );
             if is_bash && !t.progress.is_empty() {
                 let mut buf = String::new();
                 apply_bash_progress(&mut buf, &t.progress);
@@ -295,7 +298,10 @@ impl TimelineModel {
         if let Some(idx) = turn.rounds.iter().position(|r| r.round_num == round_num) {
             return &mut turn.rounds[idx];
         }
-        turn.rounds.push(Round { round_num, ..Round::default() });
+        turn.rounds.push(Round {
+            round_num,
+            ..Round::default()
+        });
         let idx = turn
             .rounds
             .iter()
@@ -338,7 +344,11 @@ impl TimelineModel {
             E::BlockOpened { block } => {
                 let round = Self::find_round_mut(turn, entry.round_num.unwrap_or(0));
                 let wire = Block::from_wire(block.clone());
-                match round.blocks.iter().position(|b| b.block_id == wire.block_id) {
+                match round
+                    .blocks
+                    .iter()
+                    .position(|b| b.block_id == wire.block_id)
+                {
                     Some(idx) => round.blocks[idx] = wire,
                     None => {
                         // 按 block_order 插入，保持块序稳定。
@@ -351,7 +361,11 @@ impl TimelineModel {
                     }
                 }
             }
-            E::TextDelta { block_id, fragment_seq, delta } => {
+            E::TextDelta {
+                block_id,
+                fragment_seq,
+                delta,
+            } => {
                 let round_num = entry.round_num.unwrap_or(0);
                 let round = Self::find_round_mut(turn, round_num);
                 if let Some(block) = Self::find_block_mut(round, block_id) {
@@ -435,7 +449,12 @@ impl TimelineModel {
 
     /// 快照整体替换（re-baseline / 打开标签页）。
     pub fn replace_from_page(&mut self, page: &TimelinePage) {
-        self.turns = page.snapshot.turns.iter().map(|t| Turn::from_wire(t.clone())).collect();
+        self.turns = page
+            .snapshot
+            .turns
+            .iter()
+            .map(|t| Turn::from_wire(t.clone()))
+            .collect();
         self.has_more = page.has_more;
         self.total_turns = page.total_turns;
         self.bump();
@@ -443,7 +462,12 @@ impl TimelineModel {
 
     /// 加载更早的回合（滚动上翻分页）。
     pub fn prepend_older(&mut self, page: &TimelinePage) {
-        let older: Vec<Turn> = page.snapshot.turns.iter().map(|t| Turn::from_wire(t.clone())).collect();
+        let older: Vec<Turn> = page
+            .snapshot
+            .turns
+            .iter()
+            .map(|t| Turn::from_wire(t.clone()))
+            .collect();
         if older.is_empty() {
             self.has_more = false;
             self.bump();
@@ -493,43 +517,84 @@ mod tests {
     use crate::protocol::timeline::{TimelineEvent, TimelineToolState};
 
     fn entry(seq: u64, turn: &str, event: TimelineEvent) -> TimelineEntry {
-        TimelineEntry { timeline_seq: seq, turn_id: turn.to_owned(), round_num: Some(0), event }
+        TimelineEntry {
+            timeline_seq: seq,
+            turn_id: turn.to_owned(),
+            round_num: Some(0),
+            event,
+        }
     }
 
     #[test]
     fn turn_and_text_flow() {
         let mut m = TimelineModel::default();
-        m.apply(&entry(1, "t1", TimelineEvent::TurnOpened { user_text: "你好".into() }));
-        m.apply(&entry(2, "t1", TimelineEvent::BlockOpened {
-            block: TimelineBlock {
-                block_id: "b1".into(),
-                block_order: 0,
-                kind: TimelineBlockKind::Text,
-                state: TimelineBlockState::Open,
-                text: String::new(),
-                tool: None,
+        m.apply(&entry(
+            1,
+            "t1",
+            TimelineEvent::TurnOpened {
+                user_text: "你好".into(),
             },
-        }));
-        m.apply(&entry(3, "t1", TimelineEvent::TextDelta {
-            block_id: "b1".into(),
-            fragment_seq: 1,
-            delta: "回答".into(),
-        }));
-        m.apply(&entry(4, "t1", TimelineEvent::TextDelta {
-            block_id: "b1".into(),
-            fragment_seq: 2,
-            delta: "开始".into(),
-        }));
-        m.apply(&entry(5, "t1", TimelineEvent::BlockCheckpoint {
-            block_id: "b1".into(),
-            text: "回答开始了".into(),
-        }));
-        m.apply(&entry(6, "t1", TimelineEvent::BlockSealed { block_id: "b1".into() }));
-        m.apply(&entry(7, "t1", TimelineEvent::RoundSealed { is_final: true }));
-        m.apply(&entry(8, "t1", TimelineEvent::TurnSealed {
-            state: TimelineTurnState::Completed,
-            failure: None,
-        }));
+        ));
+        m.apply(&entry(
+            2,
+            "t1",
+            TimelineEvent::BlockOpened {
+                block: TimelineBlock {
+                    block_id: "b1".into(),
+                    block_order: 0,
+                    kind: TimelineBlockKind::Text,
+                    state: TimelineBlockState::Open,
+                    text: String::new(),
+                    tool: None,
+                },
+            },
+        ));
+        m.apply(&entry(
+            3,
+            "t1",
+            TimelineEvent::TextDelta {
+                block_id: "b1".into(),
+                fragment_seq: 1,
+                delta: "回答".into(),
+            },
+        ));
+        m.apply(&entry(
+            4,
+            "t1",
+            TimelineEvent::TextDelta {
+                block_id: "b1".into(),
+                fragment_seq: 2,
+                delta: "开始".into(),
+            },
+        ));
+        m.apply(&entry(
+            5,
+            "t1",
+            TimelineEvent::BlockCheckpoint {
+                block_id: "b1".into(),
+                text: "回答开始了".into(),
+            },
+        ));
+        m.apply(&entry(
+            6,
+            "t1",
+            TimelineEvent::BlockSealed {
+                block_id: "b1".into(),
+            },
+        ));
+        m.apply(&entry(
+            7,
+            "t1",
+            TimelineEvent::RoundSealed { is_final: true },
+        ));
+        m.apply(&entry(
+            8,
+            "t1",
+            TimelineEvent::TurnSealed {
+                state: TimelineTurnState::Completed,
+                failure: None,
+            },
+        ));
 
         assert_eq!(m.turns.len(), 1);
         let turn = &m.turns[0];
@@ -541,67 +606,119 @@ mod tests {
     #[test]
     fn duplicate_and_replayed_entries_are_idempotent() {
         let mut m = TimelineModel::default();
-        m.apply(&entry(1, "t1", TimelineEvent::TurnOpened { user_text: "hi".into() }));
-        m.apply(&entry(2, "t1", TimelineEvent::BlockOpened {
-            block: TimelineBlock {
-                block_id: "b1".into(),
-                block_order: 0,
-                kind: TimelineBlockKind::Text,
-                state: TimelineBlockState::Open,
-                text: String::new(),
-                tool: None,
+        m.apply(&entry(
+            1,
+            "t1",
+            TimelineEvent::TurnOpened {
+                user_text: "hi".into(),
             },
-        }));
+        ));
+        m.apply(&entry(
+            2,
+            "t1",
+            TimelineEvent::BlockOpened {
+                block: TimelineBlock {
+                    block_id: "b1".into(),
+                    block_order: 0,
+                    kind: TimelineBlockKind::Text,
+                    state: TimelineBlockState::Open,
+                    text: String::new(),
+                    tool: None,
+                },
+            },
+        ));
         let v = m.version;
         // 重复 TurnOpened → no-op
-        m.apply(&entry(1, "t1", TimelineEvent::TurnOpened { user_text: "hi".into() }));
+        m.apply(&entry(
+            1,
+            "t1",
+            TimelineEvent::TurnOpened {
+                user_text: "hi".into(),
+            },
+        ));
         assert_eq!(m.version, v);
         // 重复 fragment → 丢弃
-        m.apply(&entry(2, "t1", TimelineEvent::TextDelta {
-            block_id: "b1".into(),
-            fragment_seq: 1,
-            delta: "a".into(),
-        }));
+        m.apply(&entry(
+            2,
+            "t1",
+            TimelineEvent::TextDelta {
+                block_id: "b1".into(),
+                fragment_seq: 1,
+                delta: "a".into(),
+            },
+        ));
         let v2 = m.version;
-        m.apply(&entry(2, "t1", TimelineEvent::TextDelta {
-            block_id: "b1".into(),
-            fragment_seq: 1,
-            delta: "a".into(),
-        }));
+        m.apply(&entry(
+            2,
+            "t1",
+            TimelineEvent::TextDelta {
+                block_id: "b1".into(),
+                fragment_seq: 1,
+                delta: "a".into(),
+            },
+        ));
         assert_eq!(m.version, v2);
     }
 
     #[test]
     fn tool_lifecycle_and_progress() {
         let mut m = TimelineModel::default();
-        m.apply(&entry(1, "t1", TimelineEvent::TurnOpened { user_text: "run".into() }));
-        m.apply(&entry(2, "t1", TimelineEvent::BlockOpened {
-            block: TimelineBlock {
-                block_id: "b2".into(),
-                block_order: 1,
-                kind: TimelineBlockKind::Tool,
-                state: TimelineBlockState::Open,
-                text: String::new(),
-                tool: Some(TimelineTool {
-                    tool_call_id: "c1".into(),
-                    name: "exec".into(),
-                    state: TimelineToolState::Prepared,
-                    summary: None,
-                    args_json: Some("{}".into()),
-                    output: None,
-                    diff: None,
-                    progress: String::new(),
-                    failure: None,
-                    permission: None,
-                }),
+        m.apply(&entry(
+            1,
+            "t1",
+            TimelineEvent::TurnOpened {
+                user_text: "run".into(),
             },
-        }));
-        m.apply(&entry(3, "t1", TimelineEvent::ToolProgress { block_id: "b2".into(), chunk: "out1\n".into() }));
-        m.apply(&entry(4, "t1", TimelineEvent::ToolProgress { block_id: "b2".into(), chunk: "out2\n".into() }));
-        m.apply(&entry(5, "t1", TimelineEvent::TurnSealed {
-            state: TimelineTurnState::Completed,
-            failure: None,
-        }));
+        ));
+        m.apply(&entry(
+            2,
+            "t1",
+            TimelineEvent::BlockOpened {
+                block: TimelineBlock {
+                    block_id: "b2".into(),
+                    block_order: 1,
+                    kind: TimelineBlockKind::Tool,
+                    state: TimelineBlockState::Open,
+                    text: String::new(),
+                    tool: Some(TimelineTool {
+                        tool_call_id: "c1".into(),
+                        name: "exec".into(),
+                        state: TimelineToolState::Prepared,
+                        summary: None,
+                        args_json: Some("{}".into()),
+                        output: None,
+                        diff: None,
+                        progress: String::new(),
+                        failure: None,
+                        permission: None,
+                    }),
+                },
+            },
+        ));
+        m.apply(&entry(
+            3,
+            "t1",
+            TimelineEvent::ToolProgress {
+                block_id: "b2".into(),
+                chunk: "out1\n".into(),
+            },
+        ));
+        m.apply(&entry(
+            4,
+            "t1",
+            TimelineEvent::ToolProgress {
+                block_id: "b2".into(),
+                chunk: "out2\n".into(),
+            },
+        ));
+        m.apply(&entry(
+            5,
+            "t1",
+            TimelineEvent::TurnSealed {
+                state: TimelineTurnState::Completed,
+                failure: None,
+            },
+        ));
 
         let tool = m.turns[0].rounds[0].blocks[0].tool.as_ref().unwrap();
         assert_eq!(tool.state, TimelineToolState::Prepared);
@@ -612,7 +729,13 @@ mod tests {
     fn cap_turns_keeps_recent_window() {
         let mut m = TimelineModel::default();
         for i in 1..=10 {
-            m.apply(&entry(i, &format!("t{i}"), TimelineEvent::TurnOpened { user_text: format!("n{i}") }));
+            m.apply(&entry(
+                i,
+                &format!("t{i}"),
+                TimelineEvent::TurnOpened {
+                    user_text: format!("n{i}"),
+                },
+            ));
         }
         assert_eq!(m.turns.len(), 10);
         m.cap_turns(4);
@@ -630,7 +753,13 @@ mod tests {
     fn prepend_older_merges_boundary() {
         let mut m = TimelineModel::default();
         for i in 3..=4 {
-            m.apply(&entry(i as u64, &format!("t{i}"), TimelineEvent::TurnOpened { user_text: format!("n{i}") }));
+            m.apply(&entry(
+                i as u64,
+                &format!("t{i}"),
+                TimelineEvent::TurnOpened {
+                    user_text: format!("n{i}"),
+                },
+            ));
         }
         // 服务端返回 t1..t3，其中 t3 为边界重复。
         let page = TimelinePage {
@@ -642,15 +771,17 @@ mod tests {
             total_turns: 4,
             snapshot: crate::protocol::timeline::TimelineSnapshot {
                 watermark: 3,
-                turns: (1..=3).map(|i| crate::protocol::timeline::TimelineTurn {
-                    turn_id: format!("t{i}"),
-                    created_seq: i as u64,
-                    user_text: format!("n{i}"),
-                    sealed: true,
-                    state: TimelineTurnState::Completed,
-                    failure: None,
-                    rounds: vec![],
-                }).collect(),
+                turns: (1..=3)
+                    .map(|i| crate::protocol::timeline::TimelineTurn {
+                        turn_id: format!("t{i}"),
+                        created_seq: i as u64,
+                        user_text: format!("n{i}"),
+                        sealed: true,
+                        state: TimelineTurnState::Completed,
+                        failure: None,
+                        rounds: vec![],
+                    })
+                    .collect(),
             },
         };
         m.prepend_older(&page);
@@ -753,34 +884,76 @@ mod tests {
     fn bash_progress_via_timeline_bash_vs_other_tool() {
         // bash 工具应走 apply_bash_progress，普通工具保持 push_str
         let mut m = TimelineModel::default();
-        m.apply(&entry(1, "t1", TimelineEvent::TurnOpened { user_text: "hi".into() }));
+        m.apply(&entry(
+            1,
+            "t1",
+            TimelineEvent::TurnOpened {
+                user_text: "hi".into(),
+            },
+        ));
         for (bid, name) in [("b_bash", "bash"), ("b_read", "read")] {
-            m.apply(&entry(2, "t1", TimelineEvent::BlockOpened {
-                block: TimelineBlock {
-                    block_id: bid.into(),
-                    block_order: if name == "bash" { 0 } else { 1 },
-                    kind: TimelineBlockKind::Tool,
-                    state: TimelineBlockState::Open,
-                    text: String::new(),
-                    tool: Some(TimelineTool {
-                        tool_call_id: format!("c_{name}"),
-                        name: name.into(),
-                        state: TimelineToolState::Running,
-                        summary: None,
-                        args_json: None,
-                        output: None,
-                        diff: None,
-                        progress: String::new(),
-                        failure: None,
-                        permission: None,
-                    }),
+            m.apply(&entry(
+                2,
+                "t1",
+                TimelineEvent::BlockOpened {
+                    block: TimelineBlock {
+                        block_id: bid.into(),
+                        block_order: if name == "bash" { 0 } else { 1 },
+                        kind: TimelineBlockKind::Tool,
+                        state: TimelineBlockState::Open,
+                        text: String::new(),
+                        tool: Some(TimelineTool {
+                            tool_call_id: format!("c_{name}"),
+                            name: name.into(),
+                            state: TimelineToolState::Running,
+                            summary: None,
+                            args_json: None,
+                            output: None,
+                            diff: None,
+                            progress: String::new(),
+                            failure: None,
+                            permission: None,
+                        }),
+                    },
                 },
-            }));
+            ));
         }
-        m.apply(&entry(3, "t1", TimelineEvent::ToolProgress { block_id: "b_bash".into(), chunk: "a\rb\n".into() }));
-        m.apply(&entry(4, "t1", TimelineEvent::ToolProgress { block_id: "b_read".into(), chunk: "a\rb\n".into() }));
-        let bash_progress = m.turns[0].rounds[0].blocks.iter().find(|b| b.block_id == "b_bash").unwrap().tool.as_ref().unwrap().progress.clone();
-        let read_progress = m.turns[0].rounds[0].blocks.iter().find(|b| b.block_id == "b_read").unwrap().tool.as_ref().unwrap().progress.clone();
+        m.apply(&entry(
+            3,
+            "t1",
+            TimelineEvent::ToolProgress {
+                block_id: "b_bash".into(),
+                chunk: "a\rb\n".into(),
+            },
+        ));
+        m.apply(&entry(
+            4,
+            "t1",
+            TimelineEvent::ToolProgress {
+                block_id: "b_read".into(),
+                chunk: "a\rb\n".into(),
+            },
+        ));
+        let bash_progress = m.turns[0].rounds[0]
+            .blocks
+            .iter()
+            .find(|b| b.block_id == "b_bash")
+            .unwrap()
+            .tool
+            .as_ref()
+            .unwrap()
+            .progress
+            .clone();
+        let read_progress = m.turns[0].rounds[0]
+            .blocks
+            .iter()
+            .find(|b| b.block_id == "b_read")
+            .unwrap()
+            .tool
+            .as_ref()
+            .unwrap()
+            .progress
+            .clone();
         assert_eq!(bash_progress, "b\n", "bash 需 \r 覆写");
         assert_eq!(read_progress, "a\rb\n", "非 bash 保持原文");
     }
@@ -832,7 +1005,12 @@ mod tests {
         };
         let mut m = TimelineModel::default();
         m.replace_from_page(&page);
-        let prog = m.turns[0].rounds[0].blocks[0].tool.as_ref().unwrap().progress.clone();
+        let prog = m.turns[0].rounds[0].blocks[0]
+            .tool
+            .as_ref()
+            .unwrap()
+            .progress
+            .clone();
         assert_eq!(prog, "100%\n");
         assert!(!prog.contains("\x1b"));
         assert!(!prog.contains("\r"));
