@@ -4,9 +4,7 @@ use super::*;
 
 impl App {
     pub fn fetch_config(&mut self) {
-        let client = self.client.clone();
-        let tx = self.msg_tx.clone();
-        tokio::spawn(async move {
+        self.spawn_api(move |client, tx| async move {
             let result = client
                 .service(methods::CONFIG_LOAD, &serde_json::json!({}))
                 .await
@@ -29,10 +27,8 @@ impl App {
             return;
         }
         self.settings_saving = true;
-        let client = self.client.clone();
-        let tx = self.msg_tx.clone();
         let payload = st.draft.to_json();
-        tokio::spawn(async move {
+        self.spawn_api(move |client, tx| async move {
             let result = client
                 .service(methods::CONFIG_SAVE, &payload)
                 .await
@@ -103,9 +99,7 @@ impl App {
 
     /// `profile.apply`：切换活跃 profile（服务端单写口，写后广播 reload）。
     pub fn apply_profile(&mut self, name: String) {
-        let client = self.client.clone();
-        let tx = self.msg_tx.clone();
-        tokio::spawn(async move {
+        self.spawn_api(move |client, tx| async move {
             let result = client
                 .service(methods::PROFILE_APPLY, &serde_json::json!({ "name": name }))
                 .await
@@ -119,9 +113,7 @@ impl App {
 
     /// `workspace.set_mode`：local / wsl（仅 Windows）（服务端单写口）。
     pub fn set_workspace_mode(&mut self, mode: String) {
-        let client = self.client.clone();
-        let tx = self.msg_tx.clone();
-        tokio::spawn(async move {
+        self.spawn_api(move |client, tx| async move {
             let result = client
                 .service(methods::WORKSPACE_SET_MODE, &serde_json::json!({ "mode": mode }))
                 .await
@@ -134,9 +126,7 @@ impl App {
     }
 
     pub fn set_permission_level(&mut self, level: u8) {
-        let client = self.client.clone();
-        let tx = self.msg_tx.clone();
-        tokio::spawn(async move {
+        self.spawn_api(move |client, tx| async move {
             let result = client
                 .service(
                     methods::CONFIG_SET_PERMISSION_LEVEL,

@@ -11,9 +11,7 @@ impl App {
         }
         let (text, attachments) = sess.composer.take();
         let content_refs: Vec<ContentRef> = attachments.into_iter().map(|a| a.content).collect();
-        let client = self.client.clone();
-        let tx = self.msg_tx.clone();
-        tokio::spawn(async move {
+        self.spawn_api(move |client, tx| async move {
             let cmd = build_envelope(
                 &client,
                 RingingCommand::Conversation(ConversationCommand::ConversationSendMessage {
@@ -39,9 +37,7 @@ impl App {
         if !streaming {
             return;
         }
-        let client = self.client.clone();
-        let tx = self.msg_tx.clone();
-        tokio::spawn(async move {
+        self.spawn_api(move |client, tx| async move {
             let cmd = build_envelope(
                 &client,
                 RingingCommand::Conversation(ConversationCommand::ConversationCancel { turn_id: None }),
@@ -68,9 +64,7 @@ impl App {
             sess.mode = next; // 乐观更新
             sess.rendered = None;
         }
-        let client = self.client.clone();
-        let tx = self.msg_tx.clone();
-        tokio::spawn(async move {
+        self.spawn_api(move |client, tx| async move {
             let cmd = build_envelope(
                 &client,
                 RingingCommand::Conversation(ConversationCommand::ConversationSetMode { mode: next }),
@@ -87,9 +81,7 @@ impl App {
 
     pub fn compact(&mut self) {
         let Some(seed) = self.active_seed() else { return };
-        let client = self.client.clone();
-        let tx = self.msg_tx.clone();
-        tokio::spawn(async move {
+        self.spawn_api(move |client, tx| async move {
             let cmd = build_envelope(
                 &client,
                 RingingCommand::Conversation(ConversationCommand::ConversationCompact { turn_id: None }),
@@ -110,9 +102,7 @@ impl App {
         else {
             return;
         };
-        let client = self.client.clone();
-        let tx = self.msg_tx.clone();
-        tokio::spawn(async move {
+        self.spawn_api(move |client, tx| async move {
             let cmd = build_envelope(
                 &client,
                 RingingCommand::Conversation(ConversationCommand::ConversationUndoTurn { turn_id }),
@@ -156,10 +146,8 @@ impl App {
     }
 
     pub(super) fn request_rebaseline(&mut self, seed: &str) {
-        let client = self.client.clone();
-        let tx = self.msg_tx.clone();
         let seed = seed.to_owned();
-        tokio::spawn(async move {
+        self.spawn_api(move |client, tx| async move {
             let result = client
                 .timeline_page(&seed, None, crate::runtime::TIMELINE_PAGE_LIMIT)
                 .await
@@ -182,9 +170,7 @@ impl App {
         if let Some(sess) = self.sessions.get_mut(&seed) {
             sess.loading_older = true;
         }
-        let client = self.client.clone();
-        let tx = self.msg_tx.clone();
-        tokio::spawn(async move {
+        self.spawn_api(move |client, tx| async move {
             let result = client
                 .timeline_page(&seed, Some(&before), crate::runtime::TIMELINE_PAGE_LIMIT)
                 .await
@@ -196,9 +182,7 @@ impl App {
     // ───────────────────────── 交互响应命令 ─────────────────────────
 
     pub(super) fn send_control_command(&mut self, seed: String, command: ControlCommand, label: &'static str) {
-        let client = self.client.clone();
-        let tx = self.msg_tx.clone();
-        tokio::spawn(async move {
+        self.spawn_api(move |client, tx| async move {
             let env = build_envelope(&client, RingingCommand::Control(command)).with_seed(seed.clone());
             let result = client.command(&env).await.map_err(|e| e.to_string());
             let _ = tx.send(AppMsg::Action(ActionResult::CommandAck {

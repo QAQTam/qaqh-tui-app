@@ -90,9 +90,7 @@ impl App {
             approved,
             trust_folder: panel.trust_folder,
         });
-        let client = self.client.clone();
-        let tx = self.msg_tx.clone();
-        tokio::spawn(async move {
+        self.spawn_api(move |client, tx| async move {
             let env = build_envelope(&client, cmd).with_seed(seed.clone());
             let result = client.command(&env).await.map_err(|e| e.to_string());
             let _ = tx.send(AppMsg::Action(ActionResult::CommandAck {

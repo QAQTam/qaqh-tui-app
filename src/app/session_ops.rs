@@ -17,9 +17,7 @@ impl App {
     }
 
     pub(super) fn attach_and_bootstrap(&mut self, seed: String) {
-        let tx = self.msg_tx.clone();
-        let client = self.client.clone();
-        tokio::spawn(async move {
+        self.spawn_api(move |client, tx| async move {
             let cmd = build_envelope(
                 &client,
                 RingingCommand::Control(ControlCommand::SessionResume { seed: seed.clone() }),
@@ -67,7 +65,6 @@ impl App {
     pub fn new_session_with_cwd(&mut self, cwd: Option<String>) {
         let cwd = self.effective_cwd(cwd);
         let client = self.client.clone();
-        let tx = self.msg_tx.clone();
         let cmd = build_envelope(
             &client,
             RingingCommand::Control(ControlCommand::SessionCreate {
@@ -79,7 +76,7 @@ impl App {
         );
         let command_id = cmd.command_id.clone();
         self.pending_creates.insert(command_id.clone(), Instant::now());
-        tokio::spawn(async move {
+        self.spawn_api(move |client, tx| async move {
             let result = client.command(&cmd).await.map_err(|e| e.to_string());
             let _ = tx.send(AppMsg::Action(ActionResult::CommandAck {
                 seed: None,
@@ -121,9 +118,7 @@ impl App {
     // ───────────────────────── 命令发送 ─────────────────────────
 
     pub fn fetch_session_list(&mut self) {
-        let client = self.client.clone();
-        let tx = self.msg_tx.clone();
-        tokio::spawn(async move {
+        self.spawn_api(move |client, tx| async move {
             let list = client.session_list().await.map_err(|e| e.to_string());
             let _ = tx.send(AppMsg::Action(ActionResult::SessionList(list)));
             let activity = client
@@ -151,9 +146,7 @@ impl App {
             return;
         }
         self.dashboard_fetching.insert(seed.clone());
-        let client = self.client.clone();
-        let tx = self.msg_tx.clone();
-        tokio::spawn(async move {
+        self.spawn_api(move |client, tx| async move {
             let value = client
                 .service(methods::SESSION_DASHBOARD, &serde_json::json!({ "seed": seed.clone() }))
                 .await;

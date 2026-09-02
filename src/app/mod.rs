@@ -321,10 +321,8 @@ impl App {
             RuntimeMsg::Ringing { channel, env } => self.handle_envelope(channel, *env),
             RuntimeMsg::ResetRequired { seed, .. } => {
                 // 频道级 reset → 重新 bootstrap 该会话（timeline 流自会 re-baseline）。
-                let tx = self.msg_tx.clone();
-                let client = self.client.clone();
                 let seed2 = seed.clone();
-                tokio::spawn(async move {
+                self.spawn_api(move |client, tx| async move {
                     let result = client.bootstrap(&seed2).await.map_err(|e| e.to_string());
                     let _ = tx.send(AppMsg::Action(ActionResult::Bootstrap { seed: seed2, result }));
                 });
@@ -375,9 +373,7 @@ impl App {
                 // 并 re-baseline；epoch 变化时 timeline 流自行重放。
                 let seeds = self.tabs.clone();
                 if !seeds.is_empty() {
-                    let tx = self.msg_tx.clone();
-                    let client = self.client.clone();
-                    tokio::spawn(async move {
+                    self.spawn_api(move |client, tx| async move {
                         for seed in seeds {
                             let cmd = build_envelope(
                                 &client,
@@ -934,6 +930,18 @@ impl App {
     }
 
     // ───────────────────────── 滚动 ─────────────────────────
+
+    /// app → daemon 异步出口的唯一入口：集中克隆 client/msg_tx 并 spawn。
+    /// 今后如需统一超时/退避/取消/指标，只需叠加在此处。
+    pub(super) fn spawn_api<F, Fut>(&self, task: F)
+    where
+        F: FnOnce(Arc<HttpClient>, tokio::sync::mpsc::UnboundedSender<AppMsg>) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = ()> + Send,
+    {
+        let client = self.client.clone();
+        let tx = self.msg_tx.clone();
+        tokio::spawn(async move { task(client, tx).await });
+    }
 
     fn handle_key(&mut self, key: KeyEvent) {
         use ratatui::crossterm::event::KeyModifiers;

@@ -310,9 +310,7 @@ impl App {
 
     pub fn upload_attachment(&mut self, path: String) {
         let Some(seed) = self.active_seed() else { return };
-        let client = self.client.clone();
-        let tx = self.msg_tx.clone();
-        tokio::spawn(async move {
+        self.spawn_api(move |client, tx| async move {
             let read_path = path.clone();
             let result = tokio::task::spawn_blocking(move || -> Result<(Vec<u8>, String), String> {
                 let bytes = std::fs::read(&read_path).map_err(|e| e.to_string())?;
