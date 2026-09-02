@@ -114,7 +114,7 @@ pub fn wrap_text(text: &str, width: usize) -> Vec<String> {
         let mut line_w: usize = 0;
         let mut last_space: Option<(usize, usize)> = None; // (char 下标, 累计宽度)
         for ch in para.chars() {
-            let cw = ch.width().unwrap_or(0).max(0) as usize;
+            let cw = ch.width().unwrap_or(0);
             if line_w + cw > width {
                 if ch == ' ' {
                     // 行尾空格本身就是换行点：丢弃即可，不必断词。
@@ -129,7 +129,7 @@ pub fn wrap_text(text: &str, width: usize) -> Vec<String> {
                     let tail: String = line.chars().skip(space_idx + 1).collect();
                     out.push(head);
                     line = tail;
-                    line_w = line.chars().map(|c| c.width().unwrap_or(0).max(0) as usize).sum();
+                    line_w = line.chars().map(|c| c.width().unwrap_or(0)).sum();
                     last_space = None;
                     // 当前字符重新尝试放入新行。
                     if line_w + cw <= width {

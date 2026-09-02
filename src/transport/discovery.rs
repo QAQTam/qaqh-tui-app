@@ -131,12 +131,11 @@ fn spawn_daemon_detached() -> Result<()> {
     if let Ok(cwd) = std::env::current_dir() {
         candidates.push(cwd.join("target/debug").join(exe_names));
     }
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(dir) = exe.parent() {
             candidates.push(dir.join("resources").join(exe_names));
             candidates.push(dir.join(exe_names));
         }
-    }
 
     let found = candidates.iter().find(|p| p.is_file()).cloned();
     let Some(daemon_exe) = found else {
@@ -159,11 +158,10 @@ fn spawn_daemon_detached() -> Result<()> {
 /// 确保有一个健康的 daemon：读 discovery → pid 存活 → /health 探活；
 /// 失败且允许时尝试拉起 daemon 并轮询 discovery 就绪。
 pub async fn ensure_daemon(spawn_if_missing: bool) -> Result<DaemonDiscovery> {
-    if let Some(d) = read_discovery() {
-        if pid_alive(d.pid) {
+    if let Some(d) = read_discovery()
+        && pid_alive(d.pid) {
             return Ok(d);
         }
-    }
     if !spawn_if_missing {
         bail!("daemon.json 缺失或已失效（daemon 未运行）");
     }
@@ -173,11 +171,10 @@ pub async fn ensure_daemon(spawn_if_missing: bool) -> Result<DaemonDiscovery> {
     // 与 SDK 一致：120ms 轮询 discovery，超时 25s（冷启动余量）。
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(25);
     loop {
-        if let Some(d) = read_discovery() {
-            if pid_alive(d.pid) {
+        if let Some(d) = read_discovery()
+            && pid_alive(d.pid) {
                 return Ok(d);
             }
-        }
         if tokio::time::Instant::now() >= deadline {
             bail!("等待 daemon 就绪超时（25s）");
         }

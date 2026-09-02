@@ -98,17 +98,16 @@ pub fn completions_for(input: &str) -> Vec<&'static SlashDef> {
 pub fn expand_tilde(p: &str) -> String {
     if !p.starts_with('~') { return p.to_string(); }
     // ~/ 或仅 ~
-    if p == "~" || p.starts_with("~/") || p.starts_with("~\\") {
-        if let Some(home) = dirs_home() {
+    if (p == "~" || p.starts_with("~/") || p.starts_with("~\\"))
+        && let Some(home) = dirs_home() {
             return format!("{}{}", home, &p[1..]);
         }
-    }
     p.to_string()
 }
 
 fn dirs_home() -> Option<String> {
-    if let Ok(h) = std::env::var("HOME") { if !h.is_empty() { return Some(h); } }
-    if let Ok(h) = std::env::var("USERPROFILE") { if !h.is_empty() { return Some(h); } }
+    if let Ok(h) = std::env::var("HOME") && !h.is_empty() { return Some(h); }
+    if let Ok(h) = std::env::var("USERPROFILE") && !h.is_empty() { return Some(h); }
     None
 }
 

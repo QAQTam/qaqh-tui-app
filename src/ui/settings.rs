@@ -160,8 +160,8 @@ fn row_line(
     let marker = if focused { "▶" } else { " " };
     let label = pad_width(row.label, LABEL_W);
 
-    let (value, value_style) = if focused && st.editing.is_some() {
-        let buf = st.editing.as_ref().expect("checked above");
+    let editing = if focused { st.editing.as_ref() } else { None };
+    let (value, value_style) = if let Some(buf) = editing {
         let (window, _) = edit_window(&buf.buf, buf.cursor, value_w);
         (window, Style::new().add_modifier(Modifier::REVERSED))
     } else {
@@ -219,7 +219,7 @@ fn fit_width(s: &str, max: usize) -> String {
     let mut used = 0usize;
     let budget = max.saturating_sub(1); // 留 1 列给省略号
     for c in s.chars() {
-        let w = c.width().unwrap_or(0) as usize;
+        let w = c.width().unwrap_or(0);
         if used + w > budget {
             break;
         }
@@ -231,7 +231,7 @@ fn fit_width(s: &str, max: usize) -> String {
 
 /// 编辑缓冲的可视窗口：返回 (窗口文本, 光标在窗口内的列偏移)。
 fn edit_window(buf: &[char], cursor: usize, max_w: usize) -> (String, usize) {
-    let w_of = |c: char| c.width().unwrap_or(0) as usize;
+    let w_of = |c: char| c.width().unwrap_or(0);
     let cursor = cursor.min(buf.len());
     let mut start = 0usize;
     loop {

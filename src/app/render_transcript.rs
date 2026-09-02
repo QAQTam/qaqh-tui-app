@@ -44,7 +44,7 @@ fn is_gerund_word(word: &str) -> bool {
 }
 
 fn sentence_starts_with_gerund(sentence: &str) -> bool {
-    let trimmed = sentence.trim_start_matches(|c: char| matches!(c, '•' | '-' | '"' | '\'' | '(' | ' '));
+    let trimmed = sentence.trim_start_matches(['•', '-', '"', '\'', '(', ' ']);
     if let Some(first) = trimmed.split_whitespace().next() {
         let w = first.trim_matches(|c: char| !c.is_alphabetic());
         is_gerund_word(w)
@@ -476,8 +476,8 @@ fn extract_shell_output_text(raw: &str) -> Option<String> {
         return Some(out.to_string());
     }
     // 非字符串 output（如意外对象）则序列化回文本
-    if let Some(out) = obj.get("output") {
-        if !out.is_null() {
+    if let Some(out) = obj.get("output")
+        && !out.is_null() {
             // 保持可读：若是对象则 pretty-free json
             if out.is_string() {
                 return Some(out.as_str().unwrap_or("").to_string());
@@ -485,7 +485,6 @@ fn extract_shell_output_text(raw: &str) -> Option<String> {
                 return Some(out.to_string());
             }
         }
-    }
     None
 }
 
@@ -687,11 +686,11 @@ fn push_tool_card(lines: &mut Vec<RenderLine>, tool: &crate::app::timeline_model
                         pending_added.clear();
                     }
                     lines.push(RenderLine::new().span(" ┃ ", SpanStyle::Dim).span(raw.to_owned(), SpanStyle::Dim));
-                } else if raw.starts_with('-') {
-                    pending_removed.push((raw[1..].to_owned(), old_ln));
+                } else if let Some(body) = raw.strip_prefix('-') {
+                    pending_removed.push((body.to_owned(), old_ln));
                     old_ln += 1;
-                } else if raw.starts_with('+') {
-                    pending_added.push((raw[1..].to_owned(), new_ln));
+                } else if let Some(body) = raw.strip_prefix('+') {
+                    pending_added.push((body.to_owned(), new_ln));
                     new_ln += 1;
                 } else {
                     {
@@ -770,16 +769,14 @@ fn push_tool_card(lines: &mut Vec<RenderLine>, tool: &crate::app::timeline_model
                 } else if raw.starts_with("@@") {
                     if let Some((o, n)) = parse_hunk_header(raw) { old_ln = o; new_ln = n; }
                     lines.push(RenderLine::new().span(if is_block { " ┃ " } else { "    " }, SpanStyle::Dim).span(raw.to_owned(), SpanStyle::Dim));
-                } else if raw.starts_with('+') {
+                } else if let Some(txt) = raw.strip_prefix('+') {
                     let ln = fmt_ln(new_ln, 3);
                     new_ln += 1;
-                    let txt = &raw[1..];
                     let seg = crate::app::truncate_str(txt, width.saturating_sub(10));
                     lines.push(RenderLine::new().span(if is_block { " ┃ " } else { "    " }, SpanStyle::Dim).span(ln, SpanStyle::Dim).span(" +", SpanStyle::DiffAdd).span(seg, SpanStyle::DiffAdd));
-                } else if raw.starts_with('-') {
+                } else if let Some(txt) = raw.strip_prefix('-') {
                     let ln = fmt_ln(old_ln, 3);
                     old_ln += 1;
-                    let txt = &raw[1..];
                     let seg = crate::app::truncate_str(txt, width.saturating_sub(10));
                     lines.push(RenderLine::new().span(if is_block { " ┃ " } else { "    " }, SpanStyle::Dim).span(ln, SpanStyle::Dim).span(" -", SpanStyle::DiffDel).span(seg, SpanStyle::DiffDel));
                 } else if !raw.trim().is_empty() {
@@ -869,21 +866,17 @@ fn push_tool_card(lines: &mut Vec<RenderLine>, tool: &crate::app::timeline_model
             }
             if overflow {
                 let mut hint_text = if expanded { "F7 收起".to_string() } else { "F7 展开".to_string() };
-                if !is_running {
-                    if let Some((exit, truncated, _)) = shell_meta {
-                        if let Some(code) = exit {
-                            if code != 0 { hint_text.push_str(&format!(" · exit {code}")); }
-                        }
+                if !is_running
+                    && let Some((exit, truncated, _)) = shell_meta {
+                        if let Some(code) = exit
+                            && code != 0 { hint_text.push_str(&format!(" · exit {code}")); }
                         if truncated { hint_text.push_str(" · 截断"); }
                     }
-                }
                 lines.push(RenderLine::new().span(format!("{}  ", line_prefix), SpanStyle::Dim).span(hint_text, SpanStyle::Dim));
             }
-            if is_running {
-                if let Some(last) = lines.last_mut() {
-                    if let Some(span) = last.spans.last_mut() { span.text.push('▌'); }
-                }
-            }
+            if is_running
+                && let Some(last) = lines.last_mut()
+                    && let Some(span) = last.spans.last_mut() { span.text.push('▌'); }
         }
     } else {
         let mut combined = String::new();
@@ -910,11 +903,9 @@ fn push_tool_card(lines: &mut Vec<RenderLine>, tool: &crate::app::timeline_model
                 let hint = if expanded { "F7 收起" } else { "F7 展开" };
                 lines.push(RenderLine::new().span(format!("{}  ", line_prefix), SpanStyle::Dim).span(hint, SpanStyle::Dim));
             }
-            if is_running && !overflow {
-                if let Some(last) = lines.last_mut() {
-                    if let Some(span) = last.spans.last_mut() { span.text.push('▌'); }
-                }
-            }
+            if is_running && !overflow
+                && let Some(last) = lines.last_mut()
+                    && let Some(span) = last.spans.last_mut() { span.text.push('▌'); }
         }
     }
 

@@ -15,7 +15,7 @@ pub fn height() -> u16 {
 }
 
 pub fn draw_slash_menu(f: &mut Frame, app: &App, composer_area: Rect) {
-    if app.overlays.len() > 0 {
+    if !app.overlays.is_empty() {
         return;
     }
     let candidates = app.slash_candidates();

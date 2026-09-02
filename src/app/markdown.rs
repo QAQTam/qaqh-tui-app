@@ -94,7 +94,7 @@ fn render_highlighted_code_block(text: &str, lang: Option<&str>, width: usize) -
                 let take = take_width(remaining, avail);
                 let (head, tail) = remaining.split_at(take);
                 cur_line.spans.push(crate::app::render_line::RenderSpan::with_style(head, rat_style));
-                line_w += head.chars().map(|c| unicode_width::UnicodeWidthChar::width(c).unwrap_or(0) as usize).sum::<usize>();
+                line_w += head.chars().map(|c| unicode_width::UnicodeWidthChar::width(c).unwrap_or(0)).sum::<usize>();
                 remaining = tail;
                 if !remaining.is_empty() {
                     out.push(std::mem::take(&mut cur_line));
@@ -116,7 +116,7 @@ fn take_width(s: &str, max_w: usize) -> usize {
     let mut used = 0usize;
     let mut idx = 0usize;
     for (i, c) in s.char_indices() {
-        let w = unicode_width::UnicodeWidthChar::width(c).unwrap_or(0) as usize;
+        let w = unicode_width::UnicodeWidthChar::width(c).unwrap_or(0);
         if used + w > max_w {
             break;
         }
@@ -197,12 +197,11 @@ fn has_single_emphasis(text: &str) -> bool {
             if c == '_' {
                 let before_open = if i > 0 { Some(chars[i - 1]) } else { None };
                 let after_close = if j + 1 < n { Some(chars[j + 1]) } else { None };
-                if let (Some(bo), Some(ac)) = (before_open, after_close) {
-                    if is_word_char(bo) && is_word_char(ac) {
+                if let (Some(bo), Some(ac)) = (before_open, after_close)
+                    && is_word_char(bo) && is_word_char(ac) {
                         // 词内下划线如 foo_bar_baz，按 CommonMark 不视为强调，继续找下一闭合
                         continue;
                     }
-                }
             }
             return true;
         }
@@ -431,7 +430,7 @@ pub fn render_markdown(text: &str, width: usize) -> Vec<RenderLine> {
         // 若剩余空间，按最长单元格微调（限幅）
         let rem = avail.saturating_sub(col_w * cols);
         if rem > 0 {
-            for i in 0..rem.min(cols) { col_widths[i] += 1; }
+            for w in col_widths.iter_mut().take(rem.min(cols)) { *w += 1; }
         }
 
         let hline = |widths: &[usize]| -> String {
@@ -475,8 +474,7 @@ pub fn render_markdown(text: &str, width: usize) -> Vec<RenderLine> {
         let omitted = tbl.rows.len().saturating_sub(max_rows);
         for row in tbl.rows.iter().take(max_rows) {
             let mut line = RenderLine::new().span("│", SpanStyle::MdRuler);
-            for i in 0..cols {
-                let w = col_widths[i];
+            for (i, &w) in col_widths.iter().enumerate() {
                 let raw = row.get(i).map(|s| s.as_str()).unwrap_or("");
                 let cell = format_cell(raw, w, tbl.alignments.get(i).copied());
                 line = line.span(cell, SpanStyle::MdTableCell).span("│", SpanStyle::MdRuler);
@@ -561,11 +559,10 @@ pub fn render_markdown(text: &str, width: usize) -> Vec<RenderLine> {
             Event::End(tag) => match tag {
                 TagEnd::Heading(_) | TagEnd::Strong | TagEnd::Emphasis | TagEnd::Strikethrough | TagEnd::Link => {
                     style_stack.pop();
-                    if matches!(tag, TagEnd::Link) {
-                        if let Some(dest) = link_dest.take() {
+                    if matches!(tag, TagEnd::Link)
+                        && let Some(dest) = link_dest.take() {
                             cur_spans.push((format!(" ({dest})"), SpanStyle::Dim));
                         }
-                    }
                 }
                 TagEnd::Paragraph => {
                     // 段落结束：落盘并空行

@@ -28,7 +28,7 @@ pub fn draw(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
             }
         }
     }
-    if app.pending_creates.len() > 0 {
+    if !app.pending_creates.is_empty() {
         left.push(Span::styled(" · creating…", theme::dim()));
     }
 
@@ -68,7 +68,7 @@ pub fn draw(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
 
     let right_w: usize = right.iter().map(|s| s.content.chars().count()).sum();
     let left_w: usize = left.iter().map(|s| s.content.chars().count()).sum();
-    let mid_budget = width.saturating_sub(left_w + right_w).max(0);
+    let mid_budget = width.saturating_sub(left_w + right_w);
     let mid_w: usize = middle.iter().map(|s| s.content.chars().count()).sum();
     if mid_w > mid_budget {
         middle.clear();

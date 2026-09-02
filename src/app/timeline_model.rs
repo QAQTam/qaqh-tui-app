@@ -27,7 +27,7 @@ pub fn strip_ansi_escapes(s: &str) -> String {
                     // CSI: 参数直到终字节 0x40-0x7E
                     while let Some(&nc) = chars.peek() {
                         chars.next();
-                        if '@' <= nc && nc <= '~' {
+                        if ('@'..='~').contains(&nc) {
                             break;
                         }
                     }
@@ -95,7 +95,7 @@ pub fn apply_bash_progress(buf: &mut String, chunk: &str) {
             }
             eff
         } else {
-            *part
+            part
         };
         let is_pure_cr = has_cr && effective.is_empty();
         if idx == 0 {
@@ -313,21 +313,18 @@ impl TimelineModel {
         use crate::protocol::timeline::TimelineEvent as E;
         let turn_id = entry.turn_id.as_str();
 
-        match &entry.event {
-            E::TurnOpened { user_text } => {
-                if self.find_turn_mut(turn_id).is_none() {
-                    self.turns.push(Turn {
-                        turn_id: turn_id.to_owned(),
-                        user_text: user_text.clone(),
-                        state: TimelineTurnState::Running,
-                        failure: None,
-                        rounds: Vec::new(),
-                    });
-                    self.bump();
-                }
-                return;
+        if let E::TurnOpened { user_text } = &entry.event {
+            if self.find_turn_mut(turn_id).is_none() {
+                self.turns.push(Turn {
+                    turn_id: turn_id.to_owned(),
+                    user_text: user_text.clone(),
+                    state: TimelineTurnState::Running,
+                    failure: None,
+                    rounds: Vec::new(),
+                });
+                self.bump();
             }
-            _ => {}
+            return;
         }
 
         let Some(turn) = self.find_turn_mut(turn_id) else {

@@ -92,6 +92,8 @@ pub enum ControlCommand {
 }
 
 /// Conversation 频道命令。
+// 变体名与后端 qaqh-domain 逐字镜像，保留 Conversation 前缀（协议镜像纪律）。
+#[allow(clippy::enum_variant_names)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ConversationCommand {

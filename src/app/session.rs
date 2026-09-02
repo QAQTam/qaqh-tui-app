@@ -90,12 +90,11 @@ impl AskPanel {
                 out.push((q.id.clone(), custom.to_owned()));
                 continue;
             }
-            if let Some(sel) = self.selections[idx] {
-                if let Some(opt) = q.options.get(sel) {
+            if let Some(sel) = self.selections[idx]
+                && let Some(opt) = q.options.get(sel) {
                     out.push((q.id.clone(), opt.clone()));
                     continue;
                 }
-            }
             if q.options.is_empty() && q.allow_custom {
                 // 仅自由文本的问题。
                 return Err(format!("问题 {} 需要输入", idx + 1));
@@ -403,14 +402,14 @@ impl SessionState {
 
     pub fn is_waiting_user(&self) -> bool {
         self.activity == Some(ActivityState::WaitingUser)
-            || self.pending_permissions.len() > 0
+            || !self.pending_permissions.is_empty()
             || self.pending_ask.is_some()
             || self.pending_plan.is_some()
     }
 
     /// 状态栏标签（working / waiting / idle…）。
     pub fn activity_label(&self) -> String {
-        if self.pending_permissions.len() > 0 {
+        if !self.pending_permissions.is_empty() {
             return "permission".into();
         }
         if self.pending_ask.is_some() {

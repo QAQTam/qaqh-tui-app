@@ -44,6 +44,8 @@ const ACTIVE_MODELS: usize = 4;
 const TURNS_CAP: usize = 400;
 
 /// app 后台任务回传的结果。
+// 大变体承载完整协议响应；Box 化属性能优化，推迟到独立任务（不影响正确性）。
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
 pub enum ActionResult {
     Bootstrap { seed: String, result: Result<crate::protocol::snapshot::RingingSessionBootstrap, String> },
@@ -59,6 +61,8 @@ pub enum ActionResult {
     Dashboard { seed: String, result: Result<crate::protocol::event::DashboardSnapshot, String> },
 }
 
+// 小变体（Key/Mouse/Tick）与大负载变体混排；Box 化推迟到独立性能任务。
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
 pub enum AppMsg {
     Runtime(RuntimeMsg),
@@ -91,6 +95,8 @@ pub enum ConfirmAction {
     CloseTab(String),
 }
 
+// Settings 变体内嵌完整编辑态，尺寸差较大；Box 化推迟到独立性能任务。
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone)]
 pub enum Overlay {
     SessionList { selected: usize, show_archived: bool },
@@ -231,11 +237,10 @@ impl App {
             }
         }
         self.pending_creates.retain(|_, at| at.elapsed() < Duration::from_secs(15));
-        if let Some(armed) = self.quit_armed {
-            if armed.elapsed() > Duration::from_secs(3) {
+        if let Some(armed) = self.quit_armed
+            && armed.elapsed() > Duration::from_secs(3) {
                 self.quit_armed = None;
             }
-        }
         // 首页自动刷新：无 tab 时保持列表新鲜（对齐 opencode Home 的常驻列表感）
         if self.tabs.is_empty() {
             let stale = self
@@ -258,11 +263,10 @@ impl App {
         match m.kind {
             MouseEventKind::ScrollUp => self.scroll_up(3),
             MouseEventKind::ScrollDown => self.scroll_down(3),
-            MouseEventKind::Down(kind) if kind == ratatui::crossterm::event::MouseButton::Left => {
-                if m.row == 0 {
+            MouseEventKind::Down(kind) if kind == ratatui::crossterm::event::MouseButton::Left
+                && m.row == 0 => {
                     self.click_tab(m.column);
                 }
-            }
             _ => {}
         }
     }
@@ -278,8 +282,8 @@ impl App {
             return;
         }
         // 设置页编辑态：粘贴进当前字段缓冲。
-        if let Some(Overlay::Settings(st)) = self.overlays.last_mut() {
-            if let Some(buf) = st.editing.as_mut() {
+        if let Some(Overlay::Settings(st)) = self.overlays.last_mut()
+            && let Some(buf) = st.editing.as_mut() {
                 for ch in text.chars() {
                     if ch != '\n' && ch != '\r' {
                         buf.buf.insert(buf.cursor.min(buf.buf.len()), ch);
@@ -288,20 +292,17 @@ impl App {
                 }
                 return;
             }
-        }
         let Some(sess) = self.active_session_mut() else { return };
-        if let Some(panel) = sess.pending_ask.as_mut() {
-            if panel.editing_custom.is_some() {
+        if let Some(panel) = sess.pending_ask.as_mut()
+            && panel.editing_custom.is_some() {
                 panel.input.push_str(&text);
                 return;
             }
-        }
-        if let Some(panel) = sess.pending_plan.as_mut() {
-            if panel.entering_message {
+        if let Some(panel) = sess.pending_plan.as_mut()
+            && panel.entering_message {
                 panel.message.push_str(&text);
                 return;
             }
-        }
         sess.composer.insert_str(&text);
     }
 
@@ -419,12 +420,11 @@ impl App {
                 match state {
                     SessionStateEvent::Created => {
                         // 新会话经信封 causation_id == command_id 关联（不轮询列表）。
-                        if let Some(cid) = causation_id {
-                            if self.pending_creates.remove(&cid).is_some() {
+                        if let Some(cid) = causation_id
+                            && self.pending_creates.remove(&cid).is_some() {
                                 self.open_session_tab(&seed);
                                 self.toast(NoticeLevel::Info, format!("新会话已创建 {seed}"));
                             }
-                        }
                     }
                     SessionStateEvent::Resumed => {}
                     SessionStateEvent::Closed | SessionStateEvent::Archived | SessionStateEvent::Deleted => {
@@ -452,11 +452,10 @@ impl App {
                 }
             }
             ControlEvent::SessionMetaChanged { title, .. } => {
-                if let Some(sess) = self.sessions.get_mut(&seed) {
-                    if let Some(t) = title.clone() {
+                if let Some(sess) = self.sessions.get_mut(&seed)
+                    && let Some(t) = title.clone() {
                         sess.title = Some(t);
                     }
-                }
                 self.session_list_at = None;
             }
             ControlEvent::ConfigChanged { .. } => {
@@ -478,12 +477,11 @@ impl App {
                 }
             }
             ControlEvent::InteractionResolved { resolution, interaction_id } => {
-                if let Some(sess) = self.sessions.get_mut(&seed) {
-                    if sess.pending_ask.as_ref().is_some_and(|p| p.interaction_id == interaction_id) {
+                if let Some(sess) = self.sessions.get_mut(&seed)
+                    && sess.pending_ask.as_ref().is_some_and(|p| p.interaction_id == interaction_id) {
                         sess.pending_ask = None;
                         let _ = resolution;
                     }
-                }
                 if resolution == AskResolution::Dismissed {
                     self.toast(NoticeLevel::Warn, format!("ask 已跳过 [{seed}]"));
                 }
@@ -503,11 +501,10 @@ impl App {
                 }
             }
             ControlEvent::PlanReviewResolved { interaction_id, approved } => {
-                if let Some(sess) = self.sessions.get_mut(&seed) {
-                    if sess.pending_plan.as_ref().is_some_and(|p| p.interaction_id == interaction_id) {
+                if let Some(sess) = self.sessions.get_mut(&seed)
+                    && sess.pending_plan.as_ref().is_some_and(|p| p.interaction_id == interaction_id) {
                         sess.pending_plan = None;
                     }
-                }
                 self.toast(
                     if approved { NoticeLevel::Info } else { NoticeLevel::Warn },
                     format!("plan review {}", if approved { "已批准" } else { "已拒绝" }),
@@ -540,12 +537,11 @@ impl App {
                 if let Some(sess) = self.sessions.get_mut(&target) {
                     sess.dashboard = Some(snapshot);
                     sess.rendered = None;
-                } else if self.sessions.contains_key(&snapshot.seed) {
-                    if let Some(sess) = self.sessions.get_mut(&snapshot.seed) {
+                } else if self.sessions.contains_key(&snapshot.seed)
+                    && let Some(sess) = self.sessions.get_mut(&snapshot.seed) {
                         sess.dashboard = Some(snapshot);
                         sess.rendered = None;
                     }
-                }
                 // replaceable 空快照（tasks=[]）时：老 daemon/丢帧后仍为空，主动回退 service 拉取。
                 let needs_fallback = self
                     .sessions
@@ -575,12 +571,11 @@ impl App {
             ControlEvent::OperationFailed { scope, error, .. } => {
                 self.toast(NoticeLevel::Error, format!("失败[{:?}] {}: {}", scope, error.code, error.message));
                 // 鬼影清理（winui 教训）：ask 被拒/交互不存在 → 清挂起面板。
-                if matches!(error.code.as_str(), "ask_rejected" | "interaction_not_found") {
-                    if let Some(sess) = self.sessions.get_mut(&seed) {
+                if matches!(error.code.as_str(), "ask_rejected" | "interaction_not_found")
+                    && let Some(sess) = self.sessions.get_mut(&seed) {
                         sess.pending_ask = None;
                         sess.pending_plan = None;
                     }
-                }
             }
             ControlEvent::OperationCompleted { .. } => {}
         }
@@ -604,11 +599,10 @@ impl App {
             }
             ConversationEvent::TurnCompleted { usage, turn_id, .. } => {
                 streaming_done(sess, Some(&turn_id));
-                if let Some(u) = usage {
-                    if let Some(conv) = sess.conversation.as_mut() {
+                if let Some(u) = usage
+                    && let Some(conv) = sess.conversation.as_mut() {
                         conv.usage = Some(u);
                     }
-                }
             }
             ConversationEvent::TurnFailed { turn_id, error } => {
                 streaming_done(sess, Some(&turn_id));
@@ -728,11 +722,10 @@ impl App {
                         sess.conversation = Some(conv);
                         let ctl = crate::protocol::snapshot::ChannelStateView::parse_control(&b.control.state);
                         sess.activity = ctl.activity.or(sess.activity);
-                        if sess.mode == crate::protocol::command::ConversationMode::Code {
-                            if let Some(meta) = &sess.meta {
+                        if sess.mode == crate::protocol::command::ConversationMode::Code
+                            && let Some(meta) = &sess.meta {
                                 sess.mode = meta.conversation_mode();
                             }
-                        }
                         match ctl.dashboard {
                             Some(dash) => {
                                 let is_empty = dash.tasks.is_empty() && dash.documents.is_empty() && dash.recent_edits.is_empty();
@@ -780,12 +773,11 @@ impl App {
                             ack.message.unwrap_or_default()
                         );
                         self.toast(NoticeLevel::Error, msg.clone());
-                        if let Some(seed) = seed {
-                            if let Some(sess) = self.sessions.get_mut(&seed) {
+                        if let Some(seed) = seed
+                            && let Some(sess) = self.sessions.get_mut(&seed) {
                                 sess.composer.input = msg.chars().collect(); // 不丢内容
                                 sess.composer.cursor = sess.composer.input.len();
                             }
-                        }
                     }
                 }
                 Err(e) => {
@@ -813,11 +805,9 @@ impl App {
                     for item in arr {
                         if let (Some(seed), Some(state)) =
                             (item.get("seed").and_then(|s| s.as_str()), item.get("state"))
-                        {
-                            if let Ok(state) = serde_json::from_value::<ActivityState>(state.clone()) {
+                            && let Ok(state) = serde_json::from_value::<ActivityState>(state.clone()) {
                                 self.activity_cache.insert(seed.to_owned(), state);
                             }
-                        }
                     }
                 }
             }
@@ -860,7 +850,7 @@ impl App {
                             path: name,
                             content,
                         });
-                        self.toast(NoticeLevel::Info, format!("附件已上传"));
+                        self.toast(NoticeLevel::Info, "附件已上传".to_string());
                     }
                 }
                 Err(e) => {
@@ -907,12 +897,11 @@ impl App {
                 self.dashboard_fetching.remove(&seed);
                 match result {
                     Ok(dash) => {
-                        if let Some(sess) = self.sessions.get_mut(&seed) {
-                            if !dash.tasks.is_empty() || !dash.recent_edits.is_empty() || !dash.documents.is_empty() {
+                        if let Some(sess) = self.sessions.get_mut(&seed)
+                            && (!dash.tasks.is_empty() || !dash.recent_edits.is_empty() || !dash.documents.is_empty()) {
                                 sess.dashboard = Some(dash);
                                 sess.rendered = None;
                             }
-                        }
                     }
                     Err(_e) => {}
                 }
@@ -1168,12 +1157,11 @@ impl App {
                     let mut state: Option<RingingCommandStatus> = None;
                     for _ in 0..30 {
                         tokio::time::sleep(Duration::from_millis(100)).await;
-                        if let Ok(status) = client.command_status(&command_id).await {
-                            if status.state.is_terminal() {
+                        if let Ok(status) = client.command_status(&command_id).await
+                            && status.state.is_terminal() {
                                 state = Some(status);
                                 break;
                             }
-                        }
                     }
                     let _ = tx.send(AppMsg::Action(ActionResult::Receipt {
                         label: "撤销回合",
@@ -1246,11 +1234,10 @@ impl App {
         let answers = match panel.collect_answers() {
             Ok(a) => a,
             Err(e) => {
-                if let Some(sess) = self.sessions.get_mut(&seed) {
-                    if let Some(p) = sess.pending_ask.as_mut() {
+                if let Some(sess) = self.sessions.get_mut(&seed)
+                    && let Some(p) = sess.pending_ask.as_mut() {
                         p.error = Some(e);
                     }
-                }
                 return;
             }
         };
@@ -1800,11 +1787,10 @@ impl App {
         }
 
         // 首页（无 tab 且无覆盖层时，会话列表即首页）
-        if self.tabs.is_empty() {
-            if self.home_key(key) {
+        if self.tabs.is_empty()
+            && self.home_key(key) {
                 return;
             }
-        }
 
         // Composer。
         self.composer_key(key);
@@ -2026,11 +2012,10 @@ impl App {
             D::Approve => self.respond_permission(true),
             D::Deny => self.respond_permission(false),
             D::ToggleTrust => {
-                if let Some(s) = self.sessions.get_mut(seed) {
-                    if let Some(p) = s.pending_permissions.first_mut() {
+                if let Some(s) = self.sessions.get_mut(seed)
+                    && let Some(p) = s.pending_permissions.first_mut() {
                         p.trust_folder = !p.trust_folder;
                     }
-                }
             }
             D::None => {}
         }
@@ -2084,25 +2069,22 @@ impl App {
         };
         match decision {
             D::FocusUp => {
-                if let Some(s) = self.sessions.get_mut(seed) {
-                    if let Some(p) = s.pending_ask.as_mut() {
+                if let Some(s) = self.sessions.get_mut(seed)
+                    && let Some(p) = s.pending_ask.as_mut() {
                         p.focus = p.focus.saturating_sub(1);
                     }
-                }
             }
             D::FocusDown => {
-                if let Some(s) = self.sessions.get_mut(seed) {
-                    if let Some(p) = s.pending_ask.as_mut() {
-                        if p.focus + 1 < p.questions.len() {
+                if let Some(s) = self.sessions.get_mut(seed)
+                    && let Some(p) = s.pending_ask.as_mut()
+                        && p.focus + 1 < p.questions.len() {
                             p.focus += 1;
                         }
-                    }
-                }
             }
             D::Select { focus, option } => {
-                if let Some(s) = self.sessions.get_mut(seed) {
-                    if let Some(p) = s.pending_ask.as_mut() {
-                        if p.questions
+                if let Some(s) = self.sessions.get_mut(seed)
+                    && let Some(p) = s.pending_ask.as_mut()
+                        && p.questions
                             .get(focus)
                             .map(|q| option < q.options.len())
                             .unwrap_or(false)
@@ -2110,34 +2092,29 @@ impl App {
                             p.selections[focus] = Some(option);
                             p.error = None;
                         }
-                    }
-                }
             }
             D::StartEdit { focus } => {
-                if let Some(s) = self.sessions.get_mut(seed) {
-                    if let Some(p) = s.pending_ask.as_mut() {
+                if let Some(s) = self.sessions.get_mut(seed)
+                    && let Some(p) = s.pending_ask.as_mut() {
                         p.editing_custom = Some(focus);
                         p.input = p.customs[focus].clone();
                     }
-                }
             }
             D::EditChar(c) => {
-                if let Some(s) = self.sessions.get_mut(seed) {
-                    if let Some(p) = s.pending_ask.as_mut() {
+                if let Some(s) = self.sessions.get_mut(seed)
+                    && let Some(p) = s.pending_ask.as_mut() {
                         p.input.push(c);
                     }
-                }
             }
             D::EditBackspace => {
-                if let Some(s) = self.sessions.get_mut(seed) {
-                    if let Some(p) = s.pending_ask.as_mut() {
+                if let Some(s) = self.sessions.get_mut(seed)
+                    && let Some(p) = s.pending_ask.as_mut() {
                         p.input.pop();
                     }
-                }
             }
             D::EditCommit => {
-                if let Some(s) = self.sessions.get_mut(seed) {
-                    if let Some(p) = s.pending_ask.as_mut() {
+                if let Some(s) = self.sessions.get_mut(seed)
+                    && let Some(p) = s.pending_ask.as_mut() {
                         let qi = p.editing_custom.take().unwrap_or(0);
                         if p.input.trim().is_empty() {
                             p.customs[qi].clear();
@@ -2147,15 +2124,13 @@ impl App {
                         p.input.clear();
                         p.error = None;
                     }
-                }
             }
             D::EditCancel => {
-                if let Some(s) = self.sessions.get_mut(seed) {
-                    if let Some(p) = s.pending_ask.as_mut() {
+                if let Some(s) = self.sessions.get_mut(seed)
+                    && let Some(p) = s.pending_ask.as_mut() {
                         p.editing_custom = None;
                         p.input.clear();
                     }
-                }
             }
             D::Submit => self.submit_ask(),
             D::Dismiss => self.dismiss_ask(),
@@ -2211,45 +2186,40 @@ impl App {
             D::Approve => self.respond_plan(true, false),
             D::ApproveAuto => self.respond_plan(true, true),
             D::StartReject => {
-                if let Some(s) = self.sessions.get_mut(seed) {
-                    if let Some(p) = s.pending_plan.as_mut() {
+                if let Some(s) = self.sessions.get_mut(seed)
+                    && let Some(p) = s.pending_plan.as_mut() {
                         p.entering_message = true;
                     }
-                }
             }
             D::Scroll(delta) => {
-                if let Some(s) = self.sessions.get_mut(seed) {
-                    if let Some(p) = s.pending_plan.as_mut() {
+                if let Some(s) = self.sessions.get_mut(seed)
+                    && let Some(p) = s.pending_plan.as_mut() {
                         if delta > 0 {
                             p.scroll = p.scroll.saturating_add(delta as usize);
                         } else {
                             p.scroll = p.scroll.saturating_sub((-delta) as usize);
                         }
                     }
-                }
             }
             D::EditChar(c) => {
-                if let Some(s) = self.sessions.get_mut(seed) {
-                    if let Some(p) = s.pending_plan.as_mut() {
+                if let Some(s) = self.sessions.get_mut(seed)
+                    && let Some(p) = s.pending_plan.as_mut() {
                         p.message.push(c);
                     }
-                }
             }
             D::EditBackspace => {
-                if let Some(s) = self.sessions.get_mut(seed) {
-                    if let Some(p) = s.pending_plan.as_mut() {
+                if let Some(s) = self.sessions.get_mut(seed)
+                    && let Some(p) = s.pending_plan.as_mut() {
                         p.message.pop();
                     }
-                }
             }
             D::SubmitReject => self.respond_plan(false, false),
             D::CancelEdit => {
-                if let Some(s) = self.sessions.get_mut(seed) {
-                    if let Some(p) = s.pending_plan.as_mut() {
+                if let Some(s) = self.sessions.get_mut(seed)
+                    && let Some(p) = s.pending_plan.as_mut() {
                         p.entering_message = false;
                         p.message.clear();
                     }
-                }
             }
             D::None => {}
         }
@@ -2264,7 +2234,7 @@ impl App {
         match top {
             Overlay::Help => {
                 self.overlays.pop();
-                return true;
+                true
             }
             Overlay::Settings(mut st) => {
                 use ratatui::crossterm::event::KeyCode;
@@ -2372,7 +2342,7 @@ impl App {
                     _ => {}
                 }
                 self.replace_overlay(Overlay::Settings(st));
-                return true;
+                true
             }
             Overlay::AttachPath { mut input, mut cursor, seed } => {
                 match key.code {
@@ -2425,7 +2395,7 @@ impl App {
                     }
                     _ => {}
                 }
-                return true;
+                true
             }
             Overlay::Confirm { action } => {
                 match key.code {
@@ -2440,7 +2410,7 @@ impl App {
                     _ => {}
                 }
                 self.overlays.pop();
-                return true;
+                true
             }
             Overlay::SessionList { selected, show_archived } => {
                 let items = self.filtered_sessions(show_archived);
@@ -2492,7 +2462,7 @@ impl App {
                     }
                     _ => {}
                 }
-                return true;
+                true
             }
             Overlay::CwdInput { mut input, mut cursor } => {
                 match key.code {
@@ -2520,7 +2490,7 @@ impl App {
                     }
                     _ => {}
                 }
-                return true;
+                true
             }
         }
     }
@@ -2673,11 +2643,9 @@ impl App {
         match key.code {
             KeyCode::Esc if slash_vis => {
                 self.slash_selected = 0;
-                return;
             }
             KeyCode::Tab if slash_vis => {
                 self.autocomplete_slash();
-                return;
             }
             KeyCode::Tab => {
                 // composer 为 /new 或 /n 且无参时，Tab 打开二级编辑（显式 CwdInput）
@@ -2688,7 +2656,6 @@ impl App {
                     self.overlays.push(Overlay::CwdInput { input: initial.chars().collect(), cursor: initial.len() });
                     if let Some(sess) = self.active_session_mut() { sess.composer.clear(); }
                     self.slash_selected = 0;
-                    return;
                 }
             }
             KeyCode::Enter if slash_vis || self.active_session().is_some_and(|s| s.composer.value().trim_start().starts_with('/')) => {
@@ -2704,7 +2671,7 @@ impl App {
                     let has_space = trimmed.contains(char::is_whitespace);
                     if slash_vis && !has_space {
                         // 若输入已是完整命令（如 "/new"），直接执行；否则补全
-                        let without = trimmed[1..].to_ascii_lowercase();
+                        let without = trimmed.strip_prefix('/').unwrap_or(trimmed.as_str()).to_ascii_lowercase();
                         let exact = crate::app::slash::SLASH_COMMANDS.iter().any(|d| d.name == without || (d.name == "new" && without == "n"));
                         if exact {
                             if self.execute_slash_text(&trimmed) { return; }
@@ -2720,9 +2687,8 @@ impl App {
                     }
                 }
                 self.send_message();
-                return;
             }
-            KeyCode::Enter => { self.send_message(); return; },
+            KeyCode::Enter => { self.send_message();},
             KeyCode::Esc => self.cancel_turn(),
             KeyCode::Backspace => {
                 let need_clamp = if let Some(s) = self.active_session_mut() {

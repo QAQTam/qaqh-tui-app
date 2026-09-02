@@ -3,6 +3,7 @@
 //! 数据源（均为领域状态，非事件回放）：
 //! - bootstrap control state 的 `dashboard_snapshot`（打开标签页即有初值）；
 //! - agent 调 `todo` 工具时 daemon 即时推送的 `DashboardSnapshot`（replaceable）。
+//!
 //! 失败路径：若 SSE 丢帧，`DashboardUpdated` 为空实现，未来可走 `session.dashboard` 拉取兜底。
 
 use ratatui::layout::Rect;
@@ -152,14 +153,13 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) {
             )));
         }
         // 当前聚焦
-        if let Some(cur) = dash.current_todo_id.as_deref() {
-            if let Some(task) = dash.tasks.iter().find(|t| t.id == cur) {
+        if let Some(cur) = dash.current_todo_id.as_deref()
+            && let Some(task) = dash.tasks.iter().find(|t| t.id == cur) {
                 let tag = format!(" ▶ {} ", truncate_str(&task.subject, width.saturating_sub(6)));
                 lines.push(Line::from(vec![
                     Span::styled(tag, Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
                 ]));
             }
-        }
         lines.push(Line::from(Span::styled(
             "─".repeat(width.min(28)),
             Style::new().fg(Color::Indexed(236)),

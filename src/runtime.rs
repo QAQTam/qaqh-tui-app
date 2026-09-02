@@ -30,16 +30,12 @@ const MAX_RENEW_FAILURES: u32 = 2;
 
 /// 连接信息（SSE 流通过 watch 感知 epoch/session 变化）。
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Default)]
 pub struct ConnInfo {
     pub epoch: String,
     pub generation: u64,
 }
 
-impl Default for ConnInfo {
-    fn default() -> Self {
-        Self { epoch: String::new(), generation: 0 }
-    }
-}
 
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
@@ -315,15 +311,11 @@ async fn channel_stream(
                                 Ok(Some(Ok(bytes))) => {
                                     decoder.push(&bytes);
                                     while let Some(item) = decoder.next_frame() {
-                                        match item {
-                                            Ok(frame) => {
-                                                if !handle_channel_frame(&msg_tx, channel, frame, &mut cursor) {
-                                                    reconnect = true;
-                                                    break;
-                                                }
+                                        if let Ok(frame) = item
+                                            && !handle_channel_frame(&msg_tx, channel, frame, &mut cursor) {
+                                                reconnect = true;
+                                                break;
                                             }
-                                            Err(()) => {}
-                                        }
                                     }
                                 }
                                 Ok(Some(Err(_))) | Ok(None) => reconnect = true,

@@ -154,9 +154,7 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) {
     } else {
         // 计算选中可见窗口（居中）
         let sel = app.home_selected.min(total.saturating_sub(1));
-        let start = if total <= max_visible {
-            0
-        } else if sel < max_visible / 2 {
+        let start = if total <= max_visible || sel < max_visible / 2 {
             0
         } else if sel >= total - max_visible / 2 {
             total - max_visible

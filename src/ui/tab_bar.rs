@@ -19,7 +19,7 @@ pub fn draw(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
         let mut label = format!(" {} {} ", idx + 1, title);
         if !is_active {
             // 挂起交互徽标。
-            if sess.pending_permissions.len() > 0 || sess.pending_ask.is_some() || sess.pending_plan.is_some() {
+            if !sess.pending_permissions.is_empty() || sess.pending_ask.is_some() || sess.pending_plan.is_some() {
                 label = format!(" {} {} !", idx + 1, title);
             } else if sess.streaming.is_some() {
                 label = format!(" {} {} …", idx + 1, title);

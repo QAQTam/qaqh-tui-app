@@ -393,6 +393,8 @@ pub enum ConversationEvent {
 
 // ───────────────────────── Tool 频道 ─────────────────────────
 
+// wire 镜像类型：Rust 侧变体尺寸差不影响 wire 形状；Box 化推迟到独立性能任务。
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ToolEvent {
@@ -578,6 +580,8 @@ pub enum ControlEvent {
 
 // ───────────────────────── 统一事件入口 ─────────────────────────
 
+// wire 镜像类型：Rust 侧变体尺寸差不影响 wire 形状；Box 化推迟到独立性能任务。
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "channel", rename_all = "snake_case")]
 pub enum RingingEvent {
