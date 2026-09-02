@@ -978,7 +978,7 @@ pub fn render_session_info(session: &SessionState, width: u16) -> Vec<RenderLine
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::timeline_model::{Block, Round, TimelineModel, Turn, ToolCard};
+    use crate::app::timeline_model::{Block, Round, Turn, ToolCard};
     use crate::protocol::timeline::{TimelineBlockKind, TimelineBlockState, TimelineToolState, TimelineTurnState};
 
     #[test]
