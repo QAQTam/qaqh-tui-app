@@ -5,6 +5,7 @@
 
 pub(crate) mod keymap;
 mod composer_ops;
+mod paste_guard;
 mod interaction;
 mod overlay_ops;
 mod session_ops;
@@ -19,6 +20,7 @@ pub mod slash;
 pub mod timeline_model;
 
 use self::keymap::{GlobalKey, ModalRoute};
+use self::paste_guard::PasteGuard;
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
@@ -155,6 +157,8 @@ pub struct App {
     /// todo 详情折叠（F6）。
     pub show_todo_detail: bool,
     pub last_tick: Instant,
+    /// 粘贴护栏：按键洪流检测（抑制不支持括号粘贴终端的 Enter 自动发送）。
+    pub paste_guard: PasteGuard,
     /// Ctrl+C 二次确认。
     pub quit_armed: Option<Instant>,
     /// 首页会话列表选中与归档显隐（tabs.is_empty() 时生效）。
@@ -208,6 +212,7 @@ impl App {
             last_focused: None,
             show_todo_detail: true,
             last_tick: Instant::now(),
+            paste_guard: PasteGuard::default(),
             quit_armed: None,
             home_selected: 0,
             home_show_archived: false,
@@ -945,6 +950,9 @@ impl App {
 
     fn handle_key(&mut self, key: KeyEvent) {
         use ratatui::crossterm::event::KeyModifiers;
+
+        // 粘贴护栏：记录按键节拍（洪流判定与抑制在 composer_key 的 Enter 路径）。
+        self.paste_guard.observe(Instant::now());
 
         // 退出与全局键：先经 keymap 纯映射（可单测），再做状态副作用。
         match keymap::map_global_key(&key) {

@@ -139,6 +139,20 @@ impl App {
     pub(super) fn composer_key(&mut self, key: KeyEvent) {
         use ratatui::crossterm::event::{KeyCode, KeyModifiers};
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        // 粘贴护栏：洪流期的 Enter 一律降级为空格（终端不支持括号粘贴时，
+        // 粘贴文本以按键流到达，回车会误触发送）。支持括号粘贴的终端不走这里。
+        if matches!(key.code, KeyCode::Enter) && self.paste_guard.flooding() {
+            if let Some(sess) = self.active_session_mut() {
+                sess.composer.insert(' ');
+            }
+            if self.paste_guard.take_toast() {
+                self.toast(
+                    NoticeLevel::Warn,
+                    "检测到粘贴洪流：已抑制 Enter 自动发送（当前终端不支持括号粘贴）",
+                );
+            }
+            return;
+        }
         // 斜杠菜单优先：Up/Down/Tab/Esc/Enter 劫持（需在借用前计算）
         let slash_vis = self.slash_visible();
         match key.code {

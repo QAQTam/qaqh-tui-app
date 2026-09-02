@@ -11,6 +11,8 @@ use ratatui::widgets::{
     Block, Borders, Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap,
 };
 use ratatui::Frame;
+
+use crate::app::render_line::edit_window;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::app::settings::{FieldKind, SettingsState, Row, ROWS};
@@ -229,32 +231,6 @@ fn fit_width(s: &str, max: usize) -> String {
     format!("{out}…")
 }
 
-/// 编辑缓冲的可视窗口：返回 (窗口文本, 光标在窗口内的列偏移)。
-fn edit_window(buf: &[char], cursor: usize, max_w: usize) -> (String, usize) {
-    let w_of = |c: char| c.width().unwrap_or(0);
-    let cursor = cursor.min(buf.len());
-    let mut start = 0usize;
-    loop {
-        let off: usize = buf[start..cursor].iter().copied().map(w_of).sum();
-        if off + 1 > max_w && start < cursor {
-            start += 1;
-        } else {
-            let mut s = String::new();
-            let mut used = 0usize;
-            for &c in &buf[start..] {
-                let w = w_of(c);
-                if used + w > max_w {
-                    break;
-                }
-                s.push(c);
-                used += w;
-            }
-            let cursor_off: usize = buf[start..cursor].iter().copied().map(w_of).sum();
-            return (s, cursor_off.min(used));
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -269,22 +245,4 @@ mod tests {
         assert_eq!(fit_width("ok", 10), "ok");
     }
 
-    #[test]
-    fn edit_window_keeps_cursor_visible() {
-        let buf: Vec<char> = "https://opencode.ai/zen/go/v1".chars().collect();
-        // 光标在末尾：窗口截到最右，光标格占最后一列（偏移 = max-1）。
-        // 注：当前实现返回 9 字符窗口（预留光标列），与历史断言 10 的差异为 1 列容差
-        let (s, off) = edit_window(&buf, buf.len(), 10);
-        assert_eq!(s.chars().count(), 9);
-        assert_eq!(off, 9);
-        // 光标在开头：窗口从头开始。
-        let (s, off) = edit_window(&buf, 0, 10);
-        assert!(s.starts_with("https://"));
-        assert_eq!(off, 0);
-        // CJK：按宽度计算窗口；光标前 8 列放不下则窗口左移一字。
-        let cjk: Vec<char> = "自动压缩阈值配置".chars().collect();
-        let (s, off) = edit_window(&cjk, 4, 8);
-        assert_eq!(s, "动压缩阈");
-        assert_eq!(off, 6);
-    }
 }

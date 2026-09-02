@@ -3,6 +3,8 @@
 //! transcript 渲染器产出 `Vec<RenderLine>`（按 model.version+宽度缓存），
 //! UI 层按 theme 映射为 ratatui Line。这样逻辑换行/截断只算一次。
 
+use unicode_width::UnicodeWidthChar;
+
 /// 语义样式（theme.rs 映射到 ratatui Style）。Italic/Inverse 保留作调色板扩展。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(dead_code)]
@@ -156,6 +158,35 @@ pub fn wrap_text(text: &str, width: usize) -> Vec<String> {
     out
 }
 
+
+/// 编辑缓冲的可视窗口：返回 (窗口文本, 光标在窗口内的列偏移)。
+/// 保证光标列恒在窗口内（`off + 1 <= max_w`），供单行输入框水平滚动。
+/// 从 ui/settings.rs 提升为共享（composer 与 settings 编辑态共用）。
+pub(crate) fn edit_window(buf: &[char], cursor: usize, max_w: usize) -> (String, usize) {
+    let w_of = |c: char| c.width().unwrap_or(0);
+    let cursor = cursor.min(buf.len());
+    let mut start = 0usize;
+    loop {
+        let off: usize = buf[start..cursor].iter().copied().map(w_of).sum();
+        if off + 1 > max_w && start < cursor {
+            start += 1;
+        } else {
+            let mut s = String::new();
+            let mut used = 0usize;
+            for &c in &buf[start..] {
+                let w = w_of(c);
+                if used + w > max_w {
+                    break;
+                }
+                s.push(c);
+                used += w;
+            }
+            let cursor_off: usize = buf[start..cursor].iter().copied().map(w_of).sum();
+            return (s, cursor_off.min(used));
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -184,5 +215,23 @@ mod tests {
     fn render_line_width() {
         let l = RenderLine::new().span("中文", SpanStyle::Plain).span("ab", SpanStyle::Dim);
         assert_eq!(l.display_width(), 6);
+    }
+
+    #[test]
+    fn edit_window_keeps_cursor_visible() {
+        let buf: Vec<char> = "https://opencode.ai/zen/go/v1".chars().collect();
+        // 光标在末尾：窗口截到最右，光标格占最后一列（偏移 = max-1）。
+        let (s, off) = edit_window(&buf, buf.len(), 10);
+        assert_eq!(s.chars().count(), 9);
+        assert_eq!(off, 9);
+        // 光标在开头：窗口从头开始。
+        let (s, off) = edit_window(&buf, 0, 10);
+        assert!(s.starts_with("https://"));
+        assert_eq!(off, 0);
+        // CJK：按宽度计算窗口；光标前 8 列放不下则窗口左移一字。
+        let cjk: Vec<char> = "自动压缩阈值配置".chars().collect();
+        let (s, off) = edit_window(&cjk, 4, 8);
+        assert_eq!(s, "动压缩阈");
+        assert_eq!(off, 6);
     }
 }

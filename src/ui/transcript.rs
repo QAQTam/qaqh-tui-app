@@ -15,9 +15,15 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) {
     let Some(sess) = app.sessions.get(&seed) else { return };
 
     let width = area.width.saturating_sub(1); // 右侧滚动条留 1 列
-    let lines: Vec<crate::app::render_line::RenderLine> = match &sess.rendered {
-        Some(cached) if cached.width == width => cached.lines.clone(),
-        _ => crate::app::render_transcript::render_transcript_with_opts(sess, width, app.show_reasoning),
+    // 只借用 IR，不做全量深拷贝：每帧成本 O(可视行数) 而非 O(全量 IR)。
+    // 未命中缓存时现场渲染一次（streaming/compacting/首帧），同样只转换可视窗口。
+    let fresh: Vec<crate::app::render_line::RenderLine>;
+    let lines: &[crate::app::render_line::RenderLine] = match &sess.rendered {
+        Some(cached) if cached.width == width => &cached.lines,
+        _ => {
+            fresh = crate::app::render_transcript::render_transcript_with_opts(sess, width, app.show_reasoning);
+            &fresh
+        }
     };
 
     let total = lines.len();
