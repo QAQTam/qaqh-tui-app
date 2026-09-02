@@ -370,6 +370,12 @@ fn push_reasoning_block(lines: &mut Vec<RenderLine>, text: &str, width: usize, s
     }
 }
 
+/// 默认直接展开的工具（不再折叠）。bash 系 + read：输出即结果，必须直观可见。
+/// 其它工具（grep/glob/edit/write 等）保持折叠以控屏；F7 仍可手动切换。
+pub(crate) fn is_default_expanded(name: &str) -> bool {
+    matches!(name, "bash" | "exec" | "shell" | "pwsh" | "powershell" | "read")
+}
+
 /// opencode 式工具图标（对齐 `toolDisplay` 集合） `packages/tui/src/routes/session/index.tsx:2638`
 fn tool_icon(name: &str) -> &'static str {
     match name {
@@ -495,7 +501,9 @@ fn shell_meta_from_raw(raw: &str) -> Option<(Option<i32>, bool, String)> {
     Some((exit_code, truncated, status))
 }
 
-fn push_tool_card(lines: &mut Vec<RenderLine>, tool: &crate::app::timeline_model::ToolCard, width: usize, expanded: bool) {
+fn push_tool_card(lines: &mut Vec<RenderLine>, tool: &crate::app::timeline_model::ToolCard, width: usize, expanded_raw: bool) {
+    // 默认展开的工具：expanded_raw 的语义做 xor，使 F7 仍可“收起”
+    let expanded = expanded_raw ^ is_default_expanded(&tool.name);
     // 动画帧：Running 时用四帧转轮（与 opencode Spinner 对齐，200ms/帧，Tick 500ms 驱动重绘）
     let (icon_raw, base_style, is_running) = match tool.state {
         TimelineToolState::Prepared => (tool_icon(&tool.name), SpanStyle::Dim, false),
@@ -1185,5 +1193,75 @@ mod tests {
         let lines = render_transcript_with_opts(&sess, 120, true);
         let reasoning_cnt = lines.iter().filter(|l| l.spans.iter().any(|s| s.text.contains("line"))).count();
         assert!(reasoning_cnt >= 8, "streaming 默认全显 {reasoning_cnt}");
+    }
+
+    #[test]
+    fn bash_pwsh_read_default_expanded_no_fold() {
+        assert!(is_default_expanded("bash"));
+        assert!(is_default_expanded("pwsh"));
+        assert!(is_default_expanded("read"));
+        assert!(is_default_expanded("exec"));
+        assert!(is_default_expanded("shell"));
+        assert!(is_default_expanded("powershell"));
+        assert!(!is_default_expanded("grep"));
+        assert!(!is_default_expanded("glob"));
+        assert!(!is_default_expanded("edit"));
+
+        // bash: 20 行输出，默认（raw=false）应直展全部（提示为“F7 收起”）
+        let long = (1..=20).map(|i| format!("ROW{i:02}")).collect::<Vec<_>>().join("\n");
+        let raw = format!(r#"{{"status":"completed","output":{:?},"exit_code":0}}"#, long);
+        let bash_tool = ToolCard {
+            tool_call_id: "c-bash".into(),
+            name: "bash".into(),
+            state: TimelineToolState::Succeeded,
+            summary: None,
+            args_json: None,
+            output: Some(raw),
+            diff: None,
+            progress: String::new(),
+            failure: None,
+            permission: None,
+        };
+        let mut lines = Vec::new();
+        push_tool_card(&mut lines, &bash_tool, 80, false); // raw false -> visual true
+        let flat: String = lines.iter().flat_map(|l| l.spans.iter().map(|s| s.text.clone())).collect::<Vec<_>>().join("\n");
+        assert!(flat.contains("ROW01"), "bash 默认展开应可见首行");
+        assert!(flat.contains("ROW20"), "bash 默认展开应可见尾行");
+        assert!(flat.contains("F7 收起"), "bash 默认展开提示应为收起");
+        // raw=true 时应对视觉收起（仅尾 8 行）
+        let mut lines2 = Vec::new();
+        push_tool_card(&mut lines2, &bash_tool, 80, true);
+        let flat2: String = lines2.iter().flat_map(|l| l.spans.iter().map(|s| s.text.clone())).collect::<Vec<_>>().join("\n");
+        assert!(!flat2.contains("ROW01"), "bash 收起态不应含首行");
+        assert!(flat2.contains("ROW20"));
+        assert!(flat2.contains("F7 展开"));
+
+        // read: 非 shell 分支，10 行输出默认展开应全显（>4 行折叠阈）
+        let read_out = (1..=10).map(|i| format!("r{i}")).collect::<Vec<_>>().join("\n");
+        let read_tool = ToolCard {
+            tool_call_id: "c-read".into(),
+            name: "read".into(),
+            state: TimelineToolState::Succeeded,
+            summary: None,
+            args_json: Some(r#"{"filePath":"src/lib.rs"}"#.into()),
+            output: Some(read_out.clone()),
+            diff: None,
+            progress: String::new(),
+            failure: None,
+            permission: None,
+        };
+        let mut rl = Vec::new();
+        push_tool_card(&mut rl, &read_tool, 80, false);
+        let rf: String = rl.iter().flat_map(|l| l.spans.iter().map(|s| s.text.clone())).collect::<Vec<_>>().join("\n");
+        assert!(rf.contains("r1"));
+        assert!(rf.contains("r10"));
+        // grep 默认仍折叠（raw false 即视觉收起，10 行应只显 4 行）
+        let grep_tool = ToolCard { name: "grep".into(), tool_call_id: "c-grep".into(), ..read_tool.clone() };
+        let mut gl = Vec::new();
+        push_tool_card(&mut gl, &grep_tool, 80, false);
+        let gf: String = gl.iter().flat_map(|l| l.spans.iter().map(|s| s.text.clone())).collect::<Vec<_>>().join("\n");
+        assert!(gf.contains("r1"));
+        assert!(!gf.contains("r10"), "grep 默认折叠不应含尾行");
+        assert!(gf.contains("F7 展开"));
     }
 }

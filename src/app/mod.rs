@@ -56,6 +56,7 @@ pub enum ActionResult {
     Rebaseline { seed: String, result: Result<TimelinePage, String> },
     LoadOlder { seed: String, result: Result<TimelinePage, String> },
     Receipt { label: &'static str, seed: Option<String>, result: Result<RingingCommandStatus, String> },
+    Dashboard { seed: String, result: Result<crate::protocol::event::DashboardSnapshot, String> },
 }
 
 #[derive(Debug)]
@@ -124,6 +125,7 @@ pub struct App {
     pub session_list_cache: Vec<SessionMetaView>,
     pub session_list_at: Option<Instant>,
     pub activity_cache: HashMap<String, ActivityState>,
+    dashboard_fetching: HashSet<String>,
     /// config.load 的 typed 快照（ConfigDto 镜像；ConfigChanged 到达时重拉）。
     pub config: Option<ConfigDto>,
     /// settings 保存请求在途标记（防 config.save 双发——事故 R4）。
@@ -181,6 +183,7 @@ impl App {
             session_list_cache: Vec::new(),
             session_list_at: None,
             activity_cache: HashMap::new(),
+            dashboard_fetching: HashSet::new(),
             config: None,
             settings_saving: false,
             show_reasoning: true,
@@ -536,17 +539,35 @@ impl App {
                 };
                 if let Some(sess) = self.sessions.get_mut(&target) {
                     sess.dashboard = Some(snapshot);
+                    sess.rendered = None;
                 } else if self.sessions.contains_key(&snapshot.seed) {
                     if let Some(sess) = self.sessions.get_mut(&snapshot.seed) {
                         sess.dashboard = Some(snapshot);
+                        sess.rendered = None;
                     }
                 }
-                // 若对应会话在后台 tabs 中，dashboard 仍更新以便切回即现
+                // replaceable 空快照（tasks=[]）时：老 daemon/丢帧后仍为空，主动回退 service 拉取。
+                let needs_fallback = self
+                    .sessions
+                    .get(&target)
+                    .and_then(|s| s.dashboard.as_ref())
+                    .is_some_and(|d| d.tasks.is_empty() && d.recent_edits.is_empty() && d.documents.is_empty());
+                if needs_fallback {
+                    self.fetch_dashboard(target.clone());
+                }
             }
             ControlEvent::DashboardUpdated { session_seed, .. } => {
-                // 轻量心跳：若已跟踪但 dashboard 仍为空，且 envelope seed 指向该会话，
-                // 不主动拉取（避免轮询风暴），仅标记；具体兜底由 bootstrap 完成后覆盖。
-                let _ = session_seed;
+                let target = if session_seed.is_empty() { seed.clone() } else { session_seed.clone() };
+                let needs_fetch = if self.sessions.contains_key(&target) {
+                    let sess = &self.sessions[&target];
+                    sess.dashboard.is_none()
+                        || sess.dashboard.as_ref().is_some_and(|d| d.tasks.is_empty() && d.documents.is_empty())
+                } else {
+                    false
+                };
+                if needs_fetch {
+                    self.fetch_dashboard(target);
+                }
             }
             ControlEvent::SubagentStatus { name, state, .. } => {
                 self.toast(NoticeLevel::Info, format!("子代理 {name}: {state}"));
@@ -696,7 +717,9 @@ impl App {
         match action {
             ActionResult::Bootstrap { seed, result } => match result {
                 Ok(b) => {
-                    if let Some(sess) = self.sessions.get_mut(&seed) {
+                    let bootstrap_seed = seed.clone();
+                    let mut needs_fetch = false;
+                    if let Some(sess) = self.sessions.get_mut(&bootstrap_seed) {
                         let conv = crate::protocol::snapshot::ConversationStateView::parse(&b.conversation.state);
                         sess.usage = conv.usage.clone();
                         sess.usage_totals = conv.usage_totals.clone();
@@ -710,9 +733,16 @@ impl App {
                                 sess.mode = meta.conversation_mode();
                             }
                         }
-                        if ctl.dashboard.is_some() {
-                            sess.dashboard = ctl.dashboard;
-                            sess.rendered = None;
+                        match ctl.dashboard {
+                            Some(dash) => {
+                                let is_empty = dash.tasks.is_empty() && dash.documents.is_empty() && dash.recent_edits.is_empty();
+                                sess.dashboard = Some(dash);
+                                sess.rendered = None;
+                                needs_fetch = is_empty;
+                            }
+                            None => {
+                                needs_fetch = true;
+                            }
                         }
                         let tool = crate::protocol::snapshot::ChannelStateView::parse_tool(&b.tool.state);
                         if let Some(perm) = tool.pending_permission {
@@ -733,6 +763,9 @@ impl App {
                             let _ = m;
                         }
                         sess.rendered = None;
+                    }
+                    if needs_fetch {
+                        self.fetch_dashboard(bootstrap_seed);
                     }
                 }
                 Err(e) => self.toast(NoticeLevel::Error, format!("bootstrap 失败[{seed}]: {e}")),
@@ -870,6 +903,20 @@ impl App {
                 }
                 Err(e) => self.toast(NoticeLevel::Error, format!("{label}: {e}")),
             },
+            ActionResult::Dashboard { seed, result } => {
+                self.dashboard_fetching.remove(&seed);
+                match result {
+                    Ok(dash) => {
+                        if let Some(sess) = self.sessions.get_mut(&seed) {
+                            if !dash.tasks.is_empty() || !dash.recent_edits.is_empty() || !dash.documents.is_empty() {
+                                sess.dashboard = Some(dash);
+                                sess.rendered = None;
+                            }
+                        }
+                    }
+                    Err(_e) => {}
+                }
+            }
         }
     }
 
@@ -1308,6 +1355,91 @@ impl App {
 
     // ───────────────────────── 服务面 ─────────────────────────
 
+    fn fetch_dashboard(&mut self, seed: String) {
+        if seed.is_empty() || self.dashboard_fetching.contains(&seed) {
+            return;
+        }
+        self.dashboard_fetching.insert(seed.clone());
+        let client = self.client.clone();
+        let tx = self.msg_tx.clone();
+        tokio::spawn(async move {
+            let value = client
+                .service(methods::SESSION_DASHBOARD, &serde_json::json!({ "seed": seed.clone() }))
+                .await;
+            let parsed: Result<crate::protocol::event::DashboardSnapshot, String> = match value {
+                Ok(v) => {
+                    // session.dashboard 返回 {tasks: [{id,subject,status…}], recent_edits: […]}；
+                    // DashboardSnapshot 额外含 seed/documents/current_todo_id。
+                    let tasks = if let Some(arr) = v.get("tasks").and_then(|x| x.as_array()) {
+                        arr.iter()
+                            .filter_map(|item| {
+                                Some(crate::protocol::event::DashboardTask {
+                                    id: item.get("id")?.as_str()?.to_owned(),
+                                    subject: item.get("subject")?.as_str().unwrap_or("").to_owned(),
+                                    description: item.get("description")?.as_str().unwrap_or("").to_owned(),
+                                    status: item.get("status")?.as_str().unwrap_or("idle").to_owned(),
+                                    evidence: item.get("evidence").and_then(|e| e.as_str()).map(str::to_owned),
+                                })
+                            })
+                            .collect::<Vec<_>>()
+                    } else {
+                        Vec::new()
+                    };
+                    let recent_edits = v
+                        .get("recent_edits")
+                        .and_then(|x| x.as_array())
+                        .map(|arr| arr.iter().filter_map(|s| s.as_str().map(str::to_owned)).collect())
+                        .unwrap_or_default();
+                    let seed_out = v.get("seed").and_then(|x| x.as_str()).unwrap_or(&seed).to_owned();
+                    Ok(crate::protocol::event::DashboardSnapshot {
+                        seed: seed_out,
+                        documents: Vec::new(),
+                        recent_edits,
+                        tasks,
+                        current_todo_id: v.get("current_todo_id").and_then(|x| x.as_str()).map(str::to_owned),
+                    })
+                }
+                Err(e) => {
+                    let msg = e.to_string();
+                    // fallback: todo.status 是同一数据源的另一视图
+                    let v2 = client
+                        .service(methods::TODO_STATUS, &serde_json::json!({ "seed": seed.clone() }))
+                        .await;
+                    match v2 {
+                        Ok(v) => {
+                            let items = v.get("items").and_then(|x| x.as_array()).cloned().unwrap_or_default();
+                            let tasks = items
+                                .iter()
+                                .filter_map(|item| {
+                                    Some(crate::protocol::event::DashboardTask {
+                                        id: item.get("id")?.as_str()?.to_owned(),
+                                        subject: item.get("title").or(item.get("subject"))?.as_str()?.to_owned(),
+                                        description: item.get("description")?.as_str().unwrap_or("").to_owned(),
+                                        status: item.get("status")?.as_str().unwrap_or("idle").to_owned(),
+                                        evidence: item.get("evidence").and_then(|e| e.as_str()).map(str::to_owned),
+                                    })
+                                })
+                                .collect::<Vec<_>>();
+                            if tasks.is_empty() {
+                                Err(msg)
+                            } else {
+                                Ok(crate::protocol::event::DashboardSnapshot {
+                                    seed: seed.clone(),
+                                    documents: Vec::new(),
+                                    recent_edits: Vec::new(),
+                                    tasks,
+                                    current_todo_id: v.get("current_id").and_then(|x| x.as_str()).map(str::to_owned),
+                                })
+                            }
+                        }
+                        Err(e2) => Err(format!("{msg}; todo.status: {e2}")),
+                    }
+                }
+            };
+            let _ = tx.send(AppMsg::Action(ActionResult::Dashboard { seed, result: parsed }));
+        });
+    }
+
     pub fn fetch_session_list(&mut self) {
         let client = self.client.clone();
         let tx = self.msg_tx.clone();
@@ -1721,8 +1853,8 @@ impl App {
     fn toggle_tool_expand(&mut self) {
         let Some(seed) = self.active_seed() else { return };
         let Some(sess) = self.sessions.get_mut(&seed) else { return };
-        // 收集所有可折叠工具（有输出或 diff），按时间逆序
-        let mut candidates: Vec<String> = Vec::new();
+        // 收集所有可折叠工具（有输出或 diff），按时间逆序；携带 name 以计算视觉展开态
+        let mut candidates: Vec<(String, String)> = Vec::new();
         for turn in sess.timeline.turns.iter().rev() {
             for round in turn.rounds.iter().rev() {
                 for block in round.blocks.iter().rev() {
@@ -1731,24 +1863,29 @@ impl App {
                             || !tool.progress.trim().is_empty()
                             || tool.diff.as_deref().is_some_and(|d| !d.trim().is_empty());
                         if has_content {
-                            candidates.push(tool.tool_call_id.clone());
+                            candidates.push((tool.tool_call_id.clone(), tool.name.clone()));
                         }
                     }
                 }
             }
         }
         if candidates.is_empty() { return; }
-        // 策略：优先展开最近的收起态；若全部已展开，则收起最近的展开态（循环）
+        // 视觉展开态 = expanded_raw ^ is_default_expanded(name)，F7 在此视觉上切换
+        let is_visual_expanded = |id: &str, name: &str| {
+            let raw = sess.expanded_tools.contains(id);
+            raw ^ crate::app::render_transcript::is_default_expanded(name)
+        };
+        // 策略：优先展开最近的“视觉收起”；若全部已展开，则收起最近的展开态（循环）
         let mut target: Option<String> = None;
-        for id in &candidates {
-            if !sess.expanded_tools.contains(id) {
+        for (id, name) in &candidates {
+            if !is_visual_expanded(id, name) {
                 target = Some(id.clone());
                 break;
             }
         }
         if target.is_none() {
-            // 全部已展开 → 收起最近一个
-            target = candidates.first().cloned();
+            // 全部已视觉展开 → 收起最近一个
+            target = candidates.first().map(|(id, _)| id.clone());
         }
         if let Some(id) = target {
             if sess.expanded_tools.contains(&id) {
