@@ -192,8 +192,8 @@ mod tests {
 
     #[test]
     fn backoff_is_bounded() {
-        assert_eq!(backoff_delay(0).as_millis() >= 1000, true);
-        assert_eq!(backoff_delay(10).as_millis() <= 30_250, true);
+        assert!(backoff_delay(0).as_millis() >= 1000);
+        assert!(backoff_delay(10).as_millis() <= 30_250);
     }
 
     #[test]

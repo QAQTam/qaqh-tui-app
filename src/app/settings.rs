@@ -881,8 +881,10 @@ mod tests {
 
     #[test]
     fn focus_moves_and_wraps() {
-        let mut st = SettingsState::default();
-        st.focus = row_index(FieldId::Model);
+        let mut st = SettingsState {
+            focus: row_index(FieldId::Model),
+            ..Default::default()
+        };
         st.move_focus(1);
         assert_eq!(st.row().id, FieldId::Provider);
         st.move_focus(-1);
@@ -914,8 +916,10 @@ mod tests {
     #[test]
     fn commit_edit_validates_ranges() {
         let c = cfg();
-        let mut st = SettingsState::default();
-        st.focus = row_index(FieldId::MaxTokens);
+        let mut st = SettingsState {
+            focus: row_index(FieldId::MaxTokens),
+            ..Default::default()
+        };
         let buf = |s: &str| EditBuffer {
             buf: s.chars().collect(),
             cursor: s.len(),
@@ -946,9 +950,10 @@ mod tests {
     #[test]
     fn cycle_effort_toggles_and_providers() {
         let c = cfg();
-        let mut st = SettingsState::default();
-
-        st.focus = row_index(FieldId::ReasoningEffort);
+        let mut st = SettingsState {
+            focus: row_index(FieldId::ReasoningEffort),
+            ..Default::default()
+        };
         st.cycle(Some(&c), 1).unwrap();
         assert_eq!(st.draft.reasoning_effort.as_deref(), Some("xhigh"));
         st.cycle(Some(&c), -1).unwrap();
@@ -975,14 +980,16 @@ mod tests {
 
         // 端口字段 cycle 返回 Ok(false)，由 App 层处理。
         st.focus = row_index(FieldId::ActiveProfile);
-        assert_eq!(st.cycle(Some(&c), 1).unwrap(), false);
+        assert!(!st.cycle(Some(&c), 1).unwrap());
     }
 
     #[test]
     fn patch_roundtrip_and_validation_on_save() {
         let c = cfg();
-        let mut st = SettingsState::default();
-        st.focus = row_index(FieldId::ContextLimit);
+        let mut st = SettingsState {
+            focus: row_index(FieldId::ContextLimit),
+            ..Default::default()
+        };
         st.commit_edit(
             Some(&c),
             EditBuffer {

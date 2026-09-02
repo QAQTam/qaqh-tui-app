@@ -844,7 +844,7 @@ mod tests {
                     s.text
                         .chars()
                         .map(UnicodeWidthChar::width)
-                        .map(|w| w.unwrap_or(0) as usize)
+                        .map(|w| w.unwrap_or(0))
                         .sum::<usize>()
                 })
                 .sum()
@@ -901,7 +901,7 @@ mod tests {
                         s.text
                             .chars()
                             .map(UnicodeWidthChar::width)
-                            .map(|w| w.unwrap_or(0) as usize)
+                            .map(|w| w.unwrap_or(0))
                             .sum::<usize>()
                     })
                     .sum()
@@ -1056,9 +1056,7 @@ mod tests {
                         .map(|sp| {
                             sp.text
                                 .chars()
-                                .map(|c| {
-                                    unicode_width::UnicodeWidthChar::width(c).unwrap_or(0) as usize
-                                })
+                                .map(|c| unicode_width::UnicodeWidthChar::width(c).unwrap_or(0))
                                 .sum::<usize>()
                         })
                         .sum();
