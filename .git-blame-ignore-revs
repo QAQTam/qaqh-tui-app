@@ -1,0 +1,8 @@
+# git blame 忽略名单：机器生成的大范围格式化提交不计入 blame 历史。
+# 启用方式（每台机器一次性配置）：
+#   git config blame.ignoreRevsFile .git-blame-ignore-revs
+# 或临时使用：
+#   git blame --ignore-rev-file .git-blame-ignore-revs <file>
+#
+# fmt-only 全量格式化（2026-09-02，39 文件 +4048/-1239，rustfmt 1.9.0-stable 默认配置）：
+eae0f79969b22027dafefbb048398b0258dbc1f2
