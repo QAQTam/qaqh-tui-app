@@ -370,7 +370,13 @@ impl TimelineModel {
                 let round = Self::find_round_mut(turn, round_num);
                 if let Some(block) = Self::find_block_mut(round, block_id) {
                     // 单调 fragment 计数：重复/回放的增量被丢弃。
-                    if *fragment_seq > block.last_fragment {
+                    // daemon 契约：open_block 恒空文本开块、首分片 seq=0 且严格
+                    // 递增（append_text 校验 FragmentOutOfOrder）。fresh 块必须
+                    // 接受 seq=0，否则首条 delta 被静默丢弃（流式首行吞字），
+                    // 只能等 BlockCheckpoint 自愈；快照带文本的块不算 fresh，
+                    // seq=0 回放依旧幂等丢弃。
+                    let is_fresh = block.text.is_empty() && block.last_fragment == 0;
+                    if *fragment_seq > block.last_fragment || (is_fresh && *fragment_seq == 0) {
                         block.text.push_str(delta);
                         block.last_fragment = *fragment_seq;
                     } else {
@@ -1014,5 +1020,154 @@ mod tests {
         assert_eq!(prog, "100%\n");
         assert!(!prog.contains("\x1b"));
         assert!(!prog.contains("\r"));
+    }
+
+    #[test]
+    fn first_fragment_seq_zero_is_applied() {
+        // 回归：daemon 每块首分片 fragment_seq=0（open_block 空文本开块），
+        // 曾因 `0 > last_fragment(0)` 恒假被静默丢弃 —— 流式首行吞字，
+        // 只能等 BlockCheckpoint 自愈。fresh 块必须接受 seq=0。
+        let mut m = TimelineModel::default();
+        m.apply(&entry(
+            1,
+            "t1",
+            TimelineEvent::TurnOpened {
+                user_text: "hi".into(),
+            },
+        ));
+        m.apply(&entry(
+            2,
+            "t1",
+            TimelineEvent::BlockOpened {
+                block: TimelineBlock {
+                    block_id: "b1".into(),
+                    block_order: 0,
+                    kind: TimelineBlockKind::Text,
+                    state: TimelineBlockState::Open,
+                    text: String::new(),
+                    tool: None,
+                },
+            },
+        ));
+        m.apply(&entry(
+            3,
+            "t1",
+            TimelineEvent::TextDelta {
+                block_id: "b1".into(),
+                fragment_seq: 0,
+                delta: "首段".into(),
+            },
+        ));
+        m.apply(&entry(
+            4,
+            "t1",
+            TimelineEvent::TextDelta {
+                block_id: "b1".into(),
+                fragment_seq: 1,
+                delta: "正文".into(),
+            },
+        ));
+        assert_eq!(m.turns[0].rounds[0].blocks[0].text, "首段正文");
+    }
+
+    #[test]
+    fn replayed_first_fragment_is_idempotent() {
+        // seq=0 应用后再次回放：text 非空 → 不再 fresh，幂等丢弃不重复追加。
+        let mut m = TimelineModel::default();
+        m.apply(&entry(
+            1,
+            "t1",
+            TimelineEvent::TurnOpened {
+                user_text: "hi".into(),
+            },
+        ));
+        m.apply(&entry(
+            2,
+            "t1",
+            TimelineEvent::BlockOpened {
+                block: TimelineBlock {
+                    block_id: "b1".into(),
+                    block_order: 0,
+                    kind: TimelineBlockKind::Text,
+                    state: TimelineBlockState::Open,
+                    text: String::new(),
+                    tool: None,
+                },
+            },
+        ));
+        let first = entry(
+            3,
+            "t1",
+            TimelineEvent::TextDelta {
+                block_id: "b1".into(),
+                fragment_seq: 0,
+                delta: "首段".into(),
+            },
+        );
+        m.apply(&first);
+        let v = m.version;
+        m.apply(&first);
+        assert_eq!(m.version, v, "回放不得 bump version");
+        assert_eq!(m.turns[0].rounds[0].blocks[0].text, "首段");
+    }
+
+    #[test]
+    fn snapshot_text_block_rejects_replayed_first_fragment() {
+        // re-baseline：快照块带累计文本（last_fragment=0），回放 seq=0
+        // 不得重复追加；后续活跃 delta（seq 更大）正常追加。
+        let page = TimelinePage {
+            schema: "qaqh.Ringing".into(),
+            version: 1,
+            server_epoch: "ep".into(),
+            seed: "s".into(),
+            has_more: false,
+            total_turns: 1,
+            snapshot: crate::protocol::timeline::TimelineSnapshot {
+                watermark: 10,
+                turns: vec![crate::protocol::timeline::TimelineTurn {
+                    turn_id: "t1".into(),
+                    created_seq: 1,
+                    user_text: "hi".into(),
+                    sealed: false,
+                    state: TimelineTurnState::Running,
+                    failure: None,
+                    rounds: vec![crate::protocol::timeline::TimelineRound {
+                        round_num: 0,
+                        sealed: false,
+                        is_final: false,
+                        blocks: vec![TimelineBlock {
+                            block_id: "b1".into(),
+                            block_order: 0,
+                            kind: TimelineBlockKind::Text,
+                            state: TimelineBlockState::Open,
+                            text: "快照内容".into(),
+                            tool: None,
+                        }],
+                    }],
+                }],
+            },
+        };
+        let mut m = TimelineModel::default();
+        m.replace_from_page(&page);
+        m.apply(&entry(
+            11,
+            "t1",
+            TimelineEvent::TextDelta {
+                block_id: "b1".into(),
+                fragment_seq: 0,
+                delta: "回放".into(),
+            },
+        ));
+        assert_eq!(m.turns[0].rounds[0].blocks[0].text, "快照内容");
+        m.apply(&entry(
+            12,
+            "t1",
+            TimelineEvent::TextDelta {
+                block_id: "b1".into(),
+                fragment_seq: 3,
+                delta: "+增量".into(),
+            },
+        ));
+        assert_eq!(m.turns[0].rounds[0].blocks[0].text, "快照内容+增量");
     }
 }
