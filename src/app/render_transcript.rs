@@ -375,13 +375,16 @@ fn push_reasoning_block(
             (None, trimmed.to_owned())
         }
     } else {
-        // 取首行作标题（≤48ch）
+        // 首行提升为标题仅限英文 gerund summary 句（opencode 风格，如
+        // "Gathering context."）；中文 thinking 散文首行是内容而非标题，
+        // 提升会把思考链路拼进 Thinking/Thought 标识同行。`**Title**`
+        // 显式形式已在上方分支处理。
         let mut parts = trimmed.splitn(2, '\n');
         let first = parts.next().unwrap_or("").trim();
         let rest = parts.next().unwrap_or("").trim();
         if rest.is_empty() {
             (None, trimmed.to_owned())
-        } else if first.chars().count() <= 48 {
+        } else if first.chars().count() <= 48 && sentence_starts_with_gerund(first) {
             (Some(first.to_owned()), rest.to_owned())
         } else {
             (None, trimmed.to_owned())
@@ -1633,6 +1636,112 @@ mod tests {
         assert!(looks_like_reasoning_summary(text));
     }
 
+    /// 构造单 reasoning 块的会话；block_state 决定流式/落定形态。
+    fn reasoning_sess(
+        text: &str,
+        block_state: TimelineBlockState,
+    ) -> crate::app::session::SessionState {
+        let running = block_state == TimelineBlockState::Open;
+        let mut sess = crate::app::session::SessionState::new("s".into());
+        sess.timeline.turns.push(Turn {
+            turn_id: "t1".into(),
+            user_text: String::new(),
+            state: if running {
+                TimelineTurnState::Running
+            } else {
+                TimelineTurnState::Completed
+            },
+            failure: None,
+            rounds: vec![Round {
+                round_num: 0,
+                sealed: !running,
+                is_final: !running,
+                blocks: vec![Block {
+                    block_id: "b1".into(),
+                    block_order: 0,
+                    kind: TimelineBlockKind::Reasoning,
+                    state: block_state,
+                    text: text.to_string(),
+                    tool: None,
+                    last_fragment: 0,
+                }],
+            }],
+        });
+        sess
+    }
+
+    #[test]
+    fn cjk_thinking_first_line_not_promoted_to_title() {
+        // 回归：中文 thinking 散文首行是内容而非标题，曾因 ≤48ch 兜底被
+        // 提升拼进 Thought/Thinking 标识同行。现在必须整段在标识下方。
+        let sess = reasoning_sess(
+            "分析用户的需求。我需要先看看项目结构。\n然后动手实现。",
+            TimelineBlockState::Sealed,
+        );
+        let lines = render_transcript_with_opts(&sess, 80, true);
+        let joined = |l: &RenderLine| l.spans.iter().map(|s| s.text.as_str()).collect::<String>();
+        assert!(
+            lines.iter().any(|l| joined(l).trim() == "Thought"),
+            "无标题时头部应为裸 Thought"
+        );
+        assert!(
+            !lines.iter().any(|l| joined(l).contains("Thought: 分析")),
+            "CJK 首行不得拼进标识行"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.spans.iter().any(|s| s.text.contains("分析用户的需求"))),
+            "思考内容应换行显示在标识之下"
+        );
+    }
+
+    #[test]
+    fn english_gerund_summary_first_line_still_promoted() {
+        // 英文 gerund summary 句保留 opencode 风格标题提升。
+        let sess = reasoning_sess(
+            "Gathering context.Synthesizing plan.",
+            TimelineBlockState::Sealed,
+        );
+        let lines = render_transcript_with_opts(&sess, 80, true);
+        let joined = |l: &RenderLine| l.spans.iter().map(|s| s.text.as_str()).collect::<String>();
+        assert!(
+            lines
+                .iter()
+                .any(|l| joined(l).trim() == "Thought: Gathering context."),
+            "gerund 首行应保留标题提升"
+        );
+        assert!(lines.iter().any(|l| {
+            l.spans
+                .iter()
+                .any(|s| s.text.contains("Synthesizing plan."))
+        }));
+    }
+
+    #[test]
+    fn cjk_thinking_streaming_body_below_header() {
+        // 流式态同样不得把思考内容拼进 Thinking 标识行（用户投诉场景）。
+        let sess = reasoning_sess(
+            "分析用户的需求。我需要先看看项目结构。",
+            TimelineBlockState::Open,
+        );
+        let lines = render_transcript_with_opts(&sess, 80, true);
+        let joined = |l: &RenderLine| l.spans.iter().map(|s| s.text.as_str()).collect::<String>();
+        let header_idx = lines
+            .iter()
+            .position(|l| joined(l).contains("Thinking"))
+            .expect("流式态应有 Thinking 标识行");
+        assert!(
+            !joined(&lines[header_idx]).contains("分析"),
+            "标识行不得携带思考内容"
+        );
+        assert!(
+            lines[header_idx..]
+                .iter()
+                .any(|l| l.spans.iter().any(|s| s.text.contains("分析用户的需求"))),
+            "思考内容应出现在标识行之下"
+        );
+    }
     #[test]
     fn shell_output_unwrap_and_streaming_slice() {
         let raw = r#"{"status":"completed","command":"bash ...","exit_code":0,"output":"line1\nline2\nline3","truncated":false,"timed_out":false,"cancelled":false}"#;
