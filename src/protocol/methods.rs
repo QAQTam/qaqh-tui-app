@@ -165,13 +165,15 @@ impl SessionMetaView {
         })
     }
 
-    /// 展示标题：title → last_summary → cwd 尾段 → seed。
+    /// 展示标题：title → cwd 尾段 → seed。
+    ///
+    /// last_summary 不再参与标题（2026-09）：它是「最后一条 assistant 回复
+    /// 首行」的预览（每轮 save_append 覆盖），当标题用会导致列表标题随
+    /// 对话漂移成“模型最近说了什么的开头”。标题职责完全交给后端 title
+    /// 字段（入站即 LLM 总结用户需求生成；旧会话无 title 回退 cwd/seed）。
     pub fn display_title(&self) -> String {
         if let Some(t) = self.title.as_deref().filter(|s| !s.is_empty()) {
             return t.to_owned();
-        }
-        if let Some(s) = self.last_summary.as_deref().filter(|s| !s.is_empty()) {
-            return s.to_owned();
         }
         if let Some(c) = self.cwd.as_deref().filter(|s| !s.is_empty()) {
             let trimmed = c.trim_end_matches(['/', '\\']);
@@ -208,6 +210,7 @@ mod tests {
 
     #[test]
     fn session_meta_display_title_fallbacks() {
+        // last_summary 不得再当标题（2026-09）：它是最后回复预览，不是标题。
         let v = serde_json::json!({
             "seed": "0123abcd",
             "cwd": "F:\\code\\qaqh",
@@ -217,8 +220,20 @@ mod tests {
             "mode": 1
         });
         let meta = SessionMetaView::parse(&v).unwrap();
-        assert_eq!(meta.display_title(), "修复 SSE 解码");
+        assert_eq!(meta.display_title(), "qaqh");
         assert!(meta.archived && meta.running);
         assert_eq!(meta.conversation_mode(), ConversationMode::Plan);
+    }
+
+    #[test]
+    fn session_meta_title_beats_last_summary() {
+        // title 一旦存在（入站 LLM 总结已推送），永远优先于 last_summary。
+        let v = serde_json::json!({
+            "seed": "0123abcd",
+            "title": "Bun 引导 daemon",
+            "last_summary": "完成：Bun 引导真实 daemon 的 web 形态已验证"
+        });
+        let meta = SessionMetaView::parse(&v).unwrap();
+        assert_eq!(meta.display_title(), "Bun 引导 daemon");
     }
 }
