@@ -66,9 +66,18 @@ pub struct MethodInfo {
     pub requires_seed: bool,
 }
 
-const READ: MethodInfo = MethodInfo { kind: MethodKind::Read, requires_seed: false };
-const READ_SEEDED: MethodInfo = MethodInfo { kind: MethodKind::Read, requires_seed: true };
-const WRITE: MethodInfo = MethodInfo { kind: MethodKind::Write, requires_seed: false };
+const READ: MethodInfo = MethodInfo {
+    kind: MethodKind::Read,
+    requires_seed: false,
+};
+const READ_SEEDED: MethodInfo = MethodInfo {
+    kind: MethodKind::Read,
+    requires_seed: true,
+};
+const WRITE: MethodInfo = MethodInfo {
+    kind: MethodKind::Write,
+    requires_seed: false,
+};
 
 /// 与后端 `lookup` 完全一致的方法表（22 Read + 19 Write）。
 pub fn lookup(method: &str) -> Option<MethodInfo> {
@@ -145,23 +154,44 @@ impl SessionMetaView {
             seed: obj.get("seed")?.as_str()?.to_owned(),
             created_at: obj.get("created_at").and_then(serde_json::Value::as_u64),
             updated_at: obj.get("updated_at").and_then(serde_json::Value::as_u64),
-            model: obj.get("model").and_then(serde_json::Value::as_str).map(str::to_owned),
+            model: obj
+                .get("model")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned),
             turn_count: obj.get("turn_count").and_then(serde_json::Value::as_u64),
             message_count: obj.get("message_count").and_then(serde_json::Value::as_u64),
             last_summary: obj
                 .get("last_summary")
                 .and_then(serde_json::Value::as_str)
                 .map(str::to_owned),
-            title: obj.get("title").and_then(serde_json::Value::as_str).map(str::to_owned),
-            cwd: obj.get("cwd").and_then(serde_json::Value::as_str).map(str::to_owned),
+            title: obj
+                .get("title")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned),
+            cwd: obj
+                .get("cwd")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned),
             tool_mode: obj
                 .get("tool_mode")
                 .and_then(serde_json::Value::as_str)
                 .map(str::to_owned),
-            mode: obj.get("mode").and_then(serde_json::Value::as_u64).map(|v| v as u8),
-            archived: obj.get("archived").and_then(serde_json::Value::as_bool).unwrap_or(false),
-            ephemeral: obj.get("ephemeral").and_then(serde_json::Value::as_bool).unwrap_or(false),
-            running: obj.get("running").and_then(serde_json::Value::as_bool).unwrap_or(false),
+            mode: obj
+                .get("mode")
+                .and_then(serde_json::Value::as_u64)
+                .map(|v| v as u8),
+            archived: obj
+                .get("archived")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false),
+            ephemeral: obj
+                .get("ephemeral")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false),
+            running: obj
+                .get("running")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false),
         })
     }
 
