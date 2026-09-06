@@ -203,12 +203,14 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) {
             )));
         }
         // 当前聚焦
+        // 聚焦行：id 保留在此（工作视图唯一的 id 锚点）
         if let Some(cur) = dash.current_todo_id.as_deref()
             && let Some(task) = dash.tasks.iter().find(|t| t.id == cur)
         {
             let tag = format!(
-                " ▶ {} ",
-                truncate_str(&task.subject, width.saturating_sub(6))
+                " ▶ [{}] {} ",
+                task.id,
+                truncate_str(&task.subject, width.saturating_sub(10))
             );
             lines.push(Line::from(vec![Span::styled(
                 tag,
@@ -247,8 +249,15 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) {
             ]));
         }
     } else {
-        // 保持服务端原始顺序（计划顺序），突出 in_progress
+        // 保持服务端原始顺序（计划顺序），突出 in_progress；
+        // 非详情模式下已落定项折叠为摘要行，控制列表长度。
+        let mut settled_hidden = 0usize;
         for task in &dash.tasks {
+            let settled = task.status == "completed" || task.status == "cancelled";
+            if !app.show_todo_detail && settled {
+                settled_hidden += 1;
+                continue;
+            }
             push_task(
                 &mut lines,
                 task,
@@ -257,7 +266,13 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) {
                 app.show_todo_detail,
             );
         }
-        if !app.show_todo_detail && !dash.tasks.is_empty() {
+        if settled_hidden > 0 {
+            lines.push(Line::from(Span::styled(
+                format!("  · 已落定 {} 条（F6 详情/展开）", settled_hidden),
+                theme::dim(),
+            )));
+        }
+        if !app.show_todo_detail && !dash.tasks.is_empty() && settled_hidden == 0 {
             lines.push(Line::from(Span::styled(
                 "  … F6 展开描述/证据",
                 theme::dim(),
@@ -332,10 +347,9 @@ fn push_task(
     let (glyph, glyph_style) =
         glyph_and_style(&task.status, current, crate::app::anim::frame_now(), phase);
     let mark = if current { "▸" } else { " " };
-    // ID 徽标更易扫视（T1 / T12）
-    let id_tag = format!("{} ", task.id);
+    // id 不进标题行（与落定视图一致，标题行只留内容）；id 挂在详情行
+    // （↳ [T3] …）与聚焦行（▶ [T3] …）作为对照 transcript 的锚点。
     let prefix = format!(" {mark}{glyph} ");
-    let prefix_w = prefix.width() + id_tag.width();
 
     let title_style = if current {
         Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD)
@@ -348,9 +362,8 @@ fn push_task(
     } else {
         Style::new().add_modifier(Modifier::BOLD)
     };
-    // 标题可能需换行
-    let title = format!("{} {}", task.id, task.subject);
-    let segs = wrap_text(&title, width.saturating_sub(prefix.width()));
+    // 标题可能需换行：只折 subject，续行对齐在标题起点。
+    let segs = wrap_text(&task.subject, width.saturating_sub(prefix.width()));
     for (i, seg) in segs.into_iter().enumerate() {
         if i == 0 {
             lines.push(Line::from(vec![
@@ -367,10 +380,15 @@ fn push_task(
 
     if !task.description.is_empty() && show_detail {
         let one = task.description.replace('\n', " ");
-        let desc = truncate_str(&one, width.saturating_sub(prefix_w + 1));
+        let head = format!("↳ [{}] ", task.id);
+        let desc = truncate_str(
+            &one,
+            width.saturating_sub(prefix.width() + head.width() + 1),
+        );
         lines.push(Line::from(vec![
             Span::styled(" ".repeat(prefix.width()), theme::dim()),
-            Span::styled(format!("↳ {desc}"), theme::dim()),
+            Span::styled(head, theme::dim()),
+            Span::styled(desc, theme::dim()),
         ]));
     }
     if let Some(evidence) = task
@@ -380,7 +398,7 @@ fn push_task(
         .filter(|_| show_detail)
     {
         let one = evidence.replace('\n', " ");
-        let ev = truncate_str(&one, width.saturating_sub(prefix_w + 3));
+        let ev = truncate_str(&one, width.saturating_sub(prefix.width() + 3));
         lines.push(Line::from(vec![
             Span::styled(" ".repeat(prefix.width()), theme::dim()),
             Span::styled(format!("✓ {ev}"), Style::new().fg(Color::Green)),
@@ -389,5 +407,60 @@ fn push_task(
     // 任务间微空隙（未完成任务更疏）
     if task.status != "completed" && task.status != "cancelled" {
         lines.push(Line::from(""));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn task(id: &str, subject: &str, status: &str) -> DashboardTask {
+        DashboardTask {
+            id: id.into(),
+            subject: subject.into(),
+            description: "任务描述".into(),
+            status: status.into(),
+            evidence: None,
+        }
+    }
+
+    fn joined(line: &Line<'_>) -> String {
+        line.spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    #[test]
+    fn title_line_has_no_id_and_detail_line_carries_it() {
+        // 标题行只留内容（与落定视图一致）；id 锚在详情行。
+        let mut lines = Vec::new();
+        push_task(&mut lines, &task("T3", "实现解码", "idle"), None, 40, true);
+        let title = joined(&lines[0]);
+        assert!(title.contains("实现解码"));
+        assert!(!title.contains("T3"), "标题行不得携带 id：{title}");
+        let desc = lines.iter().map(joined).find(|l| l.contains("↳")).unwrap();
+        assert!(desc.contains("[T3]"), "id 应锚在详情行：{desc}");
+    }
+
+    #[test]
+    fn wrap_continuation_aligns_without_id() {
+        // 长标题折行：续行对齐在标题起点，且不混入 id。
+        let mut lines = Vec::new();
+        push_task(
+            &mut lines,
+            &task("T7", "第一段很长很长的任务标题第二段也很长", "idle"),
+            None,
+            20,
+            false,
+        );
+        assert!(lines.len() >= 2, "应发生折行");
+        let cont = joined(&lines[1]);
+        assert!(!cont.contains("T7"));
+        assert!(cont.starts_with("   "), "续行以 prefix 宽度对齐：{cont:?}");
+    }
+
+    #[test]
+    fn detail_false_hides_description_line() {
+        let mut lines = Vec::new();
+        push_task(&mut lines, &task("T1", "标题", "idle"), None, 40, false);
+        assert!(lines.iter().all(|l| !joined(l).contains("↳")));
     }
 }
