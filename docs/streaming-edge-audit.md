@@ -34,6 +34,13 @@ engine_turn.rs L198/225/293/567）直接发 `BlockSealed`，不先发权威全�
 建议：daemon 在两个 seal 函数发 `BlockSealed` 前补发一次 `BlockCheckpoint`
 （全文），把"概率自愈"升级为"保证收敛"，成本一条事件。
 
+> **实施记录（2026-09-06，backend `c85bb43`）**：已落地，且比本建议覆盖更全——
+> `gate.rs` 新增 `emit_final_block_checkpoint`（绕过节流、幂等防御），在
+> kind 切换 / 工具块开启 / 流结束三处收口发最终 checkpoint。由于流结束后
+> deltas 冻结，末尾一次补发即可覆盖下游全部 seal 点（parse 尾封 / cancel /
+> 失败终态 / 续写封口）；悬空 turn 的 4 个 suspension seal 点传 `None` 无需处理。
+> +2 单元测试（发射/守卫两态）。
+
 ### B. 契约破坏时的已知静默点（accepted，附检测建议）
 
 **B1. reducer 对 missing block/turn 的事件静默丢弃**（`changed=false`，无计数）：
@@ -41,6 +48,12 @@ engine_turn.rs L198/225/293/567）直接发 `BlockSealed`，不先发权威全�
 实践中仅 daemon 契约破坏（round_num 缺失、事件乱序）或回合被 `cap_turns`
 逐出时可达。建议未来：TimelineModel 加 `dropped: u64` 计数，doctor/debug
 overlay 可读；或在 App 层对"块缺失的 delta"触发一次 re-baseline 请求。
+
+> **实施记录（2026-09-06，本提交）**：`TimelineModel` 新增
+> `dropped_missing_block` / `dropped_missing_turn` 计数与 `dropped_summary()`，
+> status_bar 在非零时以 warn 色展示。零噪声设计：设计内幂等重放（旧
+> fragment_seq）与 TurnOpened 去重不计入；丢弃不 bump version（不触发
+> 渲染缓存失效）。+1 回归测试（异常计入 / 重放不计入 / version 不动）。
 
 **B2. 重复 `BlockOpened` 整块替换**：`Some(idx) => round.blocks[idx] = wire` 会
 清空已累计文本并重置 last_fragment=0，后续旧 seq delta 以空文本为基重放
@@ -82,3 +95,6 @@ BlockOpened）。若未来引入"流内重开块"语义，此处必须先改。
 两个用户可见缺陷（首行吞字、思考链同行）已修复入库；其余边界全部收敛于
 "整流重摆"这一信任根，无本次需修项。最有价值的后续改进是 A1（daemon seal
 前补最终 checkpoint，一行级改动、跨端收益）与 B1（丢弃可观测化）。
+
+> **2026-09-06 更新**：A1（backend `c85bb43`）与 B1（本提交）均已实施，
+> 见上文实施记录；其余建议项（B2、C2、D1-D3）维持 accepted 现状。

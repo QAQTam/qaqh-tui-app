@@ -76,6 +76,10 @@ pub fn draw(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
             format!(" · {}", sess.activity_label()),
             theme::accent(),
         ));
+        // B1 可观测：仅契约异常丢弃非零时展示（正常会话零噪声）。
+        if let Some(dropped) = sess.timeline.dropped_summary() {
+            right.push(Span::styled(format!(" · {dropped}"), theme::warn()));
+        }
     }
     let now = chrono::Local::now().format("%H:%M");
     right.push(Span::styled(format!(" · {now} "), theme::dim()));

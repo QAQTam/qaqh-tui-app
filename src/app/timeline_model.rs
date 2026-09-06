@@ -283,11 +283,29 @@ pub struct TimelineModel {
     pub has_more: bool,
     pub total_turns: usize,
     pub version: u64,
+    /// B1 可观测：事件引用的 block/tool 卡缺失被丢弃的次数（契约异常信号）。
+    /// 设计内幂等丢弃不计入：旧 fragment_seq 重放、快照窗口外迟到条目。
+    pub dropped_missing_block: u64,
+    /// B1 可观测：事件引用的 turn 缺失被丢弃的次数（快照窗口外迟到条目，
+    /// re-baseline 自愈；持续增长 = 契约破坏或窗口配置异常）。
+    pub dropped_missing_turn: u64,
 }
 
 impl TimelineModel {
     fn bump(&mut self) {
         self.version += 1;
+    }
+
+    /// B1 可观测：非零丢弃时返回紧凑摘要（status_bar 展示），恒零返回
+    /// None——正常会话该信号必须完全不可见（零噪声设计）。
+    pub fn dropped_summary(&self) -> Option<String> {
+        if self.dropped_missing_block == 0 && self.dropped_missing_turn == 0 {
+            return None;
+        }
+        Some(format!(
+            "⚠ dropped b={} t={}",
+            self.dropped_missing_block, self.dropped_missing_turn
+        ))
     }
 
     fn find_turn_mut(&mut self, turn_id: &str) -> Option<&mut Turn> {
@@ -333,12 +351,20 @@ impl TimelineModel {
             return;
         }
 
-        let Some(turn) = self.find_turn_mut(turn_id) else {
-            // 快照窗口之外的迟到条目：忽略（re-baseline 会补齐权威状态）。
-            return;
+        let turn = match self.find_turn_mut(turn_id) {
+            Some(turn) => turn,
+            // 快照窗口之外的迟到条目：忽略（re-baseline 会补齐权威状态），
+            // 但计入 B1 可观测信号——持续增长意味着契约破坏或窗口异常。
+            None => {
+                self.dropped_missing_turn += 1;
+                return;
+            }
         };
 
         let mut changed = true;
+        // match 内 turn 可变借用存活，无法直接触碰 self——missing-block 丢弃
+        // 先记局部计数，match 后再汇总到 self（与 changed 标志同套路）。
+        let mut missing_block_drops: u8 = 0;
         match &entry.event {
             E::TurnOpened { .. } => unreachable!(),
             E::BlockOpened { block } => {
@@ -383,6 +409,7 @@ impl TimelineModel {
                         changed = false;
                     }
                 } else {
+                    missing_block_drops += 1;
                     changed = false;
                 }
             }
@@ -393,6 +420,7 @@ impl TimelineModel {
                     // 覆盖语义：自愈丢失/乱序的增量。
                     block.text = text.clone();
                 } else {
+                    missing_block_drops += 1;
                     changed = false;
                 }
             }
@@ -403,6 +431,7 @@ impl TimelineModel {
                 if let Some(block) = Self::find_block_mut(round, block_id) {
                     block.tool = Some(card);
                 } else {
+                    missing_block_drops += 1;
                     changed = false;
                 }
             }
@@ -421,9 +450,11 @@ impl TimelineModel {
                             tool.progress.push_str(chunk);
                         }
                     } else {
+                        missing_block_drops += 1;
                         changed = false;
                     }
                 } else {
+                    missing_block_drops += 1;
                     changed = false;
                 }
             }
@@ -433,6 +464,7 @@ impl TimelineModel {
                 if let Some(block) = Self::find_block_mut(round, block_id) {
                     block.state = TimelineBlockState::Sealed;
                 } else {
+                    missing_block_drops += 1;
                     changed = false;
                 }
             }
@@ -447,6 +479,9 @@ impl TimelineModel {
                 turn.failure = failure.clone();
                 changed = true;
             }
+        }
+        if missing_block_drops > 0 {
+            self.dropped_missing_block += u64::from(missing_block_drops);
         }
         if changed {
             self.bump();
@@ -1169,5 +1204,83 @@ mod tests {
             },
         ));
         assert_eq!(m.turns[0].rounds[0].blocks[0].text, "快照内容+增量");
+    }
+
+    /// B1 可观测回归：只有契约异常（block/turn 缺失）计入 dropped_*，
+    /// 设计内幂等重放（旧 fragment_seq）不计入；丢弃不 bump version。
+    #[test]
+    fn dropped_counters_signal_contract_anomalies_only() {
+        let mut m = TimelineModel::default();
+        assert_eq!(m.dropped_summary(), None, "恒零必须零噪声");
+
+        // 引用缺失 turn 的事件：计入 missing_turn，不 bump version。
+        m.apply(&entry(
+            1,
+            "ghost",
+            TimelineEvent::TextDelta {
+                block_id: "b1".into(),
+                fragment_seq: 0,
+                delta: "x".into(),
+            },
+        ));
+        assert_eq!(m.dropped_missing_turn, 1);
+        assert_eq!(m.dropped_missing_block, 0);
+        assert_eq!(m.version, 0, "丢弃不触发渲染缓存失效");
+        assert!(m.dropped_summary().is_some());
+
+        // 引用缺失 block 的事件：计入 missing_block。
+        m.apply(&entry(
+            2,
+            "t1",
+            TimelineEvent::TurnOpened {
+                user_text: "问".into(),
+            },
+        ));
+        m.apply(&entry(
+            3,
+            "t1",
+            TimelineEvent::TextDelta {
+                block_id: "b-missing".into(),
+                fragment_seq: 0,
+                delta: "y".into(),
+            },
+        ));
+        assert_eq!(m.dropped_missing_block, 1);
+
+        // 设计内幂等重放（旧 fragment_seq）不计入丢弃。
+        m.apply(&entry(
+            4,
+            "t1",
+            TimelineEvent::BlockOpened {
+                block: TimelineBlock {
+                    block_id: "b1".into(),
+                    block_order: 0,
+                    kind: TimelineBlockKind::Text,
+                    state: TimelineBlockState::Open,
+                    text: String::new(),
+                    tool: None,
+                },
+            },
+        ));
+        m.apply(&entry(
+            5,
+            "t1",
+            TimelineEvent::TextDelta {
+                block_id: "b1".into(),
+                fragment_seq: 0,
+                delta: "首".into(),
+            },
+        ));
+        m.apply(&entry(
+            6,
+            "t1",
+            TimelineEvent::TextDelta {
+                block_id: "b1".into(),
+                fragment_seq: 0,
+                delta: "重复".into(),
+            },
+        ));
+        assert_eq!(m.dropped_missing_block, 1, "重放不计入契约异常");
+        assert_eq!(m.turns[0].rounds[0].blocks[0].text, "首");
     }
 }
