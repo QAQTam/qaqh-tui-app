@@ -59,6 +59,10 @@ pub enum ControlCommand {
     SessionResume {
         seed: String,
     },
+    /// 仅 attach（无 actor 副作用）：订阅子代理等观测 seed 的 timeline 流用。
+    SessionAttach {
+        seed: String,
+    },
     SessionClose {
         seed: String,
     },

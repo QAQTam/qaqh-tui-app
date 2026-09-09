@@ -232,7 +232,7 @@ impl App {
     // ───────────────────────── 服务面 ─────────────────────────
 
     pub fn scroll_up(&mut self, lines: usize) {
-        let Some(seed) = self.active_seed() else {
+        let Some(seed) = self.view_seed() else {
             return;
         };
         let Some(sess) = self.sessions.get_mut(&seed) else {
@@ -243,7 +243,7 @@ impl App {
     }
 
     pub fn scroll_down(&mut self, lines: usize) {
-        let Some(seed) = self.active_seed() else {
+        let Some(seed) = self.view_seed() else {
             return;
         };
         let Some(sess) = self.sessions.get_mut(&seed) else {
@@ -258,7 +258,7 @@ impl App {
     }
 
     pub fn scroll_top(&mut self) {
-        let Some(seed) = self.active_seed() else {
+        let Some(seed) = self.view_seed() else {
             return;
         };
         if let Some(sess) = self.sessions.get_mut(&seed) {
@@ -268,7 +268,7 @@ impl App {
     }
 
     pub fn scroll_bottom(&mut self) {
-        let Some(seed) = self.active_seed() else {
+        let Some(seed) = self.view_seed() else {
             return;
         };
         if let Some(sess) = self.sessions.get_mut(&seed) {
@@ -282,7 +282,7 @@ impl App {
     /// PageUp：滚动；到顶且还有更早回合 → 触发分页加载。
     pub(super) fn page_up(&mut self) {
         let (total, at_limit, has_more, loading) = {
-            let Some(sess) = self.active_session() else {
+            let Some(sess) = self.view_session() else {
                 return;
             };
             let total = sess.rendered.as_ref().map(|r| r.lines.len()).unwrap_or(0);
@@ -301,7 +301,7 @@ impl App {
     }
 
     pub(super) fn toggle_tool_expand(&mut self) {
-        let Some(seed) = self.active_seed() else {
+        let Some(seed) = self.view_seed() else {
             return;
         };
         let Some(sess) = self.sessions.get_mut(&seed) else {

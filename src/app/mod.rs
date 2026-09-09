@@ -17,6 +17,7 @@ mod session_ops;
 pub mod settings;
 mod settings_ops;
 pub mod slash;
+pub mod subagent;
 pub mod timeline_model;
 mod transcript_ops;
 
@@ -206,6 +207,10 @@ pub struct App {
     pub slash_selected: usize,
     /// 启动时的进程 cwd（hybrid 回退 3），捕获后不再随 cd 变化
     pub initial_cwd: Option<String>,
+    /// 子代理观测视图栈：当前正在查看的子代理 seed（None = 正常标签视图）。
+    pub inspect: Option<String>,
+    /// 正在跟踪 timeline 流的子代理 seed 集（attach 后建立，终态后移除）。
+    pub(crate) subagent_seeds: HashSet<String>,
 }
 
 impl App {
@@ -263,6 +268,8 @@ impl App {
             home_show_archived: false,
             slash_selected: 0,
             initial_cwd,
+            inspect: None,
+            subagent_seeds: HashSet::new(),
         }
     }
 
@@ -355,6 +362,10 @@ impl App {
             }
             return;
         }
+        if self.inspecting() {
+            // 观测模式只读：粘贴不落到隐藏的父会话 composer。
+            return;
+        }
         let Some(sess) = self.active_session_mut() else {
             return;
         };
@@ -389,6 +400,12 @@ impl App {
                 });
             }
             RuntimeMsg::Timeline { seed, entry } => {
+                // 子代理发现：spawn_subagent 工具卡（增量，先于 apply 检查）。
+                if let crate::protocol::timeline::TimelineEvent::ToolUpdated { tool, .. } =
+                    &entry.event
+                {
+                    self.discover_spawn_tool(&seed, tool);
+                }
                 let Some(sess) = self.sessions.get_mut(&seed) else {
                     return;
                 };
@@ -418,8 +435,15 @@ impl App {
                     sess.scroll.offset = 0;
                 }
                 sess.rendered = None;
+                // 子代理：重扫工具卡 + 终态兑底推导。
+                self.handle_subagent_rebaseline(&seed);
             }
             RuntimeMsg::TimelineLost { seed, error } => {
+                if self.subagent_seeds.contains(&seed) {
+                    // 子代理会话已消失（404）：静默标记关闭，不再重试。
+                    self.mark_subagent_closed(&seed);
+                    return;
+                }
                 self.toast(
                     NoticeLevel::Error,
                     format!("timeline 断开[{seed}]: {error}"),
@@ -444,8 +468,11 @@ impl App {
                 self.conn_error = None;
                 // 重 open（租约重建 / daemon 重启）：重新 attach 全部 open seeds
                 // 并 re-baseline；epoch 变化时 timeline 流自行重放。
+                // 子代理 seed 走 SessionAttach（无 actor 副作用，运行中的子代理
+                // 不能被 resume）。
                 let seeds = self.tabs.clone();
-                if !seeds.is_empty() {
+                let sub_seeds: Vec<String> = self.subagent_seeds.iter().cloned().collect();
+                if !seeds.is_empty() || !sub_seeds.is_empty() {
                     self.spawn_api(move |client, tx| async move {
                         for seed in seeds {
                             let cmd = build_envelope(
@@ -459,6 +486,26 @@ impl App {
                                 let _ = tx.send(AppMsg::Action(ActionResult::CommandAck {
                                     seed: Some(seed.clone()),
                                     label: "resume",
+                                    result: Err(e.to_string()),
+                                }));
+                                continue;
+                            }
+                            let result = client.bootstrap(&seed).await.map_err(|e| e.to_string());
+                            let _ =
+                                tx.send(AppMsg::Action(ActionResult::Bootstrap { seed, result }));
+                        }
+                        for seed in sub_seeds {
+                            let cmd = build_envelope(
+                                &client,
+                                RingingCommand::Control(ControlCommand::SessionAttach {
+                                    seed: seed.clone(),
+                                }),
+                            )
+                            .with_seed(seed.clone());
+                            if let Err(e) = client.command(&cmd).await {
+                                let _ = tx.send(AppMsg::Action(ActionResult::CommandAck {
+                                    seed: Some(seed.clone()),
+                                    label: "attach",
                                     result: Err(e.to_string()),
                                 }));
                                 continue;
@@ -708,6 +755,17 @@ impl App {
                 }
             }
             ControlEvent::SubagentStatus { name, state, .. } => {
+                // 终态标签（COMPLETED/ERROR/TIMEOUT/CANCELLED）：同步条目并
+                // 停止对应 seed 的 timeline 跟踪（daemon 随后 SessionClose）。
+                let mut done_seed = None;
+                if let Some(sess) = self.sessions.get_mut(&seed)
+                    && let Some(s) = subagent::apply_status(sess, &name, &state)
+                {
+                    done_seed = Some(s);
+                }
+                if let Some(s) = done_seed {
+                    self.untrack_subagent(&s);
+                }
                 self.toast(NoticeLevel::Info, format!("子代理 {name}: {state}"));
             }
             ControlEvent::OperationFailed { scope, error, .. } => {
@@ -1147,7 +1205,13 @@ impl App {
     // ───────────────────────── 标签页 / 会话 ─────────────────────────
 
     fn sync_tracked(&mut self) {
-        let seeds: Vec<String> = self.tabs.clone();
+        // 打开的标签 + 正在跟踪的子代理 seed（各自独立 timeline 流）。
+        let mut seeds: Vec<String> = self.tabs.clone();
+        for s in &self.subagent_seeds {
+            if !seeds.contains(s) {
+                seeds.push(s.clone());
+            }
+        }
         self.tracked_seeds = seeds.iter().cloned().collect();
         self.runtime.set_tracked_seeds(seeds);
     }
@@ -1251,6 +1315,10 @@ impl App {
             && let Some(next) = keymap::alt_tab_target(self.active, self.tabs.len(), key.code)
         {
             self.active = next;
+            // 切标签即退出子代理观测（观测作用域属于原标签）。
+            if self.inspecting() {
+                self.exit_inspect();
+            }
             return;
         }
 
@@ -1261,6 +1329,19 @@ impl App {
 
         // 覆盖层。
         if self.overlay_key(key) {
+            return;
+        }
+
+        // 子代理视图栈导航（弹窗/覆盖层优先级之后）：Ctrl+↑ 深入/下一个，
+        // Ctrl+↓ 返回父会话，Esc 退出观测。
+        if self.subagent_nav_key(key) {
+            return;
+        }
+
+        // 观测模式（只读）：滚动键作用于子代理视图，其余按键一律吞掉，
+        // 避免误输入到隐藏的父会话 composer。
+        if self.inspecting() {
+            self.inspect_key(key);
             return;
         }
 
@@ -1289,7 +1370,7 @@ impl App {
     /// 每帧前维护：焦点变化时执行 LRU 内存回收；只为 active 会话重建
     /// 渲染缓存（后台标签的缓存已被丢弃，聚焦时按需重建一次）。
     pub fn ensure_render_caches(&mut self, width: u16) {
-        let Some(active) = self.active_seed() else {
+        let Some(active) = self.view_seed() else {
             return;
         };
         if self.last_focused.as_deref() != Some(active.as_str()) {

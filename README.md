@@ -32,6 +32,19 @@ cargo build --release
 （恢复/归档/删除，D 删除需确认）· Ctrl+, 配置面板 · F1 帮助 · F3 展开思考 ·
 Ctrl+C×2 / Ctrl+Q 退出。
 
+### 子代理实时观测（Ctrl+↑/↓）
+
+父会话通过 `spawn_subagent` 拉起的子代理会在标签栏以 `↳N` 徽标显示
+（运行中高亮）；子代理 seed 从父会话 timeline 的工具卡自动发现，经
+`SessionAttach`（无 actor 副作用）attach 后实时订阅其 timeline 流。
+
+- `Ctrl+↑`：深入最近拉起的子代理；再次按下在子代理间循环切换
+- `Ctrl+↓` / `Esc`：返回父会话
+- 观测中 transcript 显示子代理实时 transcript（任务/思考/工具/作答），
+  composer 折叠为只读提示条；PgUp/PgDn/Ctrl+Home/End 滚动
+- 观测为只读：子代理无人值守运行，终态结果自动注入父会话；
+  会话关闭后本地保留最后快照
+
 交互弹窗（优先级 permission > ask > plan）：工具权限 `a` 批准 / `d` 拒绝 /
 `t` 信任目录（高风险+路径时）；ask `1-9` 选项、`e` 自定义输入、`Esc` 跳过；
 plan review `a` 批准 / `g` 批准+自主 / `r` 拒绝（输入理由）。
@@ -57,6 +70,8 @@ src/
   runtime.rs     open/续租循环（renew_interval/2，2 次失败重 open）+ 三频道 SSE 流 +
                  per-seed timeline 流（严格 +1，gap/reset/epoch 变化 → 快照 re-baseline）
   app/           App 状态机 + timeline reducer（幂等）+ 渲染 IR
+    subagent.rs   子代理观测：seed 发现（spawn_subagent 工具卡）+ 状态机 +
+                  视图栈导航（Ctrl+↑/↓，SessionAttach 无副作用接入）
   ui/            ratatui 0.30 视图（标签栏/对话/弹窗/覆盖层/状态栏）
 ```
 

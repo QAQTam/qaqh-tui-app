@@ -18,6 +18,17 @@ pub fn draw(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
         };
         let is_active = idx == app.active;
         let title = truncate_str(&sess.title(), 18);
+        // 子代理徽标：有拉起的子代理时追加 ↳N；任一运行中 → 高亮。
+        let sub_count = sess.subagents.iter().filter(|e| e.seed.is_some()).count();
+        let sub_running = sess
+            .subagents
+            .iter()
+            .any(|e| e.state == crate::app::subagent::SubagentState::Running);
+        let sub_badge = if sub_count > 0 {
+            format!("↳{sub_count}")
+        } else {
+            String::new()
+        };
         let mut label = format!(" {} {} ", idx + 1, title);
         if !is_active {
             // 挂起交互徽标。
@@ -30,6 +41,14 @@ pub fn draw(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
                 label = format!(" {} {} …", idx + 1, title);
             }
         }
+        if !sub_badge.is_empty() {
+            // 追加到尾列（替换末尾空格）。
+            if label.ends_with(' ') {
+                label.pop();
+            }
+            label.push_str(&sub_badge);
+            label.push(' ');
+        }
         let w = label.chars().count() + 1;
         if used + w > area.width as usize {
             overflow = true;
@@ -37,7 +56,7 @@ pub fn draw(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
         }
         let style: Style = if is_active {
             theme::active_tab()
-        } else if sess.is_waiting_user() {
+        } else if sub_running || sess.is_waiting_user() {
             theme::warn()
         } else if sess.streaming.is_some() {
             theme::dim()

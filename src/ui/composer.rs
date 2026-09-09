@@ -16,14 +16,17 @@ use crate::ui::theme;
 /// composer 显示行数上限（超出后以尾部窗口展示，光标行恒可见）。
 const MAX_ROWS: usize = 6;
 
-/// 自适应高度：上下边框 + min(输入行数, MAX_ROWS)。
+/// 自适应高度：上下边框 + min(输入行数, MAX_ROWS)。观测子代理时降为单行只读提示。
 pub fn height(app: &App) -> u16 {
+    if app.inspecting() {
+        return 1;
+    }
     let rows = app.active_session().map(|s| s.composer.rows()).unwrap_or(1);
     (rows.clamp(1, MAX_ROWS) as u16).saturating_add(2)
 }
 
 pub fn draw_slash_menu(f: &mut Frame, app: &App, composer_area: Rect) {
-    if !app.overlays.is_empty() {
+    if !app.overlays.is_empty() || app.inspecting() {
         return;
     }
     let candidates = app.slash_candidates();
@@ -83,6 +86,18 @@ pub fn draw_slash_menu(f: &mut Frame, app: &App, composer_area: Rect) {
 }
 
 pub fn draw(f: &mut Frame, app: &App, area: Rect) {
+    // 观测子代理：composer 折叠为单行只读提示（输入被吞，防误发到父会话）。
+    if app.inspecting() {
+        let line = Line::from(vec![
+            Span::styled(" ↳ 只读观测中 ", theme::accent()),
+            Span::styled(
+                "— Ctrl+↓ 返回父会话 · PgUp/PgDn 滚动 · Ctrl+↑ 下一个子代理",
+                theme::dim(),
+            ),
+        ]);
+        f.render_widget(Paragraph::new(line), area);
+        return;
+    }
     let Some(sess) = app.active_session() else {
         f.render_widget(
             Block::new()

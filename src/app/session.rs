@@ -405,6 +405,8 @@ pub struct SessionState {
     pub loading_older: bool,
     /// 已展开的工具输出（tool_call_id 集合，折叠态默认收起超长输出）
     pub expanded_tools: std::collections::HashSet<String>,
+    /// 本会话拉起的子代理（spawn 顺序；身份锚点 = timeline 工具卡 id）。
+    pub subagents: Vec<super::subagent::SubagentEntry>,
 }
 
 impl SessionState {
@@ -440,6 +442,7 @@ impl SessionState {
             needs_rebaseline: false,
             loading_older: false,
             expanded_tools: std::collections::HashSet::new(),
+            subagents: Vec::new(),
         }
     }
 

@@ -11,7 +11,7 @@ use crate::app::render_line::{RenderStyle, SpanStyle};
 use crate::ui::theme;
 
 pub fn draw(f: &mut Frame, app: &App, area: Rect) {
-    let Some(seed) = app.active_seed() else {
+    let Some(seed) = app.view_seed() else {
         return;
     };
     let Some(sess) = app.sessions.get(&seed) else {
@@ -78,9 +78,15 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) {
     }
 }
 
-/// 会话信息行（转成 ratatui）。
+/// 会话信息行（转成 ratatui）。观测子代理时展示子代理横幅。
 pub fn draw_session_info(f: &mut Frame, app: &App, area: Rect) {
-    let Some(sess) = app.active_session() else {
+    if app.inspecting()
+        && let Some(banner) = render_subagent_banner(app, area.width)
+    {
+        f.render_widget(Paragraph::new(banner), area);
+        return;
+    }
+    let Some(sess) = app.view_session() else {
         return;
     };
     let lines = crate::app::render_transcript::render_session_info(sess, area.width);
@@ -106,3 +112,67 @@ pub fn draw_session_info(f: &mut Frame, app: &App, area: Rect) {
 
 #[allow(dead_code)]
 fn _keep_spanstyle(_: SpanStyle) {}
+
+/// 子代理观测横幅：名称 / 状态 / seed 前缀 / 在父会话子代理中的序位 + 按键提示。
+fn render_subagent_banner(app: &App, width: u16) -> Option<Vec<Line<'static>>> {
+    let inspect = app.inspect.clone()?;
+    // 嵌套观测：直属父可能也是子代理；非嵌套时直属父即活动标签会话。
+    let parent_seed = app
+        .subagent_parent(&inspect)
+        .or_else(|| app.active_seed())?;
+    let parent = app.sessions.get(&parent_seed)?;
+    let nested = !app.tabs.contains(&parent_seed);
+    let entry = parent
+        .subagents
+        .iter()
+        .enumerate()
+        .find(|(_, e)| e.seed.as_deref() == Some(inspect.as_str()))?;
+    let (idx, entry) = entry;
+    let total = parent.subagents.iter().filter(|e| e.seed.is_some()).count();
+
+    let short_seed: String = inspect.chars().take(8).collect();
+    let live = app
+        .sessions
+        .get(&inspect)
+        .is_some_and(|s| s.streaming.is_some());
+    let state_label = if live && entry.state == crate::app::subagent::SubagentState::Running {
+        "running…".to_string()
+    } else {
+        entry.state.label().to_string()
+    };
+
+    let hint = " Ctrl+↑/↓ 切换 · Esc 返回 ";
+    // 嵌套时直属父是子代理：取其观测名（从更上层父的条目里查）。
+    let scope = if nested {
+        let parent_name = parent
+            .subagents
+            .iter()
+            .find(|e| e.seed.as_deref() == Some(parent_seed.as_str()))
+            .map(|e| e.name.clone())
+            .unwrap_or_else(|| "subagent".to_string());
+        format!("{parent_name} › ")
+    } else {
+        String::new()
+    };
+    let left = format!(
+        " ↳ 子代理 {}{} · {} · {} · {}/{} ",
+        scope,
+        entry.name,
+        state_label,
+        short_seed,
+        idx + 1,
+        total.max(1),
+    );
+    let left_w = left.chars().count();
+    let hint_w = hint.chars().count();
+    let pad = (width as usize).saturating_sub(left_w + hint_w);
+
+    let mut spans = vec![Span::styled(left, theme::active_tab())];
+    if pad > 0 {
+        spans.push(Span::raw(" ".repeat(pad)));
+    }
+    if width as usize > left_w {
+        spans.push(Span::styled(hint, theme::dim()));
+    }
+    Some(vec![Line::from(spans)])
+}

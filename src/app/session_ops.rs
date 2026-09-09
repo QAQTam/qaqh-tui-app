@@ -91,6 +91,20 @@ impl App {
 
     pub(super) fn close_tab_by_seed(&mut self, seed: &str) {
         if let Some(pos) = self.tabs.iter().position(|s| s == seed) {
+            // 同标签拉起的子代理：停止跟踪并移除本地快照（标签都没了，
+            // 子代理视图无宿主；daemon 侧 ephemeral 会话自会回收）。
+            let sub_seeds: Vec<String> = self
+                .sessions
+                .get(seed)
+                .map(|s| s.subagents.iter().filter_map(|e| e.seed.clone()).collect())
+                .unwrap_or_default();
+            for sub in sub_seeds {
+                self.untrack_subagent(&sub);
+                self.sessions.remove(&sub);
+                if self.inspect.as_deref() == Some(sub.as_str()) {
+                    self.inspect = None;
+                }
+            }
             self.tabs.remove(pos);
             self.sessions.remove(seed);
             self.tracked_seeds.remove(seed);
@@ -305,6 +319,10 @@ impl App {
                 .count() as u16;
             if column >= col && column < col + label_w {
                 self.active = idx;
+                // 切标签即退出子代理观测（观测作用域属于原标签）。
+                if self.inspecting() {
+                    self.exit_inspect();
+                }
                 return;
             }
             col += label_w;
@@ -316,8 +334,20 @@ impl App {
     ///    标记 needs_rebaseline；
     /// 3) 回到被逐出的标签时自动 re-baseline（服务端是权威历史）。
     pub(super) fn touch_focus(&mut self, active: &str) {
-        self.focus_order.retain(|s| s != active);
-        self.focus_order.insert(0, active.to_owned());
+        // 活动标签与被观测的子代理同等保护（实时视图不能被 LRU 逐出）。
+        let mut focus_seeds: Vec<String> = vec![active.to_owned()];
+        if let Some(inspect) = self.inspect.clone()
+            && self.sessions.contains_key(&inspect)
+            && inspect != active
+        {
+            focus_seeds.push(inspect);
+        }
+        for seed in &focus_seeds {
+            self.focus_order.retain(|s| s != seed);
+        }
+        for seed in focus_seeds.iter().rev() {
+            self.focus_order.insert(0, seed.clone());
+        }
 
         for (seed, s) in self.sessions.iter_mut() {
             if seed != active {
