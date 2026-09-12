@@ -313,6 +313,10 @@ impl App {
             for round in turn.rounds.iter().rev() {
                 for block in round.blocks.iter().rev() {
                     if let Some(tool) = &block.tool {
+                        // 专属面板工具不渲染输出体，F7 对它无意义，排除以免空切。
+                        if crate::app::render_transcript::is_panel_owned_tool(&tool.name) {
+                            continue;
+                        }
                         let has_content =
                             tool.output.as_deref().is_some_and(|s| !s.trim().is_empty())
                                 || !tool.progress.trim().is_empty()

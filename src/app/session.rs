@@ -1,6 +1,7 @@
 //! 单会话状态：timeline 模型、流式相位、挂起交互面板、composer、滚动。
 
 use std::collections::VecDeque;
+use std::time::{Duration, Instant};
 
 use crate::app::timeline_model::TimelineModel;
 use crate::protocol::command::ConversationMode;
@@ -36,6 +37,8 @@ pub struct StreamingState {
     pub phase: StreamPhase,
     pub round_num: u32,
     pub tool_name: Option<String>,
+    /// 武装时刻：幽灵清除的宽限判据（见 [`STREAM_GHOST_GRACE`]）。
+    pub armed_at: Instant,
 }
 
 // ───────────────────────── 挂起交互面板 ─────────────────────────
@@ -520,25 +523,80 @@ pub fn streaming_done(session: &mut SessionState, turn_id: Option<&str>) {
     }
 }
 
-/// turn state → 是否仍在流式（timeline 视角兜底）。
+/// 幽灵流式状态的宽限期。
+///
+/// daemon 侧 timeline `TurnOpened` 先于 conversation `TurnStarted` 发布
+///（`agent/engine_input.rs`），但两条 SSE 通道独立投递仍可能反转；宽限期确保
+/// "timeline 暂时还没出现这个 turn" 不被误判成 "turn 已终结"。
+pub const STREAM_GHOST_GRACE: Duration = Duration::from_secs(2);
+
+/// timeline（transcript 与 turn 生命周期权威）→ streaming 状态收敛。
+///
+/// 收敛矩阵（本函数是 "working 卡死" 的唯一自愈点）：
+/// 1. 窗口内有 running turn：无状态则武装；状态指向别的 turn 则改指（漏 TurnStarted 兜底）。
+/// 2. streaming 指向的 turn 在窗口内且已非 Running → 清除。终态条目（TurnSealed）
+///    与对话终态事件走两条独立通道，任一方乱序/丢失都不允许把 UI 永久钉在 working。
+/// 3. streaming 指向的 turn 已滑出尾部窗口且窗口非空 → 宽限后清除幽灵。
+/// 4. 窗口为空（尚未装载 / 全新会话）→ 不动：信息不足，等事件或下一次 rebaseline。
 pub fn sync_streaming_from_timeline(session: &mut SessionState) {
-    let timeline_streaming = session.timeline.is_streaming();
-    match (&session.streaming, timeline_streaming) {
-        (None, true) => {
-            if let Some(turn) = session.timeline.turns.last() {
-                session.streaming = Some(StreamingState {
-                    turn_id: turn.turn_id.clone(),
-                    phase: StreamPhase::Answering,
-                    round_num: 0,
-                    tool_name: None,
-                });
+    sync_streaming_from_timeline_at(session, Instant::now());
+}
+
+/// [`sync_streaming_from_timeline`] 的可注入时钟版本（单测用）。
+pub fn sync_streaming_from_timeline_at(session: &mut SessionState, now: Instant) {
+    let running = session
+        .timeline
+        .running_turn_id()
+        .map(|turn_id| turn_id.to_owned());
+    match (session.streaming.as_ref().map(|s| s.turn_id.clone()), running) {
+        (None, Some(turn_id)) => {
+            session.streaming = Some(StreamingState {
+                turn_id,
+                phase: StreamPhase::Answering,
+                round_num: 0,
+                tool_name: None,
+                armed_at: now,
+            });
+        }
+        (Some(current), Some(turn_id)) if current != turn_id => {
+            // 新 turn 已在窗口 running 而本地还指着旧 turn：会话事件丢失后的改指。
+            if let Some(state) = session.streaming.as_mut() {
+                state.turn_id = turn_id;
+                state.armed_at = now;
             }
         }
-        (Some(_), false) => {
-            // timeline 已 sealed；等 TurnCompleted/Cancelled 事件收口，
-            // 这里不提前清除（事件是权威终态）。
-        }
+        (Some(current), None) => match session.timeline.turn_running(&current) {
+            // 权威终态：该 turn 已在窗口内 sealed/failed/cancelled。
+            Some(false) => {
+                session.streaming = None;
+                clear_busy_activity(session);
+            }
+            // 不在窗口：尾部窗口已淘汰它（窗口非空即有更新的 turn）→ 宽限后清幽灵。
+            None if !session.timeline.turns.is_empty()
+                && session
+                    .streaming
+                    .as_ref()
+                    .is_some_and(|s| now.duration_since(s.armed_at) >= STREAM_GHOST_GRACE) =>
+            {
+                session.streaming = None;
+                clear_busy_activity(session);
+            }
+            _ => {}
+        },
         _ => {}
+    }
+}
+
+/// timeline 已证伪 busy：把 control 域残留的 Working/Starting 降级为 Idle。
+///
+/// 只在 timeline 给出"无 running turn"证据时调用——daemon 真的卡在流式中时
+/// timeline 仍是 Running，此处不会说谎（两类 "working" 因此可区分）。
+fn clear_busy_activity(session: &mut SessionState) {
+    if matches!(
+        session.activity,
+        Some(ActivityState::Working | ActivityState::Starting)
+    ) {
+        session.activity = Some(ActivityState::Idle);
     }
 }
 
@@ -590,5 +648,120 @@ mod tests {
         c.insert_str("第一行\n第二行\r\n第三行");
         assert_eq!(c.rows(), 3);
         assert!(c.value().starts_with("第一行\n第二行\n第三行"));
+    }
+
+    // ───────────── streaming ↔ timeline 收敛（"working 卡死"回归） ─────────────
+
+    use crate::app::timeline_model::Turn;
+    use crate::protocol::timeline::TimelineTurnState;
+
+    fn turn(id: &str, state: TimelineTurnState) -> Turn {
+        Turn {
+            turn_id: id.into(),
+            user_text: "hi".into(),
+            state,
+            failure: None,
+            rounds: Vec::new(),
+        }
+    }
+
+    fn session_with(turns: Vec<Turn>, streaming: Option<(&str, Instant)>) -> SessionState {
+        let mut session = SessionState::new("seed".into());
+        session.timeline.turns = turns;
+        session.streaming = streaming.map(|(turn_id, armed_at)| StreamingState {
+            turn_id: turn_id.into(),
+            phase: StreamPhase::Answering,
+            round_num: 0,
+            tool_name: None,
+            armed_at,
+        });
+        session
+    }
+
+    #[test]
+    fn sealed_turn_clears_streaming_and_downgrades_busy_activity() {
+        let now = Instant::now();
+        let mut s = session_with(
+            vec![turn("t1", TimelineTurnState::Completed)],
+            Some(("t1", now - STREAM_GHOST_GRACE * 2)),
+        );
+        s.activity = Some(ActivityState::Working);
+        sync_streaming_from_timeline_at(&mut s, now);
+        assert!(s.streaming.is_none(), "sealed turn must clear streaming");
+        assert_eq!(
+            s.activity,
+            Some(ActivityState::Idle),
+            "busy activity must be downgraded together with streaming"
+        );
+    }
+
+    #[test]
+    fn sealed_turn_converges_after_late_timeline_rearm() {
+        // 旧 bug 的关键序列：TurnCompleted 已收口（streaming=None），但该 turn
+        // 的终态条目尚未到达（模型仍 Running）→ 旧实现 (None, true) 会重新武装，
+        // 且因 (Some, false) 分支不清理而永久停在 working。
+        let now = Instant::now();
+        let mut s = session_with(vec![turn("t1", TimelineTurnState::Running)], None);
+        s.activity = Some(ActivityState::Working);
+        sync_streaming_from_timeline_at(&mut s, now);
+        assert!(s.streaming.is_some(), "running turn still arms streaming");
+
+        // TurnSealed 到达：权威终态必须把 UI 收敛回 idle。
+        s.timeline.turns = vec![turn("t1", TimelineTurnState::Completed)];
+        sync_streaming_from_timeline_at(&mut s, now);
+        assert!(s.streaming.is_none(), "sealed turn must converge back to idle");
+        assert_eq!(s.activity, Some(ActivityState::Idle));
+    }
+
+    #[test]
+    fn ghost_turn_evicted_from_window_clears_after_grace() {
+        let now = Instant::now();
+        let mut s = session_with(
+            vec![turn("t2", TimelineTurnState::Completed)],
+            Some(("t1", now - STREAM_GHOST_GRACE - Duration::from_millis(1))),
+        );
+        sync_streaming_from_timeline_at(&mut s, now);
+        assert!(
+            s.streaming.is_none(),
+            "turn evicted from the tail window must not keep the UI busy"
+        );
+    }
+
+    #[test]
+    fn fresh_arm_survives_timeline_lag() {
+        // TurnStarted 早于 timeline TurnOpened 到达（跨通道投递反转）：
+        // 宽限期内不得被误判为幽灵。
+        let now = Instant::now();
+        let mut s = session_with(
+            vec![turn("t9", TimelineTurnState::Completed)],
+            Some(("t10", now)),
+        );
+        sync_streaming_from_timeline_at(&mut s, now);
+        assert!(
+            s.streaming.is_some(),
+            "freshly armed streaming must survive window lag"
+        );
+    }
+
+    #[test]
+    fn empty_window_is_not_evidence() {
+        let now = Instant::now();
+        let mut s = session_with(Vec::new(), Some(("t1", now - STREAM_GHOST_GRACE * 10)));
+        sync_streaming_from_timeline_at(&mut s, now);
+        assert!(
+            s.streaming.is_some(),
+            "an empty timeline proves nothing about the turn"
+        );
+    }
+
+    #[test]
+    fn newer_running_turn_repoints_stale_streaming() {
+        let now = Instant::now();
+        let mut s = session_with(
+            vec![turn("t2", TimelineTurnState::Running)],
+            Some(("t1", now - STREAM_GHOST_GRACE * 2)),
+        );
+        sync_streaming_from_timeline_at(&mut s, now);
+        assert_eq!(s.streaming.as_ref().map(|s| s.turn_id.as_str()), Some("t2"));
     }
 }

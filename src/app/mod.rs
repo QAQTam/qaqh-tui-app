@@ -409,7 +409,11 @@ impl App {
                 let Some(sess) = self.sessions.get_mut(&seed) else {
                     return;
                 };
-                sess.timeline.apply(&entry);
+                // TurnSealed 是 timeline 上的权威终态：立即收口 streaming，不等
+                // 对话频道 TurnCompleted（两条独立 SSE，可能乱序或丢失）。
+                if let Some(terminal) = sess.timeline.apply(&entry) {
+                    streaming_done(sess, Some(&terminal.turn_id));
+                }
                 sess.timeline.cap_turns(TURNS_CAP);
                 sync_streaming_from_timeline(sess);
                 if !sess.scroll.follow {
@@ -800,6 +804,7 @@ impl App {
                     phase: StreamPhase::Thinking,
                     round_num: 0,
                     tool_name: None,
+                    armed_at: Instant::now(),
                 });
                 sess.last_error = None;
                 sess.scroll.follow = true;
@@ -999,6 +1004,10 @@ impl App {
                             &b.control.state,
                         );
                         sess.activity = ctl.activity.or(sess.activity);
+                        // bootstrap 是 control 域快照的权威刷新点；这里与 timeline
+                        // 收敛一次，避免上一次连接遗留的 Working/Starting 与
+                        // streaming 状态把 UI 钉在 working（timeline 空则不误判）。
+                        sync_streaming_from_timeline(sess);
                         if sess.mode == crate::protocol::command::ConversationMode::Code
                             && let Some(meta) = &sess.meta
                         {

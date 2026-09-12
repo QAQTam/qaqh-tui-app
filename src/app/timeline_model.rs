@@ -276,6 +276,16 @@ impl Turn {
     }
 }
 
+/// timeline 条目携带的 turn 终态（`TurnSealed`）。
+///
+/// 调用方据此收口 streaming 状态：终态在 timeline 通道上必然可见，因而
+/// 不依赖对话频道 `TurnCompleted` 的到达顺序（两者是独立 SSE）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TurnTerminal {
+    pub turn_id: String,
+    pub state: TimelineTurnState,
+}
+
 /// 单会话 transcript 模型。`version` 每次变更自增，用于渲染缓存。
 #[derive(Debug, Clone, Default)]
 pub struct TimelineModel {
@@ -332,8 +342,8 @@ impl TimelineModel {
         round.blocks.iter_mut().find(|b| b.block_id == block_id)
     }
 
-    /// 应用一条 timeline 条目（幂等）。
-    pub fn apply(&mut self, entry: &TimelineEntry) {
+    /// 应用一条 timeline 条目（幂等）；返回该条目携带的 turn 终态（若有）。
+    pub fn apply(&mut self, entry: &TimelineEntry) -> Option<TurnTerminal> {
         use crate::protocol::timeline::TimelineEvent as E;
         let turn_id = entry.turn_id.as_str();
 
@@ -348,7 +358,7 @@ impl TimelineModel {
                 });
                 self.bump();
             }
-            return;
+            return None;
         }
 
         let turn = match self.find_turn_mut(turn_id) {
@@ -357,10 +367,12 @@ impl TimelineModel {
             // 但计入 B1 可观测信号——持续增长意味着契约破坏或窗口异常。
             None => {
                 self.dropped_missing_turn += 1;
-                return;
+                return None;
             }
         };
 
+        // 本条目携带的 turn 终态（TurnSealed）。
+        let mut terminal: Option<TurnTerminal> = None;
         let mut changed = true;
         // match 内 turn 可变借用存活，无法直接触碰 self——missing-block 丢弃
         // 先记局部计数，match 后再汇总到 self（与 changed 标志同套路）。
@@ -477,6 +489,10 @@ impl TimelineModel {
             E::TurnSealed { state, failure } => {
                 turn.state = *state;
                 turn.failure = failure.clone();
+                terminal = Some(TurnTerminal {
+                    turn_id: turn_id.to_owned(),
+                    state: *state,
+                });
                 changed = true;
             }
         }
@@ -486,6 +502,7 @@ impl TimelineModel {
         if changed {
             self.bump();
         }
+        terminal
     }
 
     /// 快照整体替换（re-baseline / 打开标签页）。
@@ -547,15 +564,34 @@ impl TimelineModel {
         self.turns.last().map(|t| t.turn_id.as_str())
     }
 
+    /// 窗口内是否还有 running turn（任一；正常至多一个）。
     pub fn is_streaming(&self) -> bool {
-        self.turns.last().is_some_and(|t| t.is_streaming())
+        self.turns.iter().any(|t| t.is_streaming())
+    }
+
+    /// 窗口内最新的 running turn（跳过已被淘汰的旧 running 幽灵）。
+    pub fn running_turn_id(&self) -> Option<&str> {
+        self.turns
+            .iter()
+            .rev()
+            .find(|t| t.is_streaming())
+            .map(|t| t.turn_id.as_str())
+    }
+
+    /// 该 turn 在窗口内的运行态：`Some(true)` 仍在跑，`Some(false)` 已终态，
+    /// `None` 表示已滑出窗口（尾部窗口语义下等于"更旧、已被更新 turn 顶掉"）。
+    pub fn turn_running(&self, turn_id: &str) -> Option<bool> {
+        self.turns
+            .iter()
+            .find(|t| t.turn_id == turn_id)
+            .map(|t| t.is_streaming())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::timeline::{TimelineEvent, TimelineToolState};
+    use crate::protocol::timeline::{TimelineEvent, TimelineToolState, TimelineTurnState};
 
     fn entry(seq: u64, turn: &str, event: TimelineEvent) -> TimelineEntry {
         TimelineEntry {
@@ -1282,5 +1318,56 @@ mod tests {
         ));
         assert_eq!(m.dropped_missing_block, 1, "重放不计入契约异常");
         assert_eq!(m.turns[0].rounds[0].blocks[0].text, "首");
+    }
+
+    #[test]
+    fn turn_sealed_entry_reports_terminal_and_window_queries() {
+        let mut m = TimelineModel::default();
+        m.apply(&entry(
+            1,
+            "t1",
+            TimelineEvent::TurnOpened {
+                user_text: "q".into(),
+            },
+        ));
+        assert_eq!(m.running_turn_id(), Some("t1"));
+        assert_eq!(m.turn_running("t1"), Some(true));
+        assert_eq!(m.turn_running("t404"), None);
+        assert!(m.is_streaming());
+
+        let terminal = m.apply(&entry(
+            2,
+            "t1",
+            TimelineEvent::TurnSealed {
+                state: TimelineTurnState::Completed,
+                failure: None,
+            },
+        ));
+        assert_eq!(
+            terminal,
+            Some(TurnTerminal {
+                turn_id: "t1".into(),
+                state: TimelineTurnState::Completed,
+            })
+        );
+        assert!(!m.is_streaming());
+        assert_eq!(m.running_turn_id(), None);
+        assert_eq!(m.turn_running("t1"), Some(false));
+    }
+
+    #[test]
+    fn missing_turn_entry_has_no_terminal() {
+        // 快照窗口外的迟到条目：丢弃 + 计数，且不得伪造终态信号。
+        let mut m = TimelineModel::default();
+        let terminal = m.apply(&entry(
+            1,
+            "t404",
+            TimelineEvent::TurnSealed {
+                state: TimelineTurnState::Failed,
+                failure: None,
+            },
+        ));
+        assert!(terminal.is_none());
+        assert_eq!(m.dropped_missing_turn, 1);
     }
 }
