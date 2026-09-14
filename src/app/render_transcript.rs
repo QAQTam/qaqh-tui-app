@@ -2072,6 +2072,7 @@ mod tests {
             user_text: "hi".into(),
             state: TimelineTurnState::Completed,
             failure: None,
+            sealed: true,
             rounds: vec![round],
         };
         let mut sess = crate::app::session::SessionState::new("s".into());
@@ -2117,6 +2118,7 @@ mod tests {
             user_text: "".into(),
             state: TimelineTurnState::Completed,
             failure: None,
+            sealed: true,
             rounds: vec![Round {
                 round_num: 0,
                 sealed: true,
@@ -2192,6 +2194,7 @@ mod tests {
                 TimelineTurnState::Completed
             },
             failure: None,
+            sealed: !running,
             rounds: vec![Round {
                 round_num: 0,
                 sealed: !running,
@@ -2375,6 +2378,7 @@ mod tests {
             user_text: "".into(),
             state: TimelineTurnState::Running,
             failure: None,
+            sealed: false,
             rounds: vec![Round {
                 round_num: 0,
                 sealed: false,

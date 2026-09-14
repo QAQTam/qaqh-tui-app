@@ -1121,6 +1121,7 @@ mod tests {
                 user_text: format!("user {i}"),
                 state: TimelineTurnState::Completed,
                 failure: None,
+                sealed: true,
                 rounds: vec![round],
             };
             model.turns.push(turn);

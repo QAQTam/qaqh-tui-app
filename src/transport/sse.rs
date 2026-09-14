@@ -4,9 +4,13 @@
 //! - 整行严格 UTF-8 解码（非法行跳过，绝不 lossy——保护中文/emoji）；
 //! - 空行定界事件帧；注释行（`:` 开头，keepalive）不产出帧；
 //! - 多 `data:` 行聚合为单帧（SSE 规范以单个 `\n` 连接）；
-//! - CRLF 兼容；流结束不冲刷残帧。
+//! - CRLF 兼容；流结束不冲刷残帧；
+//! - 流首 UTF-8 BOM 剥离一次（BUG-2026-09-13-17，中间层注入场景）。
 //!
 //! 与 daemon 发送端 `id:`/`event:`/`data:` + 空行的帧格式完全对齐。
+
+/// UTF-8 BOM（U+FEFF）字节序列。
+const BOM: [u8; 3] = [0xEF, 0xBB, 0xBF];
 
 #[allow(dead_code)] // id 字段在 cursor 校验中使用；保留完整帧语义
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -23,6 +27,11 @@ pub struct SseDecoder {
     /// 已消费前缀长度（超过阈值时统一搬移一次，摊销 O(n)）。
     consumed: usize,
     pending: Option<SseFrame>,
+    /// 流首 BOM（U+FEFF，字节 `EF BB BF`）是否已判定。
+    ///
+    /// BUG-2026-09-13-17：中间层注入 BOM 与首字段同行时 `\u{feff}id:` 前缀失配
+    /// → id 丢失、cursor 不推进（对照 `qaqh-client/src/sse_decoder.rs:71-83`）。
+    bom_checked: bool,
 }
 
 /// 搬移阈值：超过后一次性 drain 已消费前缀。
@@ -44,6 +53,22 @@ impl SseDecoder {
     /// `Some(Some(frame))` = 完整帧；`Some(None)` = 流中存在不可解析行（跳过）；
     /// `None` = 暂无完整帧。
     pub fn next_frame(&mut self) -> Option<Result<SseFrame, ()>> {
+        // 流首 BOM 剥离：三字节可能跨 chunk 到达，未到齐时原样保留等下一块。
+        // 不变量：`bom_checked == false` 时 `consumed == 0`（未判定即未消费任何行），
+        // 故此处 `avail` 必为流首。
+        if !self.bom_checked {
+            let avail = &self.buf[self.consumed..];
+            let n = BOM.iter().zip(avail).take_while(|(b, a)| b == a).count();
+            if n == BOM.len() {
+                self.consumed += BOM.len();
+                self.bom_checked = true;
+            } else if avail.len() < BOM.len() {
+                return None; // 前缀尚不完整：等更多字节，不得误判为非 BOM
+            } else {
+                self.bom_checked = true;
+            }
+        }
+
         loop {
             let rel = self.buf[self.consumed..].iter().position(|&b| b == b'\n')?;
             let end = self.consumed + rel;
@@ -157,6 +182,65 @@ mod tests {
         // 坏行被跳过、绝不 lossy；解析器继续存活并产出后续完整帧。
         d.push(b"data: \xff\xfe broken\n\ndata: fine\n\n");
         assert_eq!(frame(&mut d).data, "fine");
+    }
+
+    /// **BUG-2026-09-13-17 回归**：BOM 与首字段同行时 `\u{feff}id:` 前缀失配 →
+    /// id 丢失、cursor 不推进（旧行为下 `frame.id` 为空串，首帧被静默吞掉）。
+    #[test]
+    fn leading_bom_is_stripped_and_first_frame_survives() {
+        let mut d = SseDecoder::new();
+        d.push(
+            "\u{feff}id: epoch-1:conversation:7\nevent: turn_started\ndata: {\"x\":1}\n\n"
+                .as_bytes(),
+        );
+        let f = frame(&mut d);
+        assert_eq!(f.id, "epoch-1:conversation:7");
+        assert_eq!(f.event_type, "turn_started");
+        assert_eq!(f.data, "{\"x\":1}");
+        assert_eq!(
+            frame_seq(&f.id, "conversation"),
+            Some(7),
+            "首帧 cursor 必须可推进"
+        );
+        assert!(d.next_frame().is_none());
+    }
+
+    #[test]
+    fn leading_bom_does_not_break_data_only_frame() {
+        let mut d = SseDecoder::new();
+        d.push("\u{feff}data: {\"a\":1}\n\n".as_bytes());
+        let f = frame(&mut d);
+        assert_eq!(f.data, "{\"a\":1}");
+        assert!(f.id.is_empty());
+        assert!(d.next_frame().is_none());
+    }
+
+    #[test]
+    fn bom_split_across_chunks_is_handled() {
+        let mut d = SseDecoder::new();
+        d.push(b"\xef\xbb");
+        assert!(d.next_frame().is_none(), "BOM 未到齐时不得误判、不得产出帧");
+        d.push(b"\xbfid: epoch-1:tool:3\ndata: {}\n\n");
+        let f = frame(&mut d);
+        assert_eq!(f.id, "epoch-1:tool:3");
+        assert_eq!(f.data, "{}");
+        assert!(d.next_frame().is_none());
+    }
+
+    /// 边界：**仅**剥离流首一次（与 `qaqh-client` 参照实现一致）。
+    ///
+    /// 中间层只会在流首注入 BOM，故流中出现的 U+FEFF 不作特殊处理——该行
+    /// `id:` 前缀失配、id 被忽略。此处锁定边界：若要改变语义需显式改本测试。
+    #[test]
+    fn bom_is_stripped_only_at_stream_start() {
+        let mut d = SseDecoder::new();
+        d.push(b"id: e:conversation:1\ndata: first\n\n");
+        assert_eq!(frame(&mut d).data, "first");
+
+        d.push("\u{feff}id: e:conversation:2\ndata: second\n\n".as_bytes());
+        let f = frame(&mut d);
+        assert!(f.id.is_empty(), "流中 BOM 不剥离：id 前缀失配即忽略");
+        assert_eq!(f.data, "second");
     }
 
     #[test]

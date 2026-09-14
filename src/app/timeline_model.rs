@@ -257,6 +257,13 @@ pub struct Turn {
     pub user_text: String,
     pub state: TimelineTurnState,
     pub failure: Option<TimelineFailure>,
+    /// 服务端已封口（线协议 `TimelineTurn.sealed`）。
+    ///
+    /// 不可用 `state != Running` 代替：后端判定「原地 reopen」用的**正是**
+    /// `sealed`（`qaqh-runtime/src/timeline.rs:208-244`）。两者一旦分离
+    /// （sealed 却仍 Running），用 state 推断就会漏判——那正是本字段所修的
+    /// 那类错位。线协议本就携带它，此前在 `from_wire` 被丢弃。
+    pub sealed: bool,
     pub rounds: Vec<Round>,
 }
 
@@ -267,6 +274,7 @@ impl Turn {
             user_text: t.user_text,
             state: t.state,
             failure: t.failure,
+            sealed: t.sealed,
             rounds: t
                 .rounds
                 .into_iter()
@@ -357,15 +365,43 @@ impl TimelineModel {
         let turn_id = entry.turn_id.as_str();
 
         if let E::TurnOpened { user_text } = &entry.event {
-            if self.find_turn_mut(turn_id).is_none() {
-                self.turns.push(Turn {
-                    turn_id: turn_id.to_owned(),
-                    user_text: user_text.clone(),
-                    state: TimelineTurnState::Running,
-                    failure: None,
-                    rounds: Vec::new(),
-                });
-                self.bump();
+            // 用索引而非 `find_turn_mut` 的借用：reopen 分支改完字段后还要
+            // 调 `self.bump()`，借用必须在该调用前结束。
+            match self.turns.iter().position(|t| t.turn_id == turn_id) {
+                None => {
+                    self.turns.push(Turn {
+                        turn_id: turn_id.to_owned(),
+                        user_text: user_text.clone(),
+                        state: TimelineTurnState::Running,
+                        failure: None,
+                        sealed: false,
+                        rounds: Vec::new(),
+                    });
+                    self.bump();
+                }
+                // 镜像后端「原地 reopen」（`qaqh-runtime/src/timeline.rs:208-244`）：
+                // daemon 重启后 worker 的 turn 计数可能滞后，于是把**已 sealed** 的
+                // turn_id 复用给新输入；后端此时原地重置该回合（换 user_text、
+                // sealed=false、state=Running、rounds.clear()，并重置 fragment
+                // 计数），而非报 `DuplicateTurn`。
+                //
+                // 不同步这一步的后果：TUI 保留上一轮的 rounds，新流入的内容与旧
+                // 内容混在同一回合；且 state 停在终态 → `running_turn_id()` 不认它，
+                // 流式指示与后续收口全部错位（后端称之为「同一族错位症状」）。
+                Some(idx) if self.turns[idx].sealed => {
+                    let turn = &mut self.turns[idx];
+                    turn.user_text = user_text.clone();
+                    turn.state = TimelineTurnState::Running;
+                    turn.failure = None;
+                    turn.sealed = false;
+                    // 清 rounds 同时丢弃 per-block `last_fragment`——等价于后端
+                    // 重置 `next_fragment`，使续流复用块 id 时 seq=0 不被拒。
+                    turn.rounds.clear();
+                    self.bump();
+                }
+                // 运行中的重复 `TurnOpened`：后端不会发出（会返回 `DuplicateTurn`），
+                // 只可能是快照+回放的幂等重投，保持 no-op。
+                Some(_) => {}
             }
             return None;
         }
@@ -504,6 +540,7 @@ impl TimelineModel {
             E::TurnSealed { state, failure } => {
                 turn.state = *state;
                 turn.failure = failure.clone();
+                turn.sealed = true;
                 terminal = Some(TurnTerminal {
                     turn_id: turn_id.to_owned(),
                     state: *state,
@@ -693,6 +730,162 @@ mod tests {
         assert_eq!(turn.state, TimelineTurnState::Completed);
         assert_eq!(turn.rounds[0].blocks[0].text, "回答开始了");
         assert!(m.turns.iter().all(|t| !t.is_streaming()));
+    }
+
+    /// 流式文本块的构造夹具（`block_order` 恒 0，够用）。
+    fn text_block(id: &str) -> TimelineBlock {
+        TimelineBlock {
+            block_id: id.into(),
+            block_order: 0,
+            kind: TimelineBlockKind::Text,
+            state: TimelineBlockState::Open,
+            text: String::new(),
+            tool: None,
+        }
+    }
+
+    /// **T-07 回归**：已 sealed 的回合收到新 `TurnOpened` 必须**原地 reopen**。
+    ///
+    /// 后端语义（`qaqh-runtime/src/timeline.rs:208-244`）：daemon 重启后 worker 的
+    /// turn 计数可能滞后，于是把**已 sealed** 的 turn_id 复用给新输入；后端此时
+    /// 原地重置该回合，而非报 `DuplicateTurn`。
+    ///
+    /// 旧行为是直接 no-op（只有 `find_turn_mut().is_none()` 才建回合），后果是
+    /// 上一轮的 rounds 残留、state 停在终态 → 新旧内容混在同一回合，且
+    /// `running_turn_id()` 不认它（流式指示与收口全部错位）。
+    #[test]
+    fn sealed_turn_is_reopened_in_place() {
+        let mut m = TimelineModel::default();
+        m.apply(&entry(
+            1,
+            "t1",
+            TimelineEvent::TurnOpened {
+                user_text: "第一轮".into(),
+            },
+        ));
+        m.apply(&entry(
+            2,
+            "t1",
+            TimelineEvent::BlockOpened {
+                block: text_block("b1"),
+            },
+        ));
+        m.apply(&entry(
+            3,
+            "t1",
+            TimelineEvent::TextDelta {
+                block_id: "b1".into(),
+                fragment_seq: 0,
+                delta: "旧内容".into(),
+            },
+        ));
+        // 上一轮还有第二个块：它不会被新尝试复用，是「旧内容残留」的探针
+        // （只在 reopen 真正清空 rounds 时才会消失）。
+        m.apply(&entry(
+            4,
+            "t1",
+            TimelineEvent::BlockOpened {
+                block: text_block("b2"),
+            },
+        ));
+        m.apply(&entry(
+            5,
+            "t1",
+            TimelineEvent::TextDelta {
+                block_id: "b2".into(),
+                fragment_seq: 0,
+                delta: "上一轮的残留".into(),
+            },
+        ));
+        m.apply(&entry(
+            6,
+            "t1",
+            TimelineEvent::TurnSealed {
+                state: TimelineTurnState::Completed,
+                failure: None,
+            },
+        ));
+        assert!(m.turns[0].sealed, "TurnSealed 必须置 sealed");
+        let version_before = m.version;
+
+        // 复用同一 turn_id 的新输入
+        m.apply(&entry(
+            7,
+            "t1",
+            TimelineEvent::TurnOpened {
+                user_text: "第二轮".into(),
+            },
+        ));
+
+        assert_eq!(m.turns.len(), 1, "必须原地 reopen，不得新建回合");
+        let turn = &m.turns[0];
+        assert_eq!(turn.user_text, "第二轮", "user_text 必须换新");
+        assert_eq!(turn.state, TimelineTurnState::Running, "必须回到 Running");
+        assert!(!turn.sealed, "reopen 后不再是 sealed");
+        assert!(turn.rounds.is_empty(), "上一轮 rounds 必须清空");
+        assert!(
+            m.version > version_before,
+            "内容变化必须 bump，否则渲染缓存不失效"
+        );
+
+        // 端到端可见性：新尝试复用 b1，旧块 b2 不得再出现。
+        m.apply(&entry(
+            8,
+            "t1",
+            TimelineEvent::BlockOpened {
+                block: text_block("b1"),
+            },
+        ));
+        m.apply(&entry(
+            9,
+            "t1",
+            TimelineEvent::TextDelta {
+                block_id: "b1".into(),
+                fragment_seq: 0,
+                delta: "新首行".into(),
+            },
+        ));
+        let blocks = &m.turns[0].rounds[0].blocks;
+        assert_eq!(blocks.len(), 1, "旧块不得残留在同一回合里");
+        assert_eq!(blocks[0].block_id, "b1");
+        assert_eq!(blocks[0].text, "新首行");
+    }
+
+    /// 运行中的重复 `TurnOpened` **不是** reopen：后端对该情形返回
+    /// `DuplicateTurn`，能到达 reducer 的只有快照/回放的幂等重投，不得改内容。
+    ///
+    /// 与 [`sealed_turn_is_reopened_in_place`] 构成一对：`sealed` 是唯一判据。
+    #[test]
+    fn running_turn_duplicate_opened_keeps_content() {
+        let mut m = TimelineModel::default();
+        m.apply(&entry(
+            1,
+            "t1",
+            TimelineEvent::TurnOpened {
+                user_text: "第一轮".into(),
+            },
+        ));
+        m.apply(&entry(
+            2,
+            "t1",
+            TimelineEvent::BlockOpened {
+                block: text_block("b1"),
+            },
+        ));
+        let version_before = m.version;
+
+        m.apply(&entry(
+            3,
+            "t1",
+            TimelineEvent::TurnOpened {
+                user_text: "重投".into(),
+            },
+        ));
+
+        let turn = &m.turns[0];
+        assert_eq!(turn.user_text, "第一轮", "运行中的重复不得改 user_text");
+        assert_eq!(turn.rounds.len(), 1, "运行中的重复不得清 rounds");
+        assert_eq!(m.version, version_before, "运行中的重复必须是 no-op");
     }
 
     #[test]
