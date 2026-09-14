@@ -44,7 +44,8 @@ pub enum ConnEvent {
         epoch: String,
         epoch_changed: bool,
     },
-    /// 致命错误（token 被拒 / 协议代差）——停止重试。
+    /// **致命错误**（协议代差）——停止重试。凭据/租约类失败不再走这里：
+    /// daemon 重启会换 token/端口，重读 discovery 即可自愈（BUG-2026-09-14-01）。
     Lost(String),
     /// 非致命问题提示（renew 失败、流断开等）。
     StreamIssue {
@@ -156,6 +157,47 @@ async fn sleep_or_shutdown(d: Duration, shutdown: &mut watch::Receiver<bool>) ->
     }
 }
 
+/// `supervisor` 单次失败后的动作（纯决策，便于回归测试）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SupervisorAction {
+    /// 永久停止连接生命周期（仅协议代差）。
+    Stop,
+    /// 跳出续租循环，重新 open 换新租约。
+    Reconnect,
+    /// 继续下一个 tick（可容忍的偶发失败）。
+    Retry,
+}
+
+/// 由错误分类决定 supervisor 的动作——**本函数是 BUG-2026-09-14-01 的回归锁**。
+///
+/// 旧实现里 renew 的 plain 401（`lease expired or unknown`）被归为
+/// `Unauthorized` 后直接 `return`，supervisor 永久退出 → 客户端再也无法回连。
+/// 现在只有协议代差（`is_fatal`）才允许 `Stop`。
+fn supervisor_action(error: &ApiError, failures: u32) -> SupervisorAction {
+    if error.is_fatal() {
+        SupervisorAction::Stop
+    } else if error.is_credential() || failures >= MAX_RENEW_FAILURES {
+        SupervisorAction::Reconnect
+    } else {
+        SupervisorAction::Retry
+    }
+}
+
+/// 重读 `daemon.json` 并把新 endpoint/token 写入 client（daemon 重启自愈）。
+///
+/// BUG-2026-09-14-01：token 由 daemon 启动时随机生成（`server.rs:119`），
+/// 客户端只在启动时读一次——daemon 重启后旧 token 永远 401，而旧代码把 401
+/// 当致命错误直接终止连接生命周期，导致「再也连不回去」。
+///
+/// 返回是否拿到记录（不代表值一定变了）。
+fn refresh_credentials(client: &HttpClient) -> bool {
+    let Some(discovery) = crate::transport::discovery::read_discovery() else {
+        return false;
+    };
+    client.apply_discovery(&discovery.base_url(), &discovery.token);
+    true
+}
+
 /// open + 续租循环（连接生命周期的唯一属主）。
 async fn supervisor(
     client: Arc<HttpClient>,
@@ -167,6 +209,8 @@ async fn supervisor(
     let mut known_epoch: Option<String> = None;
     let mut generation: u64 = 0;
     let mut attempt: u32 = 0;
+    // 启动即对齐 discovery：daemon 可能在 TUI 运行期间重启过（换 token/端口）。
+    refresh_credentials(&client);
 
     loop {
         if *shutdown.borrow() {
@@ -198,40 +242,61 @@ async fn supervisor(
                     }
                     match client.renew().await {
                         Ok(_) => failures = 0,
-                        Err(e) if e.is_unauthorized() => {
-                            let _ = msg_tx.send(RuntimeMsg::Conn(ConnEvent::Lost(e.to_string())));
-                            return;
-                        }
-                        // 租约已死：跳过注定失败的 renew，直接重新协商。
-                        Err(e) if e.is_lease_required() => {
-                            let _ = msg_tx.send(RuntimeMsg::Conn(ConnEvent::StreamIssue {
-                                channel: None,
-                                error: format!("租约失效，重新协商：{e}"),
-                            }));
-                            break;
-                        }
                         Err(e) => {
+                            // BUG-2026-09-14-01：renew 的 plain 401
+                            // （`lease expired or unknown`）曾落入「token 错」分支被
+                            // 当作致命错误 `return`，supervisor 永久退出 → 客户端
+                            // 再也无法回连。现在由 `supervisor_action` 统一裁决，
+                            // 仅协议代差才停止生命周期。
                             failures += 1;
-                            let _ = msg_tx.send(RuntimeMsg::Conn(ConnEvent::StreamIssue {
-                                channel: None,
-                                error: format!(
-                                    "renew 失败（{failures}/{MAX_RENEW_FAILURES}）：{e}"
-                                ),
-                            }));
-                            if failures >= MAX_RENEW_FAILURES {
-                                break;
+                            match supervisor_action(&e, failures) {
+                                SupervisorAction::Stop => {
+                                    let _ = msg_tx
+                                        .send(RuntimeMsg::Conn(ConnEvent::Lost(e.to_string())));
+                                    return;
+                                }
+                                SupervisorAction::Reconnect => {
+                                    // 凭据类：先重读 discovery 换新 token（daemon
+                                    // 重启场景），再 break 出去重新 open 换新租约。
+                                    let refreshed =
+                                        e.is_credential() && refresh_credentials(&client);
+                                    let _ = msg_tx.send(RuntimeMsg::Conn(ConnEvent::StreamIssue {
+                                        channel: None,
+                                        error: if refreshed {
+                                            format!(
+                                                "凭据/租约失效，已重读 daemon 记录，重新协商：{e}"
+                                            )
+                                        } else {
+                                            format!("renew 失败（{failures}/{MAX_RENEW_FAILURES}），重新协商：{e}")
+                                        },
+                                    }));
+                                    break;
+                                }
+                                SupervisorAction::Retry => {
+                                    let _ = msg_tx.send(RuntimeMsg::Conn(ConnEvent::StreamIssue {
+                                        channel: None,
+                                        error: format!(
+                                            "renew 失败（{failures}/{MAX_RENEW_FAILURES}）：{e}"
+                                        ),
+                                    }));
+                                }
                             }
                         }
                     }
                 }
             }
-            Err(e) if e.is_unsupported_version() => {
+            Err(e) if e.is_fatal() => {
                 let _ = msg_tx.send(RuntimeMsg::Conn(ConnEvent::Lost(format!(
                     "协议代差，需要更新客户端：{e}"
                 ))));
-                return; // 代差 → 停止重试
+                return; // 代差 → 停止重试（唯一不可自愈情形）
             }
             Err(e) => {
+                // 凭据类失败：daemon 可能已重启（换 token/端口），重读 discovery
+                // 后再退避重试，否则会拿着旧 token 无限 401（BUG-2026-09-14-01）。
+                if e.is_credential() {
+                    refresh_credentials(&client);
+                }
                 let _ = msg_tx.send(RuntimeMsg::Conn(ConnEvent::Lost(e.to_string())));
                 if sleep_or_shutdown(backoff_delay(attempt), &mut shutdown).await {
                     return;
@@ -242,13 +307,38 @@ async fn supervisor(
     }
 }
 
-/// 处理一帧频道 SSE；返回 false 表示协议失配，需要重连。
+/// daemon 因 live 广播 `Lagged`（事件环溢出）而下发的终止帧（`sse.rs`）。
+///
+/// BUG-2026-09-14-01：TUI 此前不识别它——频道流会把它当「坏信封」静默重连
+/// （不报原因），timeline 流则因 `event_type != "timeline.entry"` 直接 continue。
+/// 服务端发出此帧后**立即关流**，客户端唯一正确动作是重连 re-baseline；
+/// 这里把它归一为可诊断的提示（对照 `qaqh-client/src/sse.rs:182-190`）。
+pub const STREAM_TERMINATED: &str = "ringing.stream_terminated";
+
+/// 解析终止帧的 `code` 字段（缺失/非法 JSON → `unknown`）。
+fn stream_terminated_code(data: &str) -> String {
+    serde_json::from_str::<serde_json::Value>(data.trim())
+        .ok()
+        .and_then(|v| v.get("code").and_then(|c| c.as_str()).map(str::to_string))
+        .unwrap_or_else(|| "unknown".into())
+}
+
+/// 处理一帧频道 SSE；返回 false 表示需要重连。
 fn handle_channel_frame(
     msg_tx: &mpsc::UnboundedSender<RuntimeMsg>,
     channel: Channel,
     frame: crate::transport::sse::SseFrame,
     cursor: &mut u64,
 ) -> bool {
+    if frame.event_type == STREAM_TERMINATED {
+        // 服务端缓冲溢出：cursor 可能已跨越丢弃区间，必须重连重定基。
+        let code = stream_terminated_code(&frame.data);
+        let _ = msg_tx.send(RuntimeMsg::Conn(ConnEvent::StreamIssue {
+            channel: Some(channel),
+            error: format!("服务端终止流（{code}），重连重定基"),
+        }));
+        return false;
+    }
     if frame.event_type == "ringing.reset_required" {
         if let Some(reset) = HttpClient::parse_reset(&frame.data) {
             let _ = msg_tx.send(RuntimeMsg::ResetRequired {
@@ -297,7 +387,10 @@ async fn channel_stream(
         if *shutdown.borrow() {
             return;
         }
-        let epoch = conn_rx.borrow().epoch.clone();
+        let (epoch, generation) = {
+            let info = conn_rx.borrow();
+            (info.epoch.clone(), info.generation)
+        };
         if epoch.is_empty() {
             if sleep_or_shutdown(Duration::from_millis(200), &mut shutdown).await {
                 return;
@@ -309,14 +402,21 @@ async fn channel_stream(
             cursor = 0;
             known_epoch = epoch.clone();
         }
+        // 同 epoch 内的重新协商计数（租约过期 → 新 client_session_id）。
+        // BUG-2026-09-14-01：旧流只比 epoch，重协商后仍持旧 session 死等，
+        // daemon 侧因旧 lease 失效而不再投递任何事件（伪健康黑障）。
+        let known_generation = generation;
         let lei = (cursor > 0).then(|| last_event_id(&epoch, channel.as_str(), cursor));
 
         match client.sse_connect(&path, lei).await {
-            Err(e) if e.is_unsupported_version() => {
+            Err(e) if e.is_fatal() => {
                 let _ = msg_tx.send(RuntimeMsg::Conn(ConnEvent::Lost(e.to_string())));
                 return;
             }
             Err(e) => {
+                if e.is_credential() {
+                    refresh_credentials(&client);
+                }
                 let _ = msg_tx.send(RuntimeMsg::Conn(ConnEvent::StreamIssue {
                     channel: Some(channel),
                     error: e.to_string(),
@@ -337,8 +437,16 @@ async fn channel_stream(
                         result = conn_rx.changed() => {
                             match result {
                                 Ok(()) => {
-                                    if conn_rx.borrow().epoch != epoch {
+                                    let (new_epoch, new_generation) = {
+                                        let info = conn_rx.borrow();
+                                        (info.epoch.clone(), info.generation)
+                                    };
+                                    if new_epoch != epoch {
                                         cursor = 0;
+                                        reconnect = true;
+                                    } else if new_generation != known_generation {
+                                        // 同 epoch 重协商（租约过期换新 cs）：
+                                        // cursor 在同 epoch 内仍有效，保留续传。
                                         reconnect = true;
                                     }
                                 }
@@ -457,13 +565,18 @@ async fn timeline_stream(
         if *cancel.borrow() || *shutdown.borrow() {
             return;
         }
-        let epoch = conn_rx.borrow().epoch.clone();
+        let (epoch, generation) = {
+            let info = conn_rx.borrow();
+            (info.epoch.clone(), info.generation)
+        };
         if epoch.is_empty() {
             if sleep_or_shutdown(Duration::from_millis(200), &mut shutdown).await {
                 return;
             }
             continue;
         }
+        // 同 epoch 内的重新协商计数（租约过期换新 cs）——见 channel_stream 同名注释。
+        let known_generation = generation;
 
         // 1) 快照基线（attach 可能尚未落地：lease_required → 短退避重试）。
         let page = match client.timeline_page(&seed, None, TIMELINE_PAGE_LIMIT).await {
@@ -486,6 +599,10 @@ async fn timeline_stream(
                 return; // seed 已不存在
             }
             Err(e) => {
+                // 凭据类失败：daemon 可能已重启（换 token/端口），先重读 discovery。
+                if e.is_credential() {
+                    refresh_credentials(&client);
+                }
                 if sleep_or_shutdown(backoff_delay(attempt), &mut shutdown).await {
                     return;
                 }
@@ -507,6 +624,9 @@ async fn timeline_stream(
         let resp = match client.sse_connect(&path, lei).await {
             Ok(resp) => resp,
             Err(e) => {
+                if e.is_credential() {
+                    refresh_credentials(&client);
+                }
                 if sleep_or_shutdown(backoff_delay(attempt), &mut shutdown).await {
                     return;
                 }
@@ -530,7 +650,15 @@ async fn timeline_stream(
                 result = conn_rx.changed() => {
                     match result {
                         Ok(()) => {
-                            if conn_rx.borrow().epoch != epoch { recover = true; }
+                            let (new_epoch, new_generation) = {
+                                let info = conn_rx.borrow();
+                                (info.epoch.clone(), info.generation)
+                            };
+                            // epoch 变化或同 epoch 重协商（旧 cs 已被服务端作废）
+                            // 均需重建流：否则 daemon 不再向旧 session 投递事件。
+                            if new_epoch != epoch || new_generation != known_generation {
+                                recover = true;
+                            }
                         }
                         Err(_) => return,
                     }
@@ -542,6 +670,19 @@ async fn timeline_stream(
                             decoder.push(&bytes);
                             while let Some(item) = decoder.next_frame() {
                                 let Ok(frame) = item else { continue };
+                                if frame.event_type == STREAM_TERMINATED {
+                                    // 溢出终止帧：服务端发完即关流。cursor 已不可信
+                                    // （可能跨过丢弃区间），必须回快照基线。
+                                    let code = stream_terminated_code(&frame.data);
+                                    let _ = msg_tx.send(RuntimeMsg::Conn(ConnEvent::StreamIssue {
+                                        channel: None,
+                                        error: format!(
+                                            "timeline[{seed}] 服务端终止流（{code}），重定基"
+                                        ),
+                                    }));
+                                    recover = true;
+                                    break;
+                                }
                                 if frame.event_type == "ringing.reset_required" {
                                     recover = true;
                                     break;
@@ -577,6 +718,120 @@ async fn timeline_stream(
             if recover {
                 break;
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! 连接生命周期决策回归（BUG-2026-09-14-01）。
+    //!
+    //! 事故链：流式输出中前端 SSE 报错 → daemon 端租约过期 → renew 回
+    //! **plain 401** `lease expired or unknown` → 旧分类把它当 `Unauthorized`
+    //! → supervisor `return` 永久退出 → 客户端再也无法回连（后续一律 401）。
+    //! 本模块锁住「只有协议代差才能停止生命周期」这一不变式。
+
+    use super::*;
+
+    /// **核心回归**：renew 的租约失效必须走重连，绝不能停止生命周期。
+    #[test]
+    fn lease_expiry_must_reconnect_not_stop() {
+        let err = ApiError::LeaseRequired("lease expired or unknown".into());
+        assert_eq!(
+            supervisor_action(&err, 1),
+            SupervisorAction::Reconnect,
+            "租约过期必须重新协商（旧 bug 在此 return 后永久卡死）"
+        );
+    }
+
+    /// token 被拒（daemon 重启换 token）同样必须重连，不得停止。
+    #[test]
+    fn token_rejection_must_reconnect_not_stop() {
+        assert_eq!(
+            supervisor_action(&ApiError::Unauthorized, 1),
+            SupervisorAction::Reconnect,
+            "token 被拒可经重读 discovery 自愈"
+        );
+    }
+
+    /// 协议代差是唯一停止情形。
+    #[test]
+    fn only_protocol_drift_stops_the_lifecycle() {
+        let err = ApiError::UnsupportedVersion("schema mismatch".into());
+        assert_eq!(supervisor_action(&err, 1), SupervisorAction::Stop);
+        assert_eq!(supervisor_action(&err, 99), SupervisorAction::Stop);
+    }
+
+    /// 偶发网络错误：未达阈值先重试，达阈值才重新协商。
+    #[test]
+    fn transient_failures_retry_then_reconnect_at_threshold() {
+        let err = ApiError::Network("connection reset".into());
+        assert_eq!(supervisor_action(&err, 1), SupervisorAction::Retry);
+        assert_eq!(
+            supervisor_action(&err, MAX_RENEW_FAILURES),
+            SupervisorAction::Reconnect,
+            "连续失败达阈值后应重新协商"
+        );
+    }
+
+    /// 任何非致命错误都不允许产出 `Stop`（防未来回归）。
+    #[test]
+    fn no_non_fatal_error_ever_stops() {
+        let cases = [
+            ApiError::Unauthorized,
+            ApiError::LeaseRequired("x".into()),
+            ApiError::Http {
+                status: 500,
+                code: "internal".into(),
+                message: "boom".into(),
+            },
+            ApiError::Network("timeout".into()),
+            ApiError::Protocol("bad frame".into()),
+        ];
+        for err in cases {
+            for failures in [1, 2, 100] {
+                assert_ne!(
+                    supervisor_action(&err, failures),
+                    SupervisorAction::Stop,
+                    "{err:?} 在 failures={failures} 时不得停止生命周期"
+                );
+            }
+        }
+    }
+
+    /// 终止帧 code 解析：正常 / 缺字段 / 非 JSON 均不 panic。
+    #[test]
+    fn stream_terminated_code_parsing_is_total() {
+        assert_eq!(
+            stream_terminated_code(r#"{"code":"lagged","skipped":7}"#),
+            "lagged"
+        );
+        assert_eq!(stream_terminated_code("{}"), "unknown");
+        assert_eq!(stream_terminated_code("not json"), "unknown");
+        assert_eq!(stream_terminated_code(""), "unknown");
+    }
+
+    /// 终止帧必须让频道流判定为「需重连」（返回 false）。
+    #[test]
+    fn termination_frame_forces_channel_reconnect() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut cursor = 42u64;
+        let frame = crate::transport::sse::SseFrame {
+            id: "ep:conversation:43".into(),
+            event_type: STREAM_TERMINATED.into(),
+            data: r#"{"code":"lagged","channel":"conversation","skipped":3}"#.into(),
+        };
+        assert!(
+            !handle_channel_frame(&tx, Channel::Conversation, frame, &mut cursor),
+            "终止帧必须触发重连"
+        );
+        assert_eq!(cursor, 42, "终止帧不得推进 cursor");
+        match rx.try_recv().expect("应上报可诊断的流问题") {
+            RuntimeMsg::Conn(ConnEvent::StreamIssue { channel, error }) => {
+                assert_eq!(channel, Some(Channel::Conversation));
+                assert!(error.contains("lagged"), "错误须携带服务端 code：{error}");
+            }
+            other => panic!("意外消息：{other:?}"),
         }
     }
 }

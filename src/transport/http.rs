@@ -27,9 +27,14 @@ pub const UPLOAD_TIMEOUT: Duration = Duration::from_secs(120);
 /// SSE 空闲判活阈值：server 每 15s 发注释行；45s 无**字节**即判死。
 pub const SSE_IDLE_TIMEOUT: Duration = Duration::from_secs(45);
 
+/// daemon 对「Bearer token 被拒」返回的 plain body（`auth.rs:12`）。
+/// 与 renew 的 `lease expired or unknown` 同为 plain 401，只能按内容区分。
+const PLAIN_UNAUTHORIZED: &str = "unauthorized";
+
 #[derive(Debug, Error)]
 pub enum ApiError {
-    /// Bearer token 被拒（plain 401）——不要循环重试，提示用户。
+    /// Bearer token 被拒（plain 401 `unauthorized`）。
+    /// **不致命**：daemon 重启会换 token，调用方应重读 discovery 自愈。
     #[error("token 被拒绝（unauthorized）")]
     Unauthorized,
     /// lease 缺失/过期/seed 未 attach（JSON 401 `lease_required`）→ 需重新 open+attach。
@@ -51,23 +56,26 @@ pub enum ApiError {
 }
 
 impl ApiError {
-    pub fn is_lease_required(&self) -> bool {
-        matches!(self, ApiError::LeaseRequired(_))
-    }
-
-    pub fn is_unauthorized(&self) -> bool {
-        matches!(self, ApiError::Unauthorized)
-    }
-
-    pub fn is_unsupported_version(&self) -> bool {
+    /// 是否**不可恢复**（继续重试无意义，应停止连接生命周期）。
+    ///
+    /// 仅协议代差。**token 被拒不算致命**：daemon 重启会换 token，调用方应
+    /// 重读 `daemon.json` 原地换值后重新协商（见 `apply_discovery`）。
+    pub fn is_fatal(&self) -> bool {
         matches!(self, ApiError::UnsupportedVersion(_))
+    }
+
+    /// 是否「凭据/租约」类失败——值得先重读 discovery 再退避。
+    pub fn is_credential(&self) -> bool {
+        matches!(self, ApiError::Unauthorized | ApiError::LeaseRequired(_))
     }
 }
 
 pub struct HttpClient {
     http: reqwest::Client,
-    base_url: String,
-    token: String,
+    /// 可热更新：daemon 重启会换端口/token，靠 `apply_discovery` 原地换值
+    /// （BUG-2026-09-14-01：旧凭据只会永久 401，无法自愈）。
+    base_url: RwLock<String>,
+    token: RwLock<String>,
     /// 客户端实例 id：open 前 require 生成，lease 绑定该身份。
     pub instance_id: String,
     /// open 成功后的连接级身份；open 更新后所有流自动携带新值。
@@ -84,8 +92,8 @@ impl HttpClient {
             .expect("reqwest client");
         Self {
             http,
-            base_url: base_url.into().trim_end_matches('/').to_string(),
-            token: token.into(),
+            base_url: RwLock::new(base_url.into().trim_end_matches('/').to_string()),
+            token: RwLock::new(token.into()),
             instance_id,
             session_id: RwLock::new(String::new()),
             open_lock: tokio::sync::Mutex::new(()),
@@ -93,8 +101,30 @@ impl HttpClient {
     }
 
     #[allow(dead_code)]
-    pub fn base_url(&self) -> &str {
-        &self.base_url
+    pub fn base_url(&self) -> String {
+        self.base_url.read().expect("base_url lock").clone()
+    }
+
+    /// 重读 daemon 发现记录后的原地换值（daemon 重启换 token/端口）。
+    /// 返回是否发生变化；变化后所有请求与 SSE 自动携带新值。
+    pub fn apply_discovery(&self, base_url: &str, token: &str) -> bool {
+        let base = base_url.trim_end_matches('/').to_string();
+        let mut changed = false;
+        {
+            let mut current = self.base_url.write().expect("base_url lock");
+            if *current != base {
+                *current = base;
+                changed = true;
+            }
+        }
+        {
+            let mut current = self.token.write().expect("token lock");
+            if *current != token {
+                *current = token.to_string();
+                changed = true;
+            }
+        }
+        changed
     }
 
     pub fn session_id(&self) -> String {
@@ -106,14 +136,20 @@ impl HttpClient {
     }
 
     fn url(&self, path: &str) -> String {
-        format!("{}{}", self.base_url, path)
+        format!("{}{}", self.base_url.read().expect("base_url lock"), path)
+    }
+
+    /// 当前 Bearer token（拷贝出锁，避免 `RwLockReadGuard` 跨 `await`
+    /// 使 future 变成 `!Send`）。
+    fn token(&self) -> String {
+        self.token.read().expect("token lock").clone()
     }
 
     /// 双头请求构造器（open 之外的一切请求）。
     fn request(&self, method: reqwest::Method, path: &str) -> reqwest::RequestBuilder {
         self.http
             .request(method, self.url(path))
-            .bearer_auth(&self.token)
+            .bearer_auth(self.token())
             .header(SESSION_ID_HEADER, self.session_id())
     }
 
@@ -128,15 +164,21 @@ impl HttpClient {
             return parse_ok(body);
         }
         let text = body;
-        // 401：plain "unauthorized"（token 错）或 JSON lease_required（租约问题）。
+        // 401 有三种来源，其中两种的 body 都是 **plain text**——只能按内容区分：
+        // - JSON `{"code":"lease_required",...}`：租约缺失/过期/seed 未 attach；
+        // - plain `unauthorized`：Bearer token 被拒（daemon `auth.rs:12`）；
+        // - plain `lease expired or unknown`：renew 时租约已死（`command.rs:137`）。
+        // BUG-2026-09-14-01：第三种此前落入 `Unauthorized` 分支，被调用方当作
+        // 「token 错、不可恢复」而**终止连接生命周期**——实际它正是「重新 open
+        // 换新租约」就能恢复的情形，误判后客户端永久 401 无法回连。
         if status == reqwest::StatusCode::UNAUTHORIZED {
             if let Ok(err) = serde_json::from_str::<WireError>(&text) {
-                if err.code == "lease_required" {
-                    return Err(ApiError::LeaseRequired(err.message));
-                }
-                return Err(ApiError::LeaseRequired(err.code));
+                return Err(ApiError::LeaseRequired(err.message));
             }
-            return Err(ApiError::Unauthorized);
+            if text.trim() == PLAIN_UNAUTHORIZED {
+                return Err(ApiError::Unauthorized);
+            }
+            return Err(ApiError::LeaseRequired(truncate(text.trim(), 200)));
         }
         if status == reqwest::StatusCode::UPGRADE_REQUIRED {
             // 426：body 是 RingingCommandAck{code:"unsupported_version"}。
@@ -185,7 +227,7 @@ impl HttpClient {
         let resp = self
             .http
             .post(self.url("/ringing/v1/clients/open"))
-            .bearer_auth(&self.token)
+            .bearer_auth(self.token())
             .json(&req)
             .timeout(OPEN_TIMEOUT)
             .send()
@@ -473,4 +515,110 @@ pub fn build_envelope(client: &HttpClient, command: RingingCommand) -> RingingCo
         command,
     )
     .with_client_session_id(client.session_id())
+}
+
+#[cfg(test)]
+mod tests {
+    //! 401 三态分类回归（BUG-2026-09-14-01）。
+    //!
+    //! daemon 对三种失败都回 401，其中两种 body 是 **plain text**：
+    //!
+    //! - `unauthorized`（token 错，`auth.rs:12`）
+    //! - `lease expired or unknown`（renew 时租约已死，`command.rs:137`）
+    //!
+    //! 旧实现把两种都归为 `Unauthorized`，而调用方把 `Unauthorized` 当致命
+    //! 错误终止连接生命周期——于是「租约过期」被误当成「token 错」，客户端
+    //! 永久 401 无法回连。分类必须按 body 内容区分。
+
+    use super::*;
+
+    fn classify(status: u16, body: &str) -> ApiError {
+        let client = HttpClient::new("http://127.0.0.1:1", "t", "ci".into());
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        rt.block_on(client.classify(
+            reqwest::StatusCode::from_u16(status).expect("status"),
+            body.to_string(),
+            Ok::<_, ApiError>,
+        ))
+        .expect_err("non-2xx must error")
+    }
+
+    /// renew 的 plain 401（租约已死）→ `LeaseRequired`（可自愈），**不是** `Unauthorized`。
+    #[test]
+    fn plain_lease_expired_is_lease_required_not_unauthorized() {
+        let err = classify(401, "lease expired or unknown");
+        assert!(
+            err.is_credential(),
+            "租约过期属凭据类，应触发重新协商：{err:?}"
+        );
+        assert!(
+            !err.is_fatal(),
+            "租约过期绝不可判为致命（旧 bug 的根因）：{err:?}"
+        );
+        assert!(matches!(err, ApiError::LeaseRequired(_)), "{err:?}");
+    }
+
+    /// token 被拒的 plain 401 → `Unauthorized`，且**同样不致命**（daemon 重启换 token）。
+    #[test]
+    fn plain_unauthorized_is_not_fatal() {
+        let err = classify(401, "unauthorized");
+        assert!(matches!(err, ApiError::Unauthorized), "{err:?}");
+        assert!(
+            !err.is_fatal(),
+            "token 被拒可经重读 discovery 自愈，不得终止连接生命周期"
+        );
+        assert!(err.is_credential());
+    }
+
+    /// JSON 401 `lease_required` → `LeaseRequired`。
+    #[test]
+    fn json_lease_required_is_lease_required() {
+        let err = classify(
+            401,
+            r#"{"code":"lease_required","message":"attach the session seed first"}"#,
+        );
+        assert!(matches!(err, ApiError::LeaseRequired(_)), "{err:?}");
+        assert!(!err.is_fatal());
+    }
+
+    /// 尾部空白/CRLF 不得影响 plain 判定（HTTP body 可能带换行）。
+    #[test]
+    fn plain_unauthorized_tolerates_surrounding_whitespace() {
+        let err = classify(401, "  unauthorized\n");
+        assert!(matches!(err, ApiError::Unauthorized), "{err:?}");
+    }
+
+    /// 426 → 唯一不可自愈情形（`is_fatal`）。
+    #[test]
+    fn unsupported_version_is_the_only_fatal_case() {
+        let err = classify(
+            426,
+            r#"{"command_id":"","status":"rejected","code":"unsupported_version","message":"unsupported Ringing schema/version"}"#,
+        );
+        assert!(matches!(err, ApiError::UnsupportedVersion(_)), "{err:?}");
+        assert!(err.is_fatal(), "协议代差是唯一停止重试的情形");
+        assert!(!err.is_credential());
+    }
+
+    /// 普通 4xx/5xx 既非致命也非凭据类（走普通退避重试）。
+    #[test]
+    fn plain_http_error_is_neither_fatal_nor_credential() {
+        let err = classify(500, "boom");
+        assert!(matches!(err, ApiError::Http { status: 500, .. }), "{err:?}");
+        assert!(!err.is_fatal());
+        assert!(!err.is_credential());
+    }
+
+    /// 热更新：`apply_discovery` 换值后请求头/URL 立即跟随。
+    #[test]
+    fn apply_discovery_hot_swaps_credentials() {
+        let client = HttpClient::new("http://127.0.0.1:1", "old-token", "ci".into());
+        assert!(!client.apply_discovery("http://127.0.0.1:1", "old-token"));
+        assert!(client.apply_discovery("http://127.0.0.1:2/", "new-token"));
+        assert_eq!(client.base_url(), "http://127.0.0.1:2");
+        assert_eq!(client.token(), "new-token");
+    }
 }
