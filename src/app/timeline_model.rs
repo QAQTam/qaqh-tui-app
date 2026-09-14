@@ -13,6 +13,18 @@ use crate::protocol::timeline::{
 const MAX_PROGRESS_LEN: usize = 8192;
 const PROGRESS_TAIL_KEEP: usize = 6144;
 
+fn retain_utf8_tail(value: &mut String, max_bytes: usize) -> bool {
+    if value.len() <= max_bytes {
+        return false;
+    }
+    let mut start = value.len() - max_bytes;
+    while !value.is_char_boundary(start) {
+        start += 1;
+    }
+    value.drain(..start);
+    true
+}
+
 /// 去除 ANSI/VT 转义（供 bash 进度流净化：ESC[..m/K/J 等）。
 /// 不引入 regex 依赖，纯状态机，保留原 UTF-8。
 pub fn strip_ansi_escapes(s: &str) -> String {
@@ -67,13 +79,13 @@ pub fn strip_ansi_escapes(s: &str) -> String {
 /// 语义：`\n` 换行；`\r` 回车覆写当前行（取最后非空 `\r` 段）；`\r\n` 视为换行；
 /// ANSI 已剥离；末尾超长截断留尾。`\r` 仅在同 chunk 内覆写，跨 chunk 的
 /// 连续覆写需同 chunk 内完成（符合 8KB/50ms 批的实际，切块边界不跨行）。
-pub fn apply_bash_progress(buf: &mut String, chunk: &str) {
+pub fn apply_bash_progress(buf: &mut String, chunk: &str) -> bool {
     if chunk.is_empty() {
-        return;
+        return false;
     }
     let cleaned = strip_ansi_escapes(chunk).replace("\r\n", "\n");
     if cleaned.is_empty() {
-        return;
+        return false;
     }
     // 按 `\n` 切，保持尾空以便还原末尾换行
     let parts: Vec<&str> = cleaned.split('\n').collect();
@@ -139,15 +151,7 @@ pub fn apply_bash_progress(buf: &mut String, chunk: &str) {
     if cleaned.ends_with('\n') && !buf.ends_with('\n') {
         buf.push('\n');
     }
-    if buf.len() > MAX_PROGRESS_LEN {
-        let keep = PROGRESS_TAIL_KEEP.min(buf.len());
-        let drain = buf.len() - keep;
-        let mut cut = drain;
-        while cut < buf.len() && !buf.is_char_boundary(cut) {
-            cut += 1;
-        }
-        buf.drain(..cut);
-    }
+    buf.len() > MAX_PROGRESS_LEN && retain_utf8_tail(buf, PROGRESS_TAIL_KEEP)
 }
 
 #[allow(dead_code)]
@@ -170,23 +174,27 @@ pub struct ToolCard {
     pub output: Option<String>,
     pub diff: Option<String>,
     pub progress: String,
+    pub progress_truncated: bool,
     pub failure: Option<TimelineFailure>,
     pub permission: Option<crate::protocol::timeline::TimelineToolPermission>,
 }
 
 impl From<TimelineTool> for ToolCard {
     fn from(t: TimelineTool) -> Self {
-        let progress = {
+        let (progress, progress_truncated) = {
+            let mut progress_truncated = t.progress_truncated;
             let is_bash = matches!(
                 t.name.as_str(),
                 "bash" | "exec" | "shell" | "pwsh" | "powershell"
             );
             if is_bash && !t.progress.is_empty() {
                 let mut buf = String::new();
-                apply_bash_progress(&mut buf, &t.progress);
-                buf
+                progress_truncated |= apply_bash_progress(&mut buf, &t.progress);
+                (buf, progress_truncated)
             } else {
-                t.progress
+                let mut progress = t.progress;
+                progress_truncated |= retain_utf8_tail(&mut progress, MAX_PROGRESS_LEN);
+                (progress, progress_truncated)
             }
         };
         Self {
@@ -198,6 +206,7 @@ impl From<TimelineTool> for ToolCard {
             output: t.output,
             diff: t.diff,
             progress,
+            progress_truncated,
             failure: t.failure,
             permission: t.permission,
         }
@@ -447,7 +456,11 @@ impl TimelineModel {
                     changed = false;
                 }
             }
-            E::ToolProgress { block_id, chunk } => {
+            E::ToolProgress {
+                block_id,
+                chunk,
+                truncated,
+            } => {
                 let round_num = entry.round_num.unwrap_or(0);
                 let round = Self::find_round_mut(turn, round_num);
                 if let Some(block) = Self::find_block_mut(round, block_id) {
@@ -456,11 +469,13 @@ impl TimelineModel {
                             tool.name.as_str(),
                             "bash" | "exec" | "shell" | "pwsh" | "powershell"
                         );
-                        if is_bash_stream {
-                            apply_bash_progress(&mut tool.progress, chunk);
+                        let local_truncated = if is_bash_stream {
+                            apply_bash_progress(&mut tool.progress, chunk)
                         } else {
                             tool.progress.push_str(chunk);
-                        }
+                            retain_utf8_tail(&mut tool.progress, MAX_PROGRESS_LEN)
+                        };
+                        tool.progress_truncated |= *truncated || local_truncated;
                     } else {
                         missing_block_drops += 1;
                         changed = false;
@@ -766,6 +781,7 @@ mod tests {
                         output: None,
                         diff: None,
                         progress: String::new(),
+                        progress_truncated: false,
                         failure: None,
                         permission: None,
                     }),
@@ -778,6 +794,7 @@ mod tests {
             TimelineEvent::ToolProgress {
                 block_id: "b2".into(),
                 chunk: "out1\n".into(),
+                truncated: false,
             },
         ));
         m.apply(&entry(
@@ -786,6 +803,7 @@ mod tests {
             TimelineEvent::ToolProgress {
                 block_id: "b2".into(),
                 chunk: "out2\n".into(),
+                truncated: false,
             },
         ));
         m.apply(&entry(
@@ -854,6 +872,7 @@ mod tests {
                         created_seq: i as u64,
                         user_text: format!("n{i}"),
                         sealed: true,
+                        offloaded: false,
                         state: TimelineTurnState::Completed,
                         failure: None,
                         rounds: vec![],
@@ -958,6 +977,146 @@ mod tests {
     }
 
     #[test]
+    fn non_bash_progress_is_bounded_and_marks_truncation() {
+        let mut m = TimelineModel::default();
+        m.apply(&entry(
+            1,
+            "t1",
+            TimelineEvent::TurnOpened {
+                user_text: "hi".into(),
+            },
+        ));
+        m.apply(&entry(
+            2,
+            "t1",
+            TimelineEvent::BlockOpened {
+                block: TimelineBlock {
+                    block_id: "b1".into(),
+                    block_order: 0,
+                    kind: TimelineBlockKind::Tool,
+                    state: TimelineBlockState::Open,
+                    text: String::new(),
+                    tool: Some(TimelineTool {
+                        tool_call_id: "c1".into(),
+                        name: "read".into(),
+                        state: TimelineToolState::Running,
+                        summary: None,
+                        args_json: None,
+                        output: None,
+                        diff: None,
+                        progress: String::new(),
+                        progress_truncated: false,
+                        failure: None,
+                        permission: None,
+                    }),
+                },
+            },
+        ));
+        m.apply(&entry(
+            3,
+            "t1",
+            TimelineEvent::ToolProgress {
+                block_id: "b1".into(),
+                chunk: format!("{}{}", "x".repeat(9000), "tail"),
+                truncated: false,
+            },
+        ));
+
+        let tool = m.turns[0].rounds[0].blocks[0].tool.as_ref().unwrap();
+        assert!(tool.progress.len() <= MAX_PROGRESS_LEN);
+        assert!(tool.progress.ends_with("tail"));
+        assert!(tool.progress_truncated);
+    }
+
+    #[test]
+    fn tool_progress_event_truncation_is_propagated() {
+        let mut m = TimelineModel::default();
+        m.apply(&entry(
+            1,
+            "t1",
+            TimelineEvent::TurnOpened {
+                user_text: "hi".into(),
+            },
+        ));
+        m.apply(&entry(
+            2,
+            "t1",
+            TimelineEvent::BlockOpened {
+                block: TimelineBlock {
+                    block_id: "b1".into(),
+                    block_order: 0,
+                    kind: TimelineBlockKind::Tool,
+                    state: TimelineBlockState::Open,
+                    text: String::new(),
+                    tool: Some(TimelineTool {
+                        tool_call_id: "c1".into(),
+                        name: "exec".into(),
+                        state: TimelineToolState::Running,
+                        summary: None,
+                        args_json: None,
+                        output: None,
+                        diff: None,
+                        progress: String::new(),
+                        progress_truncated: false,
+                        failure: None,
+                        permission: None,
+                    }),
+                },
+            },
+        ));
+        m.apply(&entry(
+            3,
+            "t1",
+            TimelineEvent::ToolProgress {
+                block_id: "b1".into(),
+                chunk: "tail".into(),
+                truncated: true,
+            },
+        ));
+
+        let tool = m.turns[0].rounds[0].blocks[0].tool.as_ref().unwrap();
+        assert_eq!(tool.progress, "tail");
+        assert!(tool.progress_truncated);
+    }
+
+    #[test]
+    fn legacy_timeline_json_defaults_new_bounded_fields() {
+        let tool: TimelineTool = serde_json::from_value(serde_json::json!({
+            "tool_call_id": "c1",
+            "name": "exec",
+            "state": "running",
+            "progress": "tail"
+        }))
+        .unwrap();
+        assert!(!tool.progress_truncated);
+
+        let event: TimelineEvent = serde_json::from_value(serde_json::json!({
+            "type": "tool_progress",
+            "block_id": "b1",
+            "chunk": "tail"
+        }))
+        .unwrap();
+        assert!(matches!(
+            event,
+            TimelineEvent::ToolProgress {
+                truncated: false,
+                ..
+            }
+        ));
+
+        let turn: TimelineTurn = serde_json::from_value(serde_json::json!({
+            "turn_id": "t1",
+            "created_seq": 1,
+            "user_text": "hi",
+            "sealed": false,
+            "state": "running",
+            "rounds": []
+        }))
+        .unwrap();
+        assert!(!turn.offloaded);
+    }
+
+    #[test]
     fn bash_progress_via_timeline_bash_vs_other_tool() {
         // bash 工具应走 apply_bash_progress，普通工具保持 push_str
         let mut m = TimelineModel::default();
@@ -988,6 +1147,7 @@ mod tests {
                             output: None,
                             diff: None,
                             progress: String::new(),
+                            progress_truncated: false,
                             failure: None,
                             permission: None,
                         }),
@@ -1001,6 +1161,7 @@ mod tests {
             TimelineEvent::ToolProgress {
                 block_id: "b_bash".into(),
                 chunk: "a\rb\n".into(),
+                truncated: false,
             },
         ));
         m.apply(&entry(
@@ -1009,6 +1170,7 @@ mod tests {
             TimelineEvent::ToolProgress {
                 block_id: "b_read".into(),
                 chunk: "a\rb\n".into(),
+                truncated: false,
             },
         ));
         let bash_progress = m.turns[0].rounds[0]
@@ -1051,6 +1213,7 @@ mod tests {
                     created_seq: 1,
                     user_text: "hi".into(),
                     sealed: true,
+                    offloaded: false,
                     state: TimelineTurnState::Completed,
                     failure: None,
                     rounds: vec![crate::protocol::timeline::TimelineRound {
@@ -1072,6 +1235,7 @@ mod tests {
                                 output: None,
                                 diff: None,
                                 progress: "\x1b[31m0%\r100%\n".into(),
+                                progress_truncated: false,
                                 failure: None,
                                 permission: None,
                             }),
@@ -1200,6 +1364,7 @@ mod tests {
                     created_seq: 1,
                     user_text: "hi".into(),
                     sealed: false,
+                    offloaded: false,
                     state: TimelineTurnState::Running,
                     failure: None,
                     rounds: vec![crate::protocol::timeline::TimelineRound {

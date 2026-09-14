@@ -315,6 +315,42 @@ async fn supervisor(
 /// 这里把它归一为可诊断的提示（对照 `qaqh-client/src/sse.rs:182-190`）。
 pub const STREAM_TERMINATED: &str = "ringing.stream_terminated";
 
+/// 连接信息变化后，流任务对当前流的处置。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StreamRebuild {
+    /// 变化与本流无关（相位、错误摘要等）——继续持有当前流。
+    None,
+    /// 同 epoch 重协商（租约过期 → 新 `client_session_id`）：cursor 在同 epoch
+    /// 内仍有效，仅重建流以继续续传。
+    Rebuild,
+    /// epoch 变化（daemon 重启）：旧 cursor 语义失效，归零后重建。
+    ResetAndRebuild,
+}
+
+/// 由连接信息变化决定流的处置——**本函数是 D-3（伪健康黑障）的回归锁**。
+///
+/// 事故链：daemon 租约过期后重新 open，`epoch` 不变而 `client_session_id` 换新
+/// （`ConnInfo.generation` 递增）。旧流只比 epoch，于是既不重连也不归零，继续
+/// 持已失效的 session——服务端 `is_active_session` 为假、不再投递任何事件，
+/// 客户端状态却仍是 `ready`（伪健康黑障，见 report D-3）。
+///
+/// 两条流共用本函数：epoch 变 → 归零重建；仅 generation 变 → 保留 cursor 重建；
+/// 两者都不变 → 不动（`conn_rx` 会因相位/错误摘要变化而唤醒，不得误判为重连）。
+fn stream_rebuild(
+    epoch: &str,
+    known_generation: u64,
+    new_epoch: &str,
+    new_generation: u64,
+) -> StreamRebuild {
+    if new_epoch != epoch {
+        StreamRebuild::ResetAndRebuild
+    } else if new_generation != known_generation {
+        StreamRebuild::Rebuild
+    } else {
+        StreamRebuild::None
+    }
+}
+
 /// 解析终止帧的 `code` 字段（缺失/非法 JSON → `unknown`）。
 fn stream_terminated_code(data: &str) -> String {
     serde_json::from_str::<serde_json::Value>(data.trim())
@@ -441,13 +477,20 @@ async fn channel_stream(
                                         let info = conn_rx.borrow();
                                         (info.epoch.clone(), info.generation)
                                     };
-                                    if new_epoch != epoch {
-                                        cursor = 0;
-                                        reconnect = true;
-                                    } else if new_generation != known_generation {
+                                    match stream_rebuild(
+                                        &epoch,
+                                        known_generation,
+                                        &new_epoch,
+                                        new_generation,
+                                    ) {
+                                        StreamRebuild::None => {}
                                         // 同 epoch 重协商（租约过期换新 cs）：
                                         // cursor 在同 epoch 内仍有效，保留续传。
-                                        reconnect = true;
+                                        StreamRebuild::Rebuild => reconnect = true,
+                                        StreamRebuild::ResetAndRebuild => {
+                                            cursor = 0;
+                                            reconnect = true;
+                                        }
                                     }
                                 }
                                 Err(_) => return,
@@ -656,7 +699,14 @@ async fn timeline_stream(
                             };
                             // epoch 变化或同 epoch 重协商（旧 cs 已被服务端作废）
                             // 均需重建流：否则 daemon 不再向旧 session 投递事件。
-                            if new_epoch != epoch || new_generation != known_generation {
+                            // 判定与频道流共用 `stream_rebuild`，防止两处再次漂移。
+                            if stream_rebuild(
+                                &epoch,
+                                known_generation,
+                                &new_epoch,
+                                new_generation,
+                            ) != StreamRebuild::None
+                            {
                                 recover = true;
                             }
                         }
@@ -729,7 +779,8 @@ mod tests {
     //! 事故链：流式输出中前端 SSE 报错 → daemon 端租约过期 → renew 回
     //! **plain 401** `lease expired or unknown` → 旧分类把它当 `Unauthorized`
     //! → supervisor `return` 永久退出 → 客户端再也无法回连（后续一律 401）。
-    //! 本模块锁住「只有协议代差才能停止生命周期」这一不变式。
+    //! 本模块锁住「只有协议代差才能停止生命周期」这一不变式；同轮修复的
+    //! D-3（同 epoch 重协商不重建流 → 伪健康黑障）由 `stream_rebuild` 锁定。
 
     use super::*;
 
@@ -832,6 +883,67 @@ mod tests {
                 assert!(error.contains("lagged"), "错误须携带服务端 code：{error}");
             }
             other => panic!("意外消息：{other:?}"),
+        }
+    }
+
+    /// **D-3 核心回归**：同 epoch 换新 `client_session_id`（generation 递增）必须
+    /// 重建流，且**保留 cursor**（同 epoch 内 cursor 语义仍有效）。
+    ///
+    /// 旧实现只比 epoch，此处返回「不重连」——旧流继续持失效 session 死等，
+    /// daemon 不再投递事件而客户端仍显示 `ready`（伪健康黑障）。
+    #[test]
+    fn generation_bump_rebuilds_stream_and_keeps_cursor() {
+        assert_eq!(
+            stream_rebuild("ep-1", 7, "ep-1", 8),
+            StreamRebuild::Rebuild,
+            "同 epoch 重协商必须重建流（旧 bug 在此不重连，伪健康卡死）"
+        );
+    }
+
+    /// epoch 变化（daemon 重启）→ cursor 语义失效，必须归零重建。
+    #[test]
+    fn epoch_change_resets_cursor_and_rebuilds() {
+        assert_eq!(
+            stream_rebuild("ep-1", 7, "ep-2", 7),
+            StreamRebuild::ResetAndRebuild
+        );
+    }
+
+    /// epoch 与 generation 同时变化时以 epoch 为准——必须归零，不得沿用旧 cursor。
+    #[test]
+    fn epoch_change_wins_over_generation_bump() {
+        assert_eq!(
+            stream_rebuild("ep-1", 7, "ep-2", 8),
+            StreamRebuild::ResetAndRebuild
+        );
+    }
+
+    /// `conn_rx` 因相位/错误摘要变化而唤醒时不得触发重连（否则流会反复重建）。
+    #[test]
+    fn unrelated_conn_info_change_does_not_rebuild() {
+        assert_eq!(stream_rebuild("ep-1", 7, "ep-1", 7), StreamRebuild::None);
+    }
+
+    /// 全组合扫描：只有「epoch 与 generation 都不变」才允许不动。
+    /// 含 generation 倒退（校验判定是 `!=` 而非方向性比较）与空 epoch（未就绪）。
+    #[test]
+    fn only_unchanged_conn_info_avoids_rebuild() {
+        let cases = [
+            ("ep-1", 7u64, "ep-1", 7u64),
+            ("ep-1", 7, "ep-1", 8),
+            ("ep-1", 8, "ep-1", 7),
+            ("ep-1", 7, "ep-2", 7),
+            ("ep-1", 7, "ep-2", 8),
+            ("", 0, "ep-1", 0),
+        ];
+        for (known_epoch, known_generation, new_epoch, new_generation) in cases {
+            let action = stream_rebuild(known_epoch, known_generation, new_epoch, new_generation);
+            let unchanged = known_epoch == new_epoch && known_generation == new_generation;
+            assert_eq!(
+                action == StreamRebuild::None,
+                unchanged,
+                "({known_epoch},{known_generation})→({new_epoch},{new_generation}) 判定错误：{action:?}"
+            );
         }
     }
 }

@@ -600,13 +600,7 @@ fn is_shell_tool(name: &str) -> bool {
 pub fn is_panel_owned_tool(name: &str) -> bool {
     matches!(
         name,
-        "todo_write"
-            | "todo_update"
-            | "todo_list"
-            | "todo"
-            | "ask"
-            | "skills"
-            | "spawn_subagent"
+        "todo_write" | "todo_update" | "todo_list" | "todo" | "ask" | "skills" | "spawn_subagent"
     )
 }
 
@@ -827,11 +821,7 @@ fn push_tool_card(
         let short = crate::app::truncate_str(p, 36);
         format!(" {short}")
     } else if let Some(cmd) = exec_summary.as_deref().filter(|s| !s.is_empty()) {
-        let one = cmd
-            .replace('\n', " ")
-            .chars()
-            .take(64)
-            .collect::<String>();
+        let one = cmd.replace('\n', " ").chars().take(64).collect::<String>();
         format!(" {one}")
     } else if let Some(summary) = tool.summary.as_deref().filter(|s| !s.is_empty()) {
         let one = summary
@@ -1644,6 +1634,7 @@ mod tests {
             ),
             diff: None,
             progress: String::new(),
+            progress_truncated: false,
             failure: None,
             permission: None,
         };
@@ -1656,7 +1647,10 @@ mod tests {
             .join("\n");
         assert!(flat.contains("ask"), "仍应显示调用轨迹");
         assert!(flat.contains("已回答"), "应给出状态专用语");
-        assert!(!flat.contains("\"status\""), "不得 dumping 机器回执: {flat}");
+        assert!(
+            !flat.contains("\"status\""),
+            "不得 dumping 机器回执: {flat}"
+        );
         assert!(!flat.contains("question_id"), "不得 dumping 答案结构");
         assert!(!flat.contains("F7"), "无输出可折叠时不应提示 F7");
     }
@@ -1681,6 +1675,7 @@ mod tests {
                 ),
                 diff: None,
                 progress: String::new(),
+                progress_truncated: false,
                 failure: None,
                 permission: None,
             };
@@ -1692,7 +1687,10 @@ mod tests {
                 .collect::<Vec<_>>()
                 .join("\n");
             assert!(flat.contains(name), "{name} 仍应显示调用轨迹");
-            assert!(!flat.contains("\"status\""), "{name} 不得 dumping 回执: {flat}");
+            assert!(
+                !flat.contains("\"status\""),
+                "{name} 不得 dumping 回执: {flat}"
+            );
             assert!(!flat.contains("timeis"), "{name} 不得显示机器时间戳");
             assert!(!flat.contains("F7"), "{name} 无输出可折叠时不应提示 F7");
         }
@@ -1714,6 +1712,7 @@ mod tests {
             ),
             diff: None,
             progress: String::new(),
+            progress_truncated: false,
             failure: None,
             permission: None,
         };
@@ -1741,6 +1740,7 @@ mod tests {
             output: Some(r#"{"status":"ok","seed":"abc-123","process_id":42}"#.into()),
             diff: None,
             progress: String::new(),
+            progress_truncated: false,
             failure: None,
             permission: None,
         };
@@ -1768,6 +1768,7 @@ mod tests {
             output: Some(r#"{"status":"error"}"#.into()),
             diff: None,
             progress: String::new(),
+            progress_truncated: false,
             failure: Some(crate::protocol::timeline::TimelineFailure {
                 code: "invalid_input".into(),
                 message: "items 为空".into(),
@@ -1797,6 +1798,7 @@ mod tests {
             output: Some("fn main() {}\n".into()),
             diff: None,
             progress: String::new(),
+            progress_truncated: false,
             failure: None,
             permission: None,
         };
@@ -1879,6 +1881,7 @@ mod tests {
             ),
             diff: None,
             progress: String::new(),
+            progress_truncated: false,
             failure: None,
             permission: None,
         };
@@ -1907,8 +1910,7 @@ mod tests {
         );
         // 显式 shell：按用户要求前缀标注
         assert_eq!(
-            exec_command_summary(Some(r#"{"command":"Get-ChildItem","shell":"pwsh"}"#))
-                .as_deref(),
+            exec_command_summary(Some(r#"{"command":"Get-ChildItem","shell":"pwsh"}"#)).as_deref(),
             Some("pwsh Get-ChildItem")
         );
         assert_eq!(
@@ -1917,8 +1919,7 @@ mod tests {
         );
         // 含空格/引号的参数需正确加引号
         assert_eq!(
-            exec_command_summary(Some(r#"{"argv":["git","commit","-m","fix a bug"]}"#))
-                .as_deref(),
+            exec_command_summary(Some(r#"{"argv":["git","commit","-m","fix a bug"]}"#)).as_deref(),
             Some("git commit -m \"fix a bug\"")
         );
     }
@@ -1948,16 +1949,15 @@ mod tests {
             state: TimelineToolState::Succeeded,
             // 后端真实行为：summary 就是整坨 ExecOutput JSON
             summary: Some(
-                r#"{"status":"completed","command":"cargo ...","exit_code":0,"output":""}"#
-                    .into(),
+                r#"{"status":"completed","command":"cargo ...","exit_code":0,"output":""}"#.into(),
             ),
             args_json: Some(r#"{"argv":["cargo","build"]}"#.into()),
             output: Some(
-                r#"{"status":"completed","command":"cargo ...","exit_code":0,"output":""}"#
-                    .into(),
+                r#"{"status":"completed","command":"cargo ...","exit_code":0,"output":""}"#.into(),
             ),
             diff: None,
             progress: String::new(),
+            progress_truncated: false,
             failure: None,
             permission: None,
         };
@@ -2003,6 +2003,7 @@ mod tests {
             output: Some("content".into()),
             diff: None,
             progress: String::new(),
+            progress_truncated: false,
             failure: None,
             permission: None,
         };
@@ -2024,6 +2025,7 @@ mod tests {
             output: Some("ok".into()),
             diff: Some(diff.into()),
             progress: String::new(),
+            progress_truncated: false,
             failure: None,
             permission: None,
         };
@@ -2299,6 +2301,7 @@ mod tests {
             output: Some(raw.to_string()),
             diff: None,
             progress: long.clone(),
+            progress_truncated: false,
             failure: None,
             permission: None,
         };
@@ -2334,6 +2337,7 @@ mod tests {
             output: Some(raw.to_string()),
             diff: None,
             progress: String::new(),
+            progress_truncated: false,
             failure: None,
             permission: None,
         };
@@ -2416,6 +2420,7 @@ mod tests {
             output: Some(raw),
             diff: None,
             progress: String::new(),
+            progress_truncated: false,
             failure: None,
             permission: None,
         };
@@ -2455,6 +2460,7 @@ mod tests {
             output: Some(read_out.clone()),
             diff: None,
             progress: String::new(),
+            progress_truncated: false,
             failure: None,
             permission: None,
         };

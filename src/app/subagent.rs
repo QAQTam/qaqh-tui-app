@@ -171,6 +171,7 @@ pub fn rescan(sess: &mut SessionState) -> Vec<String> {
             output,
             diff: None,
             progress: String::new(),
+            progress_truncated: false,
             failure: None,
             permission: None,
         };
@@ -522,6 +523,7 @@ mod tests {
             output: output.map(str::to_owned),
             diff: None,
             progress: String::new(),
+            progress_truncated: false,
             failure: None,
             permission: None,
         }
