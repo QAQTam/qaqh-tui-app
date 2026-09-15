@@ -18,7 +18,7 @@
 | ~~T-01~~ | ~~P1~~ | ~~传输层未迁移 `qaqh-client`~~ | ~~依赖表零 `qaqh-*`~~ → **阶段一已迁移**：`Cargo.toml:19` 已有 path 依赖，`grep -c qaqh Cargo.lock` = **11**；自建轮子符号（`SseDecoder`/`supervisor_action`/`stream_rebuild`/`timeline_manager`/`refresh_credentials`/`build_envelope`）**零命中**；`transport/` + `runtime.rs` 由 **2127 → 832 行** | — | **全阶段闭环**：阶段一（`56c31e7`）、阶段二（`a278ab8`→`b1a150f`）、阶段 1.5（`d379d90`）均已完成。落点：`protocol/` **2481 → 405 行**（3 文件，无 wire 镜像）、`transport/` 目录删除、`runtime.rs` 949 → 431 |
 | ~~T-03~~ | ~~P2~~ | ~~无用户可触发的重连入口~~ | 见 §2「T-03 闭环」 | — | **已闭环（2026-09-15）** |
 | ~~T-05~~ | ~~P3~~ | ~~悬空文档引用~~ | 见 §2「T-05 闭环」 | — | **已闭环（2026-09-15）** |
-| T-06 | P3 | `offloaded` 镜像字段**无消费方** | TUI：`protocol/timeline.rs:109` 定义 + `timeline_model.rs` 仅测试夹具写 `offloaded: false`，生产代码**零读取**。后端：侧车缺失/损坏/代际不符时保留壳（`timeline_hub.rs:672-675`），壳带 `offloaded=true`、block 文本 ≤512 字符、`tool.output/diff = None`（`qaqh-runtime/src/timeline.rs:881-898`） | 该退化路径下 TUI 会把「预览壳」当完整回合渲染，用户无从得知（与 B1「丢弃必须可见」同一设计原则） | transcript/状态栏标出「已归档，内容为预览」；或至少读 `offloaded` 给出提示。**注意**：该路径本机尚未发生过，根因见 §8（后端 `BUG-2026-09-14-03` —— offload 此前是死代码；后端工作区已接通，**一旦提交部署即转为可触发**） |
+| ~~T-06~~ | ~~P3~~ | ~~`offloaded` 镜像字段**无消费方**~~ | 见 §2「T-06 闭环」 | — | **已闭环（2026-09-15）**——前提已成立：后端 offload 已接通（`ea6063c`，`enable_turn_offload` 在 HEAD 有 5 个调用点），故该回合形态真的会出现 |
 
 | ~~T-08~~ | ~~P2~~ | ~~重建窗口型快照的 `has_more` 语义未定~~ | 见 §2「T-08 闭环」 | — | **已闭环（2026-09-15）**；真正能取到归档回合的**深翻页**另立后端条目 |
 
@@ -26,7 +26,7 @@
 > **同日追加（T-01 阶段一）**：T-01 阶段一、T-03 同日闭环，并连带改判 D-1/D-2（见 §2）。
 > **同日收尾（阶段二 + 阶段 1.5）**：T-01 全阶段完成，连带开 T-13（死镜像逃过 `dead_code` 的
 > 两条逃逸路径）。
-> **同日 T-05、T-08 闭环**。现余待办：**T-06**（待后端 `BUG-2026-09-14-03`）。
+> **同日 T-05、T-06、T-08 全部闭环。本清单 §1 已无待办项。**
 
 ## 2. 已核实修复（FIXED）
 
@@ -48,6 +48,7 @@
 
 | T-07 | `TurnOpened` 镜像后端「原地 reopen」（原 `BUG-2026-09-12-04` 遗留①） | 应用层 `Turn` 补回被丢弃的 `sealed` 字段（`timeline_model.rs:249` 定义、`:277` `from_wire`、`:543` `TurnSealed` 置位）；reopen 分支 `:391`：已存在且 `sealed` → 原地重置（`user_text`/`state=Running`/`failure=None`/`sealed=false`/`rounds.clear()`）并 `bump()`；运行中的重复仍 no-op | `app::timeline_model::tests::sealed_turn_is_reopened_in_place`、`running_turn_duplicate_opened_keeps_content`（**双向变异验证**见 §6）；既有 `duplicate_and_replayed_entries_are_idempotent` 保持通过 |
 
+| **T-06** | `offloaded` 字段无消费方（wire 字段在边界被静默丢弃） | `Turn::from_wire` 不搬运 `qaqh_client::TimelineTurn.offloaded`，app 的 `Turn` 里根本没这个字段。前提 `BUG-2026-09-14-03` 已解除（offload 接通、`enable_turn_offload` 在 HEAD 有 5 个调用点，后端 `ea6063c`）。**已修**（TUI `45c9ea6`）：`Turn` 增 `offloaded` + `from_wire` 搬运；transcript 加 `◌ 已归档：以下内容为预览`（Warn 色） | 2 条测试（正向 + 反向闸）；破坏验证：短路渲染分支 → 正向红；127 passed / clippy 零 warning |
 | **T-08** | 重建窗口型快照的 `has_more` 语义未定 | 语义已定案并落地：`has_more` = 「还能再往前翻一页（且那页非空）」；`total_turns` = 会话**真实**回合数（此前谎报物化窗口大小）；新增 `truncated_before` = 「物化窗口覆盖不到历史开头」。后端 `timeline_hub::persisted_turn_count` + `timeline_api::window_metadata`（纯函数，4 条契约测试）；契约层 `qaqh-client::TimelinePage.truncated_before`（`serde(default)` 兼容旧 daemon）；TUI `TimelineModel.truncated_before` + transcript 顶部警告条 | 后端 `7ef99fb`、TUI `ff38bea`；TUI 2 条模型测试（正向 + 反向闸），破坏验证：去掉空页分支赋值 → 正向红；125 passed / clippy 零 warning |
 
 | **T-05** | 悬空文档引用（原 `render_transcript.rs:330` → 已删的 `docs/markdown-plan.md`） | 不只是一删了之：那个 `500` 是裸魔数，已提为 `render_transcript.rs:15` `MD_BLOCK_LINE_CAP`，理据（markdown 富化把表格/代码块栅格化，超大块在预折行缓存里成倍放大）就地写在常量上，并保留「截断必须可见」的末尾省略标注 | `cargo test` 123 passed；clippy 零 warning；`grep -rn "markdown-plan" src/` 只剩新注释里解释该文档去向的一句 |
@@ -293,6 +294,7 @@ cd ~/Projects/qaqh-backend && cargo test -p qaqh-client sse::tests timeline::tes
 
 | 2026-09-15 | **T-01 阶段 1.5 完成 + 阶段二收尾**：服务面 8 处 `.service(` 换成语义化枚举，`Client::query`/`action` 全权接管；`transport/` 目录（`http.rs` 318 行）整个删除，`Runtime::attach_service_client`/`sync_service_credentials`/`ApiCtx.http`/`App.client` 一并消失——**双份凭据只剩一份**。删方法名字表（见 T-13 第二例）。`protocol/` 2481 → **405 行**，`runtime.rs` 949 → 431。测试 131 → 123（减 7 个随 `http.rs` 走的 `ApiError` 分类测试 + 1 个方法表测试）。TUI `d379d90` |
 | 2026-09-15 | **后端补测**：`ConfigPatch::validate` 的 `permissionLevel 1..=4` 守卫（BUG-2026-09-13-15）在 `qaqh-config-api` 自家测试里零覆盖，补双向断言 + 破坏验证。后端 `97c61c5`（该提交只含这 14 行——同文件里并发写入者的 `WorkspaceDto` 删除未随其落库） |
+| 2026-09-15 | **T-06 闭环**：`TimelineTurn.offloaded` 此前在 `from_wire` 被静默丢弃——与 T-09/T-10 同类，阶段二未覆盖到。前提已成立（后端 offload 接通，`ea6063c`），故该回合形态真的会出现：用户看到被截到 512 字符的正文却无任何提示。已补搬运 + transcript 预览标注。TUI `45c9ea6` |
 | 2026-09-15 | **T-08 闭环**：`has_more` / `total_turns` / `truncated_before` 三者语义定案并两边落地。关键取舍：**不**用 `has_more=true` 表达裁剪（那会让客户端反复请求永远为空的页，正是 BUG-2026-09-13-18 修过的死循环），单列 `truncated_before`。顺带补上 TUI 空页分支丢弃 `total_turns` 的漏洞——那正是元数据唯一确定的时刻。**未做**：真正能取到归档回合的深翻页，已登记为后端 `BUG-2026-09-15-05`。后端 `7ef99fb`；TUI `ff38bea` |
 
 | 2026-09-15 | **阶段二·第四刀（config）+ T-11 关闭**：删除 `protocol/config.rs`（367 行手抄件），TUI 改为直接依赖 `qaqh-config-api`。**顺带发现一条上游盲区**：`ConfigPatch::validate` 里 BUG-2026-09-13-15 补的 `permissionLevel 1..=4` 守卫在 `qaqh-config-api` 自己的测试中**零覆盖**（`patch_validate_rejects_out_of_range` 只测 autoCompactThreshold / reasoningEffort），本仓新测试目前是它唯一的闸。`protocol/` 由 936 → 613 行（原始 9 文件 2481 行）| 
