@@ -7,7 +7,7 @@
 | 清单日期 | 2026-09-15 |
 | 基准代码 | TUI：`main` @ `56c31e7`（T-01 阶段一迁移已提交）。后端：`qaqh-backend` @ `a72ce0c`（阶段一所需能力已提交；工作树另有**他人** workspace/工具侧重构 WIP，未提交，本清单不涉）。首版核定时为 TUI `59541dd` / 后端 `1c92413` |
 | 判定原则 | **以工作树真实代码为准**。每条状态由 `file:line` + 可复现命令核定；历史文档（report / handoff / 已删除的 `streaming-edge-audit.md`）的自述状态仅作线索，不作依据 |
-| 核定环境 | Arch Linux 7.2.4 / rustc 1.98.1。**首版**：`cargo test` 166 passed / 0 failed；`cargo clippy --all-targets` 零 warning。**本轮（阶段一 + 阶段二前两刀后）**：`cargo test` = **123 passed / 0 failed**（条数下降见 §5b 对账，非静默减少）；`cargo clippy --all-targets` 零 warning；后端 `cargo test -p qaqh-client` = **43 lib + 2 集成 passed / 0 failed** |
+| 核定环境 | Arch Linux 7.2.4 / rustc 1.98.1。**首版**：`cargo test` 166 passed / 0 failed；`cargo clippy --all-targets` 零 warning。**本轮（G1 + G2 落地后，TUI `7fb9616`）**：`cargo test` = **124 passed / 0 failed**（166 → 142 的下降见 §5b 对账；此后 126 → 124 是 G2 删掉的两条 `SessionMetaView` 保真测试，非静默减少）；`cargo clippy --all-targets` 零 warning；后端 `cargo test -p qaqh-types` = **26 lib passed / 0 failed**（+3 为本轮新增的 G2 形状锁）。**真机**：`scripts/e2e-restart.sh` 与 `scripts/e2e-session-list.sh` 均通过（后者为本轮新增） |
 | 命名约定 | `docs/buglist/以yyyy-mm-dd-标题-buglist.md作为命名` |
 | 状态图例 | `OPEN` 待修 ｜ `FIXED` 已核实修复（附回归锁）｜ `ACCEPTED` 知情接受 ｜ `EXTERNAL` 他仓/环境，本仓不可核实 |
 
@@ -49,6 +49,7 @@
 | T-07 | `TurnOpened` 镜像后端「原地 reopen」（原 `BUG-2026-09-12-04` 遗留①） | 应用层 `Turn` 补回被丢弃的 `sealed` 字段（`timeline_model.rs:249` 定义、`:277` `from_wire`、`:543` `TurnSealed` 置位）；reopen 分支 `:391`：已存在且 `sealed` → 原地重置（`user_text`/`state=Running`/`failure=None`/`sealed=false`/`rounds.clear()`）并 `bump()`；运行中的重复仍 no-op | `app::timeline_model::tests::sealed_turn_is_reopened_in_place`、`running_turn_duplicate_opened_keeps_content`（**双向变异验证**见 §6）；既有 `duplicate_and_replayed_entries_are_idempotent` 保持通过 |
 
 | **T-06** | `offloaded` 字段无消费方（wire 字段在边界被静默丢弃） | `Turn::from_wire` 不搬运 `qaqh_client::TimelineTurn.offloaded`，app 的 `Turn` 里根本没这个字段。前提 `BUG-2026-09-14-03` 已解除（offload 接通、`enable_turn_offload` 在 HEAD 有 5 个调用点，后端 `ea6063c`）。**已修**（TUI `45c9ea6`）：`Turn` 增 `offloaded` + `from_wire` 搬运；transcript 加 `◌ 已归档：以下内容为预览`（Warn 色） | 2 条测试（正向 + 反向闸）；破坏验证：短路渲染分支 → 正向红；127 passed / clippy 零 warning |
+| **T-14** | `SessionState::meta` 是一处**从未生效**的字段，其五个读取点全是死分支 | `app/session.rs:379` 声明、`:425` 初始化 `None`；**全史零赋值**（`git log -S'meta = Some'` 零命中，字段自首版 `757353b` 引入即如此）。死读取点：`session.rs` `title()` 的第三级回退、`display_model()` 的 meta 回退、`session_ops.rs::effective_cwd` 的末级回退、`ui/home.rs` 底部 cwd 提示（**一直渲染成空格**）、`app/mod.rs` bootstrap 后从 meta 同步会话模式。G2 类型化时一并删除，**语义不变**（这些分支本来就走不到）| 无独立回归锁（删的是走不到的分支）；删除后 124 passed / clippy 零 warning，两条真机 harness 通过。**衍生判断**：会话模式的实际来源是 `transcript_ops.rs` 的乐观更新 + `SessionMetaChanged`；tab 标题来自 `SessionMetaChanged`（`app/mod.rs:666`），与 meta 无关 |
 | **T-08** | 重建窗口型快照的 `has_more` 语义未定 | 语义已定案并落地：`has_more` = 「还能再往前翻一页（且那页非空）」；`total_turns` = 会话**真实**回合数（此前谎报物化窗口大小）；新增 `truncated_before` = 「物化窗口覆盖不到历史开头」。后端 `timeline_hub::persisted_turn_count` + `timeline_api::window_metadata`（纯函数，4 条契约测试）；契约层 `qaqh-client::TimelinePage.truncated_before`（`serde(default)` 兼容旧 daemon）；TUI `TimelineModel.truncated_before` + transcript 顶部警告条 | 后端 `7ef99fb`、TUI `ff38bea`；TUI 2 条模型测试（正向 + 反向闸），破坏验证：去掉空页分支赋值 → 正向红；125 passed / clippy 零 warning |
 
 | **T-05** | 悬空文档引用（原 `render_transcript.rs:330` → 已删的 `docs/markdown-plan.md`） | 不只是一删了之：那个 `500` 是裸魔数，已提为 `render_transcript.rs:15` `MD_BLOCK_LINE_CAP`，理据（markdown 富化把表格/代码块栅格化，超大块在预折行缓存里成倍放大）就地写在常量上，并保留「截断必须可见」的末尾省略标注 | `cargo test` 123 passed；clippy 零 warning；`grep -rn "markdown-plan" src/` 只剩新注释里解释该文档去向的一句 |
@@ -194,6 +195,16 @@ wc -l src/transport/*.rs src/runtime.rs | tail -1               # 832（原 2127
 grep -cE "session\.dashboard|todo\.status" ~/Projects/qaqh-backend/crates/qaqh-client/src/endpoint.rs
 #   # 7 行命中（两个变体定义 + 两处 into_parts 映射 + 测试；原为 0 → 阶段 1.5 可开工）
 
+# ── G2 会话列表条目类型化（本轮） ──
+grep -rn "SessionMetaView\|protocol::session_meta" src/ | wc -l   # 0（手解已删净）
+wc -l src/protocol/*.rs | tail -1                               # 79（仅 mod.rs；G1 后为 204，最初 2481）
+cargo test 2>&1 | grep -E "^test result"                        # 124 passed; 0 failed
+cd ~/Projects/qaqh-backend && cargo test -p qaqh-types session 2>&1 | grep -E "^test "
+#   # session_list_entry_wire_keys_are_locked（wire 键集合锁，手工维护的契约表）
+#   # session_list_entry_recovers_fields_the_hand_parse_dropped（手抄漏掉的字段必须够得着）
+#   # display_title_prefers_title_then_cwd_tail_then_seed（标题口径：last_summary 不参与）
+cd ~/Projects/qaqh-tui-app && bash scripts/e2e-session-list.sh   # RESULT: PASS
+
 # ── T-03 重连入口 ──
 grep -n "Reconnect" src/app/keymap.rs                            # :37 枚举、:51 Ctrl+R
 grep -n "Ctrl+R" src/ui/status_bar.rs                            # :31 Lost 相位提示
@@ -296,6 +307,7 @@ cd ~/Projects/qaqh-backend && cargo test -p qaqh-client sse::tests timeline::tes
 | 2026-09-15 | **后端补测**：`ConfigPatch::validate` 的 `permissionLevel 1..=4` 守卫（BUG-2026-09-13-15）在 `qaqh-config-api` 自家测试里零覆盖，补双向断言 + 破坏验证。后端 `97c61c5`（该提交只含这 14 行——同文件里并发写入者的 `WorkspaceDto` 删除未随其落库） |
 | 2026-09-15 | **协议镜像第三轮：三频道快照类型化（G1）**：删 `protocol/snapshot.rs`（206 行手解）与四个视图类型，改用 `qaqh_client::{ConversationState, ControlState, ToolState}`。**手解不仅多余、而且必然漏**——删除前它已漏六个字段（`active_turn`/`last_round`/`compact_status`/`compact_id`/`cancelled`/`last_finished`），自身还带两个零读取死字段；其中 `ConversationStateView.turns` 更严重：它把中立 `turns[]` 解成 `TimelineTurn`，而中立形状没有 `created_seq`/`sealed`/`state`，**逐条解析必然失败被过滤**——那条「无 timeline 时的降级展示」路径其实从未 work 过。`protocol/` 405 → **204 行**（最初 2481）。TUI `88ebef4`；后端类型 `2a24a2a` |
 
+| 2026-09-15 | **协议镜像第四轮：会话列表条目类型化（G2）**：删 `protocol/session_meta.rs`（128 行手解）与 `SessionMetaView`，改吃 `qaqh_client::SessionListEntry`。与 G1 同款失败模式——该手抄从未解过 `created_at`/`turn_count`/`message_count`/`tool_mode` 等键（`grep` 逐个为 0），**漏了不报错，因为 TUI 侧也零读取**。`display_title`（title → cwd 尾段 → seed）上提为 `SessionMeta` 的方法，把「`last_summary` 不得当标题」钉进类型而非各端注释。顺带删除一处**从未生效**的字段（见 §2 T-14）。**`protocol/` 204 → 79 行（仅剩 mod.rs；最初 9 文件 2481 行）**。新增真机 harness `scripts/e2e-session-list.sh`（隔离 data root + 手工 meta.json 覆盖三级回退；破坏验证：把 `last_summary` 提到 title 之前 → 恰好两条断言红，B/C 仍绿）。TUI `7fb9616`；后端类型见 spec 文档 G2 节 |
 | 2026-09-15 | **T-06 闭环**：`TimelineTurn.offloaded` 此前在 `from_wire` 被静默丢弃——与 T-09/T-10 同类，阶段二未覆盖到。前提已成立（后端 offload 接通，`ea6063c`），故该回合形态真的会出现：用户看到被截到 512 字符的正文却无任何提示。已补搬运 + transcript 预览标注。TUI `45c9ea6` |
 | 2026-09-15 | **T-08 闭环**：`has_more` / `total_turns` / `truncated_before` 三者语义定案并两边落地。关键取舍：**不**用 `has_more=true` 表达裁剪（那会让客户端反复请求永远为空的页，正是 BUG-2026-09-13-18 修过的死循环），单列 `truncated_before`。顺带补上 TUI 空页分支丢弃 `total_turns` 的漏洞——那正是元数据唯一确定的时刻。**未做**：真正能取到归档回合的深翻页，已登记为后端 `BUG-2026-09-15-05`。后端 `7ef99fb`；TUI `ff38bea` |
 
