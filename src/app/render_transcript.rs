@@ -1671,6 +1671,7 @@ mod tests {
     fn turn_with_offload(offloaded: bool) -> SessionState {
         let mut sess = SessionState::new("seed-1".into());
         sess.timeline.turns.push(Turn {
+            turn_index: None,
             turn_id: "t1".into(),
             user_text: "hi".into(),
             state: TimelineTurnState::Completed,
@@ -2154,6 +2155,7 @@ mod tests {
             blocks: vec![block],
         };
         let turn = Turn {
+            turn_index: None,
             turn_id: "t1".into(),
             user_text: "hi".into(),
             state: TimelineTurnState::Completed,
@@ -2201,6 +2203,7 @@ mod tests {
             last_fragment: 0,
         };
         sess.timeline.turns.push(Turn {
+            turn_index: None,
             turn_id: "t1".into(),
             user_text: "".into(),
             state: TimelineTurnState::Completed,
@@ -2274,6 +2277,7 @@ mod tests {
         let running = block_state == TimelineBlockState::Open;
         let mut sess = crate::app::session::SessionState::new("s".into());
         sess.timeline.turns.push(Turn {
+            turn_index: None,
             turn_id: "t1".into(),
             user_text: String::new(),
             state: if running {
@@ -2463,6 +2467,7 @@ mod tests {
             last_fragment: 0,
         };
         sess.timeline.turns.push(Turn {
+            turn_index: None,
             turn_id: "t1".into(),
             user_text: "".into(),
             state: TimelineTurnState::Running,

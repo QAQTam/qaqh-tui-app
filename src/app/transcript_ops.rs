@@ -216,17 +216,19 @@ impl App {
         if loading {
             return;
         }
-        let first_turn = self
+        // 游标 = 本窗口最旧那个回合的**全局序号**。`turn_index` 为 None 时
+        // （实时追加的回合不带序号）说明窗口里没有可当游标的回合，直接放弃。
+        let first_index = self
             .sessions
             .get(&seed)
-            .and_then(|s| s.timeline.turns.first().map(|t| t.turn_id.clone()));
-        let Some(before) = first_turn else { return };
+            .and_then(|s| s.timeline.turns.first().and_then(|t| t.turn_index));
+        let Some(before) = first_index else { return };
         if let Some(sess) = self.sessions.get_mut(&seed) {
             sess.loading_older = true;
         }
         self.spawn_api(move |api, tx| async move {
             let result = api
-                .timeline_page(&seed, Some(&before), crate::runtime::TIMELINE_PAGE_LIMIT)
+                .timeline_page(&seed, Some(before), crate::runtime::TIMELINE_PAGE_LIMIT)
                 .await
                 .map_err(|e| e.to_string());
             let _ = tx.send(AppMsg::Action(ActionResult::LoadOlder { seed, result }));

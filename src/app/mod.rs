@@ -142,15 +142,19 @@ impl ApiCtx {
     }
 
     /// 拉取 timeline 快照页（纯读，不重建流）。
+    ///
+    /// `before_index` = 排他游标（全局回合序号），`None` = 最新一页。游标由
+    /// `TimelineTurn::turn_index` 提供，**不是** `turn_id`——后者会被 worker 复用
+    /// （见后端 `TimelineAppender::open_turn` 的 reopen 注释），当不了稳定游标。
     pub async fn timeline_page(
         &self,
         seed: &str,
-        before_turn: Option<&str>,
+        before_index: Option<u64>,
         limit: u32,
     ) -> Result<qaqh_client::TimelinePage, String> {
         // 类型已权威化：不再有过桥这一步，返回的就是 `qaqh_client` 的类型。
         self.client
-            .fetch_timeline_page(seed, before_turn, Some(limit))
+            .fetch_timeline_page(seed, before_index, Some(limit))
             .await
             .map_err(|e| e.to_string())
     }

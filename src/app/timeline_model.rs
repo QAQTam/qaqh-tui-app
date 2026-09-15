@@ -254,6 +254,12 @@ pub struct Round {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Turn {
     pub turn_id: String,
+    /// 会话内的**全局回合序号**（后端 `TimelineTurn.turn_index`）——翻页游标用它。
+    ///
+    /// `turn_id` 当不了游标：它由 worker 计数器生成、**会复用**（后端
+    /// `TimelineAppender::open_turn` 明确容忍原地 reopen，注释里记着实测的 `t14`
+    /// 重启重号）。实时追加的回合不带序号（`None`），故取游标时要 `and_then`。
+    pub turn_index: Option<u64>,
     pub user_text: String,
     pub state: TimelineTurnState,
     pub failure: Option<TimelineFailure>,
@@ -276,6 +282,7 @@ impl Turn {
     fn from_wire(t: TimelineTurn) -> Self {
         Self {
             turn_id: t.turn_id,
+            turn_index: t.turn_index,
             user_text: t.user_text,
             state: t.state,
             failure: t.failure,
@@ -382,6 +389,8 @@ impl TimelineModel {
                 None => {
                     self.turns.push(Turn {
                         turn_id: turn_id.to_owned(),
+                        // 实时事件不带全局序号：分页游标只服务历史（参见 `Turn::turn_index`）。
+                        turn_index: None,
                         user_text: user_text.clone(),
                         state: TimelineTurnState::Running,
                         failure: None,
@@ -1250,6 +1259,7 @@ mod tests {
                 watermark: 3,
                 turns: (1..=3)
                     .map(|i| qaqh_client::TimelineTurn {
+                        turn_index: None,
                         turn_id: format!("t{i}"),
                         created_seq: i as u64,
                         user_text: format!("n{i}"),
@@ -1267,6 +1277,57 @@ mod tests {
         assert_eq!(m.turns[0].turn_id, "t1");
         assert_eq!(m.turns[2].turn_id, "t3");
         assert_eq!(m.turns[3].turn_id, "t4");
+    }
+
+    /// BUG-2026-09-15-05：翻页游标取自 `turn_index`（全局回合序号），**不是**
+    /// `turn_id`——后者会被 worker 复用，当不了稳定游标。这条钉住「本页最旧那个
+    /// 回合带着序号进来了」，因为 `load_older` 的游标正是从它取的。
+    #[test]
+    fn prepend_older_carries_global_turn_index_for_the_next_cursor() {
+        let mut m = TimelineModel::default();
+        // 常驻窗口是重建后的最后 40 轮：t21..t60（id 由全局序号派生）
+        m.apply(&entry(
+            60,
+            "t60",
+            TimelineEvent::TurnOpened {
+                user_text: "n60".into(),
+            },
+        ));
+        // 深翻页回来的那页：全局序号 11..=21（id 是 t12..t22）
+        let page = TimelinePage {
+            schema: "qaqh.Ringing".into(),
+            version: 1,
+            server_epoch: "ep".into(),
+            seed: "s".into(),
+            has_more: true,
+            total_turns: 60,
+            truncated_before: false,
+            snapshot: qaqh_client::TimelineSnapshot {
+                watermark: 3,
+                turns: (11..=21u64)
+                    .map(|i| qaqh_client::TimelineTurn {
+                        turn_index: Some(i),
+                        turn_id: format!("t{}", i + 1),
+                        created_seq: i,
+                        user_text: format!("n{}", i + 1),
+                        sealed: true,
+                        offloaded: false,
+                        state: TimelineTurnState::Completed,
+                        failure: None,
+                        rounds: vec![],
+                    })
+                    .collect(),
+            },
+        };
+        m.prepend_older(&page);
+        assert_eq!(
+            m.turns.first().and_then(|t| t.turn_index),
+            Some(11),
+            "下一页的游标 = 本页最旧回合的全局序号"
+        );
+        // 反向闸：实时追加的回合不带序号——拿它当游标会翻错页，故 `load_older`
+        // 必须 `and_then`（那条路径不在这里测，但这条断言钉住了「None 是可能的」）。
+        assert_eq!(m.turns.last().and_then(|t| t.turn_index), None);
     }
 
     #[test]
@@ -1592,6 +1653,7 @@ mod tests {
             snapshot: qaqh_client::TimelineSnapshot {
                 watermark: 1,
                 turns: vec![qaqh_client::TimelineTurn {
+                    turn_index: None,
                     turn_id: "t1".into(),
                     created_seq: 1,
                     user_text: "hi".into(),
@@ -1744,6 +1806,7 @@ mod tests {
             snapshot: qaqh_client::TimelineSnapshot {
                 watermark: 10,
                 turns: vec![qaqh_client::TimelineTurn {
+                    turn_index: None,
                     turn_id: "t1".into(),
                     created_seq: 1,
                     user_text: "hi".into(),

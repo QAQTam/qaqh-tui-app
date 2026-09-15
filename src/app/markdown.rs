@@ -1117,6 +1117,7 @@ mod tests {
                 blocks: vec![block],
             };
             let turn = Turn {
+                turn_index: None,
                 turn_id: format!("t{i}"),
                 user_text: format!("user {i}"),
                 state: TimelineTurnState::Completed,

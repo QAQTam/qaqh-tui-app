@@ -662,6 +662,7 @@ mod tests {
 
     fn turn(id: &str, state: TimelineTurnState) -> Turn {
         Turn {
+            turn_index: None,
             turn_id: id.into(),
             user_text: "hi".into(),
             state,
