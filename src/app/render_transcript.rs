@@ -318,6 +318,18 @@ pub fn render_transcript_with_opts(
             0,
             RenderLine::new().span("↑ 更早回合已折叠（PgUp 加载）", SpanStyle::Dim),
         );
+    } else if session.timeline.truncated_before {
+        // T-08：翻到头了，但历史并不止于此——服务端的物化窗口（timeline 从
+        // messages 重建时只物化最近若干轮）覆盖不到开头，且当前**没有**深翻页
+        // 接口能取到更早的回合。如实说明，别让用户以为「就这么多」而反复按 PgUp
+        // 干等一个永远不会来的页。
+        lines.insert(
+            0,
+            RenderLine::new().span(
+                "⚠ 更早的回合未包含在本窗口（仅存于 daemon 归档，当前无法翻到）",
+                SpanStyle::Warn,
+            ),
+        );
     }
     lines
 }

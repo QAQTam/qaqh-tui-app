@@ -309,6 +309,11 @@ pub struct TimelineModel {
     pub turns: Vec<Turn>,
     pub has_more: bool,
     pub total_turns: usize,
+    /// T-08：服务端的物化窗口**未覆盖到历史开头**——更早的回合存在（daemon
+    /// 归档里），但当前没有深翻页接口能取到。与 `has_more` 分工明确：
+    /// `has_more` = 「还能再往前翻一页（且那页非空）」，本字段 = 「翻到底了，
+    /// 但历史并不止于此」。二者可以同时为真（窗口内还能翻，翻到头仍够不到开头）。
+    pub truncated_before: bool,
     pub version: u64,
     /// B1 可观测：事件引用的 block/tool 卡缺失被丢弃的次数（契约异常信号）。
     /// 设计内幂等丢弃不计入：旧 fragment_seq 重放、快照窗口外迟到条目。
@@ -583,6 +588,7 @@ impl TimelineModel {
             .collect();
         self.has_more = page.has_more;
         self.total_turns = page.total_turns;
+        self.truncated_before = page.truncated_before;
         self.bump();
     }
 
@@ -596,6 +602,11 @@ impl TimelineModel {
             .collect();
         if older.is_empty() {
             self.has_more = false;
+            // 空页 = 翻到头那一刻。服务端此时仍会带真实总数与 truncated_before，
+            // 必须一并接收——「历史到底多长」「是否被裁剪」正是在这一刻才确定，
+            // 早先就丢弃会让 UI 永远说不出「还有 N 轮够不到」。
+            self.total_turns = self.total_turns.max(page.total_turns);
+            self.truncated_before = page.truncated_before;
             self.bump();
             return;
         }
@@ -613,6 +624,7 @@ impl TimelineModel {
         self.turns = merged;
         self.has_more = page.has_more;
         self.total_turns = self.total_turns.max(page.total_turns);
+        self.truncated_before = page.truncated_before;
         self.bump();
     }
 
@@ -1137,6 +1149,73 @@ mod tests {
         assert_eq!(m.version, v);
     }
 
+    /// T-08：翻到窗口开头（服务端回空页）且服务端声明「物化窗口覆盖不到历史
+    /// 开头」时，模型必须同时记住两件事——「没有更多可交付」与「历史并不止于此」。
+    /// 只记前者，UI 就既不翻不动也不说明，用户只能反复按 PgUp 干等一个永远不来的页。
+    ///
+    /// 破坏验证：把 `truncated_before` 的赋值去掉 → 本测试红。
+    #[test]
+    fn empty_page_at_the_wall_records_truncation() {
+        let mut m = TimelineModel::default();
+        m.apply(&entry(
+            1,
+            "t1",
+            TimelineEvent::TurnOpened {
+                user_text: "n1".into(),
+            },
+        ));
+        // 200 轮的会话，timeline 重建后只物化到 t1..t40；客户端一路 PgUp 到开头。
+        let wall = TimelinePage {
+            schema: "qaqh.Ringing".into(),
+            version: 1,
+            server_epoch: "ep".into(),
+            seed: "s".into(),
+            has_more: false,
+            total_turns: 200,
+            truncated_before: true,
+            snapshot: qaqh_client::TimelineSnapshot {
+                watermark: 0,
+                turns: vec![],
+            },
+        };
+        m.prepend_older(&wall);
+        assert!(!m.has_more, "空页 ⇒ 没有可再翻的页");
+        assert!(m.truncated_before, "服务端声明被裁剪 ⇒ 模型必须记住");
+        assert_eq!(
+            m.total_turns, 200,
+            "总数是会话真实回合数，不是本窗口大小——否则说不出「还有多少轮够不到」"
+        );
+    }
+
+    /// 反向闸：窗口完整时不得谎报「被裁剪」，否则每个正常会话都会挂一条警告。
+    #[test]
+    fn complete_window_reports_no_truncation() {
+        let mut m = TimelineModel::default();
+        m.apply(&entry(
+            1,
+            "t1",
+            TimelineEvent::TurnOpened {
+                user_text: "n1".into(),
+            },
+        ));
+        let wall = TimelinePage {
+            schema: "qaqh.Ringing".into(),
+            version: 1,
+            server_epoch: "ep".into(),
+            seed: "s".into(),
+            has_more: false,
+            total_turns: 1,
+            truncated_before: false,
+            snapshot: qaqh_client::TimelineSnapshot {
+                watermark: 0,
+                turns: vec![],
+            },
+        };
+        m.prepend_older(&wall);
+        assert!(!m.truncated_before, "窗口完整 ⇒ 不得报警告");
+        assert_eq!(m.total_turns, 1);
+    }
+
     #[test]
     fn prepend_older_merges_boundary() {
         let mut m = TimelineModel::default();
@@ -1157,6 +1236,7 @@ mod tests {
             seed: "s".into(),
             has_more: false,
             total_turns: 4,
+            truncated_before: false,
             snapshot: qaqh_client::TimelineSnapshot {
                 watermark: 3,
                 turns: (1..=3)
@@ -1499,6 +1579,7 @@ mod tests {
             seed: "s".into(),
             has_more: false,
             total_turns: 1,
+            truncated_before: false,
             snapshot: qaqh_client::TimelineSnapshot {
                 watermark: 1,
                 turns: vec![qaqh_client::TimelineTurn {
@@ -1650,6 +1731,7 @@ mod tests {
             seed: "s".into(),
             has_more: false,
             total_turns: 1,
+            truncated_before: false,
             snapshot: qaqh_client::TimelineSnapshot {
                 watermark: 10,
                 turns: vec![qaqh_client::TimelineTurn {
