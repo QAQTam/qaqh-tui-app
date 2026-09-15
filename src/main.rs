@@ -3,10 +3,7 @@
 mod app;
 mod protocol;
 mod runtime;
-mod transport;
 mod ui;
-
-use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
 use futures::StreamExt;
@@ -18,7 +15,6 @@ use tokio::sync::mpsc;
 
 use app::{App, AppMsg};
 use runtime::{Runtime, RuntimeMsg};
-use transport::http::HttpClient;
 
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -70,15 +66,6 @@ async fn run_tui(no_spawn: bool) -> Result<()> {
     let runtime = Runtime::start(rt_tx, !no_spawn)
         .await
         .context("连接 daemon 失败")?;
-
-    // 服务面（阶段 1.5 之前仍是本仓的 HttpClient）与生命周期共用同一份
-    // daemon.json；此时 daemon 必然已就绪（上一步刚协商成功）。
-    let discovery = qaqh_client::read_discovery().context("daemon 发现失败（daemon 未运行？）")?;
-    let http = Arc::new(HttpClient::new(
-        qaqh_client::DiscoveryExt::base_url(&discovery).context("解析 daemon endpoint 失败")?,
-        discovery.token.clone(),
-    ));
-    runtime.attach_service_client(http.clone()).await;
 
     // 终端初始化（ratatui 0.30：init/restore + panic hook）。
     let mut terminal = ratatui::init();
@@ -133,7 +120,7 @@ async fn run_tui(no_spawn: bool) -> Result<()> {
         });
     }
 
-    let mut app = App::new(http, runtime.clone(), app_tx.clone());
+    let mut app = App::new(runtime.clone(), app_tx.clone());
     // 首页：无 tab 时直接展示会话列表，立即拉取一次避免首帧空白
     app.fetch_session_list();
 

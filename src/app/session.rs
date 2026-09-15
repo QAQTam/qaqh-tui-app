@@ -7,7 +7,7 @@ use crate::app::timeline_model::TimelineModel;
 use qaqh_client::ConversationMode;
 // 权威类型与 `qaqh-client` 自身类型重名者带 `Domain` 前缀；在本模块内换回本地惯用名，
 // 这样下文的引用点不必逐个改（映射只此一处）。
-use crate::protocol::methods::SessionMetaView;
+use crate::protocol::session_meta::SessionMetaView;
 use crate::protocol::snapshot::ConversationStateView;
 use qaqh_client::{
     AskMode, ContentRef, DomainActivityState as ActivityState, DomainAskQuestion as AskQuestion,

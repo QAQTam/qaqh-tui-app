@@ -32,10 +32,10 @@ use ratatui::crossterm::event::{KeyEvent, MouseEvent};
 
 use crate::app::slash::SlashCmd;
 use crate::protocol::ConfigDto;
-use crate::protocol::methods::{self, SessionMetaView};
+use crate::protocol::session_meta::SessionMetaView;
 use crate::runtime::{ConnEvent, Runtime, RuntimeMsg};
-use crate::transport::http::HttpClient;
 use qaqh_client::TimelinePage;
+use qaqh_client::{ActionRequest, QueryRequest};
 use qaqh_client::{
     AskResolution, ContentRef, ControlEvent, ConversationEvent,
     DomainActivityState as ActivityState, DomainSessionState as SessionStateEvent, NoticeLevel,
@@ -115,14 +115,11 @@ pub enum AppMsg {
 
 /// 后台任务取用的 API 句柄。
 ///
-/// T-01 阶段一后本仓有**两个**客户端在跑，职责不重叠：
-/// - `client`（`qaqh-client`）：连接生命周期 + 三条频道流 + per-seed timeline
-///   流 + 命令面（`send_command`）；
-/// - `http`（本仓 `HttpClient`）：**仅**服务面 `service()`（阶段 1.5 会把它
-///   也切到 `Client::query`/`action`，届时本字段删除）。
+/// T-01 阶段 1.5 后本仓**不再持有自己的 HTTP 客户端**——连接生命周期、三条
+/// 频道流、per-seed timeline 流、命令面（`send_command`）与服务面
+/// （`query`/`action`）全由 `qaqh-client` 一处承担，凭据热更新因此也只有一份。
 #[derive(Clone)]
 pub struct ApiCtx {
-    pub http: Arc<HttpClient>,
     pub client: Arc<qaqh_client::Client>,
 }
 
@@ -217,7 +214,6 @@ use self::settings::{FieldKind, SettingsState};
 
 pub struct App {
     pub quit: bool,
-    pub client: Arc<HttpClient>,
     pub runtime: Arc<Runtime>,
     pub msg_tx: tokio::sync::mpsc::UnboundedSender<AppMsg>,
 
@@ -270,12 +266,10 @@ pub struct App {
 
 impl App {
     pub fn new(
-        client: Arc<HttpClient>,
         runtime: Arc<Runtime>,
         msg_tx: tokio::sync::mpsc::UnboundedSender<AppMsg>,
     ) -> Self {
         Self::new_with_cwd(
-            client,
             runtime,
             msg_tx,
             std::env::current_dir()
@@ -285,14 +279,12 @@ impl App {
     }
 
     pub fn new_with_cwd(
-        client: Arc<HttpClient>,
         runtime: Arc<Runtime>,
         msg_tx: tokio::sync::mpsc::UnboundedSender<AppMsg>,
         initial_cwd: Option<String>,
     ) -> Self {
         Self {
             quit: false,
-            client,
             runtime,
             msg_tx,
             tabs: Vec::new(),
@@ -1322,7 +1314,6 @@ impl App {
         Fut: std::future::Future<Output = ()> + Send,
     {
         let api = ApiCtx {
-            http: self.client.clone(),
             client: self.runtime.client(),
         };
         let tx = self.msg_tx.clone();

@@ -1,23 +1,24 @@
-//! 协议常量与本仓自有视图（PLAN.md §4 类型镜像纪律）。
+//! 协议视图与本仓自有类型（PLAN.md §4 类型镜像纪律）。
 //!
-//! **阶段二后本模块已基本不含镜像**：wire 类型一律 `use qaqh_client::*`
-//! （ringing v1 的权威实现），配置类型重导出 `qaqh_config_api`。此处只剩两类
-//! 东西——上游没有对应 Rust 产物的**协议字符串词表**，和 TUI 自己的解析视图：
+//! **阶段一 + 阶段二 + 阶段 1.5 之后，本模块已不含任何 wire 镜像**：协议类型
+//! 一律 `use qaqh_client::*`（ringing v1 权威实现），配置类型重导出
+//! `qaqh_config_api`，服务方法名归 `QueryRequest`/`ActionRequest` 的枚举持有。
+//! 此处只剩 TUI 自己的解析视图：
 //!
-//! - [`methods`] — 服务方法名字表。上游 `service_methods.rs` 是 `match`
-//!   字符串、无 `pub const` 表，`qaqh-client` 亦未导出名字映射，故无从导入
-//!   （待 T-01 阶段 1.5 服务面迁到 `Client::query/action`）。守卫 =
-//!   `methods::tests::method_table_matches_backend_shape`。
-//! - [`snapshot`] — 频道快照的宽松解析视图（wire 类型本身来自 `qaqh_client`）。
-//! - [`WireError`] — daemon 错误体，本仓服务面自用。
+//! - [`session_meta`] — 会话列表条目的宽松解析视图。
+//! - [`snapshot`] — 频道快照的宽松解析视图。
 //!
 //! 禁止在本仓散落协议字面量，全部 import 自本模块或上述权威 crate。
 //!
 //! 历史：2026-09-15 前这里是对 `qaqh-ringing`/`qaqh-domain`/`qaqh-config-api`
-//! 的手工镜像（9 文件 2481 行），已漂移出 T-09～T-12 四项缺陷；阶段二逐刀
-//! 删除，仅余上述非镜像内容。
+//! 的手工镜像（9 文件 2481 行），已漂移出 T-09～T-12 四项缺陷；此后逐刀删除
+//! （config 367 行、死镜像三处、方法表 38 常量），只余上述非镜像内容。
+//!
+//! 删除纪律（T-13）：**别指望 `dead_code` 指出残留**——私有模块里的 `pub` 项
+//! 和 `#![allow(dead_code)]` 都能让死镜像零警告地活着，自带测试还会反过来把
+//! 它钉成「活的」。逐项 grep 真实调用点才算数。
 
-pub mod methods;
+pub mod session_meta;
 pub mod snapshot;
 
 /// 配置契约：**直接用权威 crate**，本仓不再手工镜像。
@@ -29,15 +30,6 @@ pub mod snapshot;
 pub use qaqh_config_api::{
     ConfigDto, ConfigPatch, ProviderDto, SubagentDto, SubagentPatch,
 };
-
-use serde::{Deserialize, Serialize};
-
-/// daemon 统一 JSON 错误体（HTTP 4xx/5xx 的 body）。
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct WireError {
-    pub code: String,
-    pub message: String,
-}
 
 #[cfg(test)]
 mod tests {

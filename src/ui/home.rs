@@ -131,7 +131,7 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) {
     );
 
     // ── 会话列表（复用 session_list 渲染，但更紧凑好看）
-    let mut items: Vec<&crate::protocol::methods::SessionMetaView> = app
+    let mut items: Vec<&crate::protocol::session_meta::SessionMetaView> = app
         .session_list_cache
         .iter()
         .filter(|m| app.home_show_archived || !m.archived)

@@ -6,8 +6,8 @@ impl App {
     pub fn fetch_config(&mut self) {
         self.spawn_api(move |api, tx| async move {
             let result = api
-                .http
-                .service(methods::CONFIG_LOAD, &serde_json::json!({}))
+                .client
+                .query(QueryRequest::ConfigLoad)
                 .await
                 .map_err(|e| e.to_string());
             let _ = tx.send(AppMsg::Action(ActionResult::ConfigLoaded(result)));
@@ -31,8 +31,8 @@ impl App {
         let payload = serde_json::to_value(&st.draft).unwrap_or(serde_json::Value::Null);
         self.spawn_api(move |api, tx| async move {
             let result = api
-                .http
-                .service(methods::CONFIG_SAVE, &payload)
+                .client
+                .action(ActionRequest::ConfigSave { fields: payload })
                 .await
                 .map_err(|e| e.to_string());
             let _ = tx.send(AppMsg::Action(ActionResult::ConfigWrite {
@@ -86,8 +86,8 @@ impl App {
     pub fn apply_profile(&mut self, name: String) {
         self.spawn_api(move |api, tx| async move {
             let result = api
-                .http
-                .service(methods::PROFILE_APPLY, &serde_json::json!({ "name": name }))
+                .client
+                .action(ActionRequest::ProfileApply { name })
                 .await
                 .map_err(|e| e.to_string());
             let _ = tx.send(AppMsg::Action(ActionResult::ConfigWrite {
@@ -100,11 +100,10 @@ impl App {
     pub fn set_permission_level(&mut self, level: u8) {
         self.spawn_api(move |api, tx| async move {
             let result = api
-                .http
-                .service(
-                    methods::CONFIG_SET_PERMISSION_LEVEL,
-                    &serde_json::json!({ "level": level }),
-                )
+                .client
+                .action(ActionRequest::ConfigSetPermissionLevel {
+                    level: level.into(),
+                })
                 .await
                 .map_err(|e| e.to_string());
             let _ = tx.send(AppMsg::Action(ActionResult::ConfigWrite {

@@ -8,8 +8,12 @@
 //!    不用改）；
 //! 2. 把 app 维护的 seed 集合 diff 成 `activate_timeline` / `deactivate_timeline`
 //!    调用；
-//! 3. 订阅 `session_ctx`（epoch/client_session_id）向 app 报告连接相位，并在
-//!    epoch 变化时同步服务面（`HttpClient`）的凭据。
+//! 3. 订阅 `session_ctx`（epoch/client_session_id）向 app 报告连接相位。
+//!
+//! 不复刻凭据同步：服务面（`Client::query`/`action`）与连接生命周期现在同属
+//! 一个 `Client`，endpoint/token/session-id 只有一份，由 `qaqh-client` 自己在
+//! 续租失败时重读 `daemon.json`。阶段 1.5 之前这里还额外喂着一个本仓的
+//! `HttpClient`，那是双份凭据的唯一理由，已随该客户端一起删除。
 //!
 //! 行为契约由 `qaqh-client` 自己的测试锁定；本文件不再重复实现它们。
 
@@ -24,7 +28,6 @@ use qaqh_client::{
 };
 use tokio::sync::mpsc;
 
-use crate::transport::http::HttpClient;
 use qaqh_client::RingingEventEnvelope;
 use qaqh_client::{TimelineEntry, TimelinePage};
 
@@ -93,11 +96,6 @@ pub struct Runtime {
     /// 每次重建递增；旧订阅者据此退出（防止旧 session 的回调继续投递）。
     generation: AtomicU64,
     launch_daemon_if_missing: bool,
-    /// 服务面客户端：epoch 变化时同步它的端点/token/session-id。
-    ///
-    /// 晚期绑定：协商成功前 daemon 的端口/token 还不知道（甚至 daemon 都还没
-    /// 被拉起），所以由调用方在连接后经 [`Self::attach_service_client`] 注入。
-    http: RwLock<Option<Arc<HttpClient>>>,
     /// 最近一次「有频道连上」的时刻（stall 判据）。
     last_open: Arc<std::sync::Mutex<Instant>>,
     stalled: Arc<AtomicBool>,
@@ -122,7 +120,6 @@ impl Runtime {
             rebuilding: AtomicBool::new(false),
             generation: AtomicU64::new(0),
             launch_daemon_if_missing,
-            http: RwLock::new(None),
             last_open: last_open.clone(),
             stalled: Arc::new(AtomicBool::new(false)),
             self_arc: weak.clone(),
@@ -140,20 +137,6 @@ impl Runtime {
             runtime.stalled.clone(),
         ));
         Ok(runtime)
-    }
-
-    /// 注入服务面客户端（阶段 1.5 之前它仍由本仓承担）。注入即刻对齐一次凭据。
-    pub async fn attach_service_client(&self, http: Arc<HttpClient>) {
-        // 先取出 Client 的 owned 快照再 await：避免把 `&self` 带进 future。
-        let session_id = self
-            .client()
-            .session_state()
-            .await
-            .map(|s| s.client_session_id);
-        if let Some(session_id) = session_id {
-            sync_service_credentials(&http, &session_id);
-        }
-        *self.http.write().expect("http lock") = Some(http);
     }
 
     async fn connect(
@@ -309,16 +292,9 @@ async fn watch_session(runtime: Arc<Runtime>, client: Arc<Client>, generation: u
         }
         let current = rx.borrow_and_update().clone();
         match current {
-            Some((epoch, client_session_id)) => {
+            Some((epoch, _)) => {
                 let epoch_changed = known_epoch.as_deref().is_some_and(|e| e != epoch);
                 known_epoch = Some(epoch.clone());
-
-                // 服务面的双头之一是本 session id：重新协商/重建后必须跟上，
-                // 否则 service() 会拿着旧 cs 一直 401。端点与 token 同理
-                // （daemon 重启会换掉两者）。
-                if let Some(http) = runtime.http.read().expect("http lock").clone() {
-                    sync_service_credentials(&http, &client_session_id);
-                }
 
                 let _ = runtime.msg_tx.send(RuntimeMsg::Conn(ConnEvent::Ready {
                     epoch,
@@ -333,20 +309,6 @@ async fn watch_session(runtime: Arc<Runtime>, client: Arc<Client>, generation: u
             return; // session 已 drop（旧 Client 被替换）：订阅者退出
         }
     }
-}
-
-/// 把 daemon 的当前凭据同步给服务面客户端（`HttpClient`）。
-///
-/// `Client` 自己会在续租失败时重读 `daemon.json`；服务面是另一条独立路径
-/// （阶段 1.5 之前它仍由本仓的 `HttpClient` 承担），必须显式跟着换。
-fn sync_service_credentials(http: &HttpClient, client_session_id: &str) {
-    if let Ok(discovery) = qaqh_client::read_discovery()
-        && let Ok(base_url) = qaqh_client::DiscoveryExt::base_url(&discovery)
-        && base_url != http.base_url()
-    {
-        http.apply_discovery(&base_url, &discovery.token);
-    }
-    http.set_session_id(client_session_id.to_string());
 }
 
 /// 失联检测（T-03 的触发判据）。

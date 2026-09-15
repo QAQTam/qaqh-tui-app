@@ -48,7 +48,7 @@ fn draw_session_list(f: &mut Frame, app: &App, area: Rect, selected: usize, show
     let mut lines: Vec<Line> = Vec::new();
 
     // 过滤 + 行构造（与 app 的选中逻辑共享同一过滤谓词）。
-    let items: Vec<&crate::protocol::methods::SessionMetaView> = app
+    let items: Vec<&crate::protocol::session_meta::SessionMetaView> = app
         .session_list_cache
         .iter()
         .filter(|m| show_archived || !m.archived)

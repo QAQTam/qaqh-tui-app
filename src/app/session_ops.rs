@@ -145,11 +145,21 @@ impl App {
 
     pub fn fetch_session_list(&mut self) {
         self.spawn_api(move |api, tx| async move {
-            let list = api.http.session_list().await.map_err(|e| e.to_string());
+            // session.list 回数组，逐项宽松解析为 UI 视图（形状不符的条目跳过）。
+            let list = api
+                .client
+                .query(QueryRequest::SessionList)
+                .await
+                .map_err(|e| e.to_string())
+                .and_then(|v| {
+                    v.as_array()
+                        .map(|arr| arr.iter().filter_map(SessionMetaView::parse).collect())
+                        .ok_or_else(|| "session.list 应返回数组".to_string())
+                });
             let _ = tx.send(AppMsg::Action(ActionResult::SessionList(list)));
             let activity = api
-                .http
-                .service(methods::SESSION_ACTIVITY, &serde_json::json!({}))
+                .client
+                .query(QueryRequest::SessionActivity)
                 .await
                 .map_err(|e| e.to_string());
             let _ = tx.send(AppMsg::Action(ActionResult::SessionActivity(activity)));
@@ -183,11 +193,8 @@ impl App {
         self.dashboard_fetching.insert(seed.clone());
         self.spawn_api(move |api, tx| async move {
             let value = api
-                .http
-                .service(
-                    methods::SESSION_DASHBOARD,
-                    &serde_json::json!({ "seed": seed.clone() }),
-                )
+                .client
+                .query(QueryRequest::SessionDashboard { seed: seed.clone() })
                 .await;
             let parsed: Result<qaqh_client::DomainDashboardSnapshot, String> = match value {
                 Ok(v) => {
@@ -248,11 +255,8 @@ impl App {
                     let msg = e.to_string();
                     // fallback: todo.status 是同一数据源的另一视图
                     let v2 = api
-                        .http
-                        .service(
-                            methods::TODO_STATUS,
-                            &serde_json::json!({ "seed": seed.clone() }),
-                        )
+                        .client
+                        .query(QueryRequest::TodoStatus { seed: seed.clone() })
                         .await;
                     match v2 {
                         Ok(v) => {
