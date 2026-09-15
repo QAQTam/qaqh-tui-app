@@ -14,7 +14,7 @@ use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use super::*;
 use crate::app::timeline_model::Turn;
-use crate::protocol::timeline::{TimelineTool, TimelineTurnState};
+use qaqh_client::{TimelineTool, TimelineTurnState};
 
 /// spawn_subagent 工具名（与后端 `qaqh-subagent` 注册的 key 一致）。
 pub const SPAWN_TOOL: &str = "spawn_subagent";
@@ -165,7 +165,7 @@ pub fn rescan(sess: &mut SessionState) -> Vec<String> {
         let card = TimelineTool {
             tool_call_id,
             name: SPAWN_TOOL.to_string(),
-            state: crate::protocol::timeline::TimelineToolState::Succeeded,
+            state: qaqh_client::TimelineToolState::Succeeded,
             summary: None,
             args_json,
             output,
@@ -508,7 +508,7 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::timeline::TimelineToolState;
+    use qaqh_client::TimelineToolState;
 
     fn tool(
         name: &str,

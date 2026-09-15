@@ -2,7 +2,7 @@
 
 use crate::app::render_line::{RenderLine, SpanStyle, wrap_text};
 use crate::app::session::SessionState;
-use crate::protocol::timeline::{TimelineBlockKind, TimelineToolState, TimelineTurnState};
+use qaqh_client::{TimelineBlockKind, TimelineToolState, TimelineTurnState};
 
 /// 推理块折叠时保留的尾部行数（历史常量，当前默认展开路径不再截尾，保留供 hide 回退）。
 #[allow(dead_code)]
@@ -798,6 +798,11 @@ fn push_tool_card(
         ),
         TimelineToolState::Succeeded => ("●", SpanStyle::ToolOk, false),
         TimelineToolState::Failed => ("✗", SpanStyle::ToolFail, false),
+        // 后端把这两个列为**终态但非失败**：取消是「无输出或被中断」，后台化是
+        // 「调用已返回、任务仍在跑」。共用警告色而非失败色——把它们画成失败会
+        // 谎报工具出错（这正是后端单独分出这两个变体的原因）。
+        TimelineToolState::Cancelled => ("⊘", SpanStyle::Warn, false),
+        TimelineToolState::Backgrounded => ("◐", SpanStyle::Warn, false),
     };
     // 权限覆盖色（对齐 opencode InlineTool fg: warning）
     let (icon, style) = if tool.permission.is_some() {
@@ -869,6 +874,10 @@ fn push_tool_card(
             TimelineToolState::Succeeded => " completed",
             TimelineToolState::Failed => " failed",
             TimelineToolState::Prepared => " prepared",
+            // 见上方图标处：终态但非失败，标签也必须分开，否则用户看到的
+            // 是一次并不存在的工具错误。
+            TimelineToolState::Cancelled => " cancelled",
+            TimelineToolState::Backgrounded => " backgrounded",
         };
         lines.push(
             RenderLine::new()
@@ -1615,7 +1624,7 @@ pub fn render_session_info(session: &SessionState, width: u16) -> Vec<RenderLine
 mod tests {
     use super::*;
     use crate::app::timeline_model::{Block, Round, ToolCard, Turn};
-    use crate::protocol::timeline::{
+    use qaqh_client::{
         TimelineBlockKind, TimelineBlockState, TimelineToolState, TimelineTurnState,
     };
 
@@ -1769,7 +1778,7 @@ mod tests {
             diff: None,
             progress: String::new(),
             progress_truncated: false,
-            failure: Some(crate::protocol::timeline::TimelineFailure {
+            failure: Some(qaqh_client::TimelineFailure {
                 code: "invalid_input".into(),
                 message: "items 为空".into(),
             }),

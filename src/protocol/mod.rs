@@ -9,7 +9,6 @@
 //! - `qaqh-ringing/src/envelope.rs` → [`envelope`]
 //! - `qaqh-domain/src/command.rs` → [`command`]
 //! - `qaqh-domain/src/event.rs` → [`event`]
-//! - `qaqh-domain/src/timeline.rs` → [`timeline`]
 //! - `qaqh-ringing/src/{snapshot,reset}.rs` → [`snapshot`]
 //! - `qaqh-runtime/src/ringing/service_methods.rs` → [`methods`]
 
@@ -20,7 +19,6 @@ pub mod envelope;
 pub mod event;
 pub mod methods;
 pub mod snapshot;
-pub mod timeline;
 
 use serde::{Deserialize, Serialize};
 

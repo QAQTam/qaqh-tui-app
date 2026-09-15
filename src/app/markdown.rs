@@ -1095,7 +1095,7 @@ mod tests {
         use crate::app::render_transcript::render_transcript;
         use crate::app::session::SessionState;
         use crate::app::timeline_model::{Block, Round, TimelineModel, Turn};
-        use crate::protocol::timeline::{TimelineBlockKind, TimelineBlockState, TimelineTurnState};
+        use qaqh_client::{TimelineBlockKind, TimelineBlockState, TimelineTurnState};
         use std::time::Instant;
         let mut model = TimelineModel::default();
         let chunk = "# H1\n\nBold **text** `code`  ".repeat(10); // ~200 chars per turn

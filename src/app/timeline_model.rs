@@ -5,7 +5,7 @@
 //! 层保证），但 reducer 本身必须对重复应用幂等——undo 后的重取、断点续传的
 //! 回放都可能造成重复条目。
 
-use crate::protocol::timeline::{
+use qaqh_client::{
     TimelineBlock, TimelineBlockKind, TimelineBlockState, TimelineEntry, TimelineFailure,
     TimelinePage, TimelineTool, TimelineToolState, TimelineTurn, TimelineTurnState,
 };
@@ -176,7 +176,7 @@ pub struct ToolCard {
     pub progress: String,
     pub progress_truncated: bool,
     pub failure: Option<TimelineFailure>,
-    pub permission: Option<crate::protocol::timeline::TimelineToolPermission>,
+    pub permission: Option<qaqh_client::TimelineToolPermission>,
 }
 
 impl From<TimelineTool> for ToolCard {
@@ -361,7 +361,7 @@ impl TimelineModel {
 
     /// 应用一条 timeline 条目（幂等）；返回该条目携带的 turn 终态（若有）。
     pub fn apply(&mut self, entry: &TimelineEntry) -> Option<TurnTerminal> {
-        use crate::protocol::timeline::TimelineEvent as E;
+        use qaqh_client::TimelineEvent as E;
         let turn_id = entry.turn_id.as_str();
 
         if let E::TurnOpened { user_text } = &entry.event {
@@ -470,12 +470,28 @@ impl TimelineModel {
                     changed = false;
                 }
             }
-            E::BlockCheckpoint { block_id, text } => {
+            E::BlockCheckpoint {
+                block_id,
+                arg,
+                text,
+            } => {
                 let round_num = entry.round_num.unwrap_or(0);
                 let round = Self::find_round_mut(turn, round_num);
                 if let Some(block) = Self::find_block_mut(round, block_id) {
-                    // 覆盖语义：自愈丢失/乱序的增量。
-                    block.text = text.clone();
+                    // 权威语义（`qaqh-runtime` `checkpoint_block`）：`arg` 是服务端按
+                    // **已交付事件**算出的差值——即客户端此刻还缺的余量，所以追加不会
+                    // 与已应用的 `TextDelta` 重复；`text` 非空则是整流全量覆盖（丢/乱序
+                    // delta 后、或非追加改写时才会出现）。
+                    //
+                    // 注意：**不能**写成 `block.text = text.clone()`。`text` 在正常增量
+                    // 路径下是空串（`skip_serializing_if` 会让它直接缺席），那样写会在
+                    // 每个检查点把已流出的正文清空。
+                    if let Some(arg) = arg {
+                        block.text.push_str(arg);
+                    }
+                    if !text.is_empty() {
+                        block.text = text.clone();
+                    }
                 } else {
                     missing_block_drops += 1;
                     changed = false;
@@ -643,7 +659,7 @@ impl TimelineModel {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::timeline::{TimelineEvent, TimelineToolState, TimelineTurnState};
+    use qaqh_client::{TimelineEvent, TimelineToolState, TimelineTurnState};
 
     fn entry(seq: u64, turn: &str, event: TimelineEvent) -> TimelineEntry {
         TimelineEntry {
@@ -652,6 +668,88 @@ mod tests {
             round_num: Some(0),
             event,
         }
+    }
+
+    /// 权威语义：`BlockCheckpoint.arg` 是**增量**，必须**追加**而不是覆盖。
+    ///
+    /// 这是后端正常路径下发的形态：`arg` 携带「按已交付事件算出的余量」，
+    /// `text` 为空并因 `skip_serializing_if` 直接缺席。
+    ///
+    /// 锁的是一个**差点写错**的地方：旧代码无条件 `block.text = text.clone()`。
+    /// 若只把镜像的 `text` 放宽为可缺省（而不改语义），每个检查点都会把已流出
+    /// 的正文清空——本仓历史上最忌讳的「真吞字」。
+    #[test]
+    fn incremental_checkpoint_appends_and_never_wipes() {
+        use qaqh_client::TimelineEvent as E;
+        let mut m = TimelineModel::default();
+        m.apply(&entry(
+            1,
+            "t1",
+            E::TurnOpened {
+                user_text: "问".into(),
+            },
+        ));
+        m.apply(&entry(
+            2,
+            "t1",
+            E::BlockOpened {
+                block: TimelineBlock {
+                    block_id: "b1".into(),
+                    block_order: 0,
+                    kind: TimelineBlockKind::Text,
+                    state: TimelineBlockState::Open,
+                    text: String::new(),
+                    tool: None,
+                },
+            },
+        ));
+        m.apply(&entry(
+            3,
+            "t1",
+            E::TextDelta {
+                block_id: "b1".into(),
+                fragment_seq: 1,
+                delta: "回答".into(),
+            },
+        ));
+        // 增量检查点：arg = 已交付事件之后仍缺的余量，text 缺席。
+        m.apply(&entry(
+            4,
+            "t1",
+            E::BlockCheckpoint {
+                block_id: "b1".into(),
+                arg: Some("开始了".into()),
+                text: String::new(),
+            },
+        ));
+
+        let text = m.turns[0].rounds[0].blocks[0].text.clone();
+        assert_eq!(
+            text, "回答开始了",
+            "增量检查点必须**追加**：既不能丢掉 arg（少文本），也不能用空的 text 覆盖（吞文本）"
+        );
+
+        // 后半段：整流形态（text 非空）仍然覆盖，且随后的增量继续追加。
+        m.apply(&entry(
+            5,
+            "t1",
+            E::BlockCheckpoint {
+                block_id: "b1".into(),
+                arg: None,
+                text: "重建后的全文".into(),
+            },
+        ));
+        assert_eq!(m.turns[0].rounds[0].blocks[0].text, "重建后的全文");
+        m.apply(&entry(
+            6,
+            "t1",
+            E::BlockCheckpoint {
+                block_id: "b1".into(),
+                arg: Some("！".into()),
+                text: String::new(),
+            },
+        ));
+        assert_eq!(m.turns[0].rounds[0].blocks[0].text, "重建后的全文！");
     }
 
     #[test]
@@ -701,6 +799,8 @@ mod tests {
             "t1",
             TimelineEvent::BlockCheckpoint {
                 block_id: "b1".into(),
+                // 全量覆盖形态（`arg` 缺席）——正是这段文本触发整流的情形。
+                arg: None,
                 text: "回答开始了".into(),
             },
         ));
@@ -1057,10 +1157,10 @@ mod tests {
             seed: "s".into(),
             has_more: false,
             total_turns: 4,
-            snapshot: crate::protocol::timeline::TimelineSnapshot {
+            snapshot: qaqh_client::TimelineSnapshot {
                 watermark: 3,
                 turns: (1..=3)
-                    .map(|i| crate::protocol::timeline::TimelineTurn {
+                    .map(|i| qaqh_client::TimelineTurn {
                         turn_id: format!("t{i}"),
                         created_seq: i as u64,
                         user_text: format!("n{i}"),
@@ -1399,9 +1499,9 @@ mod tests {
             seed: "s".into(),
             has_more: false,
             total_turns: 1,
-            snapshot: crate::protocol::timeline::TimelineSnapshot {
+            snapshot: qaqh_client::TimelineSnapshot {
                 watermark: 1,
-                turns: vec![crate::protocol::timeline::TimelineTurn {
+                turns: vec![qaqh_client::TimelineTurn {
                     turn_id: "t1".into(),
                     created_seq: 1,
                     user_text: "hi".into(),
@@ -1409,7 +1509,7 @@ mod tests {
                     offloaded: false,
                     state: TimelineTurnState::Completed,
                     failure: None,
-                    rounds: vec![crate::protocol::timeline::TimelineRound {
+                    rounds: vec![qaqh_client::TimelineRound {
                         round_num: 0,
                         sealed: true,
                         is_final: true,
@@ -1550,9 +1650,9 @@ mod tests {
             seed: "s".into(),
             has_more: false,
             total_turns: 1,
-            snapshot: crate::protocol::timeline::TimelineSnapshot {
+            snapshot: qaqh_client::TimelineSnapshot {
                 watermark: 10,
-                turns: vec![crate::protocol::timeline::TimelineTurn {
+                turns: vec![qaqh_client::TimelineTurn {
                     turn_id: "t1".into(),
                     created_seq: 1,
                     user_text: "hi".into(),
@@ -1560,7 +1660,7 @@ mod tests {
                     offloaded: false,
                     state: TimelineTurnState::Running,
                     failure: None,
-                    rounds: vec![crate::protocol::timeline::TimelineRound {
+                    rounds: vec![qaqh_client::TimelineRound {
                         round_num: 0,
                         sealed: false,
                         is_final: false,

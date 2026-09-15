@@ -51,18 +51,6 @@ pub fn command_status_from_wire(
     to_mirror(wire)
 }
 
-pub fn timeline_page_from_wire(
-    wire: &qaqh_client::TimelinePage,
-) -> Result<crate::protocol::timeline::TimelinePage, serde_json::Error> {
-    to_mirror(wire)
-}
-
-pub fn timeline_entry_from_wire(
-    wire: &qaqh_client::TimelineEntry,
-) -> Result<crate::protocol::timeline::TimelineEntry, serde_json::Error> {
-    to_mirror(wire)
-}
-
 pub fn content_ref_from_wire(
     wire: &qaqh_client::ContentRef,
 ) -> Result<crate::protocol::event::ContentRef, serde_json::Error> {

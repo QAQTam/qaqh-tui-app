@@ -26,8 +26,8 @@ use tokio::sync::mpsc;
 
 use crate::protocol::bridge;
 use crate::protocol::envelope::RingingEventEnvelope;
-use crate::protocol::timeline::{TimelineEntry, TimelinePage};
 use crate::transport::http::HttpClient;
+use qaqh_client::{TimelineEntry, TimelinePage};
 
 /// timeline 翻页窗口（`request_rebaseline` / `load_older` 使用）。
 pub const TIMELINE_PAGE_LIMIT: u32 = 60;
@@ -446,20 +446,12 @@ fn build_handlers(
         },
         on_timeline_entry: {
             let msg_tx = msg_tx.clone();
+            // 类型已权威化：不再过桥，回调给的就是 `qaqh_client` 的类型。
             Arc::new(move |seed: String, entry: qaqh_client::TimelineEntry| {
-                match bridge::timeline_entry_from_wire(&entry) {
-                    Ok(entry) => {
-                        let _ = msg_tx.send(RuntimeMsg::Timeline {
-                            seed,
-                            entry: Box::new(entry),
-                        });
-                    }
-                    Err(e) => {
-                        let _ = msg_tx.send(RuntimeMsg::Conn(ConnEvent::StreamIssue {
-                            error: format!("timeline[{seed}] 条目过桥失败：{e}"),
-                        }));
-                    }
-                }
+                let _ = msg_tx.send(RuntimeMsg::Timeline {
+                    seed,
+                    entry: Box::new(entry),
+                });
             })
         },
         on_timeline_status: {
@@ -484,20 +476,11 @@ fn build_handlers(
         on_timeline_snapshot: {
             let msg_tx = msg_tx.clone();
             Arc::new(move |page: qaqh_client::TimelinePage| {
-                match bridge::timeline_page_from_wire(&page) {
-                    Ok(page) => {
-                        let seed = page.seed.clone();
-                        let _ = msg_tx.send(RuntimeMsg::TimelineRebaseline {
-                            seed,
-                            page: Box::new(page),
-                        });
-                    }
-                    Err(e) => {
-                        let _ = msg_tx.send(RuntimeMsg::Conn(ConnEvent::StreamIssue {
-                            error: format!("timeline 快照过桥失败（协议镜像漂移？）：{e}"),
-                        }));
-                    }
-                }
+                let seed = page.seed.clone();
+                let _ = msg_tx.send(RuntimeMsg::TimelineRebaseline {
+                    seed,
+                    page: Box::new(page),
+                });
             })
         },
     }

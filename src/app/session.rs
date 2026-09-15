@@ -548,7 +548,10 @@ pub fn sync_streaming_from_timeline_at(session: &mut SessionState, now: Instant)
         .timeline
         .running_turn_id()
         .map(|turn_id| turn_id.to_owned());
-    match (session.streaming.as_ref().map(|s| s.turn_id.clone()), running) {
+    match (
+        session.streaming.as_ref().map(|s| s.turn_id.clone()),
+        running,
+    ) {
         (None, Some(turn_id)) => {
             session.streaming = Some(StreamingState {
                 turn_id,
@@ -653,7 +656,7 @@ mod tests {
     // ───────────── streaming ↔ timeline 收敛（"working 卡死"回归） ─────────────
 
     use crate::app::timeline_model::Turn;
-    use crate::protocol::timeline::TimelineTurnState;
+    use qaqh_client::TimelineTurnState;
 
     fn turn(id: &str, state: TimelineTurnState) -> Turn {
         Turn {
@@ -712,7 +715,10 @@ mod tests {
         // TurnSealed 到达：权威终态必须把 UI 收敛回 idle。
         s.timeline.turns = vec![turn("t1", TimelineTurnState::Completed)];
         sync_streaming_from_timeline_at(&mut s, now);
-        assert!(s.streaming.is_none(), "sealed turn must converge back to idle");
+        assert!(
+            s.streaming.is_none(),
+            "sealed turn must converge back to idle"
+        );
         assert_eq!(s.activity, Some(ActivityState::Idle));
     }
 

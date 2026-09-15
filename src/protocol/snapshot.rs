@@ -8,7 +8,7 @@ use serde_json::Value;
 
 use super::Channel;
 use super::event::{ActivityState, SkillsStatus, UsageInfo};
-use super::timeline::TimelineTurn;
+use qaqh_client::TimelineTurn;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RingingChannelSnapshot {

@@ -39,9 +39,9 @@ use crate::protocol::event::{
     PermissionCategory, PermissionRisk, SessionState as SessionStateEvent, ToolEvent,
 };
 use crate::protocol::methods::{self, SessionMetaView};
-use crate::protocol::timeline::TimelinePage;
 use crate::runtime::{ConnEvent, Runtime, RuntimeMsg};
 use crate::transport::http::HttpClient;
+use qaqh_client::TimelinePage;
 use session::{
     AskPanel, PermissionPanel, PlanPanel, SessionState, StreamPhase, streaming_done,
     sync_streaming_from_timeline,
@@ -153,14 +153,12 @@ impl ApiCtx {
         seed: &str,
         before_turn: Option<&str>,
         limit: u32,
-    ) -> Result<crate::protocol::timeline::TimelinePage, String> {
-        let page = self
-            .client
+    ) -> Result<qaqh_client::TimelinePage, String> {
+        // 类型已权威化：不再有过桥这一步，返回的就是 `qaqh_client` 的类型。
+        self.client
             .fetch_timeline_page(seed, before_turn, Some(limit))
             .await
-            .map_err(|e| e.to_string())?;
-        crate::protocol::bridge::timeline_page_from_wire(&page)
-            .map_err(|e| format!("timeline 快照过桥失败（协议镜像漂移？）：{e}"))
+            .map_err(|e| e.to_string())
     }
 
     /// 会话 bootstrap（三频道快照原子恢复）。
@@ -467,9 +465,7 @@ impl App {
             }
             RuntimeMsg::Timeline { seed, entry } => {
                 // 子代理发现：spawn_subagent 工具卡（增量，先于 apply 检查）。
-                if let crate::protocol::timeline::TimelineEvent::ToolUpdated { tool, .. } =
-                    &entry.event
-                {
+                if let qaqh_client::TimelineEvent::ToolUpdated { tool, .. } = &entry.event {
                     self.discover_spawn_tool(&seed, tool);
                 }
                 let Some(sess) = self.sessions.get_mut(&seed) else {
@@ -1489,9 +1485,9 @@ impl App {
             || sess.timeline.turns.iter().any(|t| {
                 t.rounds.iter().any(|r| {
                     r.blocks.iter().any(|b| {
-                        b.tool.as_ref().is_some_and(|tl| {
-                            tl.state == crate::protocol::timeline::TimelineToolState::Running
-                        })
+                        b.tool
+                            .as_ref()
+                            .is_some_and(|tl| tl.state == qaqh_client::TimelineToolState::Running)
                     })
                 })
             });
