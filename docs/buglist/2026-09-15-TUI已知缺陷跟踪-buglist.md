@@ -7,7 +7,7 @@
 | 清单日期 | 2026-09-15 |
 | 基准代码 | TUI：`main` @ `56c31e7`（T-01 阶段一迁移已提交）。后端：`qaqh-backend` @ `a72ce0c`（阶段一所需能力已提交；工作树另有**他人** workspace/工具侧重构 WIP，未提交，本清单不涉）。首版核定时为 TUI `59541dd` / 后端 `1c92413` |
 | 判定原则 | **以工作树真实代码为准**。每条状态由 `file:line` + 可复现命令核定；历史文档（report / handoff / 已删除的 `streaming-edge-audit.md`）的自述状态仅作线索，不作依据 |
-| 核定环境 | Arch Linux 7.2.4 / rustc 1.98.1。**首版**：`cargo test` 166 passed / 0 failed；`cargo clippy --all-targets` 零 warning。**本轮（阶段一 + 阶段二前两刀后）**：`cargo test` = **135 passed / 0 failed**（条数下降见 §5b 对账，非静默减少）；`cargo clippy --all-targets` 零 warning；后端 `cargo test -p qaqh-client` = **43 lib + 2 集成 passed / 0 failed** |
+| 核定环境 | Arch Linux 7.2.4 / rustc 1.98.1。**首版**：`cargo test` 166 passed / 0 failed；`cargo clippy --all-targets` 零 warning。**本轮（阶段一 + 阶段二前两刀后）**：`cargo test` = **123 passed / 0 failed**（条数下降见 §5b 对账，非静默减少）；`cargo clippy --all-targets` 零 warning；后端 `cargo test -p qaqh-client` = **43 lib + 2 集成 passed / 0 failed** |
 | 命名约定 | `docs/buglist/以yyyy-mm-dd-标题-buglist.md作为命名` |
 | 状态图例 | `OPEN` 待修 ｜ `FIXED` 已核实修复（附回归锁）｜ `ACCEPTED` 知情接受 ｜ `EXTERNAL` 他仓/环境，本仓不可核实 |
 
@@ -15,7 +15,7 @@
 
 | ID | 级别 | 项 | 代码事实（核定证据） | 影响 | 建议动作 |
 |---|---|---|---|---|---|
-| T-01 | P1 | 传输层未迁移 `qaqh-client` | ~~依赖表零 `qaqh-*`~~ → **阶段一已迁移**：`Cargo.toml:19` 已有 path 依赖，`grep -c qaqh Cargo.lock` = **11**；自建轮子符号（`SseDecoder`/`supervisor_action`/`stream_rebuild`/`timeline_manager`/`refresh_credentials`/`build_envelope`）**零命中**；`transport/` + `runtime.rs` 由 **2127 → 832 行** | — | **阶段一闭环**（见 §2）。**阶段 1.5 阻塞已解除**：后端 `QueryRequest` 已补 `SessionDashboard`/`TodoStatus`（后端 @`a72ce0c`），可开工。**阶段二**（删 `protocol/` 2419 行）前置亦已就绪 |
+| ~~T-01~~ | ~~P1~~ | ~~传输层未迁移 `qaqh-client`~~ | ~~依赖表零 `qaqh-*`~~ → **阶段一已迁移**：`Cargo.toml:19` 已有 path 依赖，`grep -c qaqh Cargo.lock` = **11**；自建轮子符号（`SseDecoder`/`supervisor_action`/`stream_rebuild`/`timeline_manager`/`refresh_credentials`/`build_envelope`）**零命中**；`transport/` + `runtime.rs` 由 **2127 → 832 行** | — | **全阶段闭环**：阶段一（`56c31e7`）、阶段二（`a278ab8`→`b1a150f`）、阶段 1.5（`d379d90`）均已完成。落点：`protocol/` **2481 → 405 行**（3 文件，无 wire 镜像）、`transport/` 目录删除、`runtime.rs` 949 → 431 |
 | ~~T-03~~ | ~~P2~~ | ~~无用户可触发的重连入口~~ | 见 §2「T-03 闭环」 | — | **已闭环（2026-09-15）** |
 | T-05 | P3 | 悬空文档引用 | `src/app/render_transcript.rs:330` 注释指向 `docs/markdown-plan.md`，该文件已于 `18463b3 clean docs` 删除（`git log --diff-filter=D` 可证） | 注释把读者引向不存在的设计文档 | 改指向现存文档或删除该引用 |
 | T-06 | P3 | `offloaded` 镜像字段**无消费方** | TUI：`protocol/timeline.rs:109` 定义 + `timeline_model.rs` 仅测试夹具写 `offloaded: false`，生产代码**零读取**。后端：侧车缺失/损坏/代际不符时保留壳（`timeline_hub.rs:672-675`），壳带 `offloaded=true`、block 文本 ≤512 字符、`tool.output/diff = None`（`qaqh-runtime/src/timeline.rs:881-898`） | 该退化路径下 TUI 会把「预览壳」当完整回合渲染，用户无从得知（与 B1「丢弃必须可见」同一设计原则） | transcript/状态栏标出「已归档，内容为预览」；或至少读 `offloaded` 给出提示。**注意**：该路径本机尚未发生过，根因见 §8（后端 `BUG-2026-09-14-03` —— offload 此前是死代码；后端工作区已接通，**一旦提交部署即转为可触发**） |
@@ -24,7 +24,9 @@
 
 > **闭环记录（2026-09-15）**：T-02（流首 BOM）、T-04（D-3 回归锁）、T-07（`TurnOpened` 原地 reopen）已闭环，见 §2。
 > **同日追加（T-01 阶段一）**：T-01 阶段一、T-03 同日闭环，并连带改判 D-1/D-2（见 §2）。
-> 现余待办：**T-01 阶段 1.5 / 阶段二**（前置均已就绪）、T-05、T-06、T-08。
+> **同日收尾（阶段二 + 阶段 1.5）**：T-01 全阶段完成，连带开 T-13（死镜像逃过 `dead_code` 的
+> 两条逃逸路径）。
+> 现余待办：**T-05、T-06、T-08**（均为 P2/P3，其中 T-06/T-08 在等后端动作）。
 
 ## 2. 已核实修复（FIXED）
 
