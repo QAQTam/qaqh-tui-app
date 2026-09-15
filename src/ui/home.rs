@@ -131,11 +131,11 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) {
     );
 
     // ── 会话列表（复用 session_list 渲染，但更紧凑好看）
-    let mut items: Vec<&crate::protocol::session_meta::SessionMetaView> = app
+    let mut items: Vec<&qaqh_client::SessionListEntry> = app
         .session_list_cache
         .iter()
-        .filter(|m| app.home_show_archived || !m.archived)
-        .filter(|m| !m.ephemeral)
+        .filter(|m| app.home_show_archived || !m.meta.archived)
+        .filter(|m| !m.meta.ephemeral)
         .collect();
     // 按更新时间倒序（已有 list_cache 顺序即服务端返回顺序，通常已按 updated_at 倒序）
     // 截断到可见高度 -2
@@ -200,23 +200,23 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) {
         for (idx, m) in items.iter().enumerate() {
             let real_idx = start + idx;
             let is_sel = real_idx == sel;
-            let open = app.tabs.contains(&m.seed);
-            let flag = if m.archived {
+            let open = app.tabs.contains(&m.meta.seed);
+            let flag = if m.meta.archived {
                 "▤"
             } else if open {
                 "▣"
             } else {
                 " "
             };
-            let title = crate::app::truncate_str(&m.display_title(), 32);
+            let title = crate::app::truncate_str(&m.meta.display_title(), 32);
             let activity = app
                 .activity_cache
-                .get(&m.seed)
+                .get(&m.meta.seed)
                 .map(|a| format!("{a:?}"))
                 .unwrap_or_default();
-            let updated = m
-                .updated_at
-                .and_then(|ms| DateTime::from_timestamp_millis(ms as i64))
+            // `updated_at` 在权威类型里是必填 `u64`（手解当年把它当 Option，
+            // 只在该键缺失时才为 None——而产出方永远会写这个键）。
+            let updated = DateTime::from_timestamp_millis(m.meta.updated_at as i64)
                 .map(|t| {
                     t.with_timezone(&chrono::Local)
                         .format("%m-%d %H:%M")
@@ -293,18 +293,11 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) {
 
     f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), list_area);
 
-    // ── 底部提示： cwd / version
-    let hint = Line::from(vec![
-        Span::styled(
-            app.sessions
-                .values()
-                .next()
-                .and_then(|s| s.meta.as_ref().and_then(|m| m.cwd.clone()))
-                .unwrap_or_else(|| " ".into()),
-            theme::dim(),
-        ),
-        Span::styled("  ·  ", theme::dim()),
-        Span::styled("qaqh-tui 0.1.0", theme::dim()),
-    ]);
+    // ── 底部提示： version
+    //
+    // 这里原先还渲染「当前会话的 cwd」，但它的数据源 `SessionState::meta` 恒为
+    // `None`（见 `SessionState::title` 的注），即那一格**一直渲染成空格**——
+    // 一个永远为空的前缀加上一个孤零零的分隔符。G2 删除。
+    let hint = Line::from(vec![Span::styled("qaqh-tui 0.1.0", theme::dim())]);
     f.render_widget(Paragraph::new(hint).wrap(Wrap { trim: true }), hint_area);
 }

@@ -1,30 +1,33 @@
-//! 协议视图与本仓自有类型（PLAN.md §4 类型镜像纪律）。
+//! 协议视图（PLAN.md §4 类型镜像纪律）。
 //!
-//! **阶段一 + 阶段二 + 阶段 1.5 之后，本模块已不含任何 wire 镜像**：协议类型
-//! 一律 `use qaqh_client::*`（ringing v1 权威实现），配置类型重导出
-//! `qaqh_config_api`，服务方法名归 `QueryRequest`/`ActionRequest` 的枚举持有。
-//! 此处只剩**一处** TUI 自己的解析视图：
+//! **本模块已清空**：G1（三频道快照 `state`）与 G2（`session.list` 条目）先后
+//! 落地后，本仓不再持有**任何**协议解析视图——协议类型一律 `use qaqh_client::*`
+//! （ringing v1 权威实现），配置类型重导出 `qaqh_config_api`，服务方法名归
+//! `QueryRequest`/`ActionRequest` 的枚举持有。此处只剩两个 re-export 面。
 //!
-//! - [`session_meta`] — 会话列表条目的宽松解析视图（`session.list` 回的仍是裸
-//!   `Value`，见后端契约文档的缺口 **G2**；届时同样改为依赖权威类型）。
+//! 两次删除的形状完全一样，值得记下来：
 //!
-//! 三频道快照的 `state` 曾在这里手解（`snapshot.rs`，206 行），现已删除——改用
-//! `qaqh_client::{ConversationState, ControlState, ToolState}`（后端契约文档缺口
-//! **G1** 的落地）。手解不仅多余，而且**必然漏字段**：删除前它已经漏了
-//! `active_turn` / `last_round` / `compact_status` / `compact_id` / `cancelled` /
-//! `last_finished` 六个，且自身还带着两个零读取的死字段。
+//! - **G1**：三频道快照的 `state` 手解（`snapshot.rs`，206 行）删除前已经漏了
+//!   `active_turn` / `last_round` / `compact_status` / `compact_id` / `cancelled` /
+//!   `last_finished` 六个字段，且自身还带着两个零读取的死字段；其中「无 timeline
+//!   时降级展示」那条路径**从未生效过**（中立 turn 不带 `TimelineTurn` 要求的
+//!   `created_seq`/`sealed`/`state`/`failure`，逐条解析必然失败 → 全被
+//!   `filter_map` 滤空）。
+//! - **G2**：`session_meta.rs`（128 行）漏解 `created_at` / `turn_count` /
+//!   `message_count` / `tool_mode` 等键，同样是零读取所以零人发现。
+//!
+//! 即**手抄必然漏字段，而且漏了不会报错**——手抄的失败模式是静默的。这是本仓
+//! 宁可倒贴一次迁移成本也要改吃权威类型的唯一理由。
 //!
 //! 禁止在本仓散落协议字面量，全部 import 自本模块或上述权威 crate。
 //!
 //! 历史：2026-09-15 前这里是对 `qaqh-ringing`/`qaqh-domain`/`qaqh-config-api`
 //! 的手工镜像（9 文件 2481 行），已漂移出 T-09～T-12 四项缺陷；此后逐刀删除
-//! （config 367 行、死镜像三处、方法表 38 常量），只余上述非镜像内容。
+//! （config 367 行、死镜像三处、方法表 38 常量、快照手解、会话列表手解）。
 //!
 //! 删除纪律（T-13）：**别指望 `dead_code` 指出残留**——私有模块里的 `pub` 项
 //! 和 `#![allow(dead_code)]` 都能让死镜像零警告地活着，自带测试还会反过来把
 //! 它钉成「活的」。逐项 grep 真实调用点才算数。
-
-pub mod session_meta;
 
 /// 配置契约：**直接用权威 crate**，本仓不再手工镜像。
 ///

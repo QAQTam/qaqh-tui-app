@@ -30,7 +30,7 @@ impl App {
         self.session_list_cache
             .iter()
             .enumerate()
-            .filter(|(_, m)| (show_archived || !m.archived) && !m.ephemeral)
+            .filter(|(_, m)| (show_archived || !m.meta.archived) && !m.meta.ephemeral)
             .map(|(i, _)| i)
             .collect()
     }
@@ -60,7 +60,7 @@ impl App {
             }
             KeyCode::Enter => {
                 if let Some(&idx) = items.get(self.home_selected) {
-                    let seed = self.session_list_cache[idx].seed.clone();
+                    let seed = self.session_list_cache[idx].meta.seed.clone();
                     self.open_session_tab(&seed);
                 }
                 return true;
@@ -80,7 +80,7 @@ impl App {
             }
             KeyCode::Char('x') => {
                 if let Some(&idx) = items.get(self.home_selected) {
-                    let seed = self.session_list_cache[idx].seed.clone();
+                    let seed = self.session_list_cache[idx].meta.seed.clone();
                     self.overlays.push(Overlay::Confirm {
                         action: ConfirmAction::ArchiveSession(seed),
                     });
@@ -89,14 +89,14 @@ impl App {
             }
             KeyCode::Char('u') => {
                 if let Some(&idx) = items.get(self.home_selected) {
-                    let seed = self.session_list_cache[idx].seed.clone();
+                    let seed = self.session_list_cache[idx].meta.seed.clone();
                     self.unarchive_session(seed);
                 }
                 return true;
             }
             KeyCode::Char('D') => {
                 if let Some(&idx) = items.get(self.home_selected) {
-                    let seed = self.session_list_cache[idx].seed.clone();
+                    let seed = self.session_list_cache[idx].meta.seed.clone();
                     self.overlays.push(Overlay::Confirm {
                         action: ConfirmAction::DeleteSession(seed),
                     });
@@ -381,14 +381,14 @@ impl App {
                     }
                     KeyCode::Enter => {
                         if let Some(&meta_idx) = items.get(selected) {
-                            let seed = self.session_list_cache[meta_idx].seed.clone();
+                            let seed = self.session_list_cache[meta_idx].meta.seed.clone();
                             self.overlays.pop();
                             self.open_session_tab(&seed);
                         }
                     }
                     KeyCode::Char('x') => {
                         if let Some(&meta_idx) = items.get(selected) {
-                            let seed = self.session_list_cache[meta_idx].seed.clone();
+                            let seed = self.session_list_cache[meta_idx].meta.seed.clone();
                             self.overlays.push(Overlay::Confirm {
                                 action: ConfirmAction::ArchiveSession(seed),
                             });
@@ -396,13 +396,13 @@ impl App {
                     }
                     KeyCode::Char('u') => {
                         if let Some(&meta_idx) = items.get(selected) {
-                            let seed = self.session_list_cache[meta_idx].seed.clone();
+                            let seed = self.session_list_cache[meta_idx].meta.seed.clone();
                             self.unarchive_session(seed);
                         }
                     }
                     KeyCode::Char('D') => {
                         if let Some(&meta_idx) = items.get(selected) {
-                            let seed = self.session_list_cache[meta_idx].seed.clone();
+                            let seed = self.session_list_cache[meta_idx].meta.seed.clone();
                             self.overlays.push(Overlay::Confirm {
                                 action: ConfirmAction::DeleteSession(seed),
                             });

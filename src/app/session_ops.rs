@@ -43,7 +43,7 @@ impl App {
         self.new_session_with_cwd(None);
     }
 
-    /// 三档回退：显式 > 环境变量 > 启动目录 > 当前会话 > None（让后端迁移）
+    /// 三档回退：显式 > 环境变量 > 启动目录 > None（让后端迁移）
     pub fn effective_cwd(&self, explicit: Option<String>) -> Option<String> {
         if let Some(p) = explicit {
             let t = p.trim().to_string();
@@ -61,8 +61,9 @@ impl App {
         if let Some(cur) = self.initial_cwd.as_deref().filter(|s| !s.trim().is_empty()) {
             return Some(cur.to_string());
         }
-        self.active_session()
-            .and_then(|s| s.meta.as_ref().and_then(|m| m.cwd.clone()))
+        // 末级回退曾是 `active_session().meta.cwd`——`SessionState::meta` 恒为 None
+        // （见 `SessionState::title` 的注），故这一级从未生效。G2 时删除。
+        None
     }
 
     pub fn new_session_with_cwd(&mut self, cwd: Option<String>) {
@@ -145,7 +146,9 @@ impl App {
 
     pub fn fetch_session_list(&mut self) {
         self.spawn_api(move |api, tx| async move {
-            // session.list 回数组，逐项宽松解析为 UI 视图（形状不符的条目跳过）。
+            // session.list 回数组，逐项解析为**权威类型**（G2）。
+            // 仍逐项宽松：单条形状不符只跳过该条，不让整个列表失败——
+            // 与 G1 同款「解析失败一律降级而不是崩」的契约。
             let list = api
                 .client
                 .query(QueryRequest::SessionList)
@@ -153,7 +156,13 @@ impl App {
                 .map_err(|e| e.to_string())
                 .and_then(|v| {
                     v.as_array()
-                        .map(|arr| arr.iter().filter_map(SessionMetaView::parse).collect())
+                        .map(|arr| {
+                            arr.iter()
+                                .filter_map(|item| {
+                                    serde_json::from_value::<SessionListEntry>(item.clone()).ok()
+                                })
+                                .collect()
+                        })
                         .ok_or_else(|| "session.list 应返回数组".to_string())
                 });
             let _ = tx.send(AppMsg::Action(ActionResult::SessionList(list)));

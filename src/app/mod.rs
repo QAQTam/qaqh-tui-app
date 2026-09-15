@@ -32,8 +32,8 @@ use ratatui::crossterm::event::{KeyEvent, MouseEvent};
 
 use crate::app::slash::SlashCmd;
 use crate::protocol::ConfigDto;
-use crate::protocol::session_meta::SessionMetaView;
 use crate::runtime::{ConnEvent, Runtime, RuntimeMsg};
+use qaqh_client::SessionListEntry;
 use qaqh_client::TimelinePage;
 use qaqh_client::{ActionRequest, QueryRequest};
 use qaqh_client::{
@@ -69,7 +69,7 @@ pub enum ActionResult {
         label: &'static str,
         result: Result<qaqh_client::RingingCommandAck, String>,
     },
-    SessionList(Result<Vec<SessionMetaView>, String>),
+    SessionList(Result<Vec<SessionListEntry>, String>),
     SessionActivity(Result<serde_json::Value, String>),
     ConfigLoaded(Result<serde_json::Value, String>),
     ConfigWrite {
@@ -229,7 +229,7 @@ pub struct App {
     pub toasts: VecDeque<Toast>,
     /// 新建会话的 command_id → 发起时间（等 causation_id 关联）。
     pub pending_creates: HashMap<String, Instant>,
-    pub session_list_cache: Vec<SessionMetaView>,
+    pub session_list_cache: Vec<SessionListEntry>,
     pub session_list_at: Option<Instant>,
     pub activity_cache: HashMap<String, ActivityState>,
     dashboard_fetching: HashSet<String>,
@@ -1077,11 +1077,9 @@ impl App {
                         // 收敛一次，避免上一次连接遗留的 Working/Starting 与
                         // streaming 状态把 UI 钉在 working（timeline 空则不误判）。
                         sync_streaming_from_timeline(sess);
-                        if sess.mode == qaqh_client::ConversationMode::Code
-                            && let Some(meta) = &sess.meta
-                        {
-                            sess.mode = meta.conversation_mode();
-                        }
+                        // 这里原有「从 SessionState::meta 的 mode 位同步会话模式」一段，
+                        // 因 meta 恒为 None 从未生效，G2 随该字段一并删除。会话模式的实际
+                        // 来源是 transcript_ops.rs 的乐观更新 + SessionMetaChanged 刷新。
                         match ctl.dashboard_snapshot {
                             Some(dash) => {
                                 let is_empty = dash.tasks.is_empty()

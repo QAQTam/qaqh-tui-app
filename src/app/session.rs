@@ -7,7 +7,6 @@ use crate::app::timeline_model::TimelineModel;
 use qaqh_client::ConversationMode;
 // 权威类型与 `qaqh-client` 自身类型重名者带 `Domain` 前缀；在本模块内换回本地惯用名，
 // 这样下文的引用点不必逐个改（映射只此一处）。
-use crate::protocol::session_meta::SessionMetaView;
 use qaqh_client::ConversationState;
 use qaqh_client::{
     AskMode, ContentRef, DomainActivityState as ActivityState, DomainAskQuestion as AskQuestion,
@@ -376,7 +375,6 @@ pub struct CompactionAnim {
 #[derive(Debug, Clone)]
 pub struct SessionState {
     pub seed: String,
-    pub meta: Option<SessionMetaView>,
     pub title: Option<String>,
     pub mode: ConversationMode,
     pub timeline: TimelineModel,
@@ -422,7 +420,6 @@ impl SessionState {
     pub fn new(seed: String) -> Self {
         Self {
             seed,
-            meta: None,
             title: None,
             mode: ConversationMode::Code,
             timeline: TimelineModel::default(),
@@ -455,21 +452,20 @@ impl SessionState {
         }
     }
 
+    /// 标签标题：控制频道 `SessionMetaChanged` 推来的 title → `session <seed>`。
+    ///
+    /// 这里曾有第三级回退 `meta.display_title()`——**那段代码从未执行过**：
+    /// `SessionState::meta` 自首版起就没被赋过值（`git log -S'meta = Some'` 全史
+    /// 零命中），恒为 `None`。G2 类型化时一并删除，语义不变（它本来就走不到）。
     pub fn title(&self) -> String {
         if let Some(t) = self.title.as_deref().filter(|s| !s.is_empty()) {
             return t.to_owned();
-        }
-        if let Some(meta) = &self.meta {
-            return meta.display_title();
         }
         format!("session {}", self.seed)
     }
 
     pub fn display_model(&self) -> Option<String> {
-        self.conversation
-            .as_ref()
-            .and_then(|c| c.model.clone())
-            .or_else(|| self.meta.as_ref().and_then(|m| m.model.clone()))
+        self.conversation.as_ref().and_then(|c| c.model.clone())
     }
 
     /// 优先级：permission > ask > plan（winui 语义）。

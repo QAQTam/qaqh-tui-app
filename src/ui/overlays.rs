@@ -48,11 +48,11 @@ fn draw_session_list(f: &mut Frame, app: &App, area: Rect, selected: usize, show
     let mut lines: Vec<Line> = Vec::new();
 
     // 过滤 + 行构造（与 app 的选中逻辑共享同一过滤谓词）。
-    let items: Vec<&crate::protocol::session_meta::SessionMetaView> = app
+    let items: Vec<&qaqh_client::SessionListEntry> = app
         .session_list_cache
         .iter()
-        .filter(|m| show_archived || !m.archived)
-        .filter(|m| !m.ephemeral)
+        .filter(|m| show_archived || !m.meta.archived)
+        .filter(|m| !m.meta.ephemeral)
         .collect();
 
     if app.session_list_at.is_none() {
@@ -65,29 +65,28 @@ fn draw_session_list(f: &mut Frame, app: &App, area: Rect, selected: usize, show
     }
     for (idx, m) in items.iter().enumerate() {
         let selected_now = idx == selected;
-        let open = app.tabs.contains(&m.seed);
+        let open = app.tabs.contains(&m.meta.seed);
         let activity = app
             .activity_cache
-            .get(&m.seed)
+            .get(&m.meta.seed)
             .map(|a| format!("{a:?}"))
             .unwrap_or_default();
-        let updated = m
-            .updated_at
-            .and_then(|ms| chrono::DateTime::from_timestamp_millis(ms as i64))
+        // `updated_at` 在权威类型里是必填 `u64`（见 home.rs 同处注释）。
+        let updated = chrono::DateTime::from_timestamp_millis(m.meta.updated_at as i64)
             .map(|t| {
                 t.with_timezone(&chrono::Local)
                     .format("%m-%d %H:%M")
                     .to_string()
             })
             .unwrap_or_default();
-        let flag = if m.archived {
+        let flag = if m.meta.archived {
             "▤"
         } else if open {
             "▣"
         } else {
             " "
         };
-        let title = crate::app::truncate_str(&m.display_title(), 36);
+        let title = crate::app::truncate_str(&m.meta.display_title(), 36);
         let mut spans = vec![
             Span::styled(
                 format!(" {flag} "),
@@ -103,7 +102,7 @@ fn draw_session_list(f: &mut Frame, app: &App, area: Rect, selected: usize, show
             ),
             Span::styled(format!("{activity:<14}"), theme::dim()),
             Span::styled(format!("{updated:<12}"), theme::dim()),
-            Span::styled(format!("#{}", m.seed), theme::dim()),
+            Span::styled(format!("#{}", m.meta.seed), theme::dim()),
         ];
         if m.running {
             spans.push(Span::styled(" ●", theme::ok()));
