@@ -17,7 +17,7 @@ set -u
 DAEMON=${DAEMON:-$HOME/Projects/qaqh-backend/target/debug/qaqh-daemon}
 TUI=${TUI:-$HOME/Projects/qaqh-tui-app/target/debug/qaqh-tui}
 D=/tmp/qaqh-e2e-restart
-PROBE_DELAY=${PROBE_DELAY:-70}   # 杀 daemon 后等多久按 Ctrl+R（须 > STALL_AFTER=60s）
+PROBE_DELAY=${PROBE_DELAY:-30}   # 杀 daemon 后等多久按 Ctrl+R（须 > STALL_AFTER=20s）
 
 for b in "$DAEMON" "$TUI"; do
   [ -x "$b" ] || { echo "缺少可执行文件：$b（先 cargo build）"; exit 1; }
@@ -37,14 +37,14 @@ echo "t=0   daemon#1 pid=$D1 epoch=$(epoch)"
 # 喂按键：全程持住写端——关掉会让 TUI 的 stdin 立刻 EOF。
 ( exec 3>"$FIFO"
   sleep "$PROBE_DELAY"; printf '\x12' >&3; echo "t=$PROBE_DELAY  Ctrl+R（daemon 仍 dead，相位应已是 lost）"
-  sleep 20;             printf '\x12' >&3; echo "t=$((PROBE_DELAY+20))  Ctrl+R（daemon#2 已起）"
-  sleep 40 ) & FEED=$!
+  sleep 13;             printf '\x12' >&3; echo "t=$((PROBE_DELAY+13))  Ctrl+R（daemon#2 已起）"
+  sleep 20 ) & FEED=$!
 
-QAQH_DATA_DIR="$D/qaqh" timeout 125 script -qec "stty rows 40 cols 130; timeout 120 $TUI" /dev/null \
+QAQH_DATA_DIR="$D/qaqh" timeout 75 script -qec "stty rows 40 cols 130; timeout 70 $TUI" /dev/null \
   <"$FIFO" > "$D/tui.raw" 2>&1 &
 TPID=$!
 sleep 8;  echo "t=8   杀 daemon#1"; kill -9 "$D1" 2>/dev/null; rm -f "$D/qaqh/daemon.json"
-sleep 70; echo "t=78  起 daemon#2"; D2=$(start); wait_pid "$D2" && echo "t=78  daemon#2 pid=$D2 epoch=$(epoch)"
+sleep 29; echo "t=37  起 daemon#2"; D2=$(start); wait_pid "$D2" && echo "t=37  daemon#2 pid=$D2 epoch=$(epoch)"
 
 wait $TPID 2>/dev/null; kill "$D2" 2>/dev/null; wait $FEED 2>/dev/null
 

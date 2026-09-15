@@ -45,10 +45,13 @@ pub const TIMELINE_PAGE_LIMIT: u32 = 60;
 /// ——探活由那条路径负责。本阈值只该在「连重连都没能恢复」时才触发。
 /// 取 15s 时会反过来：空闲流每 45s 周期里有 30s 显示「失联」。
 ///
-/// **代价（须知会）**：daemon 真死时，`✗ lost · Ctrl+R 重连` 的升级提示要等 60s。
-/// 但更早的信号并不缺——`ChannelStatus::Reconnecting` 会在 ~1s 内推
-/// 「连接断开，Nms 后重连」。`Lost` 只是「连重连都没能恢复」的升级档。
-const STALL_AFTER: Duration = Duration::from_secs(60);
+/// 20s = daemon 的 keepalive 间隔（15s，见 `qaqh-daemon` 的
+/// `KeepAlive::new().interval(15s)`）留一轮余量。
+///
+/// 真正的信号是**每收到一块字节**（`note_daemon_activity`），而 keepalive 正好
+/// 每 15s 送一块——所以「daemon 活着」这件事每 15s 被确认一次，20s 是它的一点
+/// 余量。真死时 keepalive 断流，20s 后判定，灵敏度与最初的 15s 相当。
+const STALL_AFTER: Duration = Duration::from_secs(20);
 const STALL_TICK: Duration = Duration::from_secs(1);
 
 /// timeline 激活时等 attach 落地的重试窗口（见 `activate_with_attach_retry`）。
@@ -324,13 +327,16 @@ async fn watch_session(runtime: Arc<Runtime>, client: Arc<Client>, generation: u
 /// 记一次「daemon 还在说话」。
 ///
 /// 原先只有 `ChannelStatus::Open` 会复位这个时间戳，而客户端**只在连接建立那一刻**
-/// 发一次 `Open`（`qaqh-client/src/sse.rs:142`，紧跟 HTTP 响应成功之后）。于是：
-/// - 流**很忙** → 不触发 45s 空闲超时 → 不重连 → 再也不发 `Open` → **永久停在失联**，
-///   而数据一直在流（实测现象：后端在干活、前端在输出，状态栏却一直 `✗ lost`）；
-/// - 流**空闲** → 45s 后空闲重连 → 新的 `Open` → 自己恢复。
+/// 发一次 `Open`（`qaqh-client/src/sse.rs:142`，紧跟 HTTP 响应成功之后）。
+/// 于是这个判据量的其实是「**连接建立了多久**」，而不是「**多久没听到 daemon**」——
+/// 任何活过 STALL_AFTER 的连接都会被判失联，**空闲与否都一样**。
 ///
-/// 即「越活跃越像失联」——判据挂错了信号：活着与否该由**收到的数据**说话。
-/// 现在每收到一批频道事件或一条 timeline 事件都记一次。
+/// 为什么它永不自愈：daemon 每 15s 发一次 keepalive，客户端每次读到字节都会重置
+/// 自己的 45s 空闲计时器，于是**流永不空闲、永不重连、`Open` 永不再发**。
+/// 实测现象就是「后端在干活、前端在输出，状态栏却一直 `✗ lost`」。
+///
+/// 正确信号一直都在线上：**字节到了就是 daemon 活着**。现在由客户端在读取循环里
+/// 每消费一个 chunk 回调一次（含被解码器丢掉的 keepalive 注释行）。
 fn note_daemon_activity(last_open: &Arc<std::sync::Mutex<Instant>>) {
     *last_open.lock().expect("last_open lock") = Instant::now();
 }
@@ -371,12 +377,9 @@ fn build_handlers(
     ClientHandlers {
         on_batch: {
             let msg_tx = msg_tx.clone();
-            let last_open = last_open.clone();
             // 类型已权威化：信封直达 app 层，不再有「过桥失败 → 丢帧」这条路径。
             // 形状对不上现在会是**编译错误**，而不是运行时的静默丢弃。
             Arc::new(move |batch: qaqh_client::EventBatch| {
-                // 收到任何一批事件 = daemon 还活着（见 `note_daemon_activity`）。
-                note_daemon_activity(&last_open);
                 for env in &batch.envelopes {
                     let _ = msg_tx.send(RuntimeMsg::Ringing {
                         env: Box::new(env.clone()),
@@ -404,6 +407,12 @@ fn build_handlers(
                 },
             )
         },
+        on_liveness: {
+            // 唯一的存活信号源：客户端每从 socket 读到一块字节就调一次，
+            // **包括**解不出内容的 keepalive 注释行——空闲期只有它在说话。
+            let last_open = last_open.clone();
+            Arc::new(move || note_daemon_activity(&last_open))
+        },
         on_reset: {
             let msg_tx = msg_tx.clone();
             Some(Arc::new(
@@ -415,12 +424,8 @@ fn build_handlers(
         },
         on_timeline_entry: {
             let msg_tx = msg_tx.clone();
-            let last_open = last_open.clone();
             // 类型已权威化：不再过桥，回调给的就是 `qaqh_client` 的类型。
             Arc::new(move |seed: String, entry: qaqh_client::TimelineEntry| {
-                // transcript 有内容 = daemon 还活着。这条尤其重要：长回合里
-                // 频道事件可能稀疏，而 timeline 一直在推。
-                note_daemon_activity(&last_open);
                 let _ = msg_tx.send(RuntimeMsg::Timeline {
                     seed,
                     entry: Box::new(entry),
