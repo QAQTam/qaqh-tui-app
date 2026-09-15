@@ -51,6 +51,10 @@
 | **D-1 改判** | 401 三态分类的**裁决权**上移 | `src/transport/http.rs:31` `ApiError` 与 `classify` 保留（`:41` `LeaseRequired`、`:44` `UnsupportedVersion`）；`is_fatal`/`is_credential` **已删除**（原唯一调用方 `supervisor_action` 随 runtime 重写消失） | `transport::http::tests` 7 个保留（断言改为只查分类） |
 | **D-2 改判** | 凭据热更新的**实现**上移至 `qaqh-client` | 后端 @`a72ce0c` `crates/qaqh-client/src/session.rs:108` `refresh_discovery()`、`:92` `credentials()`；`:44`/`:78` `local_discovery` **默认关闭**、由 `connect_async` 在本地发现模式开启（安全默认值：否则指向 mock/远端直连的会话会被本机 `daemon.json` 改道） | `session::tests::{refresh_discovery_is_off_by_default, refresh_discovery_adopts_a_changed_record, constructor_normalizes_trailing_slash}`（变异验证：默认值改回 `true` → 恰好 1 红） |
 
+| **T-09** | `TimelineToolState` 少两个终态（镜像漂移） | 后端 6 变体、本仓镜像 4 个，缺 `Cancelled`/`Backgrounded`（`qaqh-domain/src/timeline.rs:35`，后端注释明写二者是「终态但非失败」）。带这两个状态的 `ToolUpdated` 在镜像侧**反序列化失败 → 整条时间线条目被丢弃**，工具卡永远停在进行中。**已修**（TUI `a278ab8`）：换权威类型 + 补渲染分支 | 渲染分支由编译期强制（非穷尽 match）；无独立回归锁 |
+| **T-10** | `BlockCheckpoint` 的 `arg`/`text` 语义弄反（镜像漂移） | 镜像把 `text` 声明为**必填**且不知道 `arg`；权威语义（`qaqh-runtime/src/timeline.rs:371` `checkpoint_block`）是 `arg` = 按**已交付事件**算出的余量（正常路径），`text` = 整流覆盖（正常路径为空且缺席）。后果：正常路径下每个检查点反序列化失败被丢弃；且旧 reducer 的 `block.text = text.clone()` 一旦只把 `text` 放宽为可缺省，就会**每个检查点清空已流出的正文**（本仓最忌讳的「真吞字」）。**已修**（TUI `a278ab8`） | `timeline_model::tests::incremental_checkpoint_appends_and_never_wipes`（**变异验证**：改回无条件覆盖 → 恰好该测试红） |
+| **T-11** | `ConfigPatch` 缺 `permission_level`、`ConfigDto` 缺 `mcp`/`lsp`（镜像漂移） | 后端 `qaqh-config-api/src/lib.rs:232` 已加 `permission_level: Option<u64>`（BUG-2026-09-13-15），TUI 镜像没有，且其注释（`protocol/config.rs:116`）仍写着「刻意不含」——**文档断言与后端现状相反**；`ConfigDto` 另缺 `mcp`/`lsp` 两段 | **待修**（阶段二 config 切片） |
+
 **回归测试数量核对**：报告称 14 个（http 7 + runtime 7）。实测 `transport::http::tests::*` 7 个、`runtime::tests::*` **12** 个（原 7 + T-04 新增 5）——报告所载的 14 个**数字一致**，新增的 5 个是本清单补的。（阶段一后 `runtime::tests` 整体删除，见 §5b 对账。）
 
 ## 3. 知情接受（ACCEPTED）
@@ -260,3 +264,4 @@ cd ~/Projects/qaqh-backend && cargo test -p qaqh-client sse::tests timeline::tes
 | 2026-09-15 | **T-01 阶段一闭环**：传输层迁移 `qaqh-client`（TUI `56c31e7` + 后端 `a72ce0c`）。删除自建连接生命周期/SSE 解码/daemon 发现；`transport/` + `runtime.rs` 2127 → **832** 行；自建轮子符号零命中。**T-03 同日闭环**（`Lost` 相位 `Ctrl+R` + 15s 失联判据）。**D-1/D-2 改判**（裁决权上移，见 §2）。测试 166 → 142，逐项对账见 §5b.1；被删断言的语义补进对端（31 → 43）。新增知情接受 E1~E3（§5b.2）。**§2/§3 中旧行号已按「以代码为准」原则标注失效并给出新落点。**真机端到端**未跑**（§5b.5） |
 | 2026-09-15 | 纠正三处上游 handoff 失真（§5b.3）：`refresh_credentials` 并非「内建」（照原样迁移会回归 BUG-2026-09-14-01）、401 三态非等价映射、`SseDecoder` 断言不全；另记一条不存在的假设（「单活跃 timeline 够用」对 TUI 不成立） |
 | 2026-09-15 | 登记后端缺口（§5b.4）：`ChannelStream` 从不比较 epoch（`TimelineStream` 早已比较）——D-3/T-04 的不变式在后端只覆盖一半；已补 `reconcile_epoch` 并加锁 |
+| 2026-09-15 | **阶段二·第一刀（timeline）**：25 处引用改用权威类型，删 `protocol/timeline.rs`。**顺带修掉两处镜像漂移** —— T-09（`TimelineToolState` 少 `Cancelled`/`Backgrounded`）、T-10（`BlockCheckpoint` 的 `arg`/`text` 语义弄反，含一次差点写成的「真吞字」）。新开 **T-11**（config 漂移，待修）。测试 142 → 143，clippy 零 warning。TUI `a278ab8`；后端再导出 `73b24fa` |
