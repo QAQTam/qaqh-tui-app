@@ -27,7 +27,6 @@ pub enum FieldId {
     AutoCompactThreshold,
     PermissionLevel,
     ActiveProfile,
-    WorkspaceMode,
     SubModel,
     SubBaseUrl,
     SubMaxTokens,
@@ -136,12 +135,6 @@ pub const ROWS: &[Row] = &[
         section: "运行时",
     },
     Row {
-        id: FieldId::WorkspaceMode,
-        label: "workspace 模式",
-        kind: FieldKind::Port,
-        section: "运行时",
-    },
-    Row {
         id: FieldId::SubModel,
         label: "子代理模型",
         kind: FieldKind::Text,
@@ -231,8 +224,6 @@ pub struct SettingsState {
     pub draft: ConfigPatch,
     /// Profile 端口的候选名（None = 展示服务端现值）。
     pub profile_sel: Option<String>,
-    /// workspace 模式端口的候选值。
-    pub ws_sel: Option<String>,
 }
 
 impl SettingsState {
@@ -284,7 +275,7 @@ impl SettingsState {
                 }
             }
             // 端口字段即时生效，无草稿。
-            FieldId::PermissionLevel | FieldId::ActiveProfile | FieldId::WorkspaceMode => false,
+            FieldId::PermissionLevel | FieldId::ActiveProfile => false,
         }
     }
 
@@ -345,23 +336,6 @@ impl SettingsState {
                             name
                         } else {
                             format!("{name}（回车应用）")
-                        }
-                    }
-                    None => "…".into(),
-                }
-            }
-            FieldId::WorkspaceMode => {
-                let cur = self
-                    .ws_sel
-                    .clone()
-                    .or_else(|| loaded.map(|c| c.workspace.mode.clone()));
-                match cur {
-                    Some(mode) => {
-                        let active = loaded.map(|c| c.workspace.mode == mode).unwrap_or(true);
-                        if active {
-                            mode
-                        } else {
-                            format!("{mode}（回车应用）")
                         }
                     }
                     None => "…".into(),
@@ -516,8 +490,7 @@ impl SettingsState {
             | FieldId::NotificationsEnabled
             | FieldId::ComplianceEnabled
             | FieldId::PermissionLevel
-            | FieldId::ActiveProfile
-            | FieldId::WorkspaceMode => return None,
+            | FieldId::ActiveProfile => return None,
         };
         let cursor = seed.chars().count();
         Some(EditBuffer {
@@ -614,8 +587,7 @@ impl SettingsState {
             | FieldId::NotificationsEnabled
             | FieldId::ComplianceEnabled
             | FieldId::PermissionLevel
-            | FieldId::ActiveProfile
-            | FieldId::WorkspaceMode => {
+            | FieldId::ActiveProfile => {
                 let _ = loaded;
             }
         }
@@ -731,7 +703,7 @@ impl SettingsState {
                     None => Err("端点无模型列表——回车直接输入".into()),
                 }
             }
-            FieldId::PermissionLevel | FieldId::ActiveProfile | FieldId::WorkspaceMode => Ok(false),
+            FieldId::PermissionLevel | FieldId::ActiveProfile => Ok(false),
             _ => Ok(false),
         }
     }

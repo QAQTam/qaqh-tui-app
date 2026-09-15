@@ -57,55 +57,29 @@ impl App {
                     self.apply_profile(name);
                 }
             }
-            settings::FieldId::WorkspaceMode => {
-                let mode = st
-                    .ws_sel
-                    .clone()
-                    .or_else(|| self.config.as_ref().map(|c| c.workspace.mode.clone()));
-                if let Some(mode) = mode {
-                    self.set_workspace_mode(mode);
-                }
-            }
             _ => {}
         }
     }
 
     /// 端口字段 ←→：切换候选（回车才真正应用）。
     pub(super) fn settings_port_cycle(&mut self, st: &mut SettingsState, delta: i32) {
-        match st.row().id {
-            settings::FieldId::ActiveProfile => {
-                let Some(cfg) = self.config.as_ref() else {
-                    return;
-                };
-                if cfg.profiles.is_empty() {
-                    return;
-                }
-                let cur = st
-                    .profile_sel
-                    .clone()
-                    .unwrap_or_else(|| cfg.active_profile.clone());
-                let idx = cfg.profiles.iter().position(|n| *n == cur).unwrap_or(0);
-                let next = (idx as i32 + delta).rem_euclid(cfg.profiles.len() as i32) as usize;
-                st.profile_sel = Some(cfg.profiles[next].clone());
-            }
-            settings::FieldId::WorkspaceMode => {
-                // local（全平台）/ wsl（仅 Windows）——与后端 workspace.set_mode 校验一致。
-                let modes: &[&str] = if cfg!(windows) {
-                    &["local", "wsl"]
-                } else {
-                    &["local"]
-                };
-                let cur = st
-                    .ws_sel
-                    .clone()
-                    .or_else(|| self.config.as_ref().map(|c| c.workspace.mode.clone()))
-                    .unwrap_or_else(|| "local".into());
-                let idx = modes.iter().position(|m| *m == cur).unwrap_or(0);
-                let next = (idx as i32 + delta).rem_euclid(modes.len() as i32) as usize;
-                st.ws_sel = Some(modes[next].to_string());
-            }
-            _ => {}
+        // 唯一剩下的端口字段是 profile（workspace 模式那个随能力下线一起删了）。
+        if !matches!(st.row().id, settings::FieldId::ActiveProfile) {
+            return;
         }
+        let Some(cfg) = self.config.as_ref() else {
+            return;
+        };
+        if cfg.profiles.is_empty() {
+            return;
+        }
+        let cur = st
+            .profile_sel
+            .clone()
+            .unwrap_or_else(|| cfg.active_profile.clone());
+        let idx = cfg.profiles.iter().position(|n| *n == cur).unwrap_or(0);
+        let next = (idx as i32 + delta).rem_euclid(cfg.profiles.len() as i32) as usize;
+        st.profile_sel = Some(cfg.profiles[next].clone());
     }
 
     /// `profile.apply`：切换活跃 profile（服务端单写口，写后广播 reload）。
@@ -118,24 +92,6 @@ impl App {
                 .map_err(|e| e.to_string());
             let _ = tx.send(AppMsg::Action(ActionResult::ConfigWrite {
                 label: "应用 Profile",
-                result,
-            }));
-        });
-    }
-
-    /// `workspace.set_mode`：local / wsl（仅 Windows）（服务端单写口）。
-    pub fn set_workspace_mode(&mut self, mode: String) {
-        self.spawn_api(move |api, tx| async move {
-            let result = api
-                .http
-                .service(
-                    methods::WORKSPACE_SET_MODE,
-                    &serde_json::json!({ "mode": mode }),
-                )
-                .await
-                .map_err(|e| e.to_string());
-            let _ = tx.send(AppMsg::Action(ActionResult::ConfigWrite {
-                label: "workspace 模式",
                 result,
             }));
         });

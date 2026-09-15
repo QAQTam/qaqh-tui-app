@@ -7,7 +7,7 @@
 | 清单日期 | 2026-09-15 |
 | 基准代码 | TUI：`main` @ `56c31e7`（T-01 阶段一迁移已提交）。后端：`qaqh-backend` @ `a72ce0c`（阶段一所需能力已提交；工作树另有**他人** workspace/工具侧重构 WIP，未提交，本清单不涉）。首版核定时为 TUI `59541dd` / 后端 `1c92413` |
 | 判定原则 | **以工作树真实代码为准**。每条状态由 `file:line` + 可复现命令核定；历史文档（report / handoff / 已删除的 `streaming-edge-audit.md`）的自述状态仅作线索，不作依据 |
-| 核定环境 | Arch Linux 7.2.4 / rustc 1.98.1。**首版**：`cargo test` 166 passed / 0 failed；`cargo clippy --all-targets` 零 warning。**本轮（阶段一迁移后）**：`cargo test` = **142 passed / 0 failed**（条数下降见 §5b 对账，非静默减少）；`cargo clippy --all-targets` 零 warning；后端 `cargo test -p qaqh-client` = **43 lib + 2 集成 passed / 0 failed** |
+| 核定环境 | Arch Linux 7.2.4 / rustc 1.98.1。**首版**：`cargo test` 166 passed / 0 failed；`cargo clippy --all-targets` 零 warning。**本轮（阶段一 + 阶段二前两刀后）**：`cargo test` = **135 passed / 0 failed**（条数下降见 §5b 对账，非静默减少）；`cargo clippy --all-targets` 零 warning；后端 `cargo test -p qaqh-client` = **43 lib + 2 集成 passed / 0 failed** |
 | 命名约定 | `docs/buglist/以yyyy-mm-dd-标题-buglist.md作为命名` |
 | 状态图例 | `OPEN` 待修 ｜ `FIXED` 已核实修复（附回归锁）｜ `ACCEPTED` 知情接受 ｜ `EXTERNAL` 他仓/环境，本仓不可核实 |
 
@@ -54,6 +54,8 @@
 | **T-09** | `TimelineToolState` 少两个终态（镜像漂移） | 后端 6 变体、本仓镜像 4 个，缺 `Cancelled`/`Backgrounded`（`qaqh-domain/src/timeline.rs:35`，后端注释明写二者是「终态但非失败」）。带这两个状态的 `ToolUpdated` 在镜像侧**反序列化失败 → 整条时间线条目被丢弃**，工具卡永远停在进行中。**已修**（TUI `a278ab8`）：换权威类型 + 补渲染分支 | 渲染分支由编译期强制（非穷尽 match）；无独立回归锁 |
 | **T-10** | `BlockCheckpoint` 的 `arg`/`text` 语义弄反（镜像漂移） | 镜像把 `text` 声明为**必填**且不知道 `arg`；权威语义（`qaqh-runtime/src/timeline.rs:371` `checkpoint_block`）是 `arg` = 按**已交付事件**算出的余量（正常路径），`text` = 整流覆盖（正常路径为空且缺席）。后果：正常路径下每个检查点反序列化失败被丢弃；且旧 reducer 的 `block.text = text.clone()` 一旦只把 `text` 放宽为可缺省，就会**每个检查点清空已流出的正文**（本仓最忌讳的「真吞字」）。**已修**（TUI `a278ab8`） | `timeline_model::tests::incremental_checkpoint_appends_and_never_wipes`（**变异验证**：改回无条件覆盖 → 恰好该测试红） |
 | **T-11** | `ConfigPatch` 缺 `permission_level`、`ConfigDto` 缺 `mcp`/`lsp`（镜像漂移） | 后端 `qaqh-config-api/src/lib.rs:232` 已加 `permission_level: Option<u64>`（BUG-2026-09-13-15），TUI 镜像没有，且其注释（`protocol/config.rs:116`）仍写着「刻意不含」——**文档断言与后端现状相反**；`ConfigDto` 另缺 `mcp`/`lsp` 两段 | **待修**（阶段二 config 切片） |
+
+| **T-12** | TUI 仍调用已下线的 `workspace.set_mode` | 服务端已删该能力：`qaqh-runtime/src/ringing/service_methods.rs` 移除 `workspace.{status,diagnose,set_mode,install_wsl}` 四项，`qaqh-runtime/src/service.rs` 对这四个名字 **0 命中**；`qaqh-client/src/endpoint.rs` 同步删掉对应枚举变体；`ConfigDto.workspace` 亦随 `[workspace] mode` 下线（其唯一消费者 `WorkspaceSupervisor` 已移除）。而 TUI 仍在 `src/app/settings_ops.rs:132` 调它 → **必然 404**。**已修**：整个 workspace-mode 功能按「能力已下线」删除（服务调用 + 4 处 `ConfigDto.workspace.mode` 读取 + 4 个 method 常量 + 设置面板控件 + `ws_sel` 草稿字段） | `clippy --all-targets` 零 warning；`cargo test` 135 passed |
 
 **回归测试数量核对**：报告称 14 个（http 7 + runtime 7）。实测 `transport::http::tests::*` 7 个、`runtime::tests::*` **12** 个（原 7 + T-04 新增 5）——报告所载的 14 个**数字一致**，新增的 5 个是本清单补的。（阶段一后 `runtime::tests` 整体删除，见 §5b 对账。）
 
@@ -144,7 +146,7 @@ D-3/T-04 锁的是「epoch 变化必须归零 cursor」。核实发现 **`Timeli
 
 - **真机端到端一条未跑**：daemon 重启自愈、租约过期自愈、`Lagged` 终止帧恢复、多标签+子代理并发、`Ctrl+R` 重连。
 - 依赖真机的两个集成测试（含本轮新增的**多 seed 并行**那条）仍是 `#[ignore]`，**只做到编译通过**；`lease_renegotiation.rs` 需要 `cargo build -p qaqh-daemon`。
-- **【2026-09-15 更正】** 此处原写「后端工作树正被他人的重构占用，编 daemon 会连带编进半成品」——**该判断不成立**：后端工作树实际可编译（`cargo check -p qaqh-daemon` 通过，`cargo build -p qaqh-daemon` 17.8s 成功）。**真实的阻塞是：daemon 在隔离 data root 下启动后不发布 `daemon.json`**（实测 60s 无产出，日志停在 `qaqh_runtime::registry: exec shell bootstrap: bash`；换用真实 `HOME` 复现同样现象，故非隔离环境所致）。该卡点位于他人正在改动的 exec/registry 区域，**本清单未做归因**（未从 HEAD 干净构建对照）。
+- **【2026-09-15 更正】** 此处原写「后端工作树正被他人的重构占用，编 daemon 会连带编进半成品」——**该判断不成立**：后端工作树实际可编译（`cargo check -p qaqh-daemon` 通过，`cargo build -p qaqh-daemon` 17.8s 成功）。**真实的阻塞是：daemon 在隔离 data root 下启动后不发布 `daemon.json`**（实测 60s 无产出，日志停在 `qaqh_runtime::registry: exec shell bootstrap: bash`；换用真实 `HOME` 复现同样现象，故非隔离环境所致）。**该归因也已证伪**：从 HEAD 干净构建对照（不含任何未提交改动）**同样复现**，且 `qaqh-daemon` 不依赖 `qaqh-client`，故与该重构、与本轮任何提交均无因果。**真实根因已登记在后端**：`BUG-2026-09-15-02` —— 启动期 `detect_os_info()` 用 `Command::…output()` 探测 `cargo --version` 等且**无超时**，被探测程序的后代持有管道写端时管道 EOF 永不出现 → `.output()` 永久阻塞（实测 daemon 停在 `do_wait`，子进程 `cargo --version` 停在 `futex_do_wait`）。属**环境触发的间歇性**问题（同机 11:26 曾正常启动）。**结论：真机验证是被这个后端缺陷堵住，不是被代码或任何人的改动堵住。**
 - 跑该测试时另修掉两个**测试自身的**缺陷（见后端 `ed6ebb3`）：`find_daemon_binary` 硬编码 `.exe` 导致**非 Windows 上必然 panic**（即所谓「端到端覆盖」在本机从来跑不起来）；以及本文件两个测试争抢进程级 `QAQH_DATA_DIR`。
 
 ## 6. 核验命令（可复现）
@@ -265,3 +267,5 @@ cd ~/Projects/qaqh-backend && cargo test -p qaqh-client sse::tests timeline::tes
 | 2026-09-15 | 纠正三处上游 handoff 失真（§5b.3）：`refresh_credentials` 并非「内建」（照原样迁移会回归 BUG-2026-09-14-01）、401 三态非等价映射、`SseDecoder` 断言不全；另记一条不存在的假设（「单活跃 timeline 够用」对 TUI 不成立） |
 | 2026-09-15 | 登记后端缺口（§5b.4）：`ChannelStream` 从不比较 epoch（`TimelineStream` 早已比较）——D-3/T-04 的不变式在后端只覆盖一半；已补 `reconcile_epoch` 并加锁 |
 | 2026-09-15 | **阶段二·第一刀（timeline）**：25 处引用改用权威类型，删 `protocol/timeline.rs`。**顺带修掉两处镜像漂移** —— T-09（`TimelineToolState` 少 `Cancelled`/`Backgrounded`）、T-10（`BlockCheckpoint` 的 `arg`/`text` 语义弄反，含一次差点写成的「真吞字」）。新开 **T-11**（config 漂移，待修）。测试 142 → 143，clippy 零 warning。TUI `a278ab8`；后端再导出 `73b24fa` |
+| 2026-09-15 | **阶段二·第三刀 + 决策 1**：TUI 的 workspace-mode 功能整体下线（T-12）——服务端已删该能力（`workspace.set_mode` 等四项），TUI 仍在调用必然 404。删除面：`settings_ops.rs` 服务调用与两个 match 分支、`settings.rs` 的 `FieldId::WorkspaceMode` 及全部臂与 `ws_sel`、`methods.rs` 4 常量、`config.rs` 的 `ConfigDto.workspace` 与 `WorkspaceDto`。测试 143 → 135（含阶段二第二刀删掉的 8 个镜像保真测试）。零 warning |
+| 2026-09-15 | **daemon 启动卡死的归因两次更正**：先前把它归到「他人正在改的 exec/registry 区域」**已证伪**（HEAD 干净构建同样复现；`qaqh-daemon` 不依赖 `qaqh-client`）。真实根因是后端 `BUG-2026-09-15-02`：启动期工具探测 `.output()` 无超时 + 管道 EOF 依赖。**真机验证是被该后端缺陷堵住，不是被代码或他人的改动堵住** |

@@ -681,7 +681,6 @@ impl App {
                 // 并复位端口候选（应用后跟随服务端现值）。
                 if let Some(Overlay::Settings(st)) = self.overlays.last_mut() {
                     st.profile_sel = None;
-                    st.ws_sel = None;
                 }
                 if self
                     .overlays

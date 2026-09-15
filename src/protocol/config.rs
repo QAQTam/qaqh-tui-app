@@ -58,7 +58,6 @@ pub struct ConfigDto {
     /// provider 预设目录（服务端派生，只读；选择器数据源）。
     pub providers: Vec<ProviderDto>,
     pub subagent: SubagentDto,
-    pub workspace: WorkspaceDto,
     #[serde(alias = "tokenizer_path")]
     pub tokenizer_path: Option<String>,
 }
@@ -105,17 +104,11 @@ pub struct SubagentDto {
     pub default_tools: Vec<String>,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
-#[serde(rename_all = "camelCase", default)]
-pub struct WorkspaceDto {
-    pub mode: String,
-}
-
 /// 写模型：JSON Merge Patch。序列化时跳过 None——wire 上永不出现 `"field": null`。
 ///
 /// 刻意**不含**（服务端独立写端口，TUI 走专用 service 方法）：`permission_level`
 /// （`config.set_permission_level`）、`active_profile`（`profile.apply`）、
-/// `workspace.mode`（`workspace.set_mode`）、providers/profiles（服务端派生）、
+/// providers/profiles（服务端派生）、
 /// `api_key_set`（服务端派生）。
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
@@ -309,7 +302,6 @@ mod tests {
                 "timeout_secs": 120,
                 "default_tools": ["read"]
             },
-            "workspace": { "mode": "local" },
             "tokenizer_path": null
         });
         let dto: ConfigDto = serde_json::from_value(payload).unwrap();
@@ -317,7 +309,6 @@ mod tests {
         assert_eq!(dto.reasoning_effort, "max");
         assert_eq!(dto.api_key, "****");
         assert!(!dto.subagent.api_key_set);
-        assert_eq!(dto.workspace.mode, "local");
         assert_eq!(dto.providers[0].endpoints[0].models, vec!["ox-alpha-free"]);
     }
 
