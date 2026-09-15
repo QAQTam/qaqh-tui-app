@@ -6,7 +6,6 @@
 //!
 //! 对应关系：
 //! - `qaqh-ringing/src/protocol.rs` → [`mod.rs`] 常量
-//! - `qaqh-ringing/src/capability.rs` → [`capability`]
 //! - `qaqh-ringing/src/envelope.rs` → [`envelope`]
 //! - `qaqh-domain/src/command.rs` → [`command`]
 //! - `qaqh-domain/src/event.rs` → [`event`]
@@ -14,7 +13,7 @@
 //! - `qaqh-ringing/src/{snapshot,reset}.rs` → [`snapshot`]
 //! - `qaqh-runtime/src/ringing/service_methods.rs` → [`methods`]
 
-pub mod capability;
+pub mod bridge;
 pub mod command;
 pub mod config;
 pub mod envelope;
@@ -26,14 +25,15 @@ pub mod timeline;
 use serde::{Deserialize, Serialize};
 
 /// Ringing 协议 schema 标识（`qaqh-ringing/src/protocol.rs:4`）。
+///
+/// 阶段一后生产路径不再消费它（open 握手已由 `qaqh-client` 负责），保留是作为
+/// 镜像契约的一部分；阶段二整体删除 `protocol/` 时一并消失。
+#[allow(dead_code)]
 pub const RINGING_SCHEMA: &str = "qaqh.Ringing";
 /// Ringing 协议版本（同上 :7）。代差不匹配时 daemon 返回 426 `unsupported_version`。
 pub const RINGING_VERSION: u32 = 1;
 /// 连接级身份 header（同上 :13）。每个请求与 SSE 连接都必须携带。
 pub const SESSION_ID_HEADER: &str = "X-QAQH-Client-Session-Id";
-
-/// SSE 帧 id 中的频道段与断点续传 header 名。
-pub const LAST_EVENT_ID_HEADER: &str = "Last-Event-ID";
 
 /// JS 安全整数上限；协议中全部 seq/revision 不得超过（同上 :23）。
 pub const MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
@@ -60,11 +60,6 @@ impl Channel {
             Channel::Conversation => "conversation",
             Channel::Tool => "tool",
         }
-    }
-
-    /// URL path 段（与 as_str 相同）。
-    pub fn path_segment(self) -> &'static str {
-        self.as_str()
     }
 
     /// SSE 帧 id 频道段：`<epoch>:<channel>:<seq>`。

@@ -15,18 +15,20 @@ impl App {
         }
         let (text, attachments) = sess.composer.take();
         let content_refs: Vec<ContentRef> = attachments.into_iter().map(|a| a.content).collect();
-        self.spawn_api(move |client, tx| async move {
-            let cmd = build_envelope(
-                &client,
-                RingingCommand::Conversation(ConversationCommand::ConversationSendMessage {
-                    text,
-                    images: vec![],
-                    attachments: (!content_refs.is_empty()).then_some(content_refs),
-                    as_system: false,
-                }),
-            )
-            .with_seed(seed.clone());
-            let result = client.command(&cmd).await.map_err(|e| e.to_string());
+        self.spawn_api(move |api, tx| async move {
+            let result = api
+                .send_command(
+                    Some(&seed.clone()),
+                    RingingCommand::Conversation(ConversationCommand::ConversationSendMessage {
+                        text,
+                        images: vec![],
+                        attachments: (!content_refs.is_empty()).then_some(content_refs),
+                        as_system: false,
+                    }),
+                    Default::default(),
+                )
+                .await
+                .map_err(|e| e.to_string());
             let _ = tx.send(AppMsg::Action(ActionResult::CommandAck {
                 seed: Some(seed),
                 label: "发送",
@@ -46,15 +48,17 @@ impl App {
         if !streaming {
             return;
         }
-        self.spawn_api(move |client, tx| async move {
-            let cmd = build_envelope(
-                &client,
-                RingingCommand::Conversation(ConversationCommand::ConversationCancel {
-                    turn_id: None,
-                }),
-            )
-            .with_seed(seed.clone());
-            let result = client.command(&cmd).await.map_err(|e| e.to_string());
+        self.spawn_api(move |api, tx| async move {
+            let result = api
+                .send_command(
+                    Some(&seed.clone()),
+                    RingingCommand::Conversation(ConversationCommand::ConversationCancel {
+                        turn_id: None,
+                    }),
+                    Default::default(),
+                )
+                .await
+                .map_err(|e| e.to_string());
             let _ = tx.send(AppMsg::Action(ActionResult::CommandAck {
                 seed: Some(seed),
                 label: "中止",
@@ -77,15 +81,17 @@ impl App {
             sess.mode = next; // 乐观更新
             sess.rendered = None;
         }
-        self.spawn_api(move |client, tx| async move {
-            let cmd = build_envelope(
-                &client,
-                RingingCommand::Conversation(ConversationCommand::ConversationSetMode {
-                    mode: next,
-                }),
-            )
-            .with_seed(seed.clone());
-            let result = client.command(&cmd).await.map_err(|e| e.to_string());
+        self.spawn_api(move |api, tx| async move {
+            let result = api
+                .send_command(
+                    Some(&seed.clone()),
+                    RingingCommand::Conversation(ConversationCommand::ConversationSetMode {
+                        mode: next,
+                    }),
+                    Default::default(),
+                )
+                .await
+                .map_err(|e| e.to_string());
             let _ = tx.send(AppMsg::Action(ActionResult::CommandAck {
                 seed: Some(seed),
                 label: "切换模式",
@@ -98,15 +104,17 @@ impl App {
         let Some(seed) = self.active_seed() else {
             return;
         };
-        self.spawn_api(move |client, tx| async move {
-            let cmd = build_envelope(
-                &client,
-                RingingCommand::Conversation(ConversationCommand::ConversationCompact {
-                    turn_id: None,
-                }),
-            )
-            .with_seed(seed.clone());
-            let result = client.command(&cmd).await.map_err(|e| e.to_string());
+        self.spawn_api(move |api, tx| async move {
+            let result = api
+                .send_command(
+                    Some(&seed.clone()),
+                    RingingCommand::Conversation(ConversationCommand::ConversationCompact {
+                        turn_id: None,
+                    }),
+                    Default::default(),
+                )
+                .await
+                .map_err(|e| e.to_string());
             let _ = tx.send(AppMsg::Action(ActionResult::CommandAck {
                 seed: Some(seed),
                 label: "compact",
@@ -126,21 +134,36 @@ impl App {
         else {
             return;
         };
-        self.spawn_api(move |client, tx| async move {
-            let cmd = build_envelope(
-                &client,
-                RingingCommand::Conversation(ConversationCommand::ConversationUndoTurn { turn_id }),
-            )
-            .with_seed(seed.clone());
-            let command_id = cmd.command_id.clone();
-            let result = client.command(&cmd).await;
+        self.spawn_api(move |api, tx| async move {
+            // command_id 由本侧生成：ack 之后要拿它轮询 receipt。
+            let command_id = uuid::Uuid::new_v4().to_string();
+            let result = api
+                .send_command(
+                    Some(&seed),
+                    RingingCommand::Conversation(ConversationCommand::ConversationUndoTurn {
+                        turn_id,
+                    }),
+                    qaqh_client::CommandOptions {
+                        command_id: Some(command_id.clone()),
+                        ..Default::default()
+                    },
+                )
+                .await;
             match result {
                 Ok(_) => {
                     // ACK ≠ 完成：轮询 receipt 到终态（对齐 winui，但消费其结果）。
                     let mut state: Option<RingingCommandStatus> = None;
                     for _ in 0..30 {
                         tokio::time::sleep(Duration::from_millis(100)).await;
-                        if let Ok(status) = client.command_status(&command_id).await
+                        if let Ok(status) = api
+                            .client
+                            .command_status(&command_id)
+                            .await
+                            .map_err(|e| e.to_string())
+                            .and_then(|s| {
+                                crate::protocol::bridge::command_status_from_wire(&s)
+                                    .map_err(|e| e.to_string())
+                            })
                             && status.state.is_terminal()
                         {
                             state = Some(status);
@@ -172,8 +195,8 @@ impl App {
 
     pub(super) fn request_rebaseline(&mut self, seed: &str) {
         let seed = seed.to_owned();
-        self.spawn_api(move |client, tx| async move {
-            let result = client
+        self.spawn_api(move |api, tx| async move {
+            let result = api
                 .timeline_page(&seed, None, crate::runtime::TIMELINE_PAGE_LIMIT)
                 .await
                 .map_err(|e| e.to_string());
@@ -200,8 +223,8 @@ impl App {
         if let Some(sess) = self.sessions.get_mut(&seed) {
             sess.loading_older = true;
         }
-        self.spawn_api(move |client, tx| async move {
-            let result = client
+        self.spawn_api(move |api, tx| async move {
+            let result = api
                 .timeline_page(&seed, Some(&before), crate::runtime::TIMELINE_PAGE_LIMIT)
                 .await
                 .map_err(|e| e.to_string());
@@ -217,10 +240,14 @@ impl App {
         command: ControlCommand,
         label: &'static str,
     ) {
-        self.spawn_api(move |client, tx| async move {
-            let env =
-                build_envelope(&client, RingingCommand::Control(command)).with_seed(seed.clone());
-            let result = client.command(&env).await.map_err(|e| e.to_string());
+        self.spawn_api(move |api, tx| async move {
+            let result = api
+                .send_command(
+                    Some(&seed),
+                    RingingCommand::Control(command),
+                    Default::default(),
+                )
+                .await;
             let _ = tx.send(AppMsg::Action(ActionResult::CommandAck {
                 seed: Some(seed),
                 label,

@@ -2,9 +2,8 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::command::RingingCommand;
 use super::event::RingingEvent;
-use super::{Channel, Delivery, RINGING_SCHEMA, RINGING_VERSION, is_safe_integer};
+use super::{Channel, Delivery, is_safe_integer};
 
 /// 事件信封。注意 M4 瘦身后 wire 上**没有** schema/version/channel/epoch 字段：
 /// 版本由端点 URL 承担，epoch/channel 由 SSE 帧 id 承担。
@@ -32,11 +31,18 @@ pub struct RingingEventEnvelope {
 }
 
 impl RingingEventEnvelope {
-    /// 信封内的 channel 必须与所在 SSE 连接一致（transport 层校验）。
+    /// 信封内的 channel 必须与所在 SSE 连接一致。
+    ///
+    /// 阶段一后**生产路径不再消费**它（帧的频道校验已由 `qaqh-client` 负责），
+    /// 仅由本文件的镜像保真测试使用——保留是为了让「镜像与权威类型同形」这条
+    /// 前提在本仓仍可被断言。阶段二整体删除 `protocol/` 时一并消失。
+    #[allow(dead_code)]
     pub fn channel(&self) -> Channel {
         self.event.channel()
     }
 
+    /// 见 [`Self::channel`]：阶段一后仅测试消费。
+    #[allow(dead_code)]
     pub fn validate(&self) -> Result<(), &'static str> {
         if self.seed.is_empty()
             || self.event_id.is_empty()
@@ -45,79 +51,6 @@ impl RingingEventEnvelope {
             || !is_safe_integer(self.session_seq)
             || self.state_revision.is_some_and(|v| !is_safe_integer(v))
         {
-            return Err("invalid_envelope");
-        }
-        Ok(())
-    }
-}
-
-/// 命令信封。
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RingingCommandEnvelope {
-    pub schema: String,
-    pub version: u32,
-    pub channel: Channel,
-    /// 命令幂等 id：accepted 前可安全重试（服务端按 payload 指纹去重）。
-    pub command_id: String,
-    pub client_instance_id: String,
-    pub client_session_id: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub seed: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub expected_revision: Option<u64>,
-    pub command: RingingCommand,
-}
-
-impl RingingCommandEnvelope {
-    pub fn new(
-        command_id: impl Into<String>,
-        client_instance_id: impl Into<String>,
-        command: RingingCommand,
-    ) -> Self {
-        Self {
-            schema: RINGING_SCHEMA.to_string(),
-            version: RINGING_VERSION,
-            channel: command.channel(),
-            command_id: command_id.into(),
-            client_instance_id: client_instance_id.into(),
-            client_session_id: String::new(),
-            seed: None,
-            expected_revision: None,
-            command,
-        }
-    }
-
-    pub fn with_seed(mut self, seed: impl Into<String>) -> Self {
-        self.seed = Some(seed.into());
-        self
-    }
-
-    pub fn with_client_session_id(mut self, client_session_id: impl Into<String>) -> Self {
-        self.client_session_id = client_session_id.into();
-        self
-    }
-
-    /// 与后端 `RingingCommandEnvelope::validate` 等价的客户端预检。
-    pub fn validate(&self) -> Result<(), &'static str> {
-        if self.schema != RINGING_SCHEMA || self.version != RINGING_VERSION {
-            return Err("unsupported_version");
-        }
-        if self.command.channel() != self.channel {
-            return Err("invalid_envelope");
-        }
-        if self.command_id.is_empty() || self.client_instance_id.is_empty() {
-            return Err("invalid_envelope");
-        }
-        if self.client_session_id.is_empty() {
-            return Err("lease_required");
-        }
-        if self.seed.as_deref().is_some_and(str::is_empty) {
-            return Err("invalid_envelope");
-        }
-        if self.seed.is_none() && !self.command.is_session_create() {
-            return Err("missing_seed");
-        }
-        if self.expected_revision.is_some_and(|v| !is_safe_integer(v)) {
             return Err("invalid_envelope");
         }
         Ok(())
@@ -188,35 +121,7 @@ pub struct RingingResetRequired {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::command::ControlCommand;
     use crate::protocol::event::ControlEvent;
-
-    #[test]
-    fn command_envelope_validation() {
-        let env = RingingCommandEnvelope::new(
-            "cmd-1",
-            "inst-1",
-            RingingCommand::Control(ControlCommand::SessionCreate {
-                close_current: false,
-                cwd: None,
-                tool_mode: None,
-                custom_tools: vec![],
-            }),
-        );
-        assert!(env.validate().is_err()); // 缺 client_session_id
-        let env = env.with_client_session_id("sess-1");
-        assert!(env.validate().is_ok()); // session_create 是唯一允许无 seed 的命令
-
-        let env = RingingCommandEnvelope::new(
-            "cmd-2",
-            "inst-1",
-            RingingCommand::Control(ControlCommand::SkillsReload),
-        )
-        .with_client_session_id("sess-1");
-        assert_eq!(env.validate(), Err("missing_seed"));
-        let env = env.with_seed("0123abcd");
-        assert!(env.validate().is_ok());
-    }
 
     #[test]
     fn event_envelope_channel_matches_connection() {

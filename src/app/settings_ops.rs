@@ -4,8 +4,9 @@ use super::*;
 
 impl App {
     pub fn fetch_config(&mut self) {
-        self.spawn_api(move |client, tx| async move {
-            let result = client
+        self.spawn_api(move |api, tx| async move {
+            let result = api
+                .http
                 .service(methods::CONFIG_LOAD, &serde_json::json!({}))
                 .await
                 .map_err(|e| e.to_string());
@@ -28,8 +29,9 @@ impl App {
         }
         self.settings_saving = true;
         let payload = st.draft.to_json();
-        self.spawn_api(move |client, tx| async move {
-            let result = client
+        self.spawn_api(move |api, tx| async move {
+            let result = api
+                .http
                 .service(methods::CONFIG_SAVE, &payload)
                 .await
                 .map_err(|e| e.to_string());
@@ -108,8 +110,9 @@ impl App {
 
     /// `profile.apply`：切换活跃 profile（服务端单写口，写后广播 reload）。
     pub fn apply_profile(&mut self, name: String) {
-        self.spawn_api(move |client, tx| async move {
-            let result = client
+        self.spawn_api(move |api, tx| async move {
+            let result = api
+                .http
                 .service(methods::PROFILE_APPLY, &serde_json::json!({ "name": name }))
                 .await
                 .map_err(|e| e.to_string());
@@ -122,8 +125,9 @@ impl App {
 
     /// `workspace.set_mode`：local / wsl（仅 Windows）（服务端单写口）。
     pub fn set_workspace_mode(&mut self, mode: String) {
-        self.spawn_api(move |client, tx| async move {
-            let result = client
+        self.spawn_api(move |api, tx| async move {
+            let result = api
+                .http
                 .service(
                     methods::WORKSPACE_SET_MODE,
                     &serde_json::json!({ "mode": mode }),
@@ -138,8 +142,9 @@ impl App {
     }
 
     pub fn set_permission_level(&mut self, level: u8) {
-        self.spawn_api(move |client, tx| async move {
-            let result = client
+        self.spawn_api(move |api, tx| async move {
+            let result = api
+                .http
                 .service(
                     methods::CONFIG_SET_PERMISSION_LEVEL,
                     &serde_json::json!({ "level": level }),

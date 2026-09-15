@@ -327,21 +327,23 @@ impl App {
     /// SessionAttach（无 actor 副作用）→ bootstrap。timeline 流由 runtime 在
     /// seed 进入跟踪集后自动建立（attach 未落地前短退避重试）。
     fn attach_subagent_seed(&mut self, seed: String) {
-        self.spawn_api(move |client, tx| async move {
-            let cmd = build_envelope(
-                &client,
-                RingingCommand::Control(ControlCommand::SessionAttach { seed: seed.clone() }),
-            )
-            .with_seed(seed.clone());
-            if let Err(e) = client.command(&cmd).await {
+        self.spawn_api(move |api, tx| async move {
+            let attach = api
+                .send_command(
+                    Some(&seed),
+                    RingingCommand::Control(ControlCommand::SessionAttach { seed: seed.clone() }),
+                    Default::default(),
+                )
+                .await;
+            if let Err(e) = attach {
                 let _ = tx.send(AppMsg::Action(ActionResult::CommandAck {
                     seed: Some(seed.clone()),
                     label: "attach",
-                    result: Err(e.to_string()),
+                    result: Err(e),
                 }));
                 return;
             }
-            let result = client.bootstrap(&seed).await.map_err(|e| e.to_string());
+            let result = api.bootstrap(&seed).await;
             let _ = tx.send(AppMsg::Action(ActionResult::Bootstrap { seed, result }));
         });
     }

@@ -18,22 +18,23 @@ impl App {
     }
 
     pub(super) fn attach_and_bootstrap(&mut self, seed: String) {
-        self.spawn_api(move |client, tx| async move {
-            let cmd = build_envelope(
-                &client,
-                RingingCommand::Control(ControlCommand::SessionResume { seed: seed.clone() }),
-            )
-            .with_seed(seed.clone());
-            let ack = client.command(&cmd).await;
+        self.spawn_api(move |api, tx| async move {
+            let ack = api
+                .send_command(
+                    Some(&seed),
+                    RingingCommand::Control(ControlCommand::SessionResume { seed: seed.clone() }),
+                    Default::default(),
+                )
+                .await;
             if let Err(e) = ack {
                 let _ = tx.send(AppMsg::Action(ActionResult::CommandAck {
                     seed: Some(seed.clone()),
                     label: "resume",
-                    result: Err(e.to_string()),
+                    result: Err(e),
                 }));
                 return;
             }
-            let result = client.bootstrap(&seed).await.map_err(|e| e.to_string());
+            let result = api.bootstrap(&seed).await;
             let _ = tx.send(AppMsg::Action(ActionResult::Bootstrap { seed, result }));
         });
     }
@@ -66,21 +67,27 @@ impl App {
 
     pub fn new_session_with_cwd(&mut self, cwd: Option<String>) {
         let cwd = self.effective_cwd(cwd);
-        let client = self.client.clone();
-        let cmd = build_envelope(
-            &client,
-            RingingCommand::Control(ControlCommand::SessionCreate {
-                close_current: false,
-                cwd,
-                tool_mode: None,
-                custom_tools: vec![],
-            }),
-        );
-        let command_id = cmd.command_id.clone();
+        // command_id 由本侧生成并透传：新会话要靠 `causation_id == command_id`
+        // 关联（`pending_creates`），不能让客户端自己造一个我们不知道的 id。
+        let command_id = uuid::Uuid::new_v4().to_string();
         self.pending_creates
             .insert(command_id.clone(), Instant::now());
-        self.spawn_api(move |client, tx| async move {
-            let result = client.command(&cmd).await.map_err(|e| e.to_string());
+        self.spawn_api(move |api, tx| async move {
+            let result = api
+                .send_command(
+                    None,
+                    RingingCommand::Control(ControlCommand::SessionCreate {
+                        close_current: false,
+                        cwd,
+                        tool_mode: None,
+                        custom_tools: vec![],
+                    }),
+                    qaqh_client::CommandOptions {
+                        command_id: Some(command_id),
+                        ..Default::default()
+                    },
+                )
+                .await;
             let _ = tx.send(AppMsg::Action(ActionResult::CommandAck {
                 seed: None,
                 label: "新会话",
@@ -137,10 +144,11 @@ impl App {
     // ───────────────────────── 命令发送 ─────────────────────────
 
     pub fn fetch_session_list(&mut self) {
-        self.spawn_api(move |client, tx| async move {
-            let list = client.session_list().await.map_err(|e| e.to_string());
+        self.spawn_api(move |api, tx| async move {
+            let list = api.http.session_list().await.map_err(|e| e.to_string());
             let _ = tx.send(AppMsg::Action(ActionResult::SessionList(list)));
-            let activity = client
+            let activity = api
+                .http
                 .service(methods::SESSION_ACTIVITY, &serde_json::json!({}))
                 .await
                 .map_err(|e| e.to_string());
@@ -173,8 +181,9 @@ impl App {
             return;
         }
         self.dashboard_fetching.insert(seed.clone());
-        self.spawn_api(move |client, tx| async move {
-            let value = client
+        self.spawn_api(move |api, tx| async move {
+            let value = api
+                .http
                 .service(
                     methods::SESSION_DASHBOARD,
                     &serde_json::json!({ "seed": seed.clone() }),
@@ -238,7 +247,8 @@ impl App {
                 Err(e) => {
                     let msg = e.to_string();
                     // fallback: todo.status 是同一数据源的另一视图
-                    let v2 = client
+                    let v2 = api
+                        .http
                         .service(
                             methods::TODO_STATUS,
                             &serde_json::json!({ "seed": seed.clone() }),

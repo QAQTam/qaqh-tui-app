@@ -126,9 +126,11 @@ impl App {
             approved,
             trust_folder: panel.trust_folder,
         });
-        self.spawn_api(move |client, tx| async move {
-            let env = build_envelope(&client, cmd).with_seed(seed.clone());
-            let result = client.command(&env).await.map_err(|e| e.to_string());
+        self.spawn_api(move |api, tx| async move {
+            let result = api
+                .send_command(Some(&seed.clone()), cmd, Default::default())
+                .await
+                .map_err(|e| e.to_string());
             let _ = tx.send(AppMsg::Action(ActionResult::CommandAck {
                 seed: Some(seed),
                 label: "权限",

@@ -18,8 +18,7 @@ use tokio::sync::mpsc;
 
 use app::{App, AppMsg};
 use runtime::{Runtime, RuntimeMsg};
-use transport::discovery::{ensure_daemon, read_discovery};
-use transport::http::{ApiError, HttpClient, new_instance_id};
+use transport::http::HttpClient;
 
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -34,7 +33,7 @@ fn main() -> Result<()> {
             println!("用法:");
             println!("  qaqh-tui            连接本地 daemon 并进入 TUI");
             println!("  qaqh-tui --no-spawn 不自动拉起 daemon（仅连接已有实例）");
-            println!("  qaqh-tui doctor     自检：发现/健康/open 握手");
+            println!("  qaqh-tui doctor     自检：发现/pid 判活/open 握手");
             println!();
             println!(
                 "环境: QAQH_DATA_DIR（数据目录覆盖）、QAQH_BACKEND_ROOT（daemon 拉起候选）、QAQH_DEFAULT_CWD（新建会话默认目录，支持 ~/ 展开）"
@@ -52,19 +51,10 @@ fn main() -> Result<()> {
 }
 
 async fn run_tui(no_spawn: bool) -> Result<()> {
-    // ── 发现 + 客户端 ──
-    let discovery = ensure_daemon(!no_spawn).await.context("daemon 发现失败")?;
-    let client = Arc::new(HttpClient::new(
-        discovery.base_url(),
-        discovery.token.clone(),
-        new_instance_id(),
-    ));
-
+    // 先建通道再连接：连接期间 `ClientHandlers` 回调发来的消息先入队，等 App
+    // 构造好后一并排空（否则首个 Ready/事件会丢）。
     let (app_tx, mut app_rx) = mpsc::unbounded_channel::<AppMsg>();
-
-    // runtime → app 桥接。
     let (rt_tx, mut rt_rx) = mpsc::unbounded_channel::<RuntimeMsg>();
-    let runtime = Arc::new(Runtime::start(client.clone(), rt_tx));
     {
         let bridge_tx = app_tx.clone();
         tokio::spawn(async move {
@@ -75,6 +65,20 @@ async fn run_tui(no_spawn: bool) -> Result<()> {
             }
         });
     }
+
+    // 连接生命周期（含「daemon 不在则拉起」）全部交给 qaqh-client。
+    let runtime = Runtime::start(rt_tx, !no_spawn)
+        .await
+        .context("连接 daemon 失败")?;
+
+    // 服务面（阶段 1.5 之前仍是本仓的 HttpClient）与生命周期共用同一份
+    // daemon.json；此时 daemon 必然已就绪（上一步刚协商成功）。
+    let discovery = qaqh_client::read_discovery().context("daemon 发现失败（daemon 未运行？）")?;
+    let http = Arc::new(HttpClient::new(
+        qaqh_client::DiscoveryExt::base_url(&discovery).context("解析 daemon endpoint 失败")?,
+        discovery.token.clone(),
+    ));
+    runtime.attach_service_client(http.clone()).await;
 
     // 终端初始化（ratatui 0.30：init/restore + panic hook）。
     let mut terminal = ratatui::init();
@@ -129,7 +133,7 @@ async fn run_tui(no_spawn: bool) -> Result<()> {
         });
     }
 
-    let mut app = App::new(client.clone(), runtime.clone(), app_tx.clone());
+    let mut app = App::new(http, runtime.clone(), app_tx.clone());
     // 首页：无 tab 时直接展示会话列表，立即拉取一次避免首帧空白
     app.fetch_session_list();
 
@@ -176,57 +180,53 @@ fn doctor() -> Result<()> {
 async fn doctor_async() -> Result<()> {
     println!("== qaqh-tui doctor ==");
 
-    // 1) discovery + pid 存活；失效则尝试拉起 daemon。
-    let discovery = match read_discovery() {
-        Some(d) if transport::discovery::pid_alive(d.pid) => {
+    // 1) discovery + pid 存活。
+    match qaqh_client::read_discovery() {
+        Ok(d) if qaqh_client::discovery::process_is_running(d.pid) => {
             println!(
                 "[1] daemon.json: endpoint={} pid={} epoch={} version={} channel={}",
                 d.endpoint, d.pid, d.server_epoch, d.daemon_version, d.channel
             );
             println!("[2] pid {} 存活", d.pid);
-            d
         }
-        stale => {
-            match stale {
-                Some(d) => println!("[1] daemon.json 过期（pid {} 已退出），尝试拉起…", d.pid),
-                None => println!(
-                    "[1] daemon.json 缺失（数据目录: {}），尝试拉起…",
-                    transport::discovery::data_dir().display()
+        Ok(d) => {
+            println!("[1] daemon.json 过期（pid {} 已退出）", d.pid);
+            println!("[2] 运行 qaqh-tui 时会尝试拉起 daemon");
+        }
+        Err(e) => {
+            println!(
+                "[1] daemon.json 不可用（数据目录: {}）：{e}",
+                qaqh_client::discovery::data_dir().display()
+            );
+            println!("[2] 运行 qaqh-tui 时会尝试拉起 daemon");
+        }
+    }
+
+    // 2) open 握手。协议代差/凭据问题都在这一步暴露。
+    match qaqh_client::Client::connect_async(qaqh_client::ClientOptions {
+        launch_daemon_if_missing: true,
+        ..Default::default()
+    })
+    .await
+    {
+        Ok(client) => {
+            match client.session_state().await {
+                Some(state) => println!(
+                    "[3] open: session={} epoch={} lease_ttl={}ms renew={}ms",
+                    state.client_session_id,
+                    state.server_epoch,
+                    state.lease_ttl_ms,
+                    state.renew_interval_ms
                 ),
+                None => bail!("[3] open 成功但未协商出 session"),
             }
-            let d = ensure_daemon(true).await?;
-            println!("[2] daemon 已就绪：endpoint={} pid={}", d.endpoint, d.pid);
-            d
+            println!("[4] OK —— 可以运行 qaqh-tui");
+            client.close();
+            Ok(())
         }
-    };
-
-    let client = HttpClient::new(
-        discovery.base_url(),
-        discovery.token.clone(),
-        new_instance_id(),
-    );
-
-    match client.health().await {
-        Ok(body) => println!("[3] /health: {body}"),
-        Err(e) => bail!("[3] /health 失败: {e}"),
+        Err(qaqh_client::ClientError::Negotiation(m)) => {
+            bail!("[3] open 被拒（协议代差）: {m} —— 请更新客户端或 daemon")
+        }
+        Err(e) => bail!("[3] open 失败: {e}"),
     }
-
-    match client.open().await {
-        Ok(resp) => {
-            print_open(&resp);
-            println!("[5] OK —— 可以运行 qaqh-tui");
-        }
-        Err(ApiError::UnsupportedVersion(m)) => {
-            bail!("[4] open 被拒（协议代差）: {m} —— 请更新客户端或 daemon")
-        }
-        Err(e) => bail!("[4] open 失败: {e}"),
-    }
-    Ok(())
-}
-
-fn print_open(resp: &protocol::capability::ClientOpenResponse) {
-    println!(
-        "[4] open: accepted={} session={} lease_ttl={}ms renew={}ms",
-        resp.accepted, resp.client_session_id, resp.lease_ttl_ms, resp.renew_interval_ms
-    );
 }

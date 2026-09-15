@@ -396,7 +396,7 @@ impl App {
         let Some(seed) = self.active_seed() else {
             return;
         };
-        self.spawn_api(move |client, tx| async move {
+        self.spawn_api(move |api, tx| async move {
             let read_path = path.clone();
             let result =
                 tokio::task::spawn_blocking(move || -> Result<(Vec<u8>, String), String> {
@@ -409,10 +409,17 @@ impl App {
                 .and_then(|r| r);
             match result {
                 Ok((bytes, media)) => {
-                    let uploaded = client
+                    // 上传走 qaqh-client（multipart 组装在 client 侧），返回的
+                    // ContentRef 过桥回本仓镜像类型。
+                    let uploaded = api
+                        .client
                         .upload_content(&seed, &media, bytes)
                         .await
-                        .map_err(|e| e.to_string());
+                        .map_err(|e| e.to_string())
+                        .and_then(|r| {
+                            crate::protocol::bridge::content_ref_from_wire(&r)
+                                .map_err(|e| e.to_string())
+                        });
                     let _ = tx.send(AppMsg::Action(ActionResult::Uploaded {
                         seed,
                         path,

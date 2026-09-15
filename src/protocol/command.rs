@@ -179,6 +179,8 @@ pub enum RingingCommand {
 }
 
 impl RingingCommand {
+    /// 见 [`crate::protocol::RINGING_SCHEMA`]：阶段一后仅测试消费。
+    #[allow(dead_code)]
     pub fn channel(&self) -> Channel {
         match self {
             RingingCommand::Control(_) => Channel::Control,
@@ -187,6 +189,8 @@ impl RingingCommand {
         }
     }
 
+    /// 见 [`crate::protocol::RINGING_SCHEMA`]：阶段一后仅测试消费。
+    #[allow(dead_code)]
     pub fn is_session_create(&self) -> bool {
         matches!(
             self,

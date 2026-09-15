@@ -27,6 +27,8 @@ pub fn draw(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
         }
         ConnPhase::Lost => {
             left.push(Span::styled(" ✗ lost", theme::err()));
+            // T-03：失联时必须让用户看见重连入口，否则唯一手段是重启进程。
+            left.push(Span::styled(" · Ctrl+R 重连", theme::warn()));
             if let Some(err) = &app.conn_error {
                 left.push(Span::styled(
                     format!(" {}", crate::app::truncate_str(err, 30)),

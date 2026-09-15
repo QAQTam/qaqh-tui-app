@@ -32,6 +32,9 @@ pub(crate) enum GlobalKey {
     ToggleTodoDetail,
     /// F7：工具卡展开。
     ToggleToolExpand,
+    /// Ctrl+R：手动重连（关闭并重建客户端）。仅在失联相位可用——见
+    /// `App::request_reconnect`：健康的连接不该被一次误按推倒重来。
+    Reconnect,
 }
 
 /// 将按键映射为全局快捷键；非全局键返回 `None`。
@@ -45,6 +48,7 @@ pub(crate) fn map_global_key(key: &KeyEvent) -> Option<GlobalKey> {
         KeyCode::Char('q') if ctrl => Some(GlobalKey::QuitNow),
         KeyCode::Char('t') if ctrl => Some(GlobalKey::NewSession),
         KeyCode::Char('l') if ctrl => Some(GlobalKey::SessionList),
+        KeyCode::Char('r') if ctrl => Some(GlobalKey::Reconnect),
         KeyCode::Char(',') if ctrl => Some(GlobalKey::ToggleSettings),
         KeyCode::Char('w') if key.modifiers.contains(KeyModifiers::ALT) => {
             Some(GlobalKey::CloseTab)

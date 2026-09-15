@@ -41,7 +41,7 @@ use crate::protocol::event::{
 use crate::protocol::methods::{self, SessionMetaView};
 use crate::protocol::timeline::TimelinePage;
 use crate::runtime::{ConnEvent, Runtime, RuntimeMsg};
-use crate::transport::http::{HttpClient, build_envelope};
+use crate::transport::http::HttpClient;
 use session::{
     AskPanel, PermissionPanel, PlanPanel, SessionState, StreamPhase, streaming_done,
     sync_streaming_from_timeline,
@@ -110,6 +110,72 @@ pub enum AppMsg {
     Paste(String),
     Resize,
     Tick,
+}
+
+/// 后台任务取用的 API 句柄。
+///
+/// T-01 阶段一后本仓有**两个**客户端在跑，职责不重叠：
+/// - `client`（`qaqh-client`）：连接生命周期 + 三条频道流 + per-seed timeline
+///   流 + 命令面（`send_command`）；
+/// - `http`（本仓 `HttpClient`）：**仅**服务面 `service()`（阶段 1.5 会把它
+///   也切到 `Client::query`/`action`，届时本字段删除）。
+#[derive(Clone)]
+pub struct ApiCtx {
+    pub http: Arc<HttpClient>,
+    pub client: Arc<qaqh_client::Client>,
+}
+
+impl ApiCtx {
+    /// 发送 Ringing 命令，返回**本仓镜像类型**的 ack（经 `protocol::bridge`）。
+    ///
+    /// 过桥失败必须如实报错：那意味着后端协议变了而本仓镜像没跟上，静默吞掉
+    /// 会让命令看起来「发出去了但没反应」。
+    pub async fn send_command(
+        &self,
+        seed: Option<&str>,
+        command: crate::protocol::command::RingingCommand,
+        options: qaqh_client::CommandOptions,
+    ) -> Result<crate::protocol::envelope::RingingCommandAck, String> {
+        let wire = crate::protocol::bridge::command_to_wire(&command)
+            .map_err(|e| format!("命令过桥失败（协议镜像漂移？）：{e}"))?;
+        let ack = self
+            .client
+            .send_command(seed, wire, options)
+            .await
+            .map_err(|e| e.to_string())?;
+        crate::protocol::bridge::ack_from_wire(&ack)
+            .map_err(|e| format!("命令回执过桥失败（协议镜像漂移？）：{e}"))
+    }
+
+    /// 拉取 timeline 快照页（纯读，不重建流）。
+    pub async fn timeline_page(
+        &self,
+        seed: &str,
+        before_turn: Option<&str>,
+        limit: u32,
+    ) -> Result<crate::protocol::timeline::TimelinePage, String> {
+        let page = self
+            .client
+            .fetch_timeline_page(seed, before_turn, Some(limit))
+            .await
+            .map_err(|e| e.to_string())?;
+        crate::protocol::bridge::timeline_page_from_wire(&page)
+            .map_err(|e| format!("timeline 快照过桥失败（协议镜像漂移？）：{e}"))
+    }
+
+    /// 会话 bootstrap（三频道快照原子恢复）。
+    pub async fn bootstrap(
+        &self,
+        seed: &str,
+    ) -> Result<crate::protocol::snapshot::RingingSessionBootstrap, String> {
+        let page = self
+            .client
+            .bootstrap(seed)
+            .await
+            .map_err(|e| e.to_string())?;
+        crate::protocol::bridge::bootstrap_from_wire(&page)
+            .map_err(|e| format!("bootstrap 过桥失败（协议镜像漂移？）：{e}"))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -387,12 +453,12 @@ impl App {
     fn handle_runtime(&mut self, msg: RuntimeMsg) {
         match msg {
             RuntimeMsg::Conn(ev) => self.handle_conn(ev),
-            RuntimeMsg::Ringing { channel, env } => self.handle_envelope(channel, *env),
-            RuntimeMsg::ResetRequired { seed, .. } => {
+            RuntimeMsg::Ringing { env } => self.handle_envelope(*env),
+            RuntimeMsg::ResetRequired { seed } => {
                 // 频道级 reset → 重新 bootstrap 该会话（timeline 流自会 re-baseline）。
                 let seed2 = seed.clone();
-                self.spawn_api(move |client, tx| async move {
-                    let result = client.bootstrap(&seed2).await.map_err(|e| e.to_string());
+                self.spawn_api(move |api, tx| async move {
+                    let result = api.bootstrap(&seed2).await;
                     let _ = tx.send(AppMsg::Action(ActionResult::Bootstrap {
                         seed: seed2,
                         result,
@@ -456,6 +522,30 @@ impl App {
         }
     }
 
+    /// **手动重连**（T-03）：关掉当前客户端并重建一个。
+    ///
+    /// 只在失联相位可用——`qaqh-client` 自己会为租约过期/daemon 重启重连，
+    /// 健康的连接上按这个键只会把好连接推倒重来。重建会重读 `daemon.json`
+    /// （含 pid 判活），所以 daemon 换了端口/token 也能恢复；成功后的相位由
+    /// 运行时推 `Ready` 回来（并触发一次全量 attach + bootstrap）。
+    fn request_reconnect(&mut self) {
+        if self.conn_phase != ConnPhase::Lost {
+            self.toast(NoticeLevel::Info, "连接正常，无需重连");
+            return;
+        }
+        let runtime = self.runtime.clone();
+        let tx = self.msg_tx.clone();
+        self.toast(NoticeLevel::Info, "正在重连 daemon…");
+        tokio::spawn(async move {
+            if let Err(e) = runtime.rebuild().await {
+                // 失败就留在 Lost 并把原因显示出来（状态栏会渲染 conn_error）。
+                let _ = tx.send(AppMsg::Runtime(RuntimeMsg::Conn(ConnEvent::Lost(format!(
+                    "重连失败：{e}"
+                )))));
+            }
+        });
+    }
+
     fn handle_conn(&mut self, ev: ConnEvent) {
         match ev {
             ConnEvent::Opening => {
@@ -477,44 +567,48 @@ impl App {
                 let seeds = self.tabs.clone();
                 let sub_seeds: Vec<String> = self.subagent_seeds.iter().cloned().collect();
                 if !seeds.is_empty() || !sub_seeds.is_empty() {
-                    self.spawn_api(move |client, tx| async move {
+                    self.spawn_api(move |api, tx| async move {
                         for seed in seeds {
-                            let cmd = build_envelope(
-                                &client,
-                                RingingCommand::Control(ControlCommand::SessionResume {
-                                    seed: seed.clone(),
-                                }),
-                            )
-                            .with_seed(seed.clone());
-                            if let Err(e) = client.command(&cmd).await {
+                            let attach = api
+                                .send_command(
+                                    Some(&seed),
+                                    RingingCommand::Control(ControlCommand::SessionResume {
+                                        seed: seed.clone(),
+                                    }),
+                                    Default::default(),
+                                )
+                                .await;
+                            if let Err(e) = attach {
                                 let _ = tx.send(AppMsg::Action(ActionResult::CommandAck {
                                     seed: Some(seed.clone()),
                                     label: "resume",
-                                    result: Err(e.to_string()),
+                                    result: Err(e),
                                 }));
                                 continue;
                             }
-                            let result = client.bootstrap(&seed).await.map_err(|e| e.to_string());
+                            let result = api.bootstrap(&seed).await;
                             let _ =
                                 tx.send(AppMsg::Action(ActionResult::Bootstrap { seed, result }));
                         }
                         for seed in sub_seeds {
-                            let cmd = build_envelope(
-                                &client,
-                                RingingCommand::Control(ControlCommand::SessionAttach {
-                                    seed: seed.clone(),
-                                }),
-                            )
-                            .with_seed(seed.clone());
-                            if let Err(e) = client.command(&cmd).await {
+                            let attach = api
+                                .send_command(
+                                    Some(&seed),
+                                    RingingCommand::Control(ControlCommand::SessionAttach {
+                                        seed: seed.clone(),
+                                    }),
+                                    Default::default(),
+                                )
+                                .await;
+                            if let Err(e) = attach {
                                 let _ = tx.send(AppMsg::Action(ActionResult::CommandAck {
                                     seed: Some(seed.clone()),
                                     label: "attach",
-                                    result: Err(e.to_string()),
+                                    result: Err(e),
                                 }));
                                 continue;
                             }
-                            let result = client.bootstrap(&seed).await.map_err(|e| e.to_string());
+                            let result = api.bootstrap(&seed).await;
                             let _ =
                                 tx.send(AppMsg::Action(ActionResult::Bootstrap { seed, result }));
                         }
@@ -528,17 +622,13 @@ impl App {
                 self.conn_phase = ConnPhase::Lost;
                 self.conn_error = Some(reason);
             }
-            ConnEvent::StreamIssue { error, .. } => {
+            ConnEvent::StreamIssue { error } => {
                 self.conn_error = Some(error);
             }
         }
     }
 
-    fn handle_envelope(
-        &mut self,
-        _channel: crate::protocol::Channel,
-        env: crate::protocol::envelope::RingingEventEnvelope,
-    ) {
+    fn handle_envelope(&mut self, env: crate::protocol::envelope::RingingEventEnvelope) {
         let seed = env.seed.clone();
         let causation_id = env.causation_id.clone();
         match env.event {
@@ -1242,14 +1332,15 @@ impl App {
     /// 今后如需统一超时/退避/取消/指标，只需叠加在此处。
     pub(super) fn spawn_api<F, Fut>(&self, task: F)
     where
-        F: FnOnce(Arc<HttpClient>, tokio::sync::mpsc::UnboundedSender<AppMsg>) -> Fut
-            + Send
-            + 'static,
+        F: FnOnce(ApiCtx, tokio::sync::mpsc::UnboundedSender<AppMsg>) -> Fut + Send + 'static,
         Fut: std::future::Future<Output = ()> + Send,
     {
-        let client = self.client.clone();
+        let api = ApiCtx {
+            http: self.client.clone(),
+            client: self.runtime.client(),
+        };
         let tx = self.msg_tx.clone();
-        tokio::spawn(async move { task(client, tx).await });
+        tokio::spawn(async move { task(api, tx).await });
     }
 
     fn handle_key(&mut self, key: KeyEvent) {
@@ -1314,6 +1405,10 @@ impl App {
             }
             Some(GlobalKey::ToggleToolExpand) => {
                 self.toggle_tool_expand();
+                return;
+            }
+            Some(GlobalKey::Reconnect) => {
+                self.request_reconnect();
                 return;
             }
             None => {}
