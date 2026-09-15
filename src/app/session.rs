@@ -669,6 +669,7 @@ mod tests {
             // 夹具约定：封口必与终态同时出现（后端 `seal_turn_with_state`
             // 也是 `sealed = true` 与 `state = <终态>` 一同写入）。
             sealed: state != TimelineTurnState::Running,
+            offloaded: false,
             rounds: Vec::new(),
         }
     }

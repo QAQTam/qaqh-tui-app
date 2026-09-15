@@ -1122,6 +1122,7 @@ mod tests {
                 state: TimelineTurnState::Completed,
                 failure: None,
                 sealed: true,
+                offloaded: false,
                 rounds: vec![round],
             };
             model.turns.push(turn);

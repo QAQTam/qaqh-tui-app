@@ -250,6 +250,17 @@ pub fn render_transcript_with_opts(
         }
         lines.push(header);
 
+        // T-06：offload 后常驻内存里只剩「预览壳」（正文截到 512 字符、
+        // tool.output/diff 清空）。不说的话用户会把残缺内容当成完整回合——
+        // 与 B1「丢弃必须可见」同一设计原则。
+        if turn.offloaded {
+            lines.push(
+                RenderLine::new()
+                    .span("  ◌ ", SpanStyle::Warn)
+                    .span("已归档：以下内容为预览", SpanStyle::Warn),
+            );
+        }
+
         // ── 用户输入 ──
         if !turn.user_text.is_empty() {
             let wrapped = wrap_text(&turn.user_text, width.saturating_sub(2));
@@ -1643,10 +1654,53 @@ pub fn render_session_info(session: &SessionState, width: u16) -> Vec<RenderLine
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app::session::SessionState;
     use crate::app::timeline_model::{Block, Round, ToolCard, Turn};
     use qaqh_client::{
         TimelineBlockKind, TimelineBlockState, TimelineToolState, TimelineTurnState,
     };
+
+    fn flatten(lines: &[RenderLine]) -> String {
+        lines
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.text.clone()))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn turn_with_offload(offloaded: bool) -> SessionState {
+        let mut sess = SessionState::new("seed-1".into());
+        sess.timeline.turns.push(Turn {
+            turn_id: "t1".into(),
+            user_text: "hi".into(),
+            state: TimelineTurnState::Completed,
+            failure: None,
+            sealed: true,
+            offloaded,
+            rounds: Vec::new(),
+        });
+        sess
+    }
+
+    /// T-06：offload 后常驻内存里只剩「预览壳」（block 正文截到 512 字符、
+    /// `tool.output`/`tool.diff` 清空）。必须在 transcript 里显式标注——否则
+    /// 用户会把残缺内容当成完整回合，读完还以为「模型就答了这么点」。
+    /// 与 B1「丢弃必须可见」同一设计原则。
+    ///
+    /// 破坏验证：去掉 `if turn.offloaded` 那段渲染分支 → 本测试红。
+    #[test]
+    fn offloaded_turn_is_marked_as_preview() {
+        let flat = flatten(&render_transcript(&turn_with_offload(true), 100));
+        assert!(flat.contains("已归档"), "offload 必须可见，实测：{flat}");
+        assert!(flat.contains("预览"));
+    }
+
+    /// 反向闸：未 offload 的回合不得挂这条警告，否则每个正常回合都被标成残缺。
+    #[test]
+    fn normal_turn_has_no_preview_warning() {
+        let flat = flatten(&render_transcript(&turn_with_offload(false), 100));
+        assert!(!flat.contains("已归档"), "未 offload 不得报警告，实测：{flat}");
+    }
 
     /// 回归：ask 的机器回执 JSON 不得出现在 transcript（答案由交互弹窗承载）。
     #[test]
@@ -2102,6 +2156,7 @@ mod tests {
             state: TimelineTurnState::Completed,
             failure: None,
             sealed: true,
+            offloaded: false,
             rounds: vec![round],
         };
         let mut sess = crate::app::session::SessionState::new("s".into());
@@ -2148,6 +2203,7 @@ mod tests {
             state: TimelineTurnState::Completed,
             failure: None,
             sealed: true,
+            offloaded: false,
             rounds: vec![Round {
                 round_num: 0,
                 sealed: true,
@@ -2224,6 +2280,7 @@ mod tests {
             },
             failure: None,
             sealed: !running,
+            offloaded: false,
             rounds: vec![Round {
                 round_num: 0,
                 sealed: !running,
@@ -2408,6 +2465,7 @@ mod tests {
             state: TimelineTurnState::Running,
             failure: None,
             sealed: false,
+            offloaded: false,
             rounds: vec![Round {
                 round_num: 0,
                 sealed: false,

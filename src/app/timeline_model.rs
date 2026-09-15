@@ -264,6 +264,11 @@ pub struct Turn {
     /// （sealed 却仍 Running），用 state 推断就会漏判——那正是本字段所修的
     /// 那类错位。线协议本就携带它，此前在 `from_wire` 被丢弃。
     pub sealed: bool,
+    /// T-06：该回合已被 offload —— 常驻内存里只剩「预览壳」：block 正文被截到
+    /// 512 字符、`tool.output`/`tool.diff` 被清空（见 `qaqh-runtime/src/timeline.rs`
+    /// 的 offload 路径）。**必须让用户看得见**，否则残缺内容会被当成完整回合
+    /// ——与 B1「丢弃必须可见」同一设计原则。
+    pub offloaded: bool,
     pub rounds: Vec<Round>,
 }
 
@@ -275,6 +280,7 @@ impl Turn {
             state: t.state,
             failure: t.failure,
             sealed: t.sealed,
+            offloaded: t.offloaded,
             rounds: t
                 .rounds
                 .into_iter()
@@ -380,6 +386,9 @@ impl TimelineModel {
                         state: TimelineTurnState::Running,
                         failure: None,
                         sealed: false,
+                        // 实时新建的回合不可能已 offload（offload 只作用于已封口的
+                        // 回合的重载路径）。
+                        offloaded: false,
                         rounds: Vec::new(),
                     });
                     self.bump();
