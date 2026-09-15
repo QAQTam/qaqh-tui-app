@@ -35,8 +35,10 @@ pub fn style_of(s: SpanStyle) -> Style {
         SpanStyle::MdH3 => Style::new()
             .fg(Color::Cyan)
             .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
-        SpanStyle::MdInlineCode => Style::new().fg(Color::Yellow).bg(Color::Indexed(236)),
-        SpanStyle::MdCodeBlock => Style::new().fg(Color::White).bg(Color::Indexed(236)),
+        // 代码（内联与块）不用背景色：融入终端底色。带背景会在文字周围拖出一块
+        // 灰影，且会盖掉用户自己的终端配色（半透明底、非纯黑底）。
+        SpanStyle::MdInlineCode => Style::new().fg(Color::Yellow),
+        SpanStyle::MdCodeBlock => Style::new().fg(Color::White),
         SpanStyle::MdLink => Style::new()
             .fg(Color::LightBlue)
             .add_modifier(Modifier::UNDERLINED),
@@ -81,4 +83,23 @@ pub fn err() -> Style {
 
 pub fn warn() -> Style {
     Style::new().fg(Color::Yellow)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 代码（内联码与代码块）必须融入终端底色：带背景会在文字周围拖出灰影，
+    /// 并盖掉用户自己的终端配色（半透明底 / 非纯黑底）。回归锁对应
+    /// `markdown::syntect_to_ratatui` 与本节同时去背景的那次改动。
+    #[test]
+    fn code_styles_have_no_background() {
+        for s in [SpanStyle::MdInlineCode, SpanStyle::MdCodeBlock] {
+            assert_eq!(
+                style_of(s).bg,
+                None,
+                "{s:?} 带了背景色；代码应融入终端底色而不是自绘色块"
+            );
+        }
+    }
 }

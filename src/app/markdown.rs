@@ -31,8 +31,12 @@ fn theme_set() -> &'static ThemeSet {
 
 fn syntect_to_ratatui(s: syntect::highlighting::Style) -> RatStyle {
     let fg = RatColor::Rgb(s.foreground.r, s.foreground.g, s.foreground.b);
-    let bg = RatColor::Rgb(s.background.r, s.background.g, s.background.b);
-    let mut style = RatStyle::new().fg(fg).bg(bg);
+    // 只取前景与字形，**刻意不搬**主题自带的 background：
+    // ① 主题底色与代码块缩进的底色不是同一个值，两块不同的灰并排会看起来像
+    //    「文字底下拖着一块影子」；
+    // ② 它会盖掉用户自己的终端配色（半透明底、非纯黑底、亮色主题）。
+    // 代码块因此**融入终端底色**，只用前景色区分 token。
+    let mut style = RatStyle::new().fg(fg);
     if s.font_style.contains(FontStyle::BOLD) {
         style = style.add_modifier(Modifier::BOLD);
     }
@@ -48,7 +52,8 @@ fn syntect_to_ratatui(s: syntect::highlighting::Style) -> RatStyle {
 fn render_highlighted_code_block(text: &str, lang: Option<&str>, width: usize) -> Vec<RenderLine> {
     let ps = syntax_set();
     let ts = theme_set();
-    // 主题选用深色：base16-ocean.dark 为 syntect 默认深色，与 MdCodeBlock 背景 Indexed(236) 接近
+    // 主题选用深色：base16-ocean.dark 的前景色在黑底上可读。背景一律不取
+    // （见 `syntect_to_ratatui`），所以这里只关心前景色。
     let theme = &ts.themes["base16-ocean.dark"];
     let syntax = lang
         .and_then(|l| ps.find_syntax_by_token(l))
@@ -61,10 +66,7 @@ fn render_highlighted_code_block(text: &str, lang: Option<&str>, width: usize) -
         // 去掉 LinesWithEndings 自带的换行符，保留空行
         let line = line.trim_end_matches("\r\n").trim_end_matches('\n');
         if line.is_empty() {
-            out.push(
-                RenderLine::new()
-                    .span_direct(CODE_INDENT, RatStyle::new().bg(RatColor::Indexed(236))),
-            );
+            out.push(RenderLine::new().span_direct(CODE_INDENT, RatStyle::new()));
             continue;
         }
         let ranges = match h.highlight_line(line, ps) {
@@ -75,9 +77,7 @@ fn render_highlighted_code_block(text: &str, lang: Option<&str>, width: usize) -
                     out.push(
                         RenderLine::new().span_direct(
                             format!("{CODE_INDENT}{seg}"),
-                            RatStyle::new()
-                                .fg(RatColor::White)
-                                .bg(RatColor::Indexed(236)),
+                            RatStyle::new().fg(RatColor::White),
                         ),
                     );
                 }
@@ -90,7 +90,7 @@ fn render_highlighted_code_block(text: &str, lang: Option<&str>, width: usize) -
             .spans
             .push(crate::app::render_line::RenderSpan::with_style(
                 CODE_INDENT,
-                RatStyle::new().bg(RatColor::Indexed(236)),
+                RatStyle::new(),
             ));
         let mut line_w: usize = 0;
         for (style, txt) in ranges {
@@ -105,7 +105,7 @@ fn render_highlighted_code_block(text: &str, lang: Option<&str>, width: usize) -
                         .spans
                         .push(crate::app::render_line::RenderSpan::with_style(
                             CODE_INDENT,
-                            RatStyle::new().bg(RatColor::Indexed(236)),
+                            RatStyle::new(),
                         ));
                     line_w = 0;
                     continue;
@@ -129,7 +129,7 @@ fn render_highlighted_code_block(text: &str, lang: Option<&str>, width: usize) -
                         .spans
                         .push(crate::app::render_line::RenderSpan::with_style(
                             CODE_INDENT,
-                            RatStyle::new().bg(RatColor::Indexed(236)),
+                            RatStyle::new(),
                         ));
                     line_w = 0;
                 }
@@ -139,9 +139,7 @@ fn render_highlighted_code_block(text: &str, lang: Option<&str>, width: usize) -
         // 流式保护：单块超 500 行截断由调用方处理，此处不再截
     }
     if out.is_empty() {
-        out.push(
-            RenderLine::new().span_direct(CODE_INDENT, RatStyle::new().bg(RatColor::Indexed(236))),
-        );
+        out.push(RenderLine::new().span_direct(CODE_INDENT, RatStyle::new()));
     }
     out
 }
@@ -668,8 +666,15 @@ pub fn render_markdown(text: &str, width: usize) -> Vec<RenderLine> {
                 _ => {}
             },
             Event::End(tag) => match tag {
-                TagEnd::Heading(_)
-                | TagEnd::Strong
+                TagEnd::Heading(_) => {
+                    style_stack.pop();
+                    // 标题是块级元素：必须独占一行并以空行收尾。此前只 pop 样式栈、
+                    // 不落盘，标题文本会留在 cur_spans 里与下一段的首个 span 合并成同一行
+                    // （亮青标题直接贴上黄色行内码，零间隔）。
+                    flush_para(&mut cur_spans, &mut out, width, quote_depth > 0);
+                    out.push(RenderLine::new());
+                }
+                TagEnd::Strong
                 | TagEnd::Emphasis
                 | TagEnd::Strikethrough
                 | TagEnd::Link => {
@@ -817,6 +822,67 @@ fn format_cell(raw: &str, width: usize, align: Option<Alignment>) -> String {
 mod tests {
     use super::*;
     use crate::app::render_line::RenderStyle;
+
+    /// 代码块必须「融入终端底色」：任何 span 带背景都会在文字周围拖出一块灰影，
+    /// 并盖掉用户自己的终端配色（半透明底 / 非纯黑底）。回归锁对应
+    /// `syntect_to_ratatui` 不再搬运主题自带的 background。
+    #[test]
+    fn code_block_spans_have_no_background() {
+        let md = "引言\n\n```rust\nfn main() {\n    let x = 1;\n}\n```\n\n结尾";
+        let lines = render_markdown(md, 60);
+        let mut highlighted = 0usize;
+        for line in &lines {
+            for span in &line.spans {
+                if let RenderStyle::Direct(st) = span.style {
+                    highlighted += 1;
+                    assert_eq!(
+                        st.bg, None,
+                        "代码 span {:?} 带了背景色；代码块应融入终端底色",
+                        span.text
+                    );
+                }
+            }
+        }
+        assert!(highlighted > 0, "用例必须真的覆盖到高亮 span，否则断言是空转");
+    }
+
+    #[test]
+    fn heading_does_not_merge_with_following_block() {
+        // 回归：标题是块级元素，必须独占一行并以空行收尾。
+        // root cause：TagEnd::Heading 原先只 pop 样式栈、不落盘，标题文本留在
+        // cur_spans 里与下一段首个 span 合并 → 亮青标题贴上黄色行内码（零间隔）。
+        let lines = render_markdown(
+            "## 一个要留意的点\n\n`base16-ocean.dark` 的前景色是它的。",
+            40,
+        );
+        let idx = lines
+            .iter()
+            .position(|l| {
+                l.spans
+                    .iter()
+                    .any(|s| s.style == RenderStyle::Semantic(SpanStyle::MdH2))
+            })
+            .expect("应有标题行");
+        assert!(
+            lines[idx]
+                .spans
+                .iter()
+                .all(|s| s.style == RenderStyle::Semantic(SpanStyle::MdH2)),
+            "标题行不得混入其它样式：{:?}",
+            lines[idx].spans
+        );
+        assert!(
+            lines.get(idx + 1).is_some_and(|l| l.spans.is_empty()),
+            "标题后必须是空行"
+        );
+        assert!(
+            lines.get(idx + 2).is_some_and(|l| l
+                .spans
+                .iter()
+                .any(|s| s.style == RenderStyle::Semantic(SpanStyle::MdInlineCode))),
+            "正文（含行内码）应另起一行"
+        );
+    }
 
     #[test]
     fn detects_markdown() {
