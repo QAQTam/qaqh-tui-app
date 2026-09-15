@@ -147,7 +147,20 @@ D-3/T-04 锁的是「epoch 变化必须归零 cursor」。核实发现 **`Timeli
 
 ### 5b.5 遗留（**未验证**，本清单不声称已通过）
 
-- **真机端到端一条未跑**：daemon 重启自愈、租约过期自愈、`Lagged` 终止帧恢复、多标签+子代理并发、`Ctrl+R` 重连。
+> **【2026-09-15 更新】阻塞已除，首轮真机端到端已跑。** 后端 `BUG-2026-09-15-02` 修复
+> （后端 `674742f`）后 daemon 可正常启动，下列各项据此逐条核过：
+>
+> | 项 | 结论 | 证据 |
+> |---|---|---|
+> | daemon 重启自愈 | ✅ **通过** | `scripts/e2e-restart.sh`：杀掉 daemon#1 → TUI 报 `✗ lost` → 起 daemon#2（**新端口 + 新 token + 新 epoch**）→ **无人工干预**恢复 `● ready <新 epoch>`。相位序列实测 `◌ connecting → ● ready 45554b23 → ✗ lost → ● ready 7dbab7fc`。这同时验证了 D-2 凭据热更新（`refresh_discovery` 重读 daemon.json）与 epoch 变更检测 |
+> | `Ctrl+R` 重连（T-03） | ✅ **通过**（含失败路径） | 同脚本：在**真的 `lost` 相位**按 Ctrl+R → 出现 `正在重连` 与 `重连失败：io error: No such file o…`（daemon.json 已删、daemon 已死）→ 恢复后第二次 Ctrl+R 生效。按键送达、相位守卫、重建执行、失败提示四条均实测到。**注意**：`STALL_AFTER=15s` 之前按 Ctrl+R 会正确地回 `连接正常，无需重连`（首次尝试即撞上此守卫，非缺陷） |
+> | 服务面（阶段 1.5） | ✅ **通过** | TUI 真机跑到 `● ready`，首页渲染出 `最近会话 — 0 个` / `暂无会话 按 n 新建首个会话`——即 `session.list` 经**新的 `Client::query`** 取回并解析成功（空数组，非报错） |
+> | 租约过期自愈 | ❌ **仍未验证** | 需要在会话活着时让租约失效；本轮未构造 |
+> | `Lagged` 终止帧恢复 | ❌ **仍未验证** | 需要压出 SSE 缓冲溢出；本轮未构造 |
+> | 多标签 + 子代理并发 | ❌ **仍未验证** | 需要真实 LLM 后端，环境不具备 |
+>
+> 复现harness：`scripts/e2e-restart.sh`（隔离 `QAQH_DATA_DIR`，不碰在用的 daemon 与会话；
+> 按显式 PID 清理，**别用 `pkill -f`**——脚本命令行含那些模式，会连自己的 shell 一起杀）。
 - 依赖真机的两个集成测试（含本轮新增的**多 seed 并行**那条）仍是 `#[ignore]`，**只做到编译通过**；`lease_renegotiation.rs` 需要 `cargo build -p qaqh-daemon`。
 - **【2026-09-15 更正】** 此处原写「后端工作树正被他人的重构占用，编 daemon 会连带编进半成品」——**该判断不成立**：后端工作树实际可编译（`cargo check -p qaqh-daemon` 通过，`cargo build -p qaqh-daemon` 17.8s 成功）。**真实的阻塞是：daemon 在隔离 data root 下启动后不发布 `daemon.json`**（实测 60s 无产出，日志停在 `qaqh_runtime::registry: exec shell bootstrap: bash`；换用真实 `HOME` 复现同样现象，故非隔离环境所致）。**该归因也已证伪**：从 HEAD 干净构建对照（不含任何未提交改动）**同样复现**，且 `qaqh-daemon` 不依赖 `qaqh-client`，故与该重构、与本轮任何提交均无因果。**真实根因已登记在后端**：`BUG-2026-09-15-02` —— 启动期 `detect_os_info()` 用 `Command::…output()` 探测 `cargo --version` 等且**无超时**，被探测程序的后代持有管道写端时管道 EOF 永不出现 → `.output()` 永久阻塞（实测 daemon 停在 `do_wait`，子进程 `cargo --version` 停在 `futex_do_wait`）。属**环境触发的间歇性**问题（同机 11:26 曾正常启动）。**结论：真机验证是被这个后端缺陷堵住，不是被代码或任何人的改动堵住。**
 - 跑该测试时另修掉两个**测试自身的**缺陷（见后端 `ed6ebb3`）：`find_daemon_binary` 硬编码 `.exe` 导致**非 Windows 上必然 panic**（即所谓「端到端覆盖」在本机从来跑不起来）；以及本文件两个测试争抢进程级 `QAQH_DATA_DIR`。
@@ -272,6 +285,8 @@ cd ~/Projects/qaqh-backend && cargo test -p qaqh-client sse::tests timeline::tes
 | 2026-09-15 | **阶段二·第一刀（timeline）**：25 处引用改用权威类型，删 `protocol/timeline.rs`。**顺带修掉两处镜像漂移** —— T-09（`TimelineToolState` 少 `Cancelled`/`Backgrounded`）、T-10（`BlockCheckpoint` 的 `arg`/`text` 语义弄反，含一次差点写成的「真吞字」）。新开 **T-11**（config 漂移，待修）。测试 142 → 143，clippy 零 warning。TUI `a278ab8`；后端再导出 `73b24fa` |
 | 2026-09-15 | **阶段二·第三刀 + 决策 1**：TUI 的 workspace-mode 功能整体下线（T-12）——服务端已删该能力（`workspace.set_mode` 等四项），TUI 仍在调用必然 404。删除面：`settings_ops.rs` 服务调用与两个 match 分支、`settings.rs` 的 `FieldId::WorkspaceMode` 及全部臂与 `ws_sel`、`methods.rs` 4 常量、`config.rs` 的 `ConfigDto.workspace` 与 `WorkspaceDto`。测试 143 → 135（含阶段二第二刀删掉的 8 个镜像保真测试）。零 warning |
 | 2026-09-15 | **阶段二·第五刀（死镜像清理）→ 开 T-13**：删掉 `protocol/snapshot.rs` 的 `RingingSessionBootstrap`/`RingingChannelSnapshot` 与 `protocol::Channel`——三者早无调用点，只因落在私有模块里而逃过 `dead_code`。`bootstrap_round_trip` 测试改为直接吃 `qaqh_client::RingingSessionBootstrap`（因此该测试现在真正钉的是权威类型能解析活体形状）。`protocol/` 936 → 546 行（会话起点 936，原始 9 文件 2481）。131 passed；clippy 零 warning |
+| 2026-09-15 | **首轮真机端到端打通**：后端修掉 `BUG-2026-09-15-02`（启动期工具探测无超时，`674742f`）后 daemon 可正常启动。据此实测通过三项——daemon 重启自愈（新端口/新 token/新 epoch 下无人工干预恢复）、`Ctrl+R` 重连（含 `重连失败：io error` 失败路径）、阶段 1.5 服务面真机可用（`session.list` 经 `Client::query` 渲染出空列表）。租约过期自愈 / `Lagged` 终止帧恢复 / 多标签+子代理并发**仍未验证**（需构造或需真 LLM）。harness 落 `scripts/e2e-restart.sh` |
+
 | 2026-09-15 | **T-01 阶段 1.5 完成 + 阶段二收尾**：服务面 8 处 `.service(` 换成语义化枚举，`Client::query`/`action` 全权接管；`transport/` 目录（`http.rs` 318 行）整个删除，`Runtime::attach_service_client`/`sync_service_credentials`/`ApiCtx.http`/`App.client` 一并消失——**双份凭据只剩一份**。删方法名字表（见 T-13 第二例）。`protocol/` 2481 → **405 行**，`runtime.rs` 949 → 431。测试 131 → 123（减 7 个随 `http.rs` 走的 `ApiError` 分类测试 + 1 个方法表测试）。TUI `d379d90` |
 | 2026-09-15 | **后端补测**：`ConfigPatch::validate` 的 `permissionLevel 1..=4` 守卫（BUG-2026-09-13-15）在 `qaqh-config-api` 自家测试里零覆盖，补双向断言 + 破坏验证。后端 `97c61c5`（该提交只含这 14 行——同文件里并发写入者的 `WorkspaceDto` 删除未随其落库） |
 | 2026-09-15 | **阶段二·第四刀（config）+ T-11 关闭**：删除 `protocol/config.rs`（367 行手抄件），TUI 改为直接依赖 `qaqh-config-api`。**顺带发现一条上游盲区**：`ConfigPatch::validate` 里 BUG-2026-09-13-15 补的 `permissionLevel 1..=4` 守卫在 `qaqh-config-api` 自己的测试中**零覆盖**（`patch_validate_rejects_out_of_range` 只测 autoCompactThreshold / reasoningEffort），本仓新测试目前是它唯一的闸。`protocol/` 由 936 → 613 行（原始 9 文件 2481 行）| 
