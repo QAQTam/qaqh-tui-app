@@ -1572,10 +1572,10 @@ pub fn render_session_info(session: &SessionState, width: u16) -> Vec<RenderLine
         spans.push((model, SpanStyle::Accent));
     }
     match session.mode {
-        crate::protocol::command::ConversationMode::Plan => {
+        qaqh_client::ConversationMode::Plan => {
             spans.push(("plan".into(), SpanStyle::Warn));
         }
-        crate::protocol::command::ConversationMode::Code => {
+        qaqh_client::ConversationMode::Code => {
             spans.push(("code".into(), SpanStyle::Dim));
         }
     }

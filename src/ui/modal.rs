@@ -169,8 +169,8 @@ fn draw_ask(f: &mut Frame, panel: &AskPanel, area: Rect) {
     let rect = centered_rect(w, h, area);
     f.render_widget(Clear, rect);
     let mode_tag = match panel.mode {
-        crate::protocol::event::AskMode::Single => "single",
-        crate::protocol::event::AskMode::Batch => "batch",
+        qaqh_client::AskMode::Single => "single",
+        qaqh_client::AskMode::Batch => "batch",
     };
     let block = Block::new()
         .borders(Borders::ALL)

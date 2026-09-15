@@ -36,12 +36,10 @@ impl App {
         }
         let answers = answers
             .into_iter()
-            .map(
-                |(question_id, answer)| crate::protocol::command::AskAnswer {
-                    question_id,
-                    answer,
-                },
-            )
+            .map(|(question_id, answer)| qaqh_client::AskAnswer {
+                question_id,
+                answer,
+            })
             .collect();
         self.send_control_command(
             seed,

@@ -72,10 +72,8 @@ impl App {
             return;
         };
         let next = match self.sessions.get(&seed).map(|s| s.mode) {
-            Some(crate::protocol::command::ConversationMode::Plan) => {
-                crate::protocol::command::ConversationMode::Code
-            }
-            _ => crate::protocol::command::ConversationMode::Plan,
+            Some(qaqh_client::ConversationMode::Plan) => qaqh_client::ConversationMode::Code,
+            _ => qaqh_client::ConversationMode::Plan,
         };
         if let Some(sess) = self.sessions.get_mut(&seed) {
             sess.mode = next; // 乐观更新
@@ -160,11 +158,14 @@ impl App {
                             .command_status(&command_id)
                             .await
                             .map_err(|e| e.to_string())
-                            .and_then(|s| {
-                                crate::protocol::bridge::command_status_from_wire(&s)
-                                    .map_err(|e| e.to_string())
-                            })
-                            && status.state.is_terminal()
+                            // 终态 = 成功/失败/拒绝（与旧镜像的 `is_terminal` 同义；
+                            // 权威类型不提供该辅助方法）。
+                            && matches!(
+                                status.state,
+                                qaqh_client::RingingCommandState::Succeeded
+                                    | qaqh_client::RingingCommandState::Failed
+                                    | qaqh_client::RingingCommandState::Rejected
+                            )
                         {
                             state = Some(status);
                             break;

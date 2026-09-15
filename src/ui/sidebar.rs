@@ -15,8 +15,8 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::app::render_line::wrap_text;
 use crate::app::{App, truncate_str};
-use crate::protocol::event::DashboardTask;
 use crate::ui::theme;
+use qaqh_client::DashboardTask;
 
 pub const PREFERRED_WIDTH: u16 = 34;
 

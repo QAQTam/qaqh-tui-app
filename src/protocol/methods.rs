@@ -6,7 +6,7 @@
 //! Read = 无副作用查询（错误码 `query_failed`）；Write = 变更（`action_failed`）。
 //! 未列出的名字 → 404 `unknown_method`。
 
-use super::command::ConversationMode;
+use qaqh_client::ConversationMode;
 
 pub const DAEMON_VERSION: &str = "daemon.version";
 pub const SESSION_LIST: &str = "session.list";

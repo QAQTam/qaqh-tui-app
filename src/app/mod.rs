@@ -31,17 +31,18 @@ use std::time::{Duration, Instant};
 use ratatui::crossterm::event::{KeyEvent, MouseEvent};
 
 use crate::app::slash::SlashCmd;
-use crate::protocol::command::{ControlCommand, ConversationCommand, RingingCommand, ToolCommand};
 use crate::protocol::config::ConfigDto;
-use crate::protocol::envelope::{CommandState, RingingCommandStatus};
-use crate::protocol::event::{
-    ActivityState, AskResolution, ContentRef, ControlEvent, ConversationEvent, NoticeLevel,
-    PermissionCategory, PermissionRisk, SessionState as SessionStateEvent, ToolEvent,
-};
 use crate::protocol::methods::{self, SessionMetaView};
 use crate::runtime::{ConnEvent, Runtime, RuntimeMsg};
 use crate::transport::http::HttpClient;
 use qaqh_client::TimelinePage;
+use qaqh_client::{
+    AskResolution, ContentRef, ControlEvent, ConversationEvent,
+    DomainActivityState as ActivityState, DomainSessionState as SessionStateEvent, NoticeLevel,
+    PermissionCategory, PermissionRisk, ToolEvent,
+};
+use qaqh_client::{ControlCommand, ConversationCommand, RingingCommand, ToolCommand};
+use qaqh_client::{RingingCommandState as CommandState, RingingCommandStatus};
 use session::{
     AskPanel, PermissionPanel, PlanPanel, SessionState, StreamPhase, streaming_done,
     sync_streaming_from_timeline,
@@ -61,12 +62,12 @@ const TURNS_CAP: usize = 400;
 pub enum ActionResult {
     Bootstrap {
         seed: String,
-        result: Result<crate::protocol::snapshot::RingingSessionBootstrap, String>,
+        result: Result<qaqh_client::RingingSessionBootstrap, String>,
     },
     CommandAck {
         seed: Option<String>,
         label: &'static str,
-        result: Result<crate::protocol::envelope::RingingCommandAck, String>,
+        result: Result<qaqh_client::RingingCommandAck, String>,
     },
     SessionList(Result<Vec<SessionMetaView>, String>),
     SessionActivity(Result<serde_json::Value, String>),
@@ -95,7 +96,7 @@ pub enum ActionResult {
     },
     Dashboard {
         seed: String,
-        result: Result<crate::protocol::event::DashboardSnapshot, String>,
+        result: Result<qaqh_client::DomainDashboardSnapshot, String>,
     },
 }
 
@@ -126,25 +127,21 @@ pub struct ApiCtx {
 }
 
 impl ApiCtx {
-    /// 发送 Ringing 命令，返回**本仓镜像类型**的 ack（经 `protocol::bridge`）。
+    /// 发送 Ringing 命令（返回权威类型的 ack）。
     ///
-    /// 过桥失败必须如实报错：那意味着后端协议变了而本仓镜像没跟上，静默吞掉
-    /// 会让命令看起来「发出去了但没反应」。
+    /// T-01 阶段二后本仓不再持有协议镜像，故这里不再过桥——命令与回执都是
+    /// `qaqh-client` 的类型。此前那层 serde 往返的存在意义（「镜像漂移会静默
+    /// 丢帧」）随之消失：现在形状对不上会直接是**编译错误**。
     pub async fn send_command(
         &self,
         seed: Option<&str>,
-        command: crate::protocol::command::RingingCommand,
+        command: qaqh_client::RingingCommand,
         options: qaqh_client::CommandOptions,
-    ) -> Result<crate::protocol::envelope::RingingCommandAck, String> {
-        let wire = crate::protocol::bridge::command_to_wire(&command)
-            .map_err(|e| format!("命令过桥失败（协议镜像漂移？）：{e}"))?;
-        let ack = self
-            .client
-            .send_command(seed, wire, options)
+    ) -> Result<qaqh_client::RingingCommandAck, String> {
+        self.client
+            .send_command(seed, command, options)
             .await
-            .map_err(|e| e.to_string())?;
-        crate::protocol::bridge::ack_from_wire(&ack)
-            .map_err(|e| format!("命令回执过桥失败（协议镜像漂移？）：{e}"))
+            .map_err(|e| e.to_string())
     }
 
     /// 拉取 timeline 快照页（纯读，不重建流）。
@@ -165,14 +162,8 @@ impl ApiCtx {
     pub async fn bootstrap(
         &self,
         seed: &str,
-    ) -> Result<crate::protocol::snapshot::RingingSessionBootstrap, String> {
-        let page = self
-            .client
-            .bootstrap(seed)
-            .await
-            .map_err(|e| e.to_string())?;
-        crate::protocol::bridge::bootstrap_from_wire(&page)
-            .map_err(|e| format!("bootstrap 过桥失败（协议镜像漂移？）：{e}"))
+    ) -> Result<qaqh_client::RingingSessionBootstrap, String> {
+        self.client.bootstrap(seed).await.map_err(|e| e.to_string())
     }
 }
 
@@ -624,17 +615,13 @@ impl App {
         }
     }
 
-    fn handle_envelope(&mut self, env: crate::protocol::envelope::RingingEventEnvelope) {
+    fn handle_envelope(&mut self, env: qaqh_client::RingingEventEnvelope) {
         let seed = env.seed.clone();
         let causation_id = env.causation_id.clone();
         match env.event {
-            crate::protocol::event::RingingEvent::Control(ev) => {
-                self.handle_control(seed, causation_id, ev)
-            }
-            crate::protocol::event::RingingEvent::Conversation(ev) => {
-                self.handle_conversation(seed, ev)
-            }
-            crate::protocol::event::RingingEvent::Tool(ev) => self.handle_tool(seed, ev),
+            qaqh_client::RingingEvent::Control(ev) => self.handle_control(seed, causation_id, ev),
+            qaqh_client::RingingEvent::Conversation(ev) => self.handle_conversation(seed, ev),
+            qaqh_client::RingingEvent::Tool(ev) => self.handle_tool(seed, ev),
         }
     }
 
@@ -781,11 +768,19 @@ impl App {
                 ..
             } => {
                 if let Some(sess) = self.sessions.get_mut(&seed) {
-                    sess.skills = Some(crate::protocol::event::SkillsStatus {
+                    // 权威 `SkillsStatus` **没有** `Default`：这里显式补齐服务端没
+                    // 随事件下发的字段（而非用 `..Default::default()` 掩盖「我们其实
+                    // 不知道」——零值在这里就是「未知」，写出来更诚实）。
+                    sess.skills = Some(qaqh_client::SkillsStatus {
                         available,
                         active,
+                        catalog_revision: String::new(),
+                        context_epoch: 0,
+                        operation_revision: 0,
+                        token_budget: 0,
+                        token_usage: 0,
                         runtime,
-                        ..Default::default()
+                        diagnostics: Vec::new(),
                     });
                 }
             }
@@ -918,11 +913,9 @@ impl App {
                 if let Some(s) = sess.streaming.as_mut() {
                     s.round_num = round_num;
                     s.phase = match kind {
-                        crate::protocol::event::RoundDeltaKind::Thinking => StreamPhase::Thinking,
-                        crate::protocol::event::RoundDeltaKind::ToolCalling => {
-                            StreamPhase::ToolCalling
-                        }
-                        crate::protocol::event::RoundDeltaKind::Answering => StreamPhase::Answering,
+                        qaqh_client::RoundDeltaKind::Thinking => StreamPhase::Thinking,
+                        qaqh_client::RoundDeltaKind::ToolCalling => StreamPhase::ToolCalling,
+                        qaqh_client::RoundDeltaKind::Answering => StreamPhase::Answering,
                     };
                 }
             }
@@ -945,9 +938,7 @@ impl App {
             ConversationEvent::ProviderToolStatus { state, .. } => {
                 if let Some(s) = sess.streaming.as_mut() {
                     s.phase = match state {
-                        crate::protocol::event::ProviderToolState::Completed => {
-                            StreamPhase::Answering
-                        }
+                        qaqh_client::ProviderToolState::Completed => StreamPhase::Answering,
                         _ => StreamPhase::ToolCalling,
                     };
                 }
@@ -985,12 +976,12 @@ impl App {
                 sess.compact_anim = None;
                 self.toast(
                     match status {
-                        crate::protocol::event::CompactStatus::Completed => NoticeLevel::Info,
+                        qaqh_client::CompactStatus::Completed => NoticeLevel::Info,
                         _ => NoticeLevel::Warn,
                     },
                     format!(
                         "compact {}: {:?}",
-                        if status == crate::protocol::event::CompactStatus::Completed {
+                        if status == qaqh_client::CompactStatus::Completed {
                             "完成"
                         } else {
                             "未完成"
@@ -1094,7 +1085,7 @@ impl App {
                         // 收敛一次，避免上一次连接遗留的 Working/Starting 与
                         // streaming 状态把 UI 钉在 working（timeline 空则不误判）。
                         sync_streaming_from_timeline(sess);
-                        if sess.mode == crate::protocol::command::ConversationMode::Code
+                        if sess.mode == qaqh_client::ConversationMode::Code
                             && let Some(meta) = &sess.meta
                         {
                             sess.mode = meta.conversation_mode();
@@ -1145,7 +1136,7 @@ impl App {
                 result,
             } => match result {
                 Ok(ack) => {
-                    if ack.status == crate::protocol::envelope::AckStatus::Rejected {
+                    if ack.status == qaqh_client::RingingCommandAckStatus::Rejected {
                         let msg = format!(
                             "{} 被拒绝: {} {}",
                             label,

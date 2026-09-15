@@ -189,14 +189,14 @@ impl App {
                     &serde_json::json!({ "seed": seed.clone() }),
                 )
                 .await;
-            let parsed: Result<crate::protocol::event::DashboardSnapshot, String> = match value {
+            let parsed: Result<qaqh_client::DomainDashboardSnapshot, String> = match value {
                 Ok(v) => {
                     // session.dashboard 返回 {tasks: [{id,subject,status…}], recent_edits: […]}；
                     // DashboardSnapshot 额外含 seed/documents/current_todo_id。
                     let tasks = if let Some(arr) = v.get("tasks").and_then(|x| x.as_array()) {
                         arr.iter()
                             .filter_map(|item| {
-                                Some(crate::protocol::event::DashboardTask {
+                                Some(qaqh_client::DashboardTask {
                                     id: item.get("id")?.as_str()?.to_owned(),
                                     subject: item.get("subject")?.as_str().unwrap_or("").to_owned(),
                                     description: item
@@ -233,7 +233,7 @@ impl App {
                         .and_then(|x| x.as_str())
                         .unwrap_or(&seed)
                         .to_owned();
-                    Ok(crate::protocol::event::DashboardSnapshot {
+                    Ok(qaqh_client::DomainDashboardSnapshot {
                         seed: seed_out,
                         documents: Vec::new(),
                         recent_edits,
@@ -264,7 +264,7 @@ impl App {
                             let tasks = items
                                 .iter()
                                 .filter_map(|item| {
-                                    Some(crate::protocol::event::DashboardTask {
+                                    Some(qaqh_client::DashboardTask {
                                         id: item.get("id")?.as_str()?.to_owned(),
                                         subject: item
                                             .get("title")
@@ -291,7 +291,7 @@ impl App {
                             if tasks.is_empty() {
                                 Err(msg)
                             } else {
-                                Ok(crate::protocol::event::DashboardSnapshot {
+                                Ok(qaqh_client::DomainDashboardSnapshot {
                                     seed: seed.clone(),
                                     documents: Vec::new(),
                                     recent_edits: Vec::new(),

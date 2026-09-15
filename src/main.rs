@@ -27,7 +27,7 @@ fn main() -> Result<()> {
         Some("--help") | Some("-h") | Some("help") => {
             println!(
                 "qaqh-tui — QAQ-Harness 终端客户端 (qaqh.Ringing v{})",
-                protocol::RINGING_VERSION
+                qaqh_client::RINGING_VERSION
             );
             println!();
             println!("用法:");

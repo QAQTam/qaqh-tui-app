@@ -48,7 +48,7 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) {
         .title(Line::from(vec![
             Span::styled(" qaqh-tui ", theme::active_tab()),
             Span::styled(
-                format!(" Ringing v{} ", crate::protocol::RINGING_VERSION),
+                format!(" Ringing v{} ", qaqh_client::RINGING_VERSION),
                 theme::dim(),
             ),
         ]))

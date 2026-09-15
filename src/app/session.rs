@@ -4,13 +4,15 @@ use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 use crate::app::timeline_model::TimelineModel;
-use crate::protocol::command::ConversationMode;
-use crate::protocol::event::{
-    ActivityState, AskMode, AskQuestion, ContentRef, DomainError, PermissionCategory,
-    PermissionRisk, SkillsStatus, UsageInfo,
-};
+use qaqh_client::ConversationMode;
+// 权威类型与 `qaqh-client` 自身类型重名者带 `Domain` 前缀；在本模块内换回本地惯用名，
+// 这样下文的引用点不必逐个改（映射只此一处）。
 use crate::protocol::methods::SessionMetaView;
 use crate::protocol::snapshot::ConversationStateView;
+use qaqh_client::{
+    AskMode, ContentRef, DomainActivityState as ActivityState, DomainAskQuestion as AskQuestion,
+    DomainError, PermissionCategory, PermissionRisk, SkillsStatus, UsageInfo,
+};
 
 // ───────────────────────── 流式相位 ─────────────────────────
 
@@ -117,7 +119,7 @@ pub struct PlanPanel {
     pub turn_id: String,
     pub plan_content: String,
     pub review_type: String,
-    pub todo_items: Vec<crate::protocol::event::TodoItem>,
+    pub todo_items: Vec<qaqh_client::TodoItem>,
     /// 拒绝理由输入。
     pub message: String,
     pub entering_message: bool,
@@ -390,7 +392,7 @@ pub struct SessionState {
     pub pending_permissions: Vec<PermissionPanel>,
     pub skills: Option<SkillsStatus>,
     /// workspace 面板数据（bootstrap control state + DashboardSnapshot 推送）。
-    pub dashboard: Option<crate::protocol::event::DashboardSnapshot>,
+    pub dashboard: Option<qaqh_client::DomainDashboardSnapshot>,
     /// 压缩进度动画（Some = 压缩进行中）。
     pub compact_anim: Option<CompactionAnim>,
     /// 代码变更聚合（+行 / −行）。

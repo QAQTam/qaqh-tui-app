@@ -17,8 +17,9 @@ use std::time::Duration;
 
 use thiserror::Error;
 
+use crate::protocol::WireError;
 use crate::protocol::methods::SessionMetaView;
-use crate::protocol::{SESSION_ID_HEADER, WireError};
+use qaqh_client::CLIENT_SESSION_HEADER;
 
 /// 服务面请求超时。
 pub const SERVICE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -125,7 +126,7 @@ impl HttpClient {
             .request(method, self.url(path))
             .bearer_auth(self.token())
             .header(
-                SESSION_ID_HEADER,
+                CLIENT_SESSION_HEADER,
                 self.session_id.read().expect("session lock").clone(),
             )
     }
@@ -157,10 +158,9 @@ impl HttpClient {
         }
         if status == reqwest::StatusCode::UPGRADE_REQUIRED {
             // 426：body 是 RingingCommandAck{code:"unsupported_version"}。
-            let message =
-                serde_json::from_str::<crate::protocol::envelope::RingingCommandAck>(&text)
-                    .map(|ack| ack.message.unwrap_or_else(|| "unsupported version".into()))
-                    .unwrap_or_else(|_| text.clone());
+            let message = serde_json::from_str::<qaqh_client::RingingCommandAck>(&text)
+                .map(|ack| ack.message.unwrap_or_else(|| "unsupported version".into()))
+                .unwrap_or_else(|_| text.clone());
             return Err(ApiError::UnsupportedVersion(message));
         }
         let (code, message) = match serde_json::from_str::<WireError>(&text) {

@@ -12,33 +12,11 @@
 //! - `qaqh-ringing/src/{snapshot,reset}.rs` → [`snapshot`]
 //! - `qaqh-runtime/src/ringing/service_methods.rs` → [`methods`]
 
-pub mod bridge;
-pub mod command;
 pub mod config;
-pub mod envelope;
-pub mod event;
 pub mod methods;
 pub mod snapshot;
 
 use serde::{Deserialize, Serialize};
-
-/// Ringing 协议 schema 标识（`qaqh-ringing/src/protocol.rs:4`）。
-///
-/// 阶段一后生产路径不再消费它（open 握手已由 `qaqh-client` 负责），保留是作为
-/// 镜像契约的一部分；阶段二整体删除 `protocol/` 时一并消失。
-#[allow(dead_code)]
-pub const RINGING_SCHEMA: &str = "qaqh.Ringing";
-/// Ringing 协议版本（同上 :7）。代差不匹配时 daemon 返回 426 `unsupported_version`。
-pub const RINGING_VERSION: u32 = 1;
-/// 连接级身份 header（同上 :13）。每个请求与 SSE 连接都必须携带。
-pub const SESSION_ID_HEADER: &str = "X-QAQH-Client-Session-Id";
-
-/// JS 安全整数上限；协议中全部 seq/revision 不得超过（同上 :23）。
-pub const MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
-
-pub fn is_safe_integer(v: u64) -> bool {
-    v <= MAX_SAFE_INTEGER
-}
 
 /// Ringing 三频道（`qaqh-domain/src/channel.rs`）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -65,15 +43,6 @@ impl Channel {
     pub fn from_path_segment(s: &str) -> Option<Self> {
         Self::ALL.iter().copied().find(|c| c.as_str() == s)
     }
-}
-
-/// 事件可靠性等级（`qaqh-domain/src/delivery.rs`）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Delivery {
-    Reliable,
-    Replaceable,
-    Ephemeral,
 }
 
 /// daemon 统一 JSON 错误体（HTTP 4xx/5xx 的 body）。

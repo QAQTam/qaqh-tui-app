@@ -5,8 +5,8 @@ use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 
 use crate::app::{App, ConnPhase};
-use crate::protocol::event::NoticeLevel;
 use crate::ui::theme;
+use qaqh_client::NoticeLevel;
 
 pub fn draw(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
     let width = area.width as usize;

@@ -7,8 +7,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::Channel;
-use super::event::{ActivityState, SkillsStatus, UsageInfo};
 use qaqh_client::TimelineTurn;
+use qaqh_client::{DomainActivityState as ActivityState, SkillsStatus, UsageInfo};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RingingChannelSnapshot {
@@ -125,7 +125,7 @@ pub struct ChannelStateView {
     pub skills: Option<SkillsStatus>,
     pub pending_permission: Option<PendingPermissionView>,
     /// bootstrap control state 内置的仪表盘快照（todo/最近改动）。
-    pub dashboard: Option<crate::protocol::event::DashboardSnapshot>,
+    pub dashboard: Option<qaqh_client::DomainDashboardSnapshot>,
 }
 
 impl ChannelStateView {
@@ -187,7 +187,7 @@ impl ChannelStateView {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::{RINGING_SCHEMA, RINGING_VERSION};
+    use qaqh_client::{RINGING_SCHEMA, RINGING_VERSION};
     use serde_json::json;
 
     #[test]

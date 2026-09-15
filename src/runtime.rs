@@ -24,9 +24,8 @@ use qaqh_client::{
 };
 use tokio::sync::mpsc;
 
-use crate::protocol::bridge;
-use crate::protocol::envelope::RingingEventEnvelope;
 use crate::transport::http::HttpClient;
+use qaqh_client::RingingEventEnvelope;
 use qaqh_client::{TimelineEntry, TimelinePage};
 
 /// timeline 翻页窗口（`request_rebaseline` / `load_older` 使用）。
@@ -386,24 +385,13 @@ fn build_handlers(
     ClientHandlers {
         on_batch: {
             let msg_tx = msg_tx.clone();
+            // 类型已权威化：信封直达 app 层，不再有「过桥失败 → 丢帧」这条路径。
+            // 形状对不上现在会是**编译错误**，而不是运行时的静默丢弃。
             Arc::new(move |batch: qaqh_client::EventBatch| {
-                let channel = bridge::channel_from_wire(batch.channel);
                 for env in &batch.envelopes {
-                    // 过桥失败**不得静默**：那意味着后端协议变了而本仓镜像没跟，
-                    // 默默丢帧会让「后端到底发了什么」变得不可见。
-                    match bridge::envelope_from_wire(env) {
-                        Ok(env) => {
-                            let _ = msg_tx.send(RuntimeMsg::Ringing { env: Box::new(env) });
-                        }
-                        Err(e) => {
-                            let _ = msg_tx.send(RuntimeMsg::Conn(ConnEvent::StreamIssue {
-                                error: format!(
-                                    "[{}] 事件过桥失败（协议镜像漂移？）：{e}",
-                                    channel.as_str()
-                                ),
-                            }));
-                        }
-                    }
+                    let _ = msg_tx.send(RuntimeMsg::Ringing {
+                        env: Box::new(env.clone()),
+                    });
                 }
             })
         },
@@ -432,15 +420,9 @@ fn build_handlers(
         on_reset: {
             let msg_tx = msg_tx.clone();
             Some(Arc::new(
-                move |reset: qaqh_client::ResetRequired| match bridge::reset_from_wire(&reset) {
-                    Ok(reset) => {
-                        let _ = msg_tx.send(RuntimeMsg::ResetRequired { seed: reset.seed });
-                    }
-                    Err(e) => {
-                        let _ = msg_tx.send(RuntimeMsg::Conn(ConnEvent::StreamIssue {
-                            error: format!("reset_required 过桥失败：{e}"),
-                        }));
-                    }
+                // 类型已权威化：直达，不再过桥。
+                move |reset: qaqh_client::ResetRequired| {
+                    let _ = msg_tx.send(RuntimeMsg::ResetRequired { seed: reset.seed });
                 },
             ))
         },
