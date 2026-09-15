@@ -7,6 +7,13 @@ use qaqh_client::{TimelineBlockKind, TimelineToolState, TimelineTurnState};
 /// 推理块折叠时保留的尾部行数（历史常量，当前默认展开路径不再截尾，保留供 hide 回退）。
 #[allow(dead_code)]
 const REASONING_TAIL: usize = 2;
+/// 单个 markdown 块渲染出的行数上限。
+///
+/// 原文注释指向 `docs/markdown-plan.md`，该文档已于 `18463b3` 删除（T-05）；
+/// 理据就地写在这里：markdown 富化会把表格/代码块栅格化成 `RenderLine`，超大块
+/// 在预折行缓存里成倍放大，故设上限并在末尾如实标注省略行数（截断必须可见，
+/// 与 B1「丢弃可观测」同一设计原则）。
+const MD_BLOCK_LINE_CAP: usize = 500;
 /// 工具输出保留的尾部行数（已由折叠逻辑替代，保留作历史阈值参考）。
 /// 单元格截断宽度。
 const ARG_PREVIEW: usize = 96;
@@ -327,10 +334,11 @@ fn push_text_block(lines: &mut Vec<RenderLine>, text: &str, width: usize, stream
     if crate::app::markdown::is_markdown(text) {
         // 落盘后富化：表格/代码块栅格化，保持单 Paragraph 滚动链路
         let mut md_lines = crate::app::markdown::render_markdown(text, width);
-        // 批处理保护：单块超 500 行截断（防 100M 爆存，见 docs/markdown-plan.md）
-        if md_lines.len() > 500 {
-            let omitted = md_lines.len() - 500;
-            md_lines.truncate(500);
+        // 批处理保护：单块超 [`MD_BLOCK_LINE_CAP`] 行即截断（防单块渲染把
+        // 预折行缓存撑爆），并在末尾如实标注省略了多少行。
+        if md_lines.len() > MD_BLOCK_LINE_CAP {
+            let omitted = md_lines.len() - MD_BLOCK_LINE_CAP;
+            md_lines.truncate(MD_BLOCK_LINE_CAP);
             md_lines.push(
                 RenderLine::new().span(format!("  （内容省略 {omitted} 行）"), SpanStyle::Dim),
             );

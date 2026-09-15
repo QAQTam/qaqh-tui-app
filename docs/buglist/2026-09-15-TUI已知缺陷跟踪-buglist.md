@@ -17,7 +17,7 @@
 |---|---|---|---|---|---|
 | ~~T-01~~ | ~~P1~~ | ~~传输层未迁移 `qaqh-client`~~ | ~~依赖表零 `qaqh-*`~~ → **阶段一已迁移**：`Cargo.toml:19` 已有 path 依赖，`grep -c qaqh Cargo.lock` = **11**；自建轮子符号（`SseDecoder`/`supervisor_action`/`stream_rebuild`/`timeline_manager`/`refresh_credentials`/`build_envelope`）**零命中**；`transport/` + `runtime.rs` 由 **2127 → 832 行** | — | **全阶段闭环**：阶段一（`56c31e7`）、阶段二（`a278ab8`→`b1a150f`）、阶段 1.5（`d379d90`）均已完成。落点：`protocol/` **2481 → 405 行**（3 文件，无 wire 镜像）、`transport/` 目录删除、`runtime.rs` 949 → 431 |
 | ~~T-03~~ | ~~P2~~ | ~~无用户可触发的重连入口~~ | 见 §2「T-03 闭环」 | — | **已闭环（2026-09-15）** |
-| T-05 | P3 | 悬空文档引用 | `src/app/render_transcript.rs:330` 注释指向 `docs/markdown-plan.md`，该文件已于 `18463b3 clean docs` 删除（`git log --diff-filter=D` 可证） | 注释把读者引向不存在的设计文档 | 改指向现存文档或删除该引用 |
+| ~~T-05~~ | ~~P3~~ | ~~悬空文档引用~~ | 见 §2「T-05 闭环」 | — | **已闭环（2026-09-15）** |
 | T-06 | P3 | `offloaded` 镜像字段**无消费方** | TUI：`protocol/timeline.rs:109` 定义 + `timeline_model.rs` 仅测试夹具写 `offloaded: false`，生产代码**零读取**。后端：侧车缺失/损坏/代际不符时保留壳（`timeline_hub.rs:672-675`），壳带 `offloaded=true`、block 文本 ≤512 字符、`tool.output/diff = None`（`qaqh-runtime/src/timeline.rs:881-898`） | 该退化路径下 TUI 会把「预览壳」当完整回合渲染，用户无从得知（与 B1「丢弃必须可见」同一设计原则） | transcript/状态栏标出「已归档，内容为预览」；或至少读 `offloaded` 给出提示。**注意**：该路径本机尚未发生过，根因见 §8（后端 `BUG-2026-09-14-03` —— offload 此前是死代码；后端工作区已接通，**一旦提交部署即转为可触发**） |
 
 | T-08 | P2 | 重建窗口型快照的 `has_more` 语义未定 | TUI 诚实消费 `has_more`（`timeline_model.rs:302`/`:531`/`:561`，翻页门控 `transcript_ops.rs:191`）；但后端从 messages 重建后窗口被裁剪，`has_more` 是否表达「窗口之前仍有历史」**未定义** | 用户可能翻不到窗口之前的回合（后端提示只能读 `messages.jsonl`） | **需先与后端定语义**，再决定 TUI 是否给「已被裁剪」提示。**领自后端登记册 `BUG-2026-09-12-04` 遗留②** |
@@ -26,7 +26,7 @@
 > **同日追加（T-01 阶段一）**：T-01 阶段一、T-03 同日闭环，并连带改判 D-1/D-2（见 §2）。
 > **同日收尾（阶段二 + 阶段 1.5）**：T-01 全阶段完成，连带开 T-13（死镜像逃过 `dead_code` 的
 > 两条逃逸路径）。
-> 现余待办：**T-05、T-06、T-08**（均为 P2/P3，其中 T-06/T-08 在等后端动作）。
+> **同日 T-05 闭环**。现余待办：**T-06、T-08**（T-06 待后端 `BUG-2026-09-14-03`、T-08 需先定语义）。
 
 ## 2. 已核实修复（FIXED）
 
@@ -47,6 +47,8 @@
 | T-02 | SSE 流首 BOM 剥离（原 D-5 / BUG-2026-09-13-17） | 本仓 `sse.rs` 已删 → **迁移后落点**：`qaqh-client/src/sse_decoder.rs`（`BOM` + 一次性 `bom_checked` 剥离，含跨 chunk 未到齐时等待）。本仓那 4 条断言已补进对端：新增**流中段 U+FEFF 不得被剥离**；并给 BOM 测试补上其测试名早已承诺、原先却没写的 `cursor_from_sse_id == Some(7)` | 本仓 4 条已删 → 对端 `qaqh-client` `sse_decoder::tests::leading_bom_is_stripped_and_first_frame_cursor_survives`（含上述补强）、`leading_bom_does_not_break_frame_payload`、`bom_split_across_chunks_is_handled`、`bom_is_stripped_only_at_stream_start`（**变异验证**：把一次性守卫换成每帧都剥离 → 恰好 1 红） |
 
 | T-07 | `TurnOpened` 镜像后端「原地 reopen」（原 `BUG-2026-09-12-04` 遗留①） | 应用层 `Turn` 补回被丢弃的 `sealed` 字段（`timeline_model.rs:249` 定义、`:277` `from_wire`、`:543` `TurnSealed` 置位）；reopen 分支 `:391`：已存在且 `sealed` → 原地重置（`user_text`/`state=Running`/`failure=None`/`sealed=false`/`rounds.clear()`）并 `bump()`；运行中的重复仍 no-op | `app::timeline_model::tests::sealed_turn_is_reopened_in_place`、`running_turn_duplicate_opened_keeps_content`（**双向变异验证**见 §6）；既有 `duplicate_and_replayed_entries_are_idempotent` 保持通过 |
+
+| **T-05** | 悬空文档引用（原 `render_transcript.rs:330` → 已删的 `docs/markdown-plan.md`） | 不只是一删了之：那个 `500` 是裸魔数，已提为 `render_transcript.rs:15` `MD_BLOCK_LINE_CAP`，理据（markdown 富化把表格/代码块栅格化，超大块在预折行缓存里成倍放大）就地写在常量上，并保留「截断必须可见」的末尾省略标注 | `cargo test` 123 passed；clippy 零 warning；`grep -rn "markdown-plan" src/` 只剩新注释里解释该文档去向的一句 |
 
 | **T-01 阶段一** | 传输层迁移 `qaqh-client`（连接生命周期 / 三频道流 / per-seed timeline） | TUI @`56c31e7`：`Cargo.toml:19` path 依赖；`src/runtime.rs` 949→504（`supervisor`/`channel_stream`/`timeline_stream`/`timeline_manager`/`stream_rebuild` 全删）；`src/transport/sse.rs`(318)、`src/transport/discovery.rs`(228) **删除**；`src/transport/http.rs` 624→318（仅剩服务面 `service()`）；新增 `src/protocol/bridge.rs`（唯一的类型转换缝） | 见 §5b 对账 |
 | **T-03** | 无用户可触发的重连入口 | `src/app/keymap.rs:51` `Ctrl+R` → `GlobalKey::Reconnect`（`:37`）；`src/app/mod.rs` `request_reconnect`（仅 `Lost` 相位生效）；`src/ui/status_bar.rs:31` 渲染 `· Ctrl+R 重连`；判据 `src/runtime.rs:39` `STALL_AFTER = 15s`（`:362` 检测、`:219` `rebuild()`、`:232` `rebuild_inner`） | `keymap::tests`（既有 8 个保持通过）；真机未验（§5b 遗留） |
