@@ -140,7 +140,8 @@ D-3/T-04 锁的是「epoch 变化必须归零 cursor」。核实发现 **`Timeli
 
 - **真机端到端一条未跑**：daemon 重启自愈、租约过期自愈、`Lagged` 终止帧恢复、多标签+子代理并发、`Ctrl+R` 重连。
 - 依赖真机的两个集成测试（含本轮新增的**多 seed 并行**那条）仍是 `#[ignore]`，**只做到编译通过**；`lease_renegotiation.rs` 需要 `cargo build -p qaqh-daemon`。
-- 本轮**未**跑通该集成测试的原因：后端工作树正被他人的 workspace/工具侧重构占用，编 daemon 会连带编进半成品。
+- **【2026-09-15 更正】** 此处原写「后端工作树正被他人的重构占用，编 daemon 会连带编进半成品」——**该判断不成立**：后端工作树实际可编译（`cargo check -p qaqh-daemon` 通过，`cargo build -p qaqh-daemon` 17.8s 成功）。**真实的阻塞是：daemon 在隔离 data root 下启动后不发布 `daemon.json`**（实测 60s 无产出，日志停在 `qaqh_runtime::registry: exec shell bootstrap: bash`；换用真实 `HOME` 复现同样现象，故非隔离环境所致）。该卡点位于他人正在改动的 exec/registry 区域，**本清单未做归因**（未从 HEAD 干净构建对照）。
+- 跑该测试时另修掉两个**测试自身的**缺陷（见后端 `ed6ebb3`）：`find_daemon_binary` 硬编码 `.exe` 导致**非 Windows 上必然 panic**（即所谓「端到端覆盖」在本机从来跑不起来）；以及本文件两个测试争抢进程级 `QAQH_DATA_DIR`。
 
 ## 6. 核验命令（可复现）
 
