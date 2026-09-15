@@ -40,6 +40,63 @@ pub use qaqh_config_api::{ConfigDto, ConfigPatch, ProviderDto, SubagentDto, Suba
 #[cfg(test)]
 mod tests {
     use super::*;
+    use qaqh_client::{SessionActivity, SessionListEntry};
+
+    /// **G2 回归闸（消费侧）**：会话列表条目与会话活动快照的**权威类型**必须
+    /// 解析得出 UI 真正要用的那几个字段。
+    ///
+    /// 与上面那条 config 闸同款用意：断言贴着「本仓实际读的字段」写，若有人把
+    /// 依赖换成缩小版、或本仓又接回手抄件，这里立刻红。注意它**不**复制上游测试
+    /// ——上游测的是上游的意图，这里测的是本仓的用量。
+    #[test]
+    fn session_payload_contract_exposes_fields_tui_needs() {
+        let wire = serde_json::json!({
+            "seed": "0123abcd",
+            "created_at": 1757800000000u64,
+            "updated_at": 1757900000000u64,
+            "model": "m1",
+            "message_count": 3,
+            "title": "Bun 引导 daemon",
+            "cwd": "/home/x/Projects/qaqh-backend",
+            "mode": 1,
+            "archived": true,
+            "ephemeral": false,
+            "running": true,
+        });
+        let entry: SessionListEntry =
+            serde_json::from_value(wire.clone()).expect("会话列表条目可解析");
+        // 列表渲染真正读的每一个字段（ui/home.rs、ui/overlays.rs、app/overlay_ops.rs）。
+        assert_eq!(entry.meta.seed, "0123abcd");
+        assert!(entry.meta.archived && !entry.meta.ephemeral);
+        assert!(entry.running);
+        assert_eq!(entry.meta.updated_at, 1757900000000);
+        assert_eq!(entry.meta.display_title(), "Bun 引导 daemon");
+        // 未分组/旧 daemon 不带 workspace_id 时必须仍是 `None` 而不是解析失败。
+        assert_eq!(entry.workspace_id, None);
+
+        // **严格度差异（须知会）**：`seed`/`created_at`/`updated_at`/`model`/
+        // `message_count` 在 `SessionMeta` 上没有 `#[serde(default)]`，缺一个整条就被
+        // 跳过；而 G2 之前那份手解把这些全当可选。实际不受影响——产出方就是
+        // `SessionMeta` 本身，缺这些键的记录在 daemon 读盘那一步就已经被丢了，
+        // 根本发不到 wire。这条断言是为了让「严格在哪」写成可执行的，而不是靠记忆。
+        for required in ["seed", "created_at", "updated_at", "model", "message_count"] {
+            let mut partial = wire.clone();
+            partial.as_object_mut().unwrap().remove(required);
+            assert!(
+                serde_json::from_value::<SessionListEntry>(partial).is_err(),
+                "{required} 缺失必须解析失败（无 serde(default)），严格度与手解不同"
+            );
+        }
+
+        // 活动快照：本仓只用 seed + state 两个键（app/mod.rs 的 activity_cache）。
+        let acts: Vec<SessionActivity> = serde_json::from_value(serde_json::json!([
+            { "seed": "0123abcd", "state": "working", "turn_id": "t1", "seq": 3, "updated_at": 1 },
+        ]))
+        .expect("活动快照可解析");
+        assert_eq!(acts[0].seed, "0123abcd");
+        assert_eq!(acts[0].state, qaqh_client::DomainActivityState::Working);
+        assert_eq!(acts[0].turn_id.as_deref(), Some("t1"));
+    }
 
     /// T-11 回归闸：这三条断言**必须**对着权威 crate 成立，否则说明本仓又
     /// 悄悄接回了手抄件（或依赖被换成了缩小版）。断言刻意贴着「TUI 实际要用的

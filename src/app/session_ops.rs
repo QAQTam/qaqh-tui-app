@@ -166,11 +166,23 @@ impl App {
                         .ok_or_else(|| "session.list 应返回数组".to_string())
                 });
             let _ = tx.send(AppMsg::Action(ActionResult::SessionList(list)));
+            // 权威类型：逐项宽松解析（单条形状不符只跳过该条，与 session.list 同款）。
             let activity = api
                 .client
                 .query(QueryRequest::SessionActivity)
                 .await
-                .map_err(|e| e.to_string());
+                .map_err(|e| e.to_string())
+                .and_then(|v| {
+                    v.as_array()
+                        .map(|arr| {
+                            arr.iter()
+                                .filter_map(|item| {
+                                    serde_json::from_value::<SessionActivity>(item.clone()).ok()
+                                })
+                                .collect()
+                        })
+                        .ok_or_else(|| "session.activity 应返回数组".to_string())
+                });
             let _ = tx.send(AppMsg::Action(ActionResult::SessionActivity(activity)));
         });
     }

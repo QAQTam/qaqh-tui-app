@@ -33,7 +33,6 @@ use ratatui::crossterm::event::{KeyEvent, MouseEvent};
 use crate::app::slash::SlashCmd;
 use crate::protocol::ConfigDto;
 use crate::runtime::{ConnEvent, Runtime, RuntimeMsg};
-use qaqh_client::SessionListEntry;
 use qaqh_client::TimelinePage;
 use qaqh_client::{ActionRequest, QueryRequest};
 use qaqh_client::{
@@ -43,6 +42,7 @@ use qaqh_client::{
 };
 use qaqh_client::{ControlCommand, ConversationCommand, RingingCommand, ToolCommand};
 use qaqh_client::{RingingCommandState as CommandState, RingingCommandStatus};
+use qaqh_client::{SessionActivity, SessionListEntry};
 use session::{
     AskPanel, PermissionPanel, PlanPanel, SessionState, StreamPhase, streaming_done,
     sync_streaming_from_timeline,
@@ -70,7 +70,7 @@ pub enum ActionResult {
         result: Result<qaqh_client::RingingCommandAck, String>,
     },
     SessionList(Result<Vec<SessionListEntry>, String>),
-    SessionActivity(Result<serde_json::Value, String>),
+    SessionActivity(Result<Vec<SessionActivity>, String>),
     ConfigLoaded(Result<serde_json::Value, String>),
     ConfigWrite {
         label: &'static str,
@@ -1159,17 +1159,12 @@ impl App {
             ActionResult::SessionList(Err(e)) => {
                 self.toast(NoticeLevel::Error, format!("session.list: {e}"))
             }
-            ActionResult::SessionActivity(Ok(v)) => {
-                if let Some(arr) = v.as_array() {
-                    for item in arr {
-                        if let (Some(seed), Some(state)) =
-                            (item.get("seed").and_then(|s| s.as_str()), item.get("state"))
-                            && let Ok(state) =
-                                serde_json::from_value::<ActivityState>(state.clone())
-                        {
-                            self.activity_cache.insert(seed.to_owned(), state);
-                        }
-                    }
+            // 权威类型 `SessionActivity`（生产者本就是 `Vec<SessionActivity>`）：
+            // 此前这里是 `item.get("seed")` + `item.get("state")` 手取两个键，
+            // 与 G2 删掉的那类手解同款。现在字段在类型上，改形状会编译报错。
+            ActionResult::SessionActivity(Ok(items)) => {
+                for item in items {
+                    self.activity_cache.insert(item.seed.clone(), item.state);
                 }
             }
             ActionResult::SessionActivity(Err(_)) => {}
