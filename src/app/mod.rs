@@ -31,7 +31,7 @@ use std::time::{Duration, Instant};
 use ratatui::crossterm::event::{KeyEvent, MouseEvent};
 
 use crate::app::slash::SlashCmd;
-use crate::protocol::config::ConfigDto;
+use crate::protocol::ConfigDto;
 use crate::protocol::methods::{self, SessionMetaView};
 use crate::runtime::{ConnEvent, Runtime, RuntimeMsg};
 use crate::transport::http::HttpClient;

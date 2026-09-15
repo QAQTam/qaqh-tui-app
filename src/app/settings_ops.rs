@@ -28,7 +28,7 @@ impl App {
             return;
         }
         self.settings_saving = true;
-        let payload = st.draft.to_json();
+        let payload = serde_json::to_value(&st.draft).unwrap_or(serde_json::Value::Null);
         self.spawn_api(move |api, tx| async move {
             let result = api
                 .http

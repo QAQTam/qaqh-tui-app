@@ -17,7 +17,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::app::settings::{FieldKind, ROWS, Row, SettingsState};
 use crate::app::{App, Overlay};
-use crate::protocol::config::ConfigDto;
+use crate::protocol::ConfigDto;
 use crate::ui::{modal, theme};
 
 /// 标签列宽（按显示宽度；最长标签「子代理 maxTokens」= 16）。

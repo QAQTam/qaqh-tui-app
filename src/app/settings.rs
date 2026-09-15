@@ -8,7 +8,7 @@
 //! - apiKey 只进不出：掩码/空 = 保持现值，用户显式输入才写；
 //! - ConfigChanged 重拉只替换 loaded 快照，脏字段草稿值优先（B5 回声拉回教训）。
 
-use crate::protocol::config::{ConfigDto, ConfigPatch, SubagentPatch};
+use crate::protocol::{ConfigDto, ConfigPatch, SubagentPatch};
 
 /// 后端 `validate` 允许的思考强度枚举。
 pub const REASONING_EFFORTS: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
@@ -711,7 +711,7 @@ impl SettingsState {
     fn effective_provider<'a>(
         &self,
         cfg: &'a ConfigDto,
-    ) -> Option<&'a crate::protocol::config::ProviderDto> {
+    ) -> Option<&'a crate::protocol::ProviderDto> {
         let pid = self
             .draft
             .provider_id
@@ -797,7 +797,7 @@ fn toggle_str(draft: Option<bool>, loaded: Option<bool>) -> String {
 fn sub_or(
     d: &ConfigPatch,
     loaded: Option<&ConfigDto>,
-    pick: impl Fn(&SubagentPatch, &crate::protocol::config::SubagentDto) -> (Option<String>, String),
+    pick: impl Fn(&SubagentPatch, &crate::protocol::SubagentDto) -> (Option<String>, String),
     empty: &str,
 ) -> String {
     let (draft, loaded) = match (d.subagent.as_ref(), loaded) {
@@ -972,7 +972,7 @@ mod tests {
         .unwrap();
         assert!(!st.draft.is_empty());
         st.draft.validate().unwrap();
-        let v = st.draft.to_json();
+        let v = serde_json::to_value(&st.draft).unwrap();
         assert_eq!(v["contextLimit"], 2_000_000);
         assert!(v.get("model").is_none(), "未改动字段不得出现在 wire 上");
     }

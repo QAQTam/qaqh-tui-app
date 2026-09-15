@@ -1977,6 +1977,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "qaqh-config-api"
+version = "1.0.1"
+dependencies = [
+ "serde",
+]
+
+[[package]]
 name = "qaqh-domain"
 version = "1.0.1"
 dependencies = [
@@ -2004,6 +2011,7 @@ dependencies = [
  "futures",
  "pulldown-cmark",
  "qaqh-client",
+ "qaqh-config-api",
  "ratatui",
  "reqwest",
  "serde",

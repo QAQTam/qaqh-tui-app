@@ -17,6 +17,10 @@ path = "src/main.rs"
 # qaqh-ringing/qaqh-types，并用 version/lints workspace = true）；代价是后端
 # 仓必须与该相对路径共存——离线单独分发 TUI 时会断。
 qaqh-client = { path = "../qaqh-backend/crates/qaqh-client" }
+# 配置契约层（`ConfigDto` 读模型 / `ConfigPatch` 写模型）。与 qaqh-client 同款
+# 取舍：直接吃权威类型，本仓不再手工镜像（阶段二 config 切片，T-11）。
+# 该 crate 只依赖 serde，不牵入 runtime/daemon 构建。
+qaqh-config-api = { path = "../qaqh-backend/crates/qaqh-config-api" }
 ratatui = "0.30"
 crossterm = { version = "0.29", features = ["event-stream"] }
 tokio = { version = "1", features = [
