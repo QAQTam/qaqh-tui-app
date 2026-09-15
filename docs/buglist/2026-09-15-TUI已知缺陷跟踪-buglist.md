@@ -294,6 +294,8 @@ cd ~/Projects/qaqh-backend && cargo test -p qaqh-client sse::tests timeline::tes
 
 | 2026-09-15 | **T-01 阶段 1.5 完成 + 阶段二收尾**：服务面 8 处 `.service(` 换成语义化枚举，`Client::query`/`action` 全权接管；`transport/` 目录（`http.rs` 318 行）整个删除，`Runtime::attach_service_client`/`sync_service_credentials`/`ApiCtx.http`/`App.client` 一并消失——**双份凭据只剩一份**。删方法名字表（见 T-13 第二例）。`protocol/` 2481 → **405 行**，`runtime.rs` 949 → 431。测试 131 → 123（减 7 个随 `http.rs` 走的 `ApiError` 分类测试 + 1 个方法表测试）。TUI `d379d90` |
 | 2026-09-15 | **后端补测**：`ConfigPatch::validate` 的 `permissionLevel 1..=4` 守卫（BUG-2026-09-13-15）在 `qaqh-config-api` 自家测试里零覆盖，补双向断言 + 破坏验证。后端 `97c61c5`（该提交只含这 14 行——同文件里并发写入者的 `WorkspaceDto` 删除未随其落库） |
+| 2026-09-15 | **协议镜像第三轮：三频道快照类型化（G1）**：删 `protocol/snapshot.rs`（206 行手解）与四个视图类型，改用 `qaqh_client::{ConversationState, ControlState, ToolState}`。**手解不仅多余、而且必然漏**——删除前它已漏六个字段（`active_turn`/`last_round`/`compact_status`/`compact_id`/`cancelled`/`last_finished`），自身还带两个零读取死字段；其中 `ConversationStateView.turns` 更严重：它把中立 `turns[]` 解成 `TimelineTurn`，而中立形状没有 `created_seq`/`sealed`/`state`，**逐条解析必然失败被过滤**——那条「无 timeline 时的降级展示」路径其实从未 work 过。`protocol/` 405 → **204 行**（最初 2481）。TUI `88ebef4`；后端类型 `2a24a2a` |
+
 | 2026-09-15 | **T-06 闭环**：`TimelineTurn.offloaded` 此前在 `from_wire` 被静默丢弃——与 T-09/T-10 同类，阶段二未覆盖到。前提已成立（后端 offload 接通，`ea6063c`），故该回合形态真的会出现：用户看到被截到 512 字符的正文却无任何提示。已补搬运 + transcript 预览标注。TUI `45c9ea6` |
 | 2026-09-15 | **T-08 闭环**：`has_more` / `total_turns` / `truncated_before` 三者语义定案并两边落地。关键取舍：**不**用 `has_more=true` 表达裁剪（那会让客户端反复请求永远为空的页，正是 BUG-2026-09-13-18 修过的死循环），单列 `truncated_before`。顺带补上 TUI 空页分支丢弃 `total_turns` 的漏洞——那正是元数据唯一确定的时刻。**未做**：真正能取到归档回合的深翻页，已登记为后端 `BUG-2026-09-15-05`。后端 `7ef99fb`；TUI `ff38bea` |
 
