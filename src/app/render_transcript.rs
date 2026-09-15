@@ -1699,7 +1699,10 @@ mod tests {
     #[test]
     fn normal_turn_has_no_preview_warning() {
         let flat = flatten(&render_transcript(&turn_with_offload(false), 100));
-        assert!(!flat.contains("已归档"), "未 offload 不得报警告，实测：{flat}");
+        assert!(
+            !flat.contains("已归档"),
+            "未 offload 不得报警告，实测：{flat}"
+        );
     }
 
     /// 回归：ask 的机器回执 JSON 不得出现在 transcript（答案由交互弹窗承载）。

@@ -35,9 +35,7 @@
 /// `ConfigPatch` 少 `permission_level`（后端 BUG-2026-09-13-15 补的 1..=4 值域
 /// 校验因此形同虚设）、`ConfigDto` 少 `mcp`/`lsp`，且注释还写着「刻意不含」——
 /// **文档断言与后端现状相反**。改为依赖后，此类漂移在编译期即暴露。
-pub use qaqh_config_api::{
-    ConfigDto, ConfigPatch, ProviderDto, SubagentDto, SubagentPatch,
-};
+pub use qaqh_config_api::{ConfigDto, ConfigPatch, ProviderDto, SubagentDto, SubagentPatch};
 
 #[cfg(test)]
 mod tests {

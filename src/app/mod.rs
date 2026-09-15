@@ -265,10 +265,7 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(
-        runtime: Arc<Runtime>,
-        msg_tx: tokio::sync::mpsc::UnboundedSender<AppMsg>,
-    ) -> Self {
+    pub fn new(runtime: Arc<Runtime>, msg_tx: tokio::sync::mpsc::UnboundedSender<AppMsg>) -> Self {
         Self::new_with_cwd(
             runtime,
             msg_tx,
@@ -1068,7 +1065,8 @@ impl App {
                         let conv = b.conversation_state().unwrap_or_default();
                         sess.usage = conv.usage.clone();
                         sess.usage_totals = conv.usage_totals.clone();
-                        sess.context_limit = conv.context_limit.map(|v| v.min(u32::MAX as u64) as u32);
+                        sess.context_limit =
+                            conv.context_limit.map(|v| v.min(u32::MAX as u64) as u32);
                         let model = conv.model.clone();
                         sess.conversation = Some(conv);
                         let ctl = b.control_state().unwrap_or_default();
