@@ -8,7 +8,7 @@ use qaqh_client::ConversationMode;
 // 权威类型与 `qaqh-client` 自身类型重名者带 `Domain` 前缀；在本模块内换回本地惯用名，
 // 这样下文的引用点不必逐个改（映射只此一处）。
 use crate::protocol::session_meta::SessionMetaView;
-use crate::protocol::snapshot::ConversationStateView;
+use qaqh_client::ConversationState;
 use qaqh_client::{
     AskMode, ContentRef, DomainActivityState as ActivityState, DomainAskQuestion as AskQuestion,
     DomainError, PermissionCategory, PermissionRisk, SkillsStatus, UsageInfo,
@@ -381,7 +381,11 @@ pub struct SessionState {
     pub mode: ConversationMode,
     pub timeline: TimelineModel,
     /// bootstrap 的 conversation 快照视图（usage/model/context）。
-    pub conversation: Option<ConversationStateView>,
+    /// conversation 频道快照的**类型化**视图（权威类型，本仓不再手解）。
+    ///
+    /// 仅作 `model` / `context_limit` / `usage` 的缓存——快照里其余字段由
+    /// `TimelineModel` 与实时事件承担。
+    pub conversation: Option<ConversationState>,
     pub activity: Option<ActivityState>,
     pub usage: Option<UsageInfo>,
     pub usage_totals: Option<UsageInfo>,
@@ -508,7 +512,7 @@ impl SessionState {
         self.context_limit = Some(context_limit);
         if let Some(conv) = self.conversation.as_mut() {
             conv.model = Some(model);
-            conv.context_limit = Some(context_limit);
+            conv.context_limit = Some(context_limit as u64);
         }
     }
 }

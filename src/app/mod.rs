@@ -1060,17 +1060,18 @@ impl App {
                     let bootstrap_seed = seed.clone();
                     let mut needs_fetch = false;
                     if let Some(sess) = self.sessions.get_mut(&bootstrap_seed) {
-                        let conv = crate::protocol::snapshot::ConversationStateView::parse(
-                            &b.conversation.state,
-                        );
+                        // G1：用权威类型化视图，本仓不再手解三频道 state。
+                        // `unwrap_or_default` 不隐藏问题——权威类型每个字段都带
+                        // `#[serde(default)]`，形状漂移表现为「字段变缺省」，而漂移由
+                        // 后端的产出方往返测试兜住（`typed_state_views_recover_every_producer_field`）；
+                        // 真走到 `Err` 已是 state 根本不是对象的病态情形。
+                        let conv = b.conversation_state().unwrap_or_default();
                         sess.usage = conv.usage.clone();
                         sess.usage_totals = conv.usage_totals.clone();
-                        sess.context_limit = conv.context_limit;
+                        sess.context_limit = conv.context_limit.map(|v| v.min(u32::MAX as u64) as u32);
                         let model = conv.model.clone();
                         sess.conversation = Some(conv);
-                        let ctl = crate::protocol::snapshot::ChannelStateView::parse_control(
-                            &b.control.state,
-                        );
+                        let ctl = b.control_state().unwrap_or_default();
                         sess.activity = ctl.activity.or(sess.activity);
                         // bootstrap 是 control 域快照的权威刷新点；这里与 timeline
                         // 收敛一次，避免上一次连接遗留的 Working/Starting 与
@@ -1081,7 +1082,7 @@ impl App {
                         {
                             sess.mode = meta.conversation_mode();
                         }
-                        match ctl.dashboard {
+                        match ctl.dashboard_snapshot {
                             Some(dash) => {
                                 let is_empty = dash.tasks.is_empty()
                                     && dash.documents.is_empty()
@@ -1094,12 +1095,11 @@ impl App {
                                 needs_fetch = true;
                             }
                         }
-                        let tool =
-                            crate::protocol::snapshot::ChannelStateView::parse_tool(&b.tool.state);
+                        let tool = b.tool_state().unwrap_or_default();
                         if let Some(perm) = tool.pending_permission {
                             // bootstrap 恢复挂起权限（详情等 tool 事件补全）。
                             sess.pending_permissions.push(PermissionPanel {
-                                tool_call_id: perm.tool_call_id,
+                                tool_call_id: perm,
                                 tool_name: "（恢复中）".into(),
                                 reason: String::new(),
                                 paths: vec![],

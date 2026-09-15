@@ -3,10 +3,16 @@
 //! **阶段一 + 阶段二 + 阶段 1.5 之后，本模块已不含任何 wire 镜像**：协议类型
 //! 一律 `use qaqh_client::*`（ringing v1 权威实现），配置类型重导出
 //! `qaqh_config_api`，服务方法名归 `QueryRequest`/`ActionRequest` 的枚举持有。
-//! 此处只剩 TUI 自己的解析视图：
+//! 此处只剩**一处** TUI 自己的解析视图：
 //!
-//! - [`session_meta`] — 会话列表条目的宽松解析视图。
-//! - [`snapshot`] — 频道快照的宽松解析视图。
+//! - [`session_meta`] — 会话列表条目的宽松解析视图（`session.list` 回的仍是裸
+//!   `Value`，见后端契约文档的缺口 **G2**；届时同样改为依赖权威类型）。
+//!
+//! 三频道快照的 `state` 曾在这里手解（`snapshot.rs`，206 行），现已删除——改用
+//! `qaqh_client::{ConversationState, ControlState, ToolState}`（后端契约文档缺口
+//! **G1** 的落地）。手解不仅多余，而且**必然漏字段**：删除前它已经漏了
+//! `active_turn` / `last_round` / `compact_status` / `compact_id` / `cancelled` /
+//! `last_finished` 六个，且自身还带着两个零读取的死字段。
 //!
 //! 禁止在本仓散落协议字面量，全部 import 自本模块或上述权威 crate。
 //!
@@ -19,7 +25,6 @@
 //! 它钉成「活的」。逐项 grep 真实调用点才算数。
 
 pub mod session_meta;
-pub mod snapshot;
 
 /// 配置契约：**直接用权威 crate**，本仓不再手工镜像。
 ///
