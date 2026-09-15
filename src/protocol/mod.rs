@@ -1,17 +1,21 @@
-//! 协议类型镜像（PLAN.md §4 类型镜像纪律）。
+//! 协议常量与本仓自有视图（PLAN.md §4 类型镜像纪律）。
 //!
-//! 手工镜像 `QAQ-Harness/crates/qaqh-ringing` 与 `qaqh-domain` 的 wire 形状。
-//! **改动须对照后端 PR**；镜像以 `F:\QAQ-Harness` 2026-08 协议瘦身后的最终形态
-//! 为基准（协议版本 1）。禁止在本仓散落协议字面量，全部 import 自本模块。
+//! **阶段二后本模块已基本不含镜像**：wire 类型一律 `use qaqh_client::*`
+//! （ringing v1 的权威实现），配置类型重导出 `qaqh_config_api`。此处只剩两类
+//! 东西——上游没有对应 Rust 产物的**协议字符串词表**，和 TUI 自己的解析视图：
 //!
-//! 对应关系：
-//! - `qaqh-ringing/src/protocol.rs` → [`mod.rs`] 常量
-//! - `qaqh-ringing/src/envelope.rs` → [`envelope`]
-//! - `qaqh-domain/src/command.rs` → [`command`]
-//! - `qaqh-domain/src/event.rs` → [`event`]
-//! - `qaqh-ringing/src/{snapshot,reset}.rs` → [`snapshot`]
-//! - `qaqh-runtime/src/ringing/service_methods.rs` → [`methods`]
-//! - `qaqh-config-api/src/lib.rs` → **本模块直接重导出**（无镜像）
+//! - [`methods`] — 服务方法名字表。上游 `service_methods.rs` 是 `match`
+//!   字符串、无 `pub const` 表，`qaqh-client` 亦未导出名字映射，故无从导入
+//!   （待 T-01 阶段 1.5 服务面迁到 `Client::query/action`）。守卫 =
+//!   `methods::tests::method_table_matches_backend_shape`。
+//! - [`snapshot`] — 频道快照的宽松解析视图（wire 类型本身来自 `qaqh_client`）。
+//! - [`WireError`] — daemon 错误体，本仓服务面自用。
+//!
+//! 禁止在本仓散落协议字面量，全部 import 自本模块或上述权威 crate。
+//!
+//! 历史：2026-09-15 前这里是对 `qaqh-ringing`/`qaqh-domain`/`qaqh-config-api`
+//! 的手工镜像（9 文件 2481 行），已漂移出 T-09～T-12 四项缺陷；阶段二逐刀
+//! 删除，仅余上述非镜像内容。
 
 pub mod methods;
 pub mod snapshot;
@@ -28,33 +32,6 @@ pub use qaqh_config_api::{
 
 use serde::{Deserialize, Serialize};
 
-/// Ringing 三频道（`qaqh-domain/src/channel.rs`）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Channel {
-    Control,
-    Conversation,
-    Tool,
-}
-
-impl Channel {
-    pub const ALL: [Channel; 3] = [Channel::Control, Channel::Conversation, Channel::Tool];
-
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Channel::Control => "control",
-            Channel::Conversation => "conversation",
-            Channel::Tool => "tool",
-        }
-    }
-
-    /// SSE 帧 id 频道段：`<epoch>:<channel>:<seq>`。
-    #[allow(dead_code)]
-    pub fn from_path_segment(s: &str) -> Option<Self> {
-        Self::ALL.iter().copied().find(|c| c.as_str() == s)
-    }
-}
-
 /// daemon 统一 JSON 错误体（HTTP 4xx/5xx 的 body）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WireError {
@@ -65,18 +42,6 @@ pub struct WireError {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn channel_round_trip() {
-        for c in Channel::ALL {
-            assert_eq!(
-                c.as_str(),
-                serde_json::to_string(&c).unwrap().trim_matches('"')
-            );
-            assert_eq!(Channel::from_path_segment(c.as_str()), Some(c));
-        }
-        assert_eq!(Channel::from_path_segment("bogus"), None);
-    }
 
     /// T-11 回归闸：这三条断言**必须**对着权威 crate 成立，否则说明本仓又
     /// 悄悄接回了手抄件（或依赖被换成了缩小版）。断言刻意贴着「TUI 实际要用的

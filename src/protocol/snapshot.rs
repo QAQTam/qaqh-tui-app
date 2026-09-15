@@ -1,49 +1,17 @@
-//! 频道快照与 bootstrap（镜像 `qaqh-ringing/src/snapshot.rs`）。
+//! 频道快照的 **UI 视图层**（宽松解析）。
 //!
-//! bootstrap 的 `state` 是各频道的领域快照 payload（中立 JSON）。本模块
-//! 提供宽松解析的 UI 视图：解析失败一律降级为 None，绝不让 UI 崩溃。
+//! wire 侧的 `RingingSessionBootstrap` / `RingingChannelSnapshot` **不再镜像**：
+//! 直接用 `qaqh_client` 的权威类型（`app/mod.rs` 的 bootstrap 路径早已如此，
+//! 本仓那份副本只被自己的测试养着，且因 `pub` 项落在私有模块里逃过了
+//! `dead_code` lint——`cargo build` 零警告）。
+//!
+//! 本模块只保留 TUI 自己的视图：bootstrap 的 `state` 是各频道的领域快照
+//! payload（中立 JSON），解析失败一律降级为 None，绝不让 UI 崩溃。
 
-use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use super::Channel;
 use qaqh_client::TimelineTurn;
 use qaqh_client::{DomainActivityState as ActivityState, SkillsStatus, UsageInfo};
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RingingChannelSnapshot {
-    pub schema: String,
-    pub version: u32,
-    pub channel: Channel,
-    pub seed: String,
-    /// 快照覆盖到的 stream_seq 基线（其后的可靠事件需从 cursor 回放）。
-    pub baseline_stream_seq: u64,
-    pub state_revision: u64,
-    pub snapshot_version: u32,
-    pub state: Value,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RingingSessionBootstrap {
-    pub schema: String,
-    pub version: u32,
-    pub server_epoch: String,
-    pub seed: String,
-    pub control: RingingChannelSnapshot,
-    pub conversation: RingingChannelSnapshot,
-    pub tool: RingingChannelSnapshot,
-}
-
-impl RingingSessionBootstrap {
-    #[allow(dead_code)]
-    pub fn channel_snapshot(&self, channel: Channel) -> Option<&RingingChannelSnapshot> {
-        match channel {
-            Channel::Control => Some(&self.control),
-            Channel::Conversation => Some(&self.conversation),
-            Channel::Tool => Some(&self.tool),
-        }
-    }
-}
 
 /// UI 需要的 conversation 频道快照视图（宽松解析）。
 #[allow(dead_code)]
@@ -187,7 +155,7 @@ impl ChannelStateView {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use qaqh_client::{RINGING_SCHEMA, RINGING_VERSION};
+    use qaqh_client::{RINGING_SCHEMA, RINGING_VERSION, RingingSessionBootstrap};
     use serde_json::json;
 
     #[test]
