@@ -38,7 +38,17 @@ pub const TIMELINE_PAGE_LIMIT: u32 = 60;
 ///
 /// 对齐 winui 的 `compute_stall`（同样 15s）。`qaqh-client` 不会因为失败而
 /// 停止生命周期，所以**没有**致命错误信号可等——失联只能靠「一直连不上」推断。
-const STALL_AFTER: Duration = Duration::from_secs(15);
+/// 判定「与 daemon 失联」的静默阈值。
+///
+/// **必须大于客户端的 SSE 空闲超时（`qaqh-client` 的 `SSE_IDLE_TIMEOUT = 45s`）**：
+/// 一条健康但安静 >45s 的流会被客户端主动断开重连，重连成功即刷新活跃时间戳
+/// ——探活由那条路径负责。本阈值只该在「连重连都没能恢复」时才触发。
+/// 取 15s 时会反过来：空闲流每 45s 周期里有 30s 显示「失联」。
+///
+/// **代价（须知会）**：daemon 真死时，`✗ lost · Ctrl+R 重连` 的升级提示要等 60s。
+/// 但更早的信号并不缺——`ChannelStatus::Reconnecting` 会在 ~1s 内推
+/// 「连接断开，Nms 后重连」。`Lost` 只是「连重连都没能恢复」的升级档。
+const STALL_AFTER: Duration = Duration::from_secs(60);
 const STALL_TICK: Duration = Duration::from_secs(1);
 
 /// timeline 激活时等 attach 落地的重试窗口（见 `activate_with_attach_retry`）。
@@ -311,6 +321,20 @@ async fn watch_session(runtime: Arc<Runtime>, client: Arc<Client>, generation: u
     }
 }
 
+/// 记一次「daemon 还在说话」。
+///
+/// 原先只有 `ChannelStatus::Open` 会复位这个时间戳，而客户端**只在连接建立那一刻**
+/// 发一次 `Open`（`qaqh-client/src/sse.rs:142`，紧跟 HTTP 响应成功之后）。于是：
+/// - 流**很忙** → 不触发 45s 空闲超时 → 不重连 → 再也不发 `Open` → **永久停在失联**，
+///   而数据一直在流（实测现象：后端在干活、前端在输出，状态栏却一直 `✗ lost`）；
+/// - 流**空闲** → 45s 后空闲重连 → 新的 `Open` → 自己恢复。
+///
+/// 即「越活跃越像失联」——判据挂错了信号：活着与否该由**收到的数据**说话。
+/// 现在每收到一批频道事件或一条 timeline 事件都记一次。
+fn note_daemon_activity(last_open: &Arc<std::sync::Mutex<Instant>>) {
+    *last_open.lock().expect("last_open lock") = Instant::now();
+}
+
 /// 失联检测（T-03 的触发判据）。
 async fn watch_stall(
     runtime: Arc<Runtime>,
@@ -347,9 +371,12 @@ fn build_handlers(
     ClientHandlers {
         on_batch: {
             let msg_tx = msg_tx.clone();
+            let last_open = last_open.clone();
             // 类型已权威化：信封直达 app 层，不再有「过桥失败 → 丢帧」这条路径。
             // 形状对不上现在会是**编译错误**，而不是运行时的静默丢弃。
             Arc::new(move |batch: qaqh_client::EventBatch| {
+                // 收到任何一批事件 = daemon 还活着（见 `note_daemon_activity`）。
+                note_daemon_activity(&last_open);
                 for env in &batch.envelopes {
                     let _ = msg_tx.send(RuntimeMsg::Ringing {
                         env: Box::new(env.clone()),
@@ -362,9 +389,7 @@ fn build_handlers(
             let msg_tx = msg_tx.clone();
             Arc::new(
                 move |_channel: WireChannel, status: ChannelStatus| match status {
-                    ChannelStatus::Open { .. } => {
-                        *last_open.lock().expect("last_open lock") = Instant::now();
-                    }
+                    ChannelStatus::Open { .. } => note_daemon_activity(&last_open),
                     ChannelStatus::Reconnecting { retry_ms, .. } => {
                         let _ = msg_tx.send(RuntimeMsg::Conn(ConnEvent::StreamIssue {
                             error: format!("连接断开，{retry_ms}ms 后重连"),
@@ -390,8 +415,12 @@ fn build_handlers(
         },
         on_timeline_entry: {
             let msg_tx = msg_tx.clone();
+            let last_open = last_open.clone();
             // 类型已权威化：不再过桥，回调给的就是 `qaqh_client` 的类型。
             Arc::new(move |seed: String, entry: qaqh_client::TimelineEntry| {
+                // transcript 有内容 = daemon 还活着。这条尤其重要：长回合里
+                // 频道事件可能稀疏，而 timeline 一直在推。
+                note_daemon_activity(&last_open);
                 let _ = msg_tx.send(RuntimeMsg::Timeline {
                     seed,
                     entry: Box::new(entry),
