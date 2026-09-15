@@ -98,7 +98,7 @@ mod tests {
         assert_eq!(acts[0].turn_id.as_deref(), Some("t1"));
     }
 
-    /// T-11 回归闸：这三条断言**必须**对着权威 crate 成立，否则说明本仓又
+    /// T-11 回归闸：这几条断言**必须**对着权威 crate 成立，否则说明本仓又
     /// 悄悄接回了手抄件（或依赖被换成了缩小版）。断言刻意贴着「TUI 实际要用的
     /// 那几个字段」，而非上游测试的复制。
     #[test]
@@ -118,17 +118,24 @@ mod tests {
         assert!(bad.validate().is_err(), "档位 5 必须被拒，不得落成 Level 4");
 
         // 2) 读路径：mcp/lsp 两段不再是盲区（T-11 前 ConfigDto 里没有）。
-        let dto: ConfigDto = serde_json::from_value(serde_json::json!({
-            "model": "m1",
-            "mcp": { "enabled": true, "idleShutdownSecs": 300, "servers": [] },
-            "lsp": { "enabled": true, "idleShutdownSecs": 600, "servers": [] },
-        }))
-        .unwrap();
+        //    载荷由权威类型自身生成——**完整**是它的默认状态。本仓要钉的是
+        //    「这几个字段够得着」，wire 形状本身由后端
+        //    `qaqh-config-api::tests::dto_parses_the_full_wire_shape` 锁住。
+        let mut payload = serde_json::to_value(ConfigDto::default()).expect("serialize");
+        payload["mcp"]["enabled"] = serde_json::json!(true);
+        payload["lsp"]["idleShutdownSecs"] = serde_json::json!(600);
+        let dto: ConfigDto = serde_json::from_value(payload).expect("完整载荷必须可解析");
         assert!(dto.mcp.enabled);
         assert_eq!(dto.lsp.idle_shutdown_secs, 600);
-        // 3) 旧 daemon 的 snake_case 形状仍须可解析（前向兼容未随迁移丢失）。
-        let legacy: ConfigDto =
-            serde_json::from_value(serde_json::json!({ "base_url": "https://x/v1" })).unwrap();
-        assert_eq!(legacy.base_url, "https://x/v1");
+
+        // 3) 反向闸：**残缺载荷必须失败**。G2 之前这里断言的是相反的行为
+        //    （「旧 daemon 的 snake_case 形状仍须可解析」）——该兼容臂已按后端
+        //    spec §0b 删除：前后端共进退，不留「另一个版本的对方」。
+        //    留着 struct 级 default 更糟：未知键被忽略 + 缺字段走 default ⇒
+        //    解析**成功**但得到一份全默认的配置，设置页会显示一堆空值。
+        assert!(
+            serde_json::from_value::<ConfigDto>(serde_json::json!({ "base_url": "x" })).is_err(),
+            "残缺/旧形状载荷必须报错，不得静默降级成全默认"
+        );
     }
 }

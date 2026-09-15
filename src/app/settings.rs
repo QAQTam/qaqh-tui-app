@@ -816,35 +816,48 @@ fn sub_or(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
+    /// 完整读模型载荷。
+    ///
+    /// **由权威类型自身生成**（`ConfigDto::default()` 序列化出来就是完整形状），
+    /// 只覆盖本测试真正关心的几个字段与 providers 树——这样后端新增字段时这里
+    /// 不会因为「少写一个键」而红，而要钉住的东西（providers 树、subagent）仍是
+    /// 显式写出来的。
+    ///
+    /// 历史：原先是一份手写 JSON，靠 `qaqh-config-api` 的 struct 级
+    /// `#[serde(default)]` 才解析得动——缺 `lang`/`fontFamily`/`theme`/`mcp`/`lsp`/
+    /// `tokenizerPath`，且 `subagent.api_key` 还是 snake_case、靠 `alias` 兜着。
+    /// 那两个兼容臂已按后端 spec §0b 删除，故改为从类型生成。
     fn cfg() -> ConfigDto {
-        serde_json::from_value(serde_json::json!({
-            "model": "gpt-5",
-            "baseUrl": "https://api.example.com/v1",
-            "providerId": "prov-a",
-            "endpoint": "ep-a1",
-            "maxTokens": 96000,
-            "contextLimit": 1000000,
-            "reasoningEffort": "high",
-            "autoCompactThreshold": 0.95,
-            "permissionLevel": 3,
-            "apiKey": "****",
-            "activeProfile": "default",
-            "profiles": ["default", "fast"],
-            "notificationsEnabled": true,
-            "complianceEnabled": false,
-            "providers": [
-                { "id": "prov-a", "display": "A", "endpoints": [
-                    { "id": "ep-a1", "display": "A1", "protocol": "openai", "baseUrl": "https://api.example.com/v1", "defaultModel": "", "models": ["gpt-5", "gpt-5-mini"], "stateful": false, "beta": false }
-                ]},
-                { "id": "prov-b", "display": "B", "endpoints": [
-                    { "id": "ep-b1", "display": "B1", "protocol": "openai", "baseUrl": "https://b.example.com/v1", "defaultModel": "", "models": ["b1"], "stateful": false, "beta": false }
-                ]}
-            ],
-            "subagent": { "model": "", "baseUrl": "", "api_key": "", "apiKeySet": false, "maxTokens": 4096, "timeoutSecs": 120, "defaultTools": [] },
-            "workspace": { "mode": "local" }
-        }))
-        .unwrap()
+        let mut payload = serde_json::to_value(ConfigDto::default()).expect("serialize");
+        payload["model"] = json!("gpt-5");
+        payload["baseUrl"] = json!("https://api.example.com/v1");
+        payload["providerId"] = json!("prov-a");
+        payload["endpoint"] = json!("ep-a1");
+        payload["maxTokens"] = json!(96000);
+        payload["contextLimit"] = json!(1000000);
+        payload["reasoningEffort"] = json!("high");
+        payload["autoCompactThreshold"] = json!(0.95);
+        payload["permissionLevel"] = json!(3);
+        payload["apiKey"] = json!("****");
+        payload["activeProfile"] = json!("default");
+        payload["profiles"] = json!(["default", "fast"]);
+        payload["notificationsEnabled"] = json!(true);
+        payload["complianceEnabled"] = json!(false);
+        payload["providers"] = json!([
+            { "id": "prov-a", "display": "A", "endpoints": [
+                { "id": "ep-a1", "display": "A1", "protocol": "openai", "baseUrl": "https://api.example.com/v1", "defaultModel": "", "models": ["gpt-5", "gpt-5-mini"], "stateful": false, "beta": false }
+            ]},
+            { "id": "prov-b", "display": "B", "endpoints": [
+                { "id": "ep-b1", "display": "B1", "protocol": "openai", "baseUrl": "https://b.example.com/v1", "defaultModel": "", "models": ["b1"], "stateful": false, "beta": false }
+            ]}
+        ]);
+        payload["subagent"] = json!({
+            "model": "", "baseUrl": "", "apiKey": "", "apiKeySet": false,
+            "maxTokens": 4096, "timeoutSecs": 120, "defaultTools": []
+        });
+        serde_json::from_value(payload).expect("完整载荷必须可解析")
     }
 
     fn row_index(id: FieldId) -> usize {
