@@ -51,6 +51,23 @@ syntect = "5"
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.60", features = ["Win32_System_Threading"] }
 
+# ── 本地 ratatui 工作树（main @ e02e2a62）──────────────────────────────
+# 上游已合并「宽字符仅样式变化时尾部单元格残留」的修复（ratatui#2743 / 7babd829），
+# 但尚未发版。先按 path 跟随 main 拿到修复；等 ratatui 发下一个版本后删除本节即可
+# （届时无需任何代码改动）。
+#
+# 复现/验证（本仓实验）：0.30.2 上同一宽字形只改样式时 diff 仅吐 [(0,0,字形)]，
+# 尾部单元格缺失 → 汉字右侧残留上一帧底色；main 上为 [(1,0," "), (0,0,字形)]。
+#
+# ⚠ 下列包必须同源。只 patch 门面会得到「未发版 ratatui + 已发版 ratatui-core」
+# 的错配组合，编译期未必报错但语义已漂移。
+[patch.crates-io]
+ratatui = { path = "../ratatui/ratatui" }
+ratatui-core = { path = "../ratatui/ratatui-core" }
+ratatui-crossterm = { path = "../ratatui/ratatui-crossterm" }
+ratatui-macros = { path = "../ratatui/ratatui-macros" }
+ratatui-widgets = { path = "../ratatui/ratatui-widgets" }
+
 [profile.release]
 lto = "thin"
 strip = "symbols"
