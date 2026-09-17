@@ -94,13 +94,48 @@ pub enum RuntimeMsg {
     },
     TimelineLost {
         seed: String,
-        error: String,
+        /// **结构化**原因：字符串化会抹掉「404 = 会话真的没了」与「超时/网络
+        /// 错 = 会话可能还活着」的区别，app 只能把任何一次抖动都当成消失。
+        reason: TimelineLostReason,
     },
+}
+
+/// timeline 流丢失的原因。
+///
+/// 只有 [`Self::SessionMissing`] 能证明会话已不存在（服务端 404）；其余一切
+/// （401 租约尚未落地、超时、网络错、流被主动停止）都只说明**这条流**没了，
+/// 会话本身可能还活着。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TimelineLostReason {
+    /// 服务端明确回答「该会话不存在」（HTTP 404）。
+    SessionMissing,
+    /// 其余原因：保留现状，只提示（附可读描述）。
+    Other(String),
+}
+
+impl TimelineLostReason {
+    /// 由 `activate_timeline` 的错误归一。**404 是唯一**的「会话不存在」判据。
+    fn from_client_error(err: &ClientError) -> Self {
+        match err {
+            ClientError::Http { status: 404, .. } => Self::SessionMissing,
+            other => Self::Other(other.to_string()),
+        }
+    }
+
+    /// 展示用描述（toast）。
+    pub fn describe(&self) -> String {
+        match self {
+            Self::SessionMissing => "会话不存在（404）".to_string(),
+            Self::Other(text) => text.clone(),
+        }
+    }
 }
 
 /// 生命周期属主。持有当前 `Client`（可在 T-03 手动重连时原地替换）。
 pub struct Runtime {
-    client: RwLock<Arc<Client>>,
+    /// 当前客户端。`None` 只出现在测试桩（[`Runtime::stub_for_test`]）——
+    /// 生产路径经 [`Runtime::start`] 建立，恒为 `Some`。
+    client: RwLock<Option<Arc<Client>>>,
     msg_tx: mpsc::UnboundedSender<RuntimeMsg>,
     /// app 当前跟踪的 seed 集（重连后据此恢复 timeline 流）。
     tracked: std::sync::Mutex<HashSet<String>>,
@@ -127,7 +162,7 @@ impl Runtime {
         let client = Self::connect(&msg_tx, &last_open, launch_daemon_if_missing).await?;
 
         let runtime = Arc::new_cyclic(|weak| Self {
-            client: RwLock::new(client.clone()),
+            client: RwLock::new(Some(client.clone())),
             msg_tx: msg_tx.clone(),
             tracked: std::sync::Mutex::new(HashSet::new()),
             rebuilding: AtomicBool::new(false),
@@ -152,6 +187,23 @@ impl Runtime {
         Ok(runtime)
     }
 
+    /// 不连 daemon 的运行时桩（**仅供测试**）：只保留 app 侧跟踪集语义，
+    /// timeline 激活/停用等网络副作用一律跳过。
+    #[cfg(test)]
+    pub(crate) fn stub_for_test(msg_tx: mpsc::UnboundedSender<RuntimeMsg>) -> Arc<Self> {
+        Arc::new_cyclic(|weak| Self {
+            client: RwLock::new(None),
+            msg_tx,
+            tracked: std::sync::Mutex::new(HashSet::new()),
+            rebuilding: AtomicBool::new(false),
+            generation: AtomicU64::new(0),
+            launch_daemon_if_missing: false,
+            last_open: Arc::new(std::sync::Mutex::new(Instant::now())),
+            stalled: Arc::new(AtomicBool::new(false)),
+            self_arc: weak.clone(),
+        })
+    }
+
     async fn connect(
         msg_tx: &mpsc::UnboundedSender<RuntimeMsg>,
         last_open: &Arc<std::sync::Mutex<Instant>>,
@@ -174,6 +226,12 @@ impl Runtime {
     /// 同步返回：`spawn_api` 需要在**非 async** 上下文里拿到它，而且把
     /// `&self` 借进 spawned task 是不允许的。
     pub fn client(&self) -> Arc<Client> {
+        self.live_client()
+            .expect("runtime 尚未持有 client（仅测试桩会走到这里）")
+    }
+
+    /// 已建立的客户端；未连接（测试桩）时为 `None`。
+    fn live_client(&self) -> Option<Arc<Client>> {
         self.client.read().expect("client lock").clone()
     }
 
@@ -190,9 +248,12 @@ impl Runtime {
         if to_add.is_empty() && to_remove.is_empty() {
             return;
         }
+        // 测试桩没有 client：跟踪集已经更新，网络侧无动作可做。
+        let Some(client) = self.live_client() else {
+            return;
+        };
         let msg_tx = self.msg_tx.clone();
         let generation = self.generation.load(Ordering::SeqCst);
-        let client = self.client();
         tokio::spawn(async move {
             for seed in to_remove {
                 client.deactivate_timeline(&seed).await;
@@ -204,7 +265,9 @@ impl Runtime {
     }
 
     pub async fn shutdown(&self) {
-        self.client().close();
+        if let Some(client) = self.live_client() {
+            client.close();
+        }
     }
 
     /// **手动重连**（T-03）：关掉当前客户端并重建一个，随后恢复跟踪的 timeline。
@@ -225,8 +288,9 @@ impl Runtime {
     }
 
     async fn rebuild_inner(&self) -> Result<(), String> {
-        let old = self.client();
-        old.close();
+        if let Some(old) = self.live_client() {
+            old.close();
+        }
         // 让旧任务先退出，避免两套流短暂并存。
         tokio::time::sleep(Duration::from_millis(80)).await;
 
@@ -235,7 +299,7 @@ impl Runtime {
             .map_err(|e| e.to_string())?;
 
         let generation = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
-        *self.client.write().expect("client lock") = new.clone();
+        *self.client.write().expect("client lock") = Some(new.clone());
         self.stalled.store(false, Ordering::SeqCst);
         *self.last_open.lock().expect("last_open lock") = Instant::now();
 
@@ -287,7 +351,7 @@ async fn activate_with_attach_retry(
                 let _ = generation;
                 let _ = msg_tx.send(RuntimeMsg::TimelineLost {
                     seed: seed.to_string(),
-                    error: e.to_string(),
+                    reason: TimelineLostReason::from_client_error(&e),
                 });
                 return;
             }
@@ -435,12 +499,13 @@ fn build_handlers(
         on_timeline_status: {
             let msg_tx = msg_tx.clone();
             Arc::new(move |status: TimelineStatus| match status {
-                // 子代理会话被 GC 后消失：旧实现在快照 404 时停止并静默收口，
-                // 这里保留等价的可观测信号（app 侧对子代理 seed 静默处理）。
+                // 流结束（主动停用 / 客户端关闭）**不等于**会话消失：`reason`
+                // 只是流侧描述，故归入 `Other`——app 不会再据此把子代理标 Closed。
+                // 「会话真的没了」只能由 `activate_timeline` 的 404 证明。
                 TimelineStatus::Closed { seed, reason } => {
                     let _ = msg_tx.send(RuntimeMsg::TimelineLost {
                         seed,
-                        error: format!("timeline 流结束：{reason}"),
+                        reason: TimelineLostReason::Other(format!("timeline 流结束：{reason}")),
                     });
                 }
                 TimelineStatus::Reconnecting { seed, retry_ms, .. } => {

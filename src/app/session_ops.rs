@@ -98,21 +98,11 @@ impl App {
     }
 
     pub(super) fn close_tab_by_seed(&mut self, seed: &str) {
+        // 子代理回收**不依赖** seed 是否在本地 `tabs`：daemon 主动关父会话、
+        // 或父本身就是子代理时，父 seed 从来不在 tabs 里——旧实现把整段回收罩在
+        // `tabs` 命中内，这些子代理的 timeline 流与本地快照就永远留在跟踪集里。
+        self.reclaim_subagents(seed);
         if let Some(pos) = self.tabs.iter().position(|s| s == seed) {
-            // 同标签拉起的子代理：停止跟踪并移除本地快照（标签都没了，
-            // 子代理视图无宿主；daemon 侧 ephemeral 会话自会回收）。
-            let sub_seeds: Vec<String> = self
-                .sessions
-                .get(seed)
-                .map(|s| s.subagents.iter().filter_map(|e| e.seed.clone()).collect())
-                .unwrap_or_default();
-            for sub in sub_seeds {
-                self.untrack_subagent(&sub);
-                self.sessions.remove(&sub);
-                if self.inspect.as_deref() == Some(sub.as_str()) {
-                    self.inspect = None;
-                }
-            }
             self.tabs.remove(pos);
             self.sessions.remove(seed);
             self.tracked_seeds.remove(seed);
@@ -124,6 +114,48 @@ impl App {
                 self.active = self.tabs.len() - 1;
             }
             self.sync_tracked();
+            return;
+        }
+        // 不在 tabs：没有标签栈可调。会话确实已消失 → 停止跟踪并把（可能挂在
+        // 别人名下的）条目收口为 `Closed`（权威终态标签仍可覆盖它）；本地快照
+        // **保留**——终态子代理仍要能被查看。
+        self.mark_subagent_closed(seed);
+        self.tracked_seeds.remove(seed);
+        self.focus_order.retain(|s| s != seed);
+        if self.last_focused.as_deref() == Some(seed) {
+            self.last_focused = None;
+        }
+        self.sync_tracked();
+    }
+
+    /// 按父子关系回收 `seed` 名下的全部子代理（含多层嵌套）：停止 timeline
+    /// 跟踪并移除本地快照（子代理视图无宿主；daemon 侧 ephemeral 会话自会回收）。
+    ///
+    /// 先收集整个后代集合再统一删除——边删边找会把孙代一起弄丢（父条目随
+    /// 快照删除后，父子关系就无从查起）。
+    fn reclaim_subagents(&mut self, seed: &str) {
+        let mut descendants: Vec<String> = Vec::new();
+        let mut frontier = vec![seed.to_owned()];
+        while let Some(parent) = frontier.pop() {
+            let children: Vec<String> = self
+                .sessions
+                .get(&parent)
+                .map(|s| s.subagents.iter().filter_map(|e| e.seed.clone()).collect())
+                .unwrap_or_default();
+            for child in children {
+                if child == parent || descendants.contains(&child) {
+                    continue;
+                }
+                descendants.push(child.clone());
+                frontier.push(child);
+            }
+        }
+        for sub in descendants {
+            self.untrack_subagent(&sub);
+            self.sessions.remove(&sub);
+            if self.inspect.as_deref() == Some(sub.as_str()) {
+                self.inspect = None;
+            }
         }
     }
 
@@ -414,5 +446,82 @@ impl App {
         {
             self.request_rebaseline(active);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::subagent::{SubagentEntry, SubagentState};
+
+    fn entry(tool_call_id: &str, seed: &str) -> SubagentEntry {
+        SubagentEntry {
+            tool_call_id: tool_call_id.into(),
+            seed: Some(seed.into()),
+            name: "explore".into(),
+            state: SubagentState::Running,
+        }
+    }
+
+    /// issue #2 缺陷 3：父 seed **不在**本地 tabs（daemon 主动关父 / 父本身是
+    /// 子代理）时，也必须按父子关系回收它的子代理（含多层嵌套）。
+    /// 旧实现把整段回收罩在 `tabs` 命中内 → 零动作，流与快照永久滞留。
+    #[test]
+    fn close_tab_by_seed_reclaims_children_of_non_tab_parent() {
+        let mut app = App::new_for_test();
+
+        let mut parent = SessionState::new("parent".into());
+        parent.subagents.push(entry("c1", "sub"));
+        app.sessions.insert("parent".into(), parent);
+
+        // 子代理自己又派生了孙代。
+        let mut sub = SessionState::new("sub".into());
+        sub.subagents.push(entry("c2", "grand"));
+        app.sessions.insert("sub".into(), sub);
+
+        app.sessions
+            .insert("grand".into(), SessionState::new("grand".into()));
+        for s in ["sub", "grand"] {
+            app.subagent_seeds.insert(s.into());
+        }
+        assert!(
+            !app.tabs.contains(&"parent".to_string()),
+            "前提：父不是本地标签"
+        );
+
+        app.close_tab_by_seed("parent");
+
+        assert!(
+            !app.subagent_seeds.contains("sub") && !app.subagent_seeds.contains("grand"),
+            "父不在 tabs 时子代理/孙代同样必须停止 timeline 跟踪"
+        );
+        assert!(
+            !app.sessions.contains_key("sub") && !app.sessions.contains_key("grand"),
+            "子代理/孙代的本地快照随父一起回收"
+        );
+        assert!(
+            app.tracked_seeds.is_empty(),
+            "跟踪集必须只剩真正打开的标签（此处没有标签）"
+        );
+    }
+
+    /// 回归护栏：父在 tabs 时行为不变（回收子代理 + 关标签）。
+    #[test]
+    fn close_tab_by_seed_still_closes_tab_and_children() {
+        let mut app = App::new_for_test();
+        app.tabs.push("parent".into());
+        let mut parent = SessionState::new("parent".into());
+        parent.subagents.push(entry("c1", "sub"));
+        app.sessions.insert("parent".into(), parent);
+        app.sessions
+            .insert("sub".into(), SessionState::new("sub".into()));
+        app.subagent_seeds.insert("sub".into());
+
+        app.close_tab_by_seed("parent");
+
+        assert!(app.tabs.is_empty());
+        assert!(!app.sessions.contains_key("parent"));
+        assert!(!app.subagent_seeds.contains("sub"));
+        assert!(!app.sessions.contains_key("sub"));
     }
 }
