@@ -58,6 +58,18 @@ const STALL_TICK: Duration = Duration::from_secs(1);
 const ATTACH_RETRY_INTERVAL: Duration = Duration::from_millis(400);
 const ATTACH_RETRY_ATTEMPTS: u32 = 75; // ≈30s
 
+/// 流的身份：三条主频道流 + 每个 seed 的 timeline 流。
+///
+/// 告警与恢复必须**按流**记账：某条 timeline 流断开的同时另一条频道流恰好重连
+/// 成功，不能把前者的告警当成「一切正常」清掉（反向顺序下文案也会串成后者）。
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum StreamKey {
+    /// 主频道 SSE 流（control / conversation / tool）。
+    Channel(WireChannel),
+    /// 某个 seed 的 timeline 流。
+    Timeline(String),
+}
+
 /// 连接相位事件。
 #[derive(Debug, Clone)]
 pub enum ConnEvent {
@@ -68,14 +80,14 @@ pub enum ConnEvent {
     Ready { epoch: String, epoch_changed: bool },
     /// 与 daemon 失联（≥[`STALL_AFTER`] 无任何频道连接）——可由用户触发重连。
     Lost(String),
-    /// 非致命问题提示（流断开重连中、事件过桥失败等）。
-    StreamIssue { error: String },
-    /// 某条频道流重新 `Open`——`StreamIssue` 的对应恢复信号。
+    /// 某条流报了非致命问题（断开重连中、流被关闭等）。
+    StreamIssue { stream: StreamKey, error: String },
+    /// 某条流重新 `Open`——**它自己**那条 `StreamIssue` 的对应恢复信号。
     ///
     /// 单独一个变体而不是复用 `Ready`：`Ready` 在 app 侧会触发全量 re-attach +
     /// bootstrap（那是「重新协商/daemon 重启」的代价），而流重连成功只是
     /// 「刚才那条告警可以撤了」。
-    StreamRecovered,
+    StreamRecovered { stream: StreamKey },
 }
 
 /// 运行时报文（app 消费）。
@@ -397,20 +409,24 @@ fn build_handlers(
             let last_open = last_open.clone();
             let msg_tx = msg_tx.clone();
             Arc::new(
-                move |_channel: WireChannel, status: ChannelStatus| match status {
+                move |channel: WireChannel, status: ChannelStatus| match status {
                     ChannelStatus::Open { .. } => {
                         note_daemon_activity(&last_open);
-                        // 流重连成功 → 撤掉 app 侧的流告警（否则 `ReadyWithIssue`
+                        // 这条流重连成功 → 只撤它自己的告警（否则 `ReadyWithIssue`
                         // 会一直挂在状态栏上，直到下一次 daemon 重启）。
-                        let _ = msg_tx.send(RuntimeMsg::Conn(ConnEvent::StreamRecovered));
+                        let _ = msg_tx.send(RuntimeMsg::Conn(ConnEvent::StreamRecovered {
+                            stream: StreamKey::Channel(channel),
+                        }));
                     }
                     ChannelStatus::Reconnecting { retry_ms, .. } => {
                         let _ = msg_tx.send(RuntimeMsg::Conn(ConnEvent::StreamIssue {
+                            stream: StreamKey::Channel(channel),
                             error: format!("连接断开，{retry_ms}ms 后重连"),
                         }));
                     }
                     ChannelStatus::Closed { reason } => {
                         let _ = msg_tx.send(RuntimeMsg::Conn(ConnEvent::StreamIssue {
+                            stream: StreamKey::Channel(channel),
                             error: format!("流已关闭：{reason}"),
                         }));
                     }
@@ -450,13 +466,25 @@ fn build_handlers(
                 // 这里保留等价的可观测信号（app 侧对子代理 seed 静默处理）。
                 TimelineStatus::Closed { seed, reason } => {
                     let _ = msg_tx.send(RuntimeMsg::TimelineLost {
-                        seed,
+                        seed: seed.clone(),
                         error: format!("timeline 流结束：{reason}"),
                     });
+                    // 这条 timeline 流到此为止（会话被 GC / 停止跟踪），不会再发
+                    // `Open`：若不在这里撤掉它的告警，那条告警会永久留在账本里。
+                    let _ = msg_tx.send(RuntimeMsg::Conn(ConnEvent::StreamRecovered {
+                        stream: StreamKey::Timeline(seed),
+                    }));
                 }
                 TimelineStatus::Reconnecting { seed, retry_ms, .. } => {
                     let _ = msg_tx.send(RuntimeMsg::Conn(ConnEvent::StreamIssue {
+                        stream: StreamKey::Timeline(seed.clone()),
                         error: format!("timeline[{seed}] 断开，{retry_ms}ms 后重连"),
+                    }));
+                }
+                TimelineStatus::Open { seed, .. } => {
+                    // timeline 重连/重定基成功：撤掉它自己的告警。
+                    let _ = msg_tx.send(RuntimeMsg::Conn(ConnEvent::StreamRecovered {
+                        stream: StreamKey::Timeline(seed),
                     }));
                 }
                 _ => {}
@@ -472,5 +500,126 @@ fn build_handlers(
                 });
             })
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 驱动 `build_handlers` 的回调（不需要真 client：`ClientHandlers` 的字段是
+    /// 可调用的 `Arc<dyn Fn>`），收集它们投递出去的运行时报文。
+    fn handlers_and_rx() -> (ClientHandlers, mpsc::UnboundedReceiver<RuntimeMsg>) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let last_open = Arc::new(std::sync::Mutex::new(Instant::now()));
+        (build_handlers(tx, last_open), rx)
+    }
+
+    fn drain(rx: &mut mpsc::UnboundedReceiver<RuntimeMsg>) -> Vec<RuntimeMsg> {
+        let mut out = Vec::new();
+        while let Ok(msg) = rx.try_recv() {
+            out.push(msg);
+        }
+        out
+    }
+
+    fn is_issue(msg: &RuntimeMsg, key: &StreamKey) -> bool {
+        matches!(msg, RuntimeMsg::Conn(ConnEvent::StreamIssue { stream, .. }) if stream == key)
+    }
+
+    fn is_recovered(msg: &RuntimeMsg, key: &StreamKey) -> bool {
+        matches!(msg, RuntimeMsg::Conn(ConnEvent::StreamRecovered { stream }) if stream == key)
+    }
+
+    /// 阻断项 1 的运行时半边：`Open` 只能为**它自己**那条流发恢复信号。
+    ///
+    /// 证伪方式：把 `on_status` 改回「任意 channel 的 Open 都发一个无身份的
+    /// `StreamRecovered`」（本次审查指出的旧写法）——下面「control 不得被别人的
+    /// Open 恢复」与「恢复信号必须带 conversation 身份」两条断言同时变红。
+    #[test]
+    fn channel_open_recovers_only_its_own_stream() {
+        let (handlers, mut rx) = handlers_and_rx();
+        let control = StreamKey::Channel(WireChannel::Control);
+        let conversation = StreamKey::Channel(WireChannel::Conversation);
+
+        (handlers.on_status)(
+            WireChannel::Control,
+            ChannelStatus::Reconnecting {
+                retry_ms: 500,
+                last_cursor: 3,
+            },
+        );
+        (handlers.on_status)(
+            WireChannel::Conversation,
+            ChannelStatus::Open {
+                server_epoch: "e1".into(),
+                cursor: 9,
+            },
+        );
+
+        let msgs = drain(&mut rx);
+        assert!(
+            msgs.iter().any(|m| is_issue(m, &control)),
+            "control 的重连必须只标 control：{msgs:?}"
+        );
+        assert!(
+            msgs.iter().any(|m| is_recovered(m, &conversation)),
+            "conversation 的 Open 必须带 conversation 身份：{msgs:?}"
+        );
+        assert!(
+            !msgs.iter().any(|m| is_recovered(m, &control)),
+            "control 仍在重连，不得被别人的 Open 当成已恢复：{msgs:?}"
+        );
+    }
+
+    /// timeline 流的告警/恢复也必须按 seed 记账；被关闭（不再重连）的流要撤销告警，
+    /// 否则那条告警会永久留在 app 的账本里。
+    #[test]
+    fn timeline_events_are_scoped_to_their_seed() {
+        let (handlers, mut rx) = handlers_and_rx();
+        let a = StreamKey::Timeline("A".into());
+        let b = StreamKey::Timeline("B".into());
+
+        (handlers.on_timeline_status)(TimelineStatus::Reconnecting {
+            seed: "A".into(),
+            retry_ms: 800,
+            cursor: 1,
+        });
+        (handlers.on_timeline_status)(TimelineStatus::Open {
+            seed: "A".into(),
+            server_epoch: "e1".into(),
+            cursor: 2,
+        });
+        (handlers.on_timeline_status)(TimelineStatus::Closed {
+            seed: "B".into(),
+            reason: "stopped".into(),
+        });
+
+        let msgs = drain(&mut rx);
+        assert!(
+            msgs.iter().any(|m| is_issue(m, &a)),
+            "A 的重连只标 A：{msgs:?}"
+        );
+        assert!(
+            msgs.iter().any(|m| is_recovered(m, &a)),
+            "A 重连成功必须撤掉 A 自己的告警：{msgs:?}"
+        );
+        assert!(
+            msgs.iter().any(|m| matches!(
+                m,
+                RuntimeMsg::TimelineLost { seed, .. } if seed == "B"
+            )),
+            "B 关闭仍要报 TimelineLost：{msgs:?}"
+        );
+        assert!(
+            msgs.iter().any(|m| is_recovered(m, &b)),
+            "B 已停止跟踪、不会再发 Open，必须在这里撤销它的告警：{msgs:?}"
+        );
+        assert!(
+            !msgs
+                .iter()
+                .any(|m| is_recovered(m, &StreamKey::Channel(WireChannel::Tool))),
+            "timeline 事件不得影响频道流的账本：{msgs:?}"
+        );
     }
 }

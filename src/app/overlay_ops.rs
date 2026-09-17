@@ -544,6 +544,39 @@ mod tests {
         assert!(matches!(home[0], Overlay::Help));
     }
 
+    /// 多层栈 + 连续切换（审查建议 5）：全局层按**原相对顺序**留下，且栈顶必须是
+    /// 全局层——渲染与按键路由都取 `overlays.last()`，绝不能让一个过期的确认层
+    /// 接管按键。
+    #[test]
+    fn pruning_keeps_global_layers_in_order() {
+        let mut overlays = vec![
+            Overlay::Settings(crate::app::settings::SettingsState::default()),
+            confirm_close("a"),
+            Overlay::Help,
+            attach("a"),
+        ];
+        prune_seed_bound_overlays(&mut overlays, Some("b"));
+        assert_eq!(overlays.len(), 2, "只剩两个全局层：{overlays:?}");
+        assert!(
+            matches!(overlays[0], Overlay::Settings(_)),
+            "相对顺序不变：{overlays:?}"
+        );
+        assert!(
+            matches!(overlays[1], Overlay::Help),
+            "相对顺序不变：{overlays:?}"
+        );
+        assert!(
+            overlays.last().is_some_and(|o| o.bound_seed().is_none()),
+            "栈顶必须是全局 overlay：{overlays:?}"
+        );
+
+        // 连续切换（b → a → 无标签）不会把已经作废的层捞回来。
+        prune_seed_bound_overlays(&mut overlays, Some("a"));
+        prune_seed_bound_overlays(&mut overlays, None);
+        assert_eq!(overlays.len(), 2, "全局层始终在：{overlays:?}");
+        assert!(matches!(overlays[1], Overlay::Help));
+    }
+
     /// 判据本身（这是「别一刀切」的可执行说明）：哪些算 seed 绑定、哪些算全局。
     #[test]
     fn bound_seed_classifies_overlays() {

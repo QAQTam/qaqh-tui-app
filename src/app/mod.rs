@@ -32,7 +32,7 @@ use ratatui::crossterm::event::{KeyEvent, MouseEvent};
 
 use crate::app::slash::SlashCmd;
 use crate::protocol::ConfigDto;
-use crate::runtime::{ConnEvent, Runtime, RuntimeMsg};
+use crate::runtime::{ConnEvent, Runtime, RuntimeMsg, StreamKey};
 use qaqh_client::TimelinePage;
 use qaqh_client::{ActionRequest, QueryRequest};
 use qaqh_client::{
@@ -196,34 +196,91 @@ pub enum ConnPhase {
 }
 
 impl ConnPhase {
-    /// `ConnEvent::StreamIssue` 到达后的相位（纯函数，便于回归测试）。
+    /// 结合「当前是否有流处于告警」重算相位（纯函数，便于回归测试）。
     ///
     /// 判据：
-    /// - `Ready` / `ReadyWithIssue` → `ReadyWithIssue`：流告警必须可见。
+    /// - `Ready` 家族：有告警 → `ReadyWithIssue`，告警清空 → `Ready`。
     /// - `Lost` → 不变：失联的原因比流告警更重要，相位本身也已可见。
     /// - `Opening` → 不变：还没协商出 session，「连接中」已经表达了状态。
-    pub fn with_stream_issue(&self) -> ConnPhase {
+    pub fn with_stream_issues(&self, any_issue: bool) -> ConnPhase {
         match self {
-            ConnPhase::Ready | ConnPhase::ReadyWithIssue => ConnPhase::ReadyWithIssue,
+            ConnPhase::Ready | ConnPhase::ReadyWithIssue => {
+                if any_issue {
+                    ConnPhase::ReadyWithIssue
+                } else {
+                    ConnPhase::Ready
+                }
+            }
             other => other.clone(),
         }
     }
+}
 
-    /// `ConnEvent::StreamRecovered` 到达后的相位（纯函数，便于回归测试）。
-    ///
-    /// 只清掉流告警这一种状态——`Lost` / `Opening` 的可见性由它们自己的相位
-    /// 负责，不该被「某条流重连成功」抹掉。
-    pub fn with_stream_recovered(&self) -> ConnPhase {
-        match self {
-            ConnPhase::ReadyWithIssue => ConnPhase::Ready,
-            other => other.clone(),
+/// 「当前有哪些流在告警」的账本：流身份 → 最近一条告警文案。
+///
+/// **按流记账，而不是一个全局布尔**：某条 timeline 流断开的同时另一条频道流恰好
+/// 重连成功，不能把前者的告警当成「一切正常」清掉（反向顺序下文案还会串成后者）。
+///
+/// 同一 `StreamKey` 重复告警只**覆盖**文案并把它挪到最新，不堆积条目。
+#[derive(Debug, Clone, Default)]
+pub struct StreamIssues {
+    /// 最近告警在后的顺序（[`StreamIssues::latest`] 取末位）。
+    order: Vec<StreamKey>,
+    messages: HashMap<StreamKey, String>,
+}
+
+impl StreamIssues {
+    /// 记一条告警；返回该流此前是否**不在**告警集合里。
+    pub fn raise(&mut self, stream: StreamKey, message: String) -> bool {
+        let fresh = !self.messages.contains_key(&stream);
+        if !fresh {
+            self.order.retain(|k| k != &stream);
         }
+        self.order.push(stream.clone());
+        self.messages.insert(stream, message);
+        fresh
     }
 
-    /// 连接可用（含「可用但流有告警」）。
-    pub fn is_ready(&self) -> bool {
-        matches!(self, ConnPhase::Ready | ConnPhase::ReadyWithIssue)
+    /// 该流恢复：只移除**它自己**那条告警；返回它此前是否在告警集合里。
+    pub fn clear(&mut self, stream: &StreamKey) -> bool {
+        let existed = self.messages.remove(stream).is_some();
+        if existed {
+            self.order.retain(|k| k != stream);
+        }
+        existed
     }
+
+    pub fn is_empty(&self) -> bool {
+        self.messages.is_empty()
+    }
+
+    /// 最近一条告警文案（状态栏展示用）。
+    pub fn latest(&self) -> Option<&str> {
+        let stream = self.order.last()?;
+        self.messages.get(stream).map(String::as_str)
+    }
+}
+
+/// 由「当前有哪些流在告警」重算可见的连接指示（纯函数，便于回归测试）。
+///
+/// 返回 `(相位, conn_error)`：
+/// - 相位由 [`ConnPhase::with_stream_issues`] 给出；
+/// - `Lost` 相位下 `conn_error` **原样保留**——那是「为什么失联」，比「某条流在
+///   重连」重要，不能被流告警覆盖（失联分支靠它给用户原因）；
+/// - 其余相位下 `conn_error` 恒等于账本里最近一条告警（没有告警就是 `None`），
+///   所以某条流恢复后不会残留它自己的旧文案。
+pub fn reconcile_conn(
+    phase: &ConnPhase,
+    issues: &StreamIssues,
+    conn_error: Option<String>,
+) -> (ConnPhase, Option<String>) {
+    let phase = phase.with_stream_issues(!issues.is_empty());
+    let error = if phase == ConnPhase::Lost {
+        conn_error
+    } else {
+        issues.latest().map(str::to_owned)
+    };
+    (phase, error)
 }
 
 #[derive(Debug, Clone)]
@@ -325,6 +382,8 @@ pub struct App {
     pub conn_phase: ConnPhase,
     pub epoch: String,
     pub conn_error: Option<String>,
+    /// 处于告警状态的流账本（相位与 `conn_error` 由它推导，见 [`reconcile_conn`]）。
+    pub stream_issues: StreamIssues,
 
     pub toasts: VecDeque<Toast>,
     /// 新建会话的 command_id → 发起时间（等 causation_id 关联）。
@@ -391,6 +450,7 @@ impl App {
             conn_phase: ConnPhase::Opening,
             epoch: String::new(),
             conn_error: None,
+            stream_issues: StreamIssues::default(),
             toasts: VecDeque::new(),
             pending_creates: HashMap::new(),
             session_list_cache: Vec::new(),
@@ -634,6 +694,10 @@ impl App {
                     self.epoch = epoch.clone();
                 }
                 self.conn_error = None;
+                // 新 session（首次协商 / 租约重建 / daemon 重启）：所有流都随旧
+                // client 作废，告警账本整体清空——否则旧代遗留的 timeline 告警
+                // 会永久挂在状态栏上（那条流再也不会发 `Open` 来撤自己）。
+                self.stream_issues = StreamIssues::default();
                 // 重 open（租约重建 / daemon 重启）：重新 attach 全部 open seeds
                 // 并 re-baseline；epoch 变化时 timeline 流自行重放。
                 // 子代理 seed 走 SessionAttach（无 actor 副作用，运行中的子代理
@@ -696,24 +760,29 @@ impl App {
                 self.conn_phase = ConnPhase::Lost;
                 self.conn_error = Some(reason);
             }
-            ConnEvent::StreamIssue { error } => {
-                // 相位：Ready 家族升到 ReadyWithIssue（见 `with_stream_issue`）。
-                self.conn_phase = self.conn_phase.with_stream_issue();
-                // 原因：`Lost` 的原因（为什么失联）比「某条流在重连」更重要，
-                // 别把它覆盖掉——失联相位下原因已经在状态栏里给用户看着。
-                if self.conn_phase != ConnPhase::Lost {
-                    self.conn_error = Some(error);
-                }
+            ConnEvent::StreamIssue { stream, error } => {
+                // 按流记账：只把**这条**流标成告警，相位/文案由账本统一推导。
+                self.stream_issues.raise(stream, error);
+                self.reconcile_conn_view();
             }
-            ConnEvent::StreamRecovered => {
-                // 流恢复：只清流告警，失联/连接中不受影响。
-                let next = self.conn_phase.with_stream_recovered();
-                if next != self.conn_phase {
-                    self.conn_phase = next;
-                    self.conn_error = None;
-                }
+            ConnEvent::StreamRecovered { stream } => {
+                // 只撤这条流自己的告警——别的流仍在自愈时必须继续显示告警，
+                // 否则「A 流断开 + B 流重连成功」会把 A 的告警静默吞掉。
+                self.stream_issues.clear(&stream);
+                self.reconcile_conn_view();
             }
         }
+    }
+
+    /// 依据流告警账本刷新相位与 `conn_error`（唯一入口，规则见 [`reconcile_conn`]）。
+    fn reconcile_conn_view(&mut self) {
+        let (phase, error) = reconcile_conn(
+            &self.conn_phase,
+            &self.stream_issues,
+            self.conn_error.take(),
+        );
+        self.conn_phase = phase;
+        self.conn_error = error;
     }
 
     fn handle_envelope(&mut self, env: qaqh_client::RingingEventEnvelope) {
@@ -1616,4 +1685,137 @@ pub fn guess_media_type(path: &str) -> String {
         _ => "text/plain",
     }
     .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn channel(c: qaqh_client::Channel) -> StreamKey {
+        StreamKey::Channel(c)
+    }
+
+    fn timeline(seed: &str) -> StreamKey {
+        StreamKey::Timeline(seed.into())
+    }
+
+    /// 阻断项 1 的回归：告警必须**按流**记账。
+    ///
+    /// 场景：seed A 的 timeline 流断开（告警），随后另一条流（session 频道）重连
+    /// 成功（恢复信号）——A 的告警必须还在、相位仍是 `ReadyWithIssue`，文案也不能
+    /// 串成后者的。证伪方式：把账本退回「一个全局布尔 + 直接清 conn_error」（旧
+    /// 行为），本测试会变成 `Ready` 且无文案。
+    #[test]
+    fn stream_alert_is_cleared_only_by_its_own_recovery() {
+        let mut issues = StreamIssues::default();
+        issues.raise(timeline("A"), "timeline[A] 断开，3000ms 后重连".into());
+        let (phase, error) = reconcile_conn(&ConnPhase::Ready, &issues, None);
+        assert_eq!(phase, ConnPhase::ReadyWithIssue);
+        assert!(
+            error.as_deref().unwrap_or_default().contains("timeline[A]"),
+            "首次告警文案必须可见：{error:?}"
+        );
+
+        // 另一条流恢复：不能把 A 的告警吞掉。
+        assert!(
+            !issues.clear(&channel(qaqh_client::Channel::Conversation)),
+            "这条流本来就没有告警，clear 应当报告「原本不在账本里」"
+        );
+        let (phase, error) = reconcile_conn(&phase, &issues, error);
+        assert_eq!(
+            phase,
+            ConnPhase::ReadyWithIssue,
+            "别的流重连成功不得清掉 A 的告警"
+        );
+        assert!(
+            error.as_deref().unwrap_or_default().contains("timeline[A]"),
+            "文案不得串成别人的：{error:?}"
+        );
+
+        // A 自己恢复：这才是清空的时机。
+        assert!(issues.clear(&timeline("A")), "A 此前在账本里");
+        let (phase, error) = reconcile_conn(&phase, &issues, error);
+        assert_eq!(phase, ConnPhase::Ready);
+        assert!(error.is_none());
+    }
+
+    /// 多条流同时告警：全部清完才回到 `Ready`，文案取最近一条。
+    #[test]
+    fn ready_is_restored_only_when_every_stream_recovers() {
+        let mut issues = StreamIssues::default();
+        issues.raise(
+            channel(qaqh_client::Channel::Control),
+            "control 断开".into(),
+        );
+        issues.raise(timeline("A"), "timeline[A] 断开".into());
+        let (phase, error) = reconcile_conn(&ConnPhase::Ready, &issues, None);
+        assert_eq!(phase, ConnPhase::ReadyWithIssue);
+        assert_eq!(error.as_deref(), Some("timeline[A] 断开"), "取最近一条");
+
+        issues.clear(&channel(qaqh_client::Channel::Control));
+        let (phase, error) = reconcile_conn(&phase, &issues, error);
+        assert_eq!(phase, ConnPhase::ReadyWithIssue, "还剩 timeline[A] 没恢复");
+        assert_eq!(
+            error.as_deref(),
+            Some("timeline[A] 断开"),
+            "不能残留已经恢复那条流的文案"
+        );
+
+        issues.clear(&timeline("A"));
+        let (phase, error) = reconcile_conn(&phase, &issues, error);
+        assert_eq!(phase, ConnPhase::Ready);
+        assert!(error.is_none());
+    }
+
+    /// 同一 `StreamKey` 重复告警只覆盖文案，不堆积条目。
+    #[test]
+    fn repeated_issue_for_same_stream_overwrites() {
+        let mut issues = StreamIssues::default();
+        let key = timeline("A");
+        assert!(
+            issues.raise(key.clone(), "第一次".into()),
+            "首次算新出现的流"
+        );
+        assert!(
+            !issues.raise(key.clone(), "第二次".into()),
+            "同一条流重复告警不算新增"
+        );
+        assert_eq!(issues.messages.len(), 1, "账本条目不堆积");
+        assert_eq!(issues.order.len(), 1, "顺序表也不堆积");
+        assert_eq!(issues.latest(), Some("第二次"), "覆盖为最新文案");
+    }
+
+    /// 建议项 4：`Lost` 期间收到流事件，相位仍是 `Lost`，失联原因不被覆盖/清掉。
+    #[test]
+    fn lost_phase_keeps_its_reason_across_stream_events() {
+        let mut issues = StreamIssues::default();
+        issues.raise(timeline("A"), "timeline[A] 断开".into());
+        let reason = "与 daemon 失联（20s 内无任何频道连接）——按 R 重连".to_string();
+
+        let (phase, error) = reconcile_conn(&ConnPhase::Lost, &issues, Some(reason.clone()));
+        assert_eq!(phase, ConnPhase::Lost);
+        assert_eq!(
+            error.as_deref(),
+            Some(reason.as_str()),
+            "流告警不得覆盖失联原因"
+        );
+
+        // 某条流恢复：失联相位与原因都不动。
+        issues.clear(&timeline("A"));
+        let (phase, error) = reconcile_conn(&phase, &issues, error);
+        assert_eq!(phase, ConnPhase::Lost);
+        assert!(
+            error.is_some(),
+            "Lost 分支靠 conn_error 给用户原因，不许被流恢复信号清掉"
+        );
+    }
+
+    /// `Opening`：流告警不改相位（「连接中」已经表达了状态）。
+    #[test]
+    fn opening_phase_ignores_stream_alerts() {
+        let mut issues = StreamIssues::default();
+        issues.raise(channel(qaqh_client::Channel::Tool), "tool 断开".into());
+        let (phase, _) = reconcile_conn(&ConnPhase::Opening, &issues, None);
+        assert_eq!(phase, ConnPhase::Opening);
+    }
 }
