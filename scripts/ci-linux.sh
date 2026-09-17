@@ -74,17 +74,37 @@ if command -v apt-get >/dev/null 2>&1; then
 fi
 
 echo
+echo "== 工具链与组件 =="
+# ⚠ 这里有个容易误诊的坑（PR #19 审查指出，实测确认）：
+# CI 镜像用的是 `rust:1.98.1`，而**本仓 `rust-toolchain.toml` 钉的是 1.98.0**。
+# 两者在 rustup home 里并存、组件各自独立。cargo 一旦在仓库目录里运行就会按
+# `rust-toolchain.toml` 切到 1.98.0（此时才会去下载那套 toolchain），而
+# `rustup component add` 不带 `--toolchain` 时装的是**当前活动**那套。
+# 于是「镜像里缺 fmt」是错的归因——真正会缺组件的是**仓库钉的那套**。
+# 所以这里显式解析 `rust-toolchain.toml` 并把组件装到那套上，不靠 cwd 的隐式行为。
+if command -v rustup >/dev/null 2>&1; then
+    TC=""
+    if [ -f rust-toolchain.toml ]; then
+        TC=$(grep -E '^[[:space:]]*channel[[:space:]]*=' rust-toolchain.toml \
+             | head -1 | sed -E 's/.*"([^"]+)".*/\1/')
+    fi
+    if [ -n "$TC" ]; then
+        echo "  按 rust-toolchain.toml 使用 toolchain: $TC"
+        rustup component add --toolchain "$TC" clippy rustfmt
+    else
+        echo "  未解析到 rust-toolchain.toml 的 channel，回退到默认 toolchain"
+        rustup component add clippy rustfmt
+    fi
+    # 记下 cargo 实际会用的那套，供后面 fmt 的失败信息定位。
+    echo "  cargo 实际使用: $(rustup show active-toolchain 2>/dev/null || echo '(未知)')"
+fi
+
+echo
 echo "== cargo test =="
 cargo test --all-targets
 
 echo
 echo "== cargo clippy =="
-# 官方 rust 镜像只带 rustc/cargo，clippy 与 rustfmt 都要显式补装，否则
-# `cargo clippy` / `cargo fmt` 会报 "'cargo-xxx' is not installed for the toolchain"
-# （实测：`rust:1.98.1` 上 cargo fmt 就是这么挂的）。
-if command -v rustup >/dev/null 2>&1; then
-    rustup component add clippy rustfmt >/dev/null 2>&1 || true
-fi
 cargo clippy --all-targets -- -D warnings
 
 echo
@@ -92,7 +112,10 @@ echo "== fmt（仅本仓）=="
 # 注意：**不能**裸跑 `cargo fmt --all` —— 它会连带格式化兄弟仓库里别人的工作树
 # （`../qaqh-backend` 在 HEAD 上本就不是 fmt-clean）。不带 `--all` 只检查本包。
 if ! cargo fmt --version >/dev/null 2>&1; then
-    echo "✗ rustfmt 不可用——请确认上面的 'rustup component add clippy rustfmt' 成功" >&2
+    # 失败信息必须带上**实际** toolchain：镜像版本（1.98.1）与仓库钉的版本（1.98.0）
+    # 不同，只写「rustfmt 不可用」会把排查引向错误方向。
+    echo "✗ cargo fmt 不可用。当前活动 toolchain：$(rustup show active-toolchain 2>/dev/null || echo '(rustup 不可用)')" >&2
+    echo "  若上面那行显示的不是 rust-toolchain.toml 里的版本，说明组件装错了 toolchain。" >&2
     exit 1
 fi
 cargo fmt --check
