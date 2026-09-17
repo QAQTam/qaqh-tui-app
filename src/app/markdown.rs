@@ -1154,16 +1154,15 @@ mod tests {
         eprintln!("CJK table lines: {}", lines.len());
     }
 
-    #[test]
-    fn perf_transcript_400() {
-        use crate::app::render_transcript::render_transcript;
+    /// 构造 N 个 Completed 文本回合的会话，用于 perf 测试的规模/基线对照。
+    fn transcript_session(turns: usize) -> crate::app::session::SessionState {
         use crate::app::session::SessionState;
         use crate::app::timeline_model::{Block, Round, TimelineModel, Turn};
         use qaqh_client::{TimelineBlockKind, TimelineBlockState, TimelineTurnState};
-        use std::time::Instant;
+
         let mut model = TimelineModel::default();
         let chunk = "# H1\n\nBold **text** `code`  ".repeat(10); // ~200 chars per turn
-        for i in 0..400 {
+        for i in 0..turns {
             let text = format!("回合 {i} {}", chunk);
             let block = Block {
                 block_id: format!("b{i}"),
@@ -1196,13 +1195,38 @@ mod tests {
         let mut sess = SessionState::new("perf".into());
         sess.timeline = model;
         sess.timeline.version = 1;
+        sess
+    }
+
+    #[test]
+    fn perf_transcript_400() {
+        use crate::app::render_transcript::render_transcript;
+        use std::time::{Duration, Instant};
+
+        let sess_400 = transcript_session(400);
+        let sess_40 = transcript_session(40);
+
+        // U-24：固定墙钟阈值在高负载（CI/并行测试）下会误红。先在同一渲染
+        // 路径上跑一个小基线，再按比例给 400 回合定预算；两者承受同一台机器
+        // 的负载，能把「机器慢/忙」与「算法回归」区分开。
+        let mut baseline = Duration::from_secs(3600);
+        for _ in 0..3 {
+            let start = Instant::now();
+            let lines = render_transcript(&sess_40, 80);
+            let elapsed = start.elapsed();
+            assert!(!lines.is_empty(), "40-turn baseline must render lines");
+            baseline = baseline.min(elapsed);
+        }
+        let baseline = baseline.max(Duration::from_millis(1));
+
         let start = Instant::now();
-        let lines = render_transcript(&sess, 80);
+        let lines = render_transcript(&sess_400, 80);
         let elapsed = start.elapsed();
         eprintln!(
-            "transcript 400 turns -> {} lines in {:?}",
+            "transcript 400 turns -> {} lines in {:?} (40-turn baseline {:?})",
             lines.len(),
-            elapsed
+            elapsed,
+            baseline
         );
         // 预估内存：每行平均 ~80 chars + 2 spans ~100B => 25600*100B ~2.5MB，远 <100MB
         assert!(
@@ -1210,18 +1234,29 @@ mod tests {
             "400 turns should be <40000 lines, got {}",
             lines.len()
         );
+        let budget = baseline.saturating_mul(30) + Duration::from_millis(500);
         assert!(
-            elapsed.as_millis() < 500,
-            "400 turns render should be <500ms, got {:?}",
-            elapsed
+            elapsed < budget,
+            "400 turns render should be <30x baseline +500ms ({budget:?}), got {elapsed:?} (baseline {baseline:?})"
         );
+
         // 模拟流式增量：单回合追加 100 次，每次仅重算 active（缓存命中 width 相同则快）
-        // 注：直接 render_transcript 无 App 缓存，每次 38ms，100x ~3.8s 仍 <5s；若走 ensure_render_caches 则 <100ms
+        // 注：直接 render_transcript 无 App 缓存；用 10x 的实测结果给 100x 定比例预算。
+        let start = Instant::now();
+        for _ in 0..10 {
+            let _ = render_transcript(&sess_400, 80);
+        }
+        let ten = start.elapsed();
         let start = Instant::now();
         for _ in 0..100 {
-            let _ = render_transcript(&sess, 80);
+            let _ = render_transcript(&sess_400, 80);
         }
-        eprintln!("cached re-render 100x: {:?}", start.elapsed());
-        assert!(start.elapsed().as_millis() < 5000);
+        let hundred = start.elapsed();
+        eprintln!("cached re-render 10x: {ten:?}, 100x: {hundred:?}");
+        let budget = ten.saturating_mul(20) + Duration::from_secs(2);
+        assert!(
+            hundred < budget,
+            "100x re-render should be <20x the 10x run +2s ({budget:?}), got {hundred:?} (10x {ten:?})"
+        );
     }
 }
