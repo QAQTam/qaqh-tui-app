@@ -112,8 +112,41 @@ pub enum RuntimeMsg {
     },
     TimelineLost {
         seed: String,
-        error: String,
+        /// **结构化**原因：字符串化会抹掉「404 = 会话真的没了」与「超时/网络
+        /// 错 = 会话可能还活着」的区别，app 只能把任何一次抖动都当成消失。
+        reason: TimelineLostReason,
     },
+}
+
+/// timeline 流丢失的原因。
+///
+/// 只有 [`Self::SessionMissing`] 能证明会话已不存在（服务端 404）；其余一切
+/// （401 租约尚未落地、超时、网络错、流被主动停止）都只说明**这条流**没了，
+/// 会话本身可能还活着。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TimelineLostReason {
+    /// 服务端明确回答「该会话不存在」（HTTP 404）。
+    SessionMissing,
+    /// 其余原因：保留现状，只提示（附可读描述）。
+    Other(String),
+}
+
+impl TimelineLostReason {
+    /// 由 `activate_timeline` 的错误归一。**404 是唯一**的「会话不存在」判据。
+    fn from_client_error(err: &ClientError) -> Self {
+        match err {
+            ClientError::Http { status: 404, .. } => Self::SessionMissing,
+            other => Self::Other(other.to_string()),
+        }
+    }
+
+    /// 展示用描述（toast）。
+    pub fn describe(&self) -> String {
+        match self {
+            Self::SessionMissing => "会话不存在（404）".to_string(),
+            Self::Other(text) => text.clone(),
+        }
+    }
 }
 
 /// 生命周期属主。持有当前 `Client`（可在 T-03 手动重连时原地替换）。
@@ -241,12 +274,12 @@ impl Runtime {
         if to_add.is_empty() && to_remove.is_empty() {
             return;
         }
-        let msg_tx = self.msg_tx.clone();
-        let generation = self.generation.load(Ordering::SeqCst);
         // 测试替身没有连接：跟踪集合已经更新，等 `Ready` 重新 diff 即可。
         let Some(client) = self.client_opt() else {
             return;
         };
+        let msg_tx = self.msg_tx.clone();
+        let generation = self.generation.load(Ordering::SeqCst);
         tokio::spawn(async move {
             for seed in to_remove {
                 client.deactivate_timeline(&seed).await;
@@ -345,7 +378,7 @@ async fn activate_with_attach_retry(
                 let _ = generation;
                 let _ = msg_tx.send(RuntimeMsg::TimelineLost {
                     seed: seed.to_string(),
-                    error: e.to_string(),
+                    reason: TimelineLostReason::from_client_error(&e),
                 });
                 return;
             }
@@ -502,12 +535,13 @@ fn build_handlers(
         on_timeline_status: {
             let msg_tx = msg_tx.clone();
             Arc::new(move |status: TimelineStatus| match status {
-                // 子代理会话被 GC 后消失：旧实现在快照 404 时停止并静默收口，
-                // 这里保留等价的可观测信号（app 侧对子代理 seed 静默处理）。
+                // 流结束（主动停用 / 客户端关闭）**不等于**会话消失：`reason`
+                // 只是流侧描述，故归入 `Other`——app 不会再据此把子代理标 Closed。
+                // 「会话真的没了」只能由 `activate_timeline` 的 404 证明。
                 TimelineStatus::Closed { seed, reason } => {
                     let _ = msg_tx.send(RuntimeMsg::TimelineLost {
                         seed: seed.clone(),
-                        error: format!("timeline 流结束：{reason}"),
+                        reason: TimelineLostReason::Other(format!("timeline 流结束：{reason}")),
                     });
                     // 这条 timeline 流到此为止（会话被 GC / 停止跟踪），不会再发
                     // `Open`：若不在这里撤掉它的告警，那条告警会永久留在账本里。

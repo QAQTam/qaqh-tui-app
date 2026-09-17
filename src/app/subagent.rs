@@ -383,10 +383,12 @@ impl App {
         for s in discovered {
             self.ensure_subagent_tracked(seed, &s);
         }
-        if self.subagent_seeds.contains(seed)
-            && let Some(sub) = self.sessions.get(seed)
-            && let Some(state) = subagent::derive_terminal(sub)
-        {
+        let derived = if self.subagent_seeds.contains(seed) {
+            self.sessions.get(seed).and_then(subagent::derive_terminal)
+        } else {
+            None
+        };
+        if let Some(state) = derived {
             for sess in self.sessions.values_mut() {
                 for entry in sess.subagents.iter_mut() {
                     if entry.seed.as_deref() == Some(seed)
@@ -396,6 +398,10 @@ impl App {
                     }
                 }
             }
+            // 派生终态与 `ControlEvent::SubagentStatus` 同等权威：同样停止该
+            // seed 的 timeline 跟踪（daemon 随后 SessionClose）。漏掉这一步会
+            // 让终态子代理的流一直挂着，直到连接重建才被动收口。
+            self.untrack_subagent(seed);
         }
     }
 
@@ -628,5 +634,50 @@ mod tests {
         let sub = SessionState::new("sub".into());
         assert_eq!(derive_terminal(&sub), None);
         // 带 turn 的情形由 timeline_model 集成行为覆盖，这里只锁空表语义。
+    }
+
+    /// issue #2 缺陷 2：派生终态（`SubagentStatus` 缺失时的兜底）必须与
+    /// `ControlEvent::SubagentStatus` 同等收口——标记状态**并停止 timeline 跟踪**。
+    #[test]
+    fn derived_terminal_also_stops_tracking() {
+        use crate::app::timeline_model::Turn;
+        let (mut app, _rx) = App::new_for_test();
+        let sub = "seed-sub";
+
+        // 子代理自身 timeline：唯一回合已封口且非 Running → derive_terminal = Completed。
+        let mut st = SessionState::new(sub.into());
+        st.timeline.turns.push(Turn {
+            turn_id: "t1".into(),
+            turn_index: Some(1),
+            user_text: String::new(),
+            state: TimelineTurnState::Completed,
+            failure: None,
+            sealed: true,
+            offloaded: false,
+            rounds: Vec::new(),
+        });
+        app.sessions.insert(sub.into(), st);
+        app.subagent_seeds.insert(sub.into());
+
+        let mut parent = SessionState::new("parent".into());
+        parent.subagents.push(SubagentEntry {
+            tool_call_id: "c1".into(),
+            seed: Some(sub.into()),
+            name: "explore".into(),
+            state: SubagentState::Running,
+        });
+        app.sessions.insert("parent".into(), parent);
+
+        app.handle_subagent_rebaseline(sub);
+
+        assert_eq!(
+            app.sessions["parent"].subagents[0].state,
+            SubagentState::Completed,
+            "派生终态仍要落到父会话条目上"
+        );
+        assert!(
+            !app.subagent_seeds.contains(sub),
+            "派生终态必须停止该 seed 的 timeline 跟踪（否则流一直挂着）"
+        );
     }
 }
