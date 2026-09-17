@@ -16,7 +16,7 @@
 | 收敛日期 | 2026-09-17 |
 | 基准代码 | TUI `809e317`（main，工作树干净）；后端 `qaqh-backend` main |
 | 判定原则 | **以工作树真实代码为准**。历史文档（report / handoff / 已删除的 `streaming-edge-audit.md`）的自述状态仅作线索，不作依据 |
-| 核定环境 | Arch Linux / rustc 1.98.1。本轮复测：`cargo test --all-targets` **148 passed / 0 failed**；`cargo clippy --all-targets -- -D warnings` **零 warning**；本仓 `cargo fmt --all --check` **干净** |
+| 核定环境 | Arch Linux / rustc 1.98.1。本轮复测（**本机**，核定 commit `809e317`）：`cargo test --all-targets` **148 passed / 0 failed**；`cargo clippy --all-targets -- -D warnings` **零 warning**；`cargo fmt --check` **干净**（不加 `--all`——那会连带格式化 `../qaqh-backend` 里别人的工作树）。**⚠ CNB 侧 CI 自 2026-09-15 起不可用，见 todo 台账 U-22** |
 | 状态图例 | `DONE` 已核实闭环 ｜ `ACCEPTED` 知情接受 ｜ `INVALID` 已核实不成立 |
 
 ### 0b. 本次收敛做了什么
@@ -105,7 +105,7 @@
 | `grep -c qaqh Cargo.lock` | 11 | **13** |
 | `STALL_AFTER` | §2/§5b.5 记 15s、§9 记 20s（自相矛盾） | **20s**（`src/runtime.rs:54`） |
 | `src/transport/` | 318 行 | **目录不存在** |
-| 本仓 `cargo fmt --all --check` | §0/§9 称全绿 | 曾在 `src/app/markdown.rs` 有 3 处偏差，已修 |
+| 本仓 `cargo fmt --all --check` | §0/§9 称全绿 | 曾在 `src/app/markdown.rs` 有 3 处偏差，已修；现行命令为 `cargo fmt --check` |
 
 > **教训**：台账里的「实测数字」会随提交快速过期。今后数字要么标注核定 commit，
 > 要么只保留可复现命令、不再抄写结果。
