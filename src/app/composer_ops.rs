@@ -392,10 +392,19 @@ impl App {
         }
     }
 
-    pub fn upload_attachment(&mut self, path: String) {
-        let Some(seed) = self.active_seed() else {
+    /// 上传附件到 [`AttachSubmit`] 指定的会话。
+    ///
+    /// 目标 seed **只**来自 `AttachSubmit`（即 `Overlay::AttachPath` 里存的那个），
+    /// 这里不再查 `active_seed()`——那会让「判据说属于 seed X、执行挂到活动标签」
+    /// 两条路径相反，切标签后附件落到用户没在看的会话上。
+    pub fn upload_attachment(&mut self, submit: AttachSubmit) {
+        let (seed, path) = submit.into_parts();
+        // 目标会话已关闭：剪枝理论上已经拦住了（关闭标签会剪掉它的 overlay），
+        // 这里兜住竞态（overlay 打开期间会话被 daemon 关掉），别静默丢附件。
+        if !self.sessions.contains_key(&seed) {
+            self.toast(NoticeLevel::Error, format!("附件目标会话已关闭：{seed}"));
             return;
-        };
+        }
         self.spawn_api(move |api, tx| async move {
             let read_path = path.clone();
             let result =
@@ -410,12 +419,9 @@ impl App {
             match result {
                 Ok((bytes, media)) => {
                     // 上传走 qaqh-client（multipart 组装在 client 侧），返回的
-                    // ContentRef 过桥回本仓镜像类型。
-                    let uploaded = api
-                        .client
-                        .upload_content(&seed, &media, bytes)
-                        .await
-                        .map_err(|e| e.to_string());
+                    // ContentRef 过桥回本仓镜像类型。没有连接（测试替身）时
+                    // `upload_content` 立刻返回 Err——`seed` 仍然照实回传。
+                    let uploaded = api.upload_content(&seed, &media, bytes).await;
                     let _ = tx.send(AppMsg::Action(ActionResult::Uploaded {
                         seed,
                         path,

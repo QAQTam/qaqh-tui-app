@@ -103,6 +103,8 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) {
         Span::styled(
             match app.conn_phase {
                 crate::app::ConnPhase::Ready => "● 已连接",
+                // 连接可用但有流在自愈：与「已断开」区分开（这里不该建议重连）。
+                crate::app::ConnPhase::ReadyWithIssue => "◐ 已连接·流告警",
                 crate::app::ConnPhase::Opening => "○ 连接中…",
                 crate::app::ConnPhase::Lost => "◌ 已断开",
             },

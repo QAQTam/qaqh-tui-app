@@ -116,8 +116,8 @@ impl App {
             return;
         };
         if let Some(sess) = self.sessions.get_mut(&seed) {
-            sess.pending_permissions
-                .retain(|p| p.tool_call_id != panel.tool_call_id);
+            // 下架 + 记入已解决：应答之后补投的同 id 权限请求不再入队（防幽灵面板）。
+            sess.resolve_permission(&panel.tool_call_id);
         }
         let cmd = RingingCommand::Tool(ToolCommand::ToolPermissionRespond {
             tool_call_id: panel.tool_call_id,

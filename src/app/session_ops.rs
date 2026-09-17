@@ -6,12 +6,14 @@ impl App {
     pub fn open_session_tab(&mut self, seed: &str) {
         if self.tabs.iter().any(|s| s == seed) {
             self.active = self.tabs.iter().position(|s| s == seed).unwrap_or(0);
+            self.prune_overlays_for_active_seed();
             return;
         }
         self.tabs.push(seed.to_owned());
         self.sessions
             .insert(seed.to_owned(), SessionState::new(seed.to_owned()));
         self.active = self.tabs.len() - 1;
+        self.prune_overlays_for_active_seed();
         self.sync_tracked();
         // attach + bootstrap（timeline 流由 runtime 自动建立）。
         self.attach_and_bootstrap(seed.to_owned());
@@ -123,6 +125,8 @@ impl App {
             if self.active >= self.tabs.len() && self.active > 0 {
                 self.active = self.tabs.len() - 1;
             }
+            // 活动标签可能已经换成别的 seed：旧 seed 的确认/附件 overlay 作废。
+            self.prune_overlays_for_active_seed();
             self.sync_tracked();
         }
     }
@@ -149,29 +153,22 @@ impl App {
             // session.list 回数组，逐项解析为**权威类型**（G2）。
             // 仍逐项宽松：单条形状不符只跳过该条，不让整个列表失败——
             // 与 G1 同款「解析失败一律降级而不是崩」的契约。
-            let list = api
-                .client
-                .query(QueryRequest::SessionList)
-                .await
-                .map_err(|e| e.to_string())
-                .and_then(|v| {
-                    v.as_array()
-                        .map(|arr| {
-                            arr.iter()
-                                .filter_map(|item| {
-                                    serde_json::from_value::<SessionListEntry>(item.clone()).ok()
-                                })
-                                .collect()
-                        })
-                        .ok_or_else(|| "session.list 应返回数组".to_string())
-                });
+            let list = api.query(QueryRequest::SessionList).await.and_then(|v| {
+                v.as_array()
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|item| {
+                                serde_json::from_value::<SessionListEntry>(item.clone()).ok()
+                            })
+                            .collect()
+                    })
+                    .ok_or_else(|| "session.list 应返回数组".to_string())
+            });
             let _ = tx.send(AppMsg::Action(ActionResult::SessionList(list)));
             // 权威类型：逐项宽松解析（单条形状不符只跳过该条，与 session.list 同款）。
             let activity = api
-                .client
                 .query(QueryRequest::SessionActivity)
                 .await
-                .map_err(|e| e.to_string())
                 .and_then(|v| {
                     v.as_array()
                         .map(|arr| {
@@ -214,7 +211,6 @@ impl App {
         self.dashboard_fetching.insert(seed.clone());
         self.spawn_api(move |api, tx| async move {
             let value = api
-                .client
                 .query(QueryRequest::SessionDashboard { seed: seed.clone() })
                 .await;
             let parsed: Result<qaqh_client::DomainDashboardSnapshot, String> = match value {
@@ -276,7 +272,6 @@ impl App {
                     let msg = e.to_string();
                     // fallback: todo.status 是同一数据源的另一视图
                     let v2 = api
-                        .client
                         .query(QueryRequest::TodoStatus { seed: seed.clone() })
                         .await;
                     match v2 {
@@ -358,6 +353,7 @@ impl App {
                 if self.inspecting() {
                     self.exit_inspect();
                 }
+                self.prune_overlays_for_active_seed();
                 return;
             }
             col += label_w;
