@@ -2466,6 +2466,99 @@ mod tests {
         assert!(pretty_json_output(&raw).is_none());
     }
 
+    // ── 回归锁：`serde_json` 保序（preserve_order）对渲染路径的影响 ──────────
+    //
+    // 背景：`qaqh-client` 声明 `serde_json = { version = "1", features =
+    // ["preserve_order"] }`；cargo 的 feature 相加把它统一到本仓共用的同一个
+    // `serde_json` 节点上——于是 TUI 的 JSON map 从 `BTreeMap`（按 key 字典序）
+    // 变成 `IndexMap`（按 JSON 原文顺序）。
+    //
+    // 依据：`docs/handoff/2026-09-15-TUI镜像层修复与qaqh-client迁移阶段一-handoff.md:90`
+    // 明写「属行为变化，迁移后需回归一遍依赖 key 顺序的渲染路径」；此后两仓 docs
+    // 再无第二次出现该条，也没有任何测试覆盖。下面这组测试即那条缺失的回归锁。
+    //
+    // 本文件里「整表遍历」只有两处：`format_args_preview`（`map.iter()`）与
+    // `pretty_json_output`（`obj.iter()`）；其余全部是 `obj.get(...)` 定点取值，
+    // 天然与顺序无关。
+
+    /// 根因探针：直接钉住「map 迭代顺序 = JSON 原文顺序」。
+    ///
+    /// 若 `qaqh-client` 哪天去掉 `preserve_order`（或本仓改回显式排序），本测试
+    /// 先红，提示下面两条渲染断言需要重新决策。
+    #[test]
+    fn serde_json_map_iteration_order_is_source_order() {
+        let v: serde_json::Value = serde_json::from_str(r#"{"zeta":1,"alpha":2,"mid":3}"#).unwrap();
+        let keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
+        assert_eq!(
+            keys,
+            ["zeta", "alpha", "mid"],
+            "保序生效时为原文顺序；退化成字典序会得到 [alpha, mid, zeta]"
+        );
+    }
+
+    /// 回归锁：`pretty_json_output` 的**行序** = JSON 原文 key 顺序（非字典序）。
+    ///
+    /// 该函数承担非 shell 工具（`process`/`journal`/`read`/…）的输出投影，
+    /// 是保序 feature 最直接的可见面。
+    #[test]
+    fn pretty_json_output_follows_source_key_order() {
+        let pretty = pretty_json_output(r#"{"zeta":"z","alpha":"a","mid":"m"}"#).expect("应可投影");
+        assert_eq!(pretty, "zeta: z\nalpha: a\nmid: m");
+        assert_ne!(
+            pretty, "alpha: a\nmid: m\nzeta: z",
+            "退化成字典序说明 preserve_order 不再生效"
+        );
+    }
+
+    /// 回归锁：`format_args_preview` 的 `[k=v, …]` 顺序同样跟随原文 key 顺序。
+    ///
+    /// 该预览用于非 shell 工具卡的 `⌗` 参数行。
+    #[test]
+    fn format_args_preview_follows_source_key_order() {
+        let preview = format_args_preview(r#"{"zeta":"z","alpha":"a","mid":"m"}"#);
+        assert_eq!(preview, "[zeta=z, alpha=a, mid=m]");
+    }
+
+    /// 结论钉住：**exec 工具卡的渲染与 key 顺序无关**。
+    ///
+    /// 与上面两条相反，exec 走 shell 专用分支：标题 `exec_command_summary` 与输出
+    /// `extract_shell_output_text` 都只用 `obj.get(...)` 定点取值；参数预览对 exec
+    /// 又被显式跳过（`skip_args_preview = exec_summary.is_some()`）。因此同一份内容
+    /// 的两种 key 排列必须渲染出完全相同的行——这既是结论，也是防止将来有人把
+    /// exec 改成整表遍历的守卫。
+    #[test]
+    fn exec_tool_card_render_is_key_order_independent() {
+        let card = |args: &str, output: &str| ToolCard {
+            tool_call_id: "c-exec".into(),
+            name: "exec".into(),
+            state: TimelineToolState::Succeeded,
+            summary: None,
+            args_json: Some(args.into()),
+            output: Some(output.into()),
+            diff: None,
+            progress: String::new(),
+            progress_truncated: false,
+            failure: None,
+            permission: None,
+        };
+        let a = card(
+            r#"{"argv":["ls","-la"],"cwd":"/tmp"}"#,
+            r#"{"status":"completed","exit_code":0,"output":"hello\n"}"#,
+        );
+        let b = card(
+            r#"{"cwd":"/tmp","argv":["ls","-la"]}"#,
+            r#"{"output":"hello\n","exit_code":0,"status":"completed"}"#,
+        );
+        let mut lines_a = Vec::new();
+        let mut lines_b = Vec::new();
+        push_tool_card(&mut lines_a, &a, 100, false);
+        push_tool_card(&mut lines_b, &b, 100, false);
+        let flat_a = flatten(&lines_a);
+        assert_eq!(flat_a, flatten(&lines_b), "exec 卡渲染不应随 key 顺序变化");
+        assert!(flat_a.contains("ls -la"), "argv 应进标题：{flat_a}");
+        assert!(flat_a.contains("hello"), "输出应透出：{flat_a}");
+    }
+
     /// 回归：process 的 JSON 不再以单行长串形式出现。
     #[test]
     fn process_json_is_rendered_readably() {
