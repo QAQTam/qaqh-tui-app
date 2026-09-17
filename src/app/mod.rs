@@ -1138,12 +1138,12 @@ impl App {
             } => match result {
                 Ok(ack) => {
                     if ack.status == qaqh_client::RingingCommandAckStatus::Rejected {
-                        let msg = format!(
-                            "{} 被拒绝: {} {}",
-                            label,
-                            ack.code.unwrap_or_default(),
-                            ack.message.unwrap_or_default()
-                        );
+                        // 缺陷 1（CNB issue #4）：拒绝是终态，不会再有
+                        // `causation_id == command_id` 的 `Created` 事件。不撤销
+                        // pending create 的话，状态栏的 `· creating…` 会一直挂到
+                        // 15s 过期（`handle_tick`），用户以为还在创建。
+                        let msg =
+                            session_ops::apply_rejected_ack(&mut self.pending_creates, label, &ack);
                         self.toast(NoticeLevel::Error, msg.clone());
                         if let Some(seed) = seed
                             && let Some(sess) = self.sessions.get_mut(&seed)

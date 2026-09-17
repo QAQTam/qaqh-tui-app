@@ -1312,6 +1312,27 @@ fn shell_meta_from_raw(raw: &str) -> Option<(Option<i32>, bool, String)> {
     Some((exit_code, truncated, status))
 }
 
+/// 工具进度被截断时的可见标注（B1「丢弃必须可见」）。
+///
+/// `ToolCard::progress_truncated` 为真 = **进度缓冲的前段已被丢弃**（wire 语义见
+/// `qaqh-domain/src/timeline.rs:120`：*"True once the writer discarded an older
+/// prefix of `progress`"*；本侧在 `apply_bash_progress` / `retain_utf8_tail`
+/// 超 `MAX_PROGRESS_LEN`(8KB) 时同样丢头保尾，见 `timeline_model.rs:13/154/585`）。
+/// 不说的话用户会把「只剩尾巴」当成完整输出——与回合级的
+/// `◌ 已归档：以下内容为预览`（见 `render_turn`）同一条设计原则。
+///
+/// 每张卡**只出一行**、内容不随帧变化（不刷屏，稳定可读）；位置在正文之前，
+/// 且仅在进度**确实上屏**时给出（否则就是在为看不见的东西报警）。
+const PROGRESS_TRUNCATED_MARK: &str = "◌ 进度前段已丢弃：以下为末尾片段";
+
+/// 进度截断标注行（前缀沿用卡片内的注记风格：`┃ ✗` / `┃ ⚠` → `┃ ◌`）。
+fn progress_truncated_line(is_block: bool) -> RenderLine {
+    let pfx = if is_block { " ┃ ◌ " } else { "    ◌ " };
+    RenderLine::new()
+        .span(pfx, SpanStyle::Warn)
+        .span(PROGRESS_TRUNCATED_MARK, SpanStyle::Warn)
+}
+
 fn push_tool_card(
     lines: &mut Vec<RenderLine>,
     tool: &crate::app::timeline_model::ToolCard,
@@ -1922,7 +1943,14 @@ fn push_tool_card(
         } else {
             String::new()
         };
+        // 正文是否来自 progress 缓冲：截断标注只在进度**真的上屏**时给——
+        // 工具已结束且拿到了完整 `output` 时，progress 只是被取代的中间态，
+        // 此时标注它「前段已丢弃」是噪音（用户看到的正文并没有缺）。
+        let src_from_progress = !tool.progress.trim().is_empty() && src == tool.progress;
         if !src.trim().is_empty() {
+            if src_from_progress && tool.progress_truncated {
+                lines.push(progress_truncated_line(is_block));
+            }
             let max_lines = 8usize;
             let expanded_limit = 24usize;
             let total_raw_lines = src.lines().count();
@@ -2035,6 +2063,15 @@ fn push_tool_card(
             } else {
                 combined
             };
+            // 非 shell：progress 拼在 output 之后。折叠时只留**头部**
+            // （`collapse_output` 取前 `max_lines` 行），进度可能整段被折掉 →
+            // 只有进度确实可见时才标注截断（同上，不给看不见的内容报警）。
+            if tool.progress_truncated
+                && !tool.progress.trim().is_empty()
+                && (!overflow || expanded)
+            {
+                lines.push(progress_truncated_line(is_block));
+            }
             let line_prefix = if is_block { " ┃ │ " } else { "    │ " };
             let mut shown_lines = 0usize;
             for out in display
@@ -3088,6 +3125,130 @@ mod tests {
             lines
                 .iter()
                 .any(|l| l.spans.iter().any(|s| s.text.contains("▌")))
+        );
+    }
+
+    /// CNB issue #4 缺陷 2（B1「丢弃必须可见」）：`progress_truncated` 此前是**死字段**
+    /// ——`timeline_model.rs` 只写、全仓无生产读取，于是进度被丢头保尾时用户看到
+    /// 的「只剩尾巴」和完整输出长得一模一样。本测试锁住消费面：截断必须上屏。
+    ///
+    /// 变异验证（实测）：删掉 `push_tool_card` 里 `progress_truncated_line` 的推送
+    /// → 本测试红。
+    #[test]
+    fn truncated_progress_is_marked_in_tool_card() {
+        let mut progress = String::new();
+        for i in 1..=20 {
+            progress.push_str(&format!("line{i}\n"));
+        }
+        let tool = ToolCard {
+            tool_call_id: "c-trunc".into(),
+            name: "bash".into(),
+            state: TimelineToolState::Running,
+            summary: None,
+            args_json: None,
+            output: None,
+            diff: None,
+            progress,
+            // wire 语义：writer 已丢弃过 progress 的前段。
+            progress_truncated: true,
+            failure: None,
+            permission: None,
+        };
+        let mut lines = Vec::new();
+        push_tool_card(&mut lines, &tool, 80, false);
+        let flat = flatten(&lines);
+        assert!(
+            flat.contains(PROGRESS_TRUNCATED_MARK),
+            "进度被截断必须可见（B1），实测：{flat}"
+        );
+        // 提示必须**只出一行**（不刷屏）且不随帧变化。
+        let marked = lines
+            .iter()
+            .filter(|l| {
+                l.spans
+                    .iter()
+                    .any(|s| s.text.contains(PROGRESS_TRUNCATED_MARK))
+            })
+            .count();
+        assert_eq!(marked, 1, "截断标注每张卡只应出现一次，实测 {marked} 次");
+    }
+
+    /// 反向闸 1：未截断的进度不得挂标注——否则每个正常流式工具都被标成残缺。
+    #[test]
+    fn complete_progress_has_no_truncation_mark() {
+        let tool = ToolCard {
+            tool_call_id: "c-full".into(),
+            name: "bash".into(),
+            state: TimelineToolState::Running,
+            summary: None,
+            args_json: None,
+            output: None,
+            diff: None,
+            progress: "line1\nline2\n".into(),
+            progress_truncated: false,
+            failure: None,
+            permission: None,
+        };
+        let mut lines = Vec::new();
+        push_tool_card(&mut lines, &tool, 80, false);
+        let flat = flatten(&lines);
+        assert!(
+            !flat.contains(PROGRESS_TRUNCATED_MARK),
+            "未截断不得标注，实测：{flat}"
+        );
+    }
+
+    /// 反向闸 2：工具已结束且拿到完整 `output` 时，progress 只是被取代的中间态，
+    /// 正文并非残缺 → 不得把「前段已丢弃」挂在完整输出上（那是假警报）。
+    #[test]
+    fn finished_shell_output_supersedes_truncated_progress_mark() {
+        let raw = r#"{"status":"completed","command":"bash ...","exit_code":0,"output":"full result","truncated":false,"timed_out":false,"cancelled":false}"#;
+        let tool = ToolCard {
+            tool_call_id: "c-done".into(),
+            name: "bash".into(),
+            state: TimelineToolState::Succeeded,
+            summary: None,
+            args_json: None,
+            output: Some(raw.to_string()),
+            diff: None,
+            progress: "tail only\n".into(),
+            progress_truncated: true,
+            failure: None,
+            permission: None,
+        };
+        let mut lines = Vec::new();
+        push_tool_card(&mut lines, &tool, 80, false);
+        let flat = flatten(&lines);
+        assert!(flat.contains("full result"), "正文应是完整输出：{flat}");
+        assert!(
+            !flat.contains(PROGRESS_TRUNCATED_MARK),
+            "进度未上屏时不得标注截断，实测：{flat}"
+        );
+    }
+
+    /// 非 shell 分支同样要接上消费面：快照里 `progress_truncated` 为真、且进度
+    /// 短到能直接看见（wire 侧丢头后只剩尾部片段）时，标注必须出现。
+    #[test]
+    fn truncated_progress_is_marked_for_non_shell_tool() {
+        let tool = ToolCard {
+            tool_call_id: "c-read".into(),
+            name: "read".into(),
+            state: TimelineToolState::Running,
+            summary: None,
+            args_json: None,
+            output: None,
+            diff: None,
+            progress: "tail of a long stream\n".into(),
+            progress_truncated: true,
+            failure: None,
+            permission: None,
+        };
+        let mut lines = Vec::new();
+        push_tool_card(&mut lines, &tool, 80, false);
+        let flat = flatten(&lines);
+        assert!(
+            flat.contains(PROGRESS_TRUNCATED_MARK),
+            "非 shell 工具的截断进度也必须可见，实测：{flat}"
         );
     }
 

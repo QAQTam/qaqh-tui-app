@@ -416,3 +416,133 @@ impl App {
         }
     }
 }
+
+/// 被拒 ack 的本地效果：**立即**撤销对应的 pending create，并给出失败文案。
+///
+/// 为什么必须撤销：`Rejected` 是**终态拒绝**（`qaqh-ringing/src/envelope.rs:199`
+/// 的 ack 语义：accepted 才进入 actor，业务完成另经 `causation_id == command_id`
+/// 的可靠事件返回）。被拒的 `SessionCreate` 因此**永远等不到**
+/// `SessionStateEvent::Created`，`pending_creates` 里那条只能等 `handle_tick`
+/// 的 15s `retain` 过期——这 15s 里状态栏一直显示 `· creating…`
+/// （`ui/status_bar.rs:40`），用户以为还在创建，实际早已失败。
+///
+/// 判据是**精确关联**，不是猜：`ack.command_id` 就是本侧为 `SessionCreate`
+/// 生成并透传的那个 id（见 `App::new_session_with_cwd`），且 `qaqh-client` 的
+/// `send_command` 会校验 ack 的 `command_id` 与提交时一致
+/// （`qaqh-client/src/client.rs:381`），不符即返回 `Err`。故无需按 `seed`
+/// 或 label 反查——create 的 `seed` 恒为 `None`，label 也不是唯一键。
+///
+/// 注意 `Err` 分支**不适用**本函数：传输失败（超时/HTTP 非 2xx）是**结果未知**，
+/// 命令可能已在后端执行，晚到的 `Created` 仍会经 `causation_id` 回来；提前撤销
+/// 反而会丢掉那次自动开标签页。故只有终态拒绝才撤销，`Err` 仍留给 15s 兜底。
+pub(super) fn apply_rejected_ack(
+    pending_creates: &mut HashMap<String, Instant>,
+    label: &str,
+    ack: &qaqh_client::RingingCommandAck,
+) -> String {
+    let aborted_create = if ack.status == qaqh_client::RingingCommandAckStatus::Rejected {
+        pending_creates.remove(&ack.command_id).is_some()
+    } else {
+        false
+    };
+    let detail = format!(
+        "{} {}",
+        ack.code.as_deref().unwrap_or_default(),
+        ack.message.as_deref().unwrap_or_default()
+    );
+    let detail = detail.trim();
+    let mut msg = if detail.is_empty() {
+        format!("{label} 被拒绝")
+    } else {
+        format!("{label} 被拒绝: {detail}")
+    };
+    if aborted_create {
+        // 与状态栏的 `creating…` 必须同时消失，否则用户仍不知道会话到底建没建。
+        msg.push_str("（会话未创建）");
+    }
+    msg
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use qaqh_client::{RingingCommandAck, RingingCommandAckStatus};
+
+    fn ack(command_id: &str, status: RingingCommandAckStatus) -> RingingCommandAck {
+        RingingCommandAck {
+            command_id: command_id.to_string(),
+            status,
+            code: Some("rate_limited".into()),
+            message: Some("too many sessions".into()),
+            retry_after_ms: Some(500),
+        }
+    }
+
+    fn pending_with(command_id: &str) -> HashMap<String, Instant> {
+        let mut pending = HashMap::new();
+        pending.insert(command_id.to_string(), Instant::now());
+        pending
+    }
+
+    /// CNB issue #4 缺陷 1：被拒的 `SessionCreate` 必须**立即**撤销 pending create，
+    /// 否则状态栏的 `· creating…` 会一直挂到 `handle_tick` 的 15s 过期。
+    ///
+    /// 变异验证（实测）：把 `apply_rejected_ack` 里的 `pending_creates.remove(...)`
+    /// 换成不删（= 旧行为「只 toast」）→ 本测试红。
+    #[test]
+    fn rejected_create_ack_clears_pending_create_immediately() {
+        let mut pending = pending_with("cmd-create-1");
+        let msg = apply_rejected_ack(
+            &mut pending,
+            "新会话",
+            &ack("cmd-create-1", RingingCommandAckStatus::Rejected),
+        );
+        assert!(
+            pending.is_empty(),
+            "被拒的 create 不得滞留（旧行为下 15s 内状态栏一直 creating…），实测残留 {:?}",
+            pending.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            msg.contains("未创建"),
+            "提示必须说清会话没建成，实测：{msg}"
+        );
+        assert!(
+            msg.contains("rate_limited") && msg.contains("too many sessions"),
+            "后端给的 code/message 不得丢，实测：{msg}"
+        );
+    }
+
+    /// 反向闸 1：`Accepted` 不得撤销 pending——命令已进入 actor，`Created` 事件
+    /// 还会经 `causation_id` 回来；提前撤销会让新建的标签页永不自动打开。
+    #[test]
+    fn accepted_ack_keeps_pending_create() {
+        let mut pending = pending_with("cmd-create-2");
+        let msg = apply_rejected_ack(
+            &mut pending,
+            "新会话",
+            &ack("cmd-create-2", RingingCommandAckStatus::Accepted),
+        );
+        assert_eq!(
+            pending.len(),
+            1,
+            "Accepted 不是失败，不得撤销 pending create"
+        );
+        assert!(
+            !msg.contains("未创建"),
+            "Accepted 不该产出失败文案，实测：{msg}"
+        );
+    }
+
+    /// 反向闸 2：别的命令被拒不得误伤新建会话的 pending（command_id 是精确键）。
+    #[test]
+    fn rejected_ack_for_other_command_leaves_pending_create() {
+        let mut pending = pending_with("cmd-create-3");
+        let msg = apply_rejected_ack(
+            &mut pending,
+            "撤销回合",
+            &ack("cmd-other-9", RingingCommandAckStatus::Rejected),
+        );
+        assert_eq!(pending.len(), 1, "无关命令的拒绝不得撤销 pending create");
+        assert!(msg.contains("撤销回合"), "文案仍应归属该命令，实测：{msg}");
+    }
+}
