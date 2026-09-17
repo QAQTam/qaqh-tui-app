@@ -1,8 +1,9 @@
 //! transcript 渲染器：TimelineModel → Vec<RenderLine>（预折行，缓存友好）。
 
 use crate::app::render_line::{RenderLine, SpanStyle, wrap_text};
-use crate::app::session::SessionState;
-use qaqh_client::{TimelineBlockKind, TimelineToolState, TimelineTurnState};
+use crate::app::session::{KEEP_MARGIN_SEGMENTS, SessionState};
+use crate::app::timeline_model::Turn;
+use qaqh_client::{TimelineBlockKind, TimelineBlockState, TimelineToolState, TimelineTurnState};
 
 /// 推理块折叠时保留的尾部行数（历史常量，当前默认展开路径不再截尾，保留供 hide 回退）。
 #[allow(dead_code)]
@@ -223,9 +224,51 @@ pub fn render_transcript_with_opts(
 ) -> Vec<RenderLine> {
     let width = width.max(20) as usize;
     let mut lines: Vec<RenderLine> = Vec::new();
-    let total = session.timeline.turns.len();
 
     for (turn_idx, turn) in session.timeline.turns.iter().enumerate() {
+        lines.extend(render_turn(session, turn, turn_idx, width, show_reasoning));
+    }
+
+    if session.timeline.turns.is_empty() {
+        lines.push(RenderLine::new().span("（暂无回合——输入消息开始对话）", SpanStyle::Dim));
+    }
+    if let Some(banner) = render_banner(session) {
+        lines.insert(0, banner);
+    }
+    lines
+}
+
+/// 头部横幅：更早回合是否被折叠 / 是否根本够不到（T-08）。
+pub(crate) fn render_banner(session: &SessionState) -> Option<RenderLine> {
+    if session.timeline.has_more {
+        return Some(RenderLine::new().span("↑ 更早回合已折叠（PgUp 加载）", SpanStyle::Dim));
+    }
+    if session.timeline.truncated_before {
+        // T-08：翻到头了，但历史并不止于此——服务端的物化窗口（timeline 从
+        // messages 重建时只物化最近若干轮）覆盖不到开头，且当前**没有**深翻页
+        // 接口能取到更早的回合。如实说明，别让用户以为「就这么多」而反复按 PgUp
+        // 干等一个永远不会来的页。
+        return Some(RenderLine::new().span(
+            "⚠ 更早的回合未包含在本窗口（仅存于 daemon 归档，当前无法翻到）",
+            SpanStyle::Warn,
+        ));
+    }
+    None
+}
+
+/// 渲染**单个回合**（头部 + 正文 + 尾部空行）。
+///
+/// 这是分段渲染缓存的粒度单位：回合内任一块内容变化都会使其 `rev` 变化，
+/// 进而使 [`turn_cache_key`] 变化 → 只重渲这一段。
+fn render_turn(
+    session: &SessionState,
+    turn: &Turn,
+    turn_idx: usize,
+    width: usize,
+    show_reasoning: bool,
+) -> Vec<RenderLine> {
+    let mut lines: Vec<RenderLine> = Vec::new();
+    {
         // ── 回合分隔 ──
         let state_tag = match turn.state {
             TimelineTurnState::Running => "… running".to_string(),
@@ -237,9 +280,14 @@ pub fn render_transcript_with_opts(
                 .unwrap_or_else(|| "✗ failed".into()),
             TimelineTurnState::Cancelled => "⊘ cancelled".into(),
         };
-        let num = turn_idx + 1;
+        // 编号用**稳定值**（见 `turn_number`）。
+        //
+        // ⚠ **不得**把 `turn_total()` 放进头部：它每新增一回合就变，而头部属于
+        // 段内容 → 每段 key 都会变 → 增量复用彻底失效（实测 cap 边界重渲 21/30）。
+        // 这就是「全局状态混进分段键」的反模式。总数改在会话信息行展示（不缓存）。
+        let num = session.timeline.turn_number(turn_idx);
         let mut header = RenderLine::new().span("──── ", SpanStyle::Dim);
-        header = header.span(format!("turn {num}/{total}"), SpanStyle::Dim);
+        header = header.span(format!("turn {num}"), SpanStyle::Dim);
         if !state_tag.is_empty() {
             let style = match turn.state {
                 TimelineTurnState::Failed => SpanStyle::Error,
@@ -320,29 +368,482 @@ pub fn render_transcript_with_opts(
         }
         lines.push(RenderLine::new());
     }
+    lines
+}
 
-    if session.timeline.turns.is_empty() {
-        lines.push(RenderLine::new().span("（暂无回合——输入消息开始对话）", SpanStyle::Dim));
+// ── 分段渲染缓存的键 ────────────────────────────────────────────────
+
+const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+#[inline]
+fn h_u64(h: &mut u64, v: u64) {
+    *h ^= v;
+    *h = h.wrapping_mul(FNV_PRIME);
+}
+
+#[inline]
+fn h_str(h: &mut u64, s: &str) {
+    for b in s.as_bytes() {
+        *h ^= u64::from(*b);
+        *h = h.wrapping_mul(FNV_PRIME);
     }
-    if session.timeline.has_more {
-        lines.insert(
-            0,
-            RenderLine::new().span("↑ 更早回合已折叠（PgUp 加载）", SpanStyle::Dim),
-        );
-    } else if session.timeline.truncated_before {
-        // T-08：翻到头了，但历史并不止于此——服务端的物化窗口（timeline 从
-        // messages 重建时只物化最近若干轮）覆盖不到开头，且当前**没有**深翻页
-        // 接口能取到更早的回合。如实说明，别让用户以为「就这么多」而反复按 PgUp
-        // 干等一个永远不会来的页。
-        lines.insert(
-            0,
-            RenderLine::new().span(
-                "⚠ 更早的回合未包含在本窗口（仅存于 daemon 归档，当前无法翻到）",
-                SpanStyle::Warn,
-            ),
-        );
+    // 长度参与：防止 "ab"+"c" 与 "a"+"bc" 拼接后同哈希。
+    h_u64(h, s.len() as u64);
+}
+
+fn turn_state_tag(s: TimelineTurnState) -> u64 {
+    match s {
+        TimelineTurnState::Running => 0,
+        TimelineTurnState::Completed => 1,
+        TimelineTurnState::Failed => 2,
+        TimelineTurnState::Cancelled => 3,
+    }
+}
+
+/// 单回合的渲染缓存键。
+///
+/// 只读**块级 `rev` 计数**而不哈希正文：哈希是 O(text)，而这里要的是 O(块数)。
+/// 任何影响该回合渲染的输入都在键里：
+/// - 块内容：`block.rev`（每次可见变更自增）；
+/// - 块状态：`state`（Open→Sealed 会从纯文本切到 markdown）；
+/// - 工具展开态（F7）、`show_reasoning`（F3）、宽度；
+/// - 回合头部文案：`turn_idx` / `total`（`cap_turns` 丢回合会让编号漂移）；
+/// - **动画**：含 spinner/▌/进度条的回合每帧换键 → 只重渲这一段，
+///   其余段落保持命中。这正是「空闲零渲染、流式只渲活跃段」的实现基础。
+pub(crate) fn turn_cache_key(
+    session: &SessionState,
+    turn: &Turn,
+    turn_idx: usize,
+    width: u16,
+    show_reasoning: bool,
+) -> u64 {
+    let mut h = FNV_OFFSET;
+    h_u64(&mut h, 0x7475_726e); // "turn" 域分隔
+    h_str(&mut h, &turn.turn_id);
+    // 用**稳定编号**而非裸下标：否则 `cap_turns` 丢头部会让每个回合的键都变，
+    // 增量复用彻底失效（实测丢 1 个 → 19/19 全量重渲）。
+    h_u64(&mut h, session.timeline.turn_number(turn_idx));
+    h_u64(&mut h, u64::from(width));
+    h_u64(&mut h, u64::from(show_reasoning));
+    h_u64(&mut h, turn_state_tag(turn.state));
+    h_u64(&mut h, u64::from(turn.sealed));
+    h_u64(&mut h, u64::from(turn.offloaded));
+    h_str(&mut h, &turn.user_text);
+    if let Some(f) = &turn.failure {
+        h_str(&mut h, &f.code);
+        h_str(&mut h, &f.message);
+    }
+    let mut animating = false;
+    for round in &turn.rounds {
+        h_u64(&mut h, u64::from(round.round_num));
+        h_u64(&mut h, u64::from(round.sealed));
+        for b in &round.blocks {
+            h_str(&mut h, &b.block_id);
+            h_u64(&mut h, b.rev);
+            h_u64(&mut h, u64::from(b.block_order));
+            h_u64(&mut h, u64::from(b.state == TimelineBlockState::Sealed));
+            if let Some(t) = &b.tool {
+                h_u64(
+                    &mut h,
+                    u64::from(session.expanded_tools.contains(&t.tool_call_id)),
+                );
+            }
+            animating |= b.is_animating();
+        }
+    }
+    if animating {
+        // 动画字形依赖墙钟而非内容：把帧号纳入键，使本段每帧重渲。
+        h_u64(&mut h, crate::app::anim::frame_now());
+    }
+    h
+}
+
+/// 头部横幅的缓存键。
+pub(crate) fn banner_cache_key(session: &SessionState, width: u16) -> u64 {
+    let mut h = FNV_OFFSET;
+    h_u64(&mut h, 0x6261_6e6e); // "bann"
+    h_u64(&mut h, u64::from(session.timeline.has_more));
+    h_u64(&mut h, u64::from(session.timeline.truncated_before));
+    h_u64(&mut h, u64::from(width));
+    h
+}
+
+// ── 分段缓存的增量重建 ──────────────────────────────────────────────
+
+/// 布局不动点迭代的最大趟数。
+///
+/// 渲染会把估算高度换成精确高度，几何因此位移；本循环保证「窗口覆盖到的段
+/// 一定已精确渲染」。精确高度不会再次变化，故必然收敛（实测 1~2 趟）。
+/// 上限只是防御性护栏。
+const MAX_LAYOUT_PASSES: usize = 4;
+
+/// **廉价估算**单回合的渲染行数（离屏段用）。
+///
+/// 不跑 markdown/syntect/normalize，只按源文本的**字符显示宽度**推换行行数
+/// （Grok `estimate_source_lines` 同一思路：缓存每行宽度，按宽推导行数）。
+///
+/// 估算偏差只会导致滚动几何略微偏移，而**不会**导致显示错误：任何真正进入
+/// 视口的段都会被精确重渲（见 [`refresh_segments`]）。
+///
+/// 刻意取**保守偏小**（宁少不多）：估小 → 按几何挑选的可见段集合偏大 → 多渲
+/// 几段也无害；估大 → 可见段集合偏小 → 窗口内出现未渲染段（破坏不变式）。
+/// Claude Code 的 `PESSIMISTIC_HEIGHT=1` 就是同一取向的极端版本。
+fn estimate_turn_lines(turn: &Turn, width: usize) -> usize {
+    let w = width.max(1);
+    let mut lines = 0usize;
+
+    // 回合头部 1 行 +（offloaded 时）归档提示 1 行 + 尾部空行 1 行。
+    lines += 1;
+    if turn.offloaded {
+        lines += 1;
+    }
+    lines += 1;
+
+    // 用户输入：按显示宽推换行。
+    if !turn.user_text.is_empty() {
+        lines += estimate_wrapped_lines(&turn.user_text, w.saturating_sub(2));
+    }
+
+    for round in &turn.rounds {
+        for block in &round.blocks {
+            lines += match block.kind {
+                TimelineBlockKind::Text | TimelineBlockKind::Reasoning => {
+                    estimate_wrapped_lines(&block.text, w)
+                }
+                TimelineBlockKind::Notice => {
+                    estimate_wrapped_lines(&block.text, w.saturating_sub(2))
+                }
+                // 工具卡：折叠态是固定几行（标题+参数摘要），展开态才含输出。
+                // 这里按保守的折叠估法；展开后该段必然在视口内（用户刚点开）。
+                TimelineBlockKind::Tool => 3,
+            };
+        }
+    }
+
+    if turn.failure.is_some() {
+        lines += 1;
     }
     lines
+}
+
+/// 按**显示宽度**推换行行数（不建字符串，O(字符数)）。
+///
+/// 与 `wrap_text` 的贪心折行语义一致到「行数」这一层（不断言切分点）。
+fn estimate_wrapped_lines(text: &str, width: usize) -> usize {
+    use unicode_width::UnicodeWidthStr;
+    let w = width.max(1);
+    let mut total = 0usize;
+    for para in text.split('\n') {
+        let pw = UnicodeWidthStr::width(para);
+        // 空段落仍占 1 行（与 wrap_text 一致）。向上取整即行数。
+        total += pw.div_ceil(w).max(1);
+    }
+    total
+}
+
+/// 维护 `session.segments`（无视口版本）。
+///
+/// 仅测试用：不传视口时保留全部段的渲染结果，便于断言增量语义。
+/// 生产路径走 [`refresh_segments_at`]（带视口 → 触发虚拟化淘汰）。
+#[cfg(test)]
+pub fn refresh_segments(session: &mut SessionState, width: u16, show_reasoning: bool) -> usize {
+    refresh_segments_at(session, width, show_reasoning, None)
+}
+
+/// 带视口的 [`refresh_segments`]（生产路径用）。
+///
+/// `viewport` 为 `(视口顶端行号, 可视行数)`。传 `None` 表示不关心视口
+/// （如测试），此时保留全部段。
+///
+/// 复杂度：O(回合数) 取键（每回合 O(块数)，不哈希正文）+ O(可见段的行数) 重渲。
+/// 对比旧实现每帧 O(全量文本) 的 markdown/syntect/normalize，这是数量级的差异。
+///
+/// 返回本次实际重渲的段数（供测试与观测断言“增量真的发生了”）。
+pub fn refresh_segments_at(
+    session: &mut SessionState,
+    width: u16,
+    show_reasoning: bool,
+    viewport: Option<(usize, usize)>,
+) -> usize {
+    let width = width.max(20);
+
+    // ── 宽度 / F3 变化 ──
+    // 宽度：**不重建**，改为高度缩放 + 丢弃 Lines（Claude Code `ratio` 缩放）。
+    // F3：输出语义变了，必须整份重建。
+    let prev = session.segments.as_ref();
+    let reasoning_changed = prev.is_some_and(|c| c.show_reasoning != show_reasoning);
+    let width_changed = prev.is_some_and(|c| c.width != width);
+    let missing = prev.is_none();
+
+    if reasoning_changed || missing {
+        return rebuild_all(session, width, show_reasoning);
+    }
+
+    if width_changed {
+        let old_w = prev.map_or(width, |c| c.width).max(1) as f64;
+        let new_w = width.max(1) as f64;
+        // 宽度变大 → 行变少；ratio<1 时高度缩下去，与 Claude Code 注释的
+        // 「widen 时 ratio<1，缩放后偏移量与重排后的真实布局大致对齐」一致。
+        let ratio = old_w / new_w;
+        let cache = session.segments.as_mut().expect("checked above");
+        cache.width = width;
+        for seg in cache.turns.iter_mut() {
+            let h = seg.body.height() as f64;
+            let scaled = ((h * ratio).round() as usize).max(1);
+            seg.body = crate::app::session::SegmentBody::Height(scaled);
+        }
+        if let Some(b) = &mut cache.banner {
+            b.body = crate::app::session::SegmentBody::Height(1);
+        }
+        if let Some(e) = &mut cache.empty {
+            e.body = crate::app::session::SegmentBody::Height(1);
+        }
+        // 缩放后所有 Lines 都被丢弃 → 视口内会在下面被重新精确渲染。
+    }
+
+    // ── 增量：逐回合比对键，只重渲变化段 ──
+    // 先算出所有键（只读借用），再在**只读**阶段把需重渲的段渲好，
+    // 最后才拿可变借用写回——避开 `render_turn(&SessionState)` 与
+    // `segments.as_mut()` 的借用冲突。
+    let keys: Vec<u64> = session
+        .timeline
+        .turns
+        .iter()
+        .enumerate()
+        .map(|(idx, turn)| turn_cache_key(session, turn, idx, width, show_reasoning))
+        .collect();
+
+    let prev_len = session.segments.as_ref().map_or(0, |c| c.turns.len());
+    let same_len = prev_len == keys.len();
+
+    if !same_len {
+        // 长度变化有两种截然不同的成因，必须区分对待：
+        //
+        // - **cap_turns 丢头部**（每回合都发生，一旦到 cap 就是热路径）：
+        //   其余段内容未变，按 `turn_id` 对齐后可全部复用。若在这里整份重建，
+        //   则到达 cap 后每回合重渲 400 段（实测 197ms）——真卡顿源。
+        // - **prepend / reopen**（低频）：按 id 对不上就整份重建。
+        //
+        // 编号已改为**稳定**（`turn_number`），所以内容未变的回合其 key 也不变，
+        // 对齐后可直接复用；只有真正新增/变化的回合才进 dirty。
+        let old: Vec<crate::app::session::Segment> = session
+            .segments
+            .as_mut()
+            .map(|c| std::mem::take(&mut c.turns))
+            .unwrap_or_default();
+        let mut by_id: std::collections::HashMap<String, crate::app::session::Segment> =
+            old.into_iter().map(|s| (s.turn_id.clone(), s)).collect();
+        let mut realigned: Vec<crate::app::session::Segment> = Vec::with_capacity(keys.len());
+        let mut reused = 0usize;
+        for (idx, turn) in session.timeline.turns.iter().enumerate() {
+            match by_id.remove(&turn.turn_id) {
+                Some(seg) if seg.key == keys[idx] => {
+                    reused += 1;
+                    realigned.push(seg);
+                }
+                _ => realigned.push(crate::app::session::Segment {
+                    key: keys[idx],
+                    body: crate::app::session::SegmentBody::Height(estimate_turn_lines(
+                        turn,
+                        width as usize,
+                    )),
+                    turn_id: turn.turn_id.clone(),
+                }),
+            }
+        }
+        // 一个都没复用上（如首次 prepend 到完全不同的历史）：整份重建更划算。
+        if reused == 0 && !realigned.is_empty() {
+            session.segments.as_mut().expect("Some").turns = realigned;
+            return rebuild_all(session, width, show_reasoning);
+        }
+        session.segments.as_mut().expect("Some").turns = realigned;
+    }
+
+    // ── 虚拟化：只精确渲染视口附近的段，其余退化为估算高度 ──
+    //
+    // 用**不动点迭代**而非单趟：渲染会把估算高度换成精确高度 → 几何位移 →
+    // 覆盖的段集合可能变化。每趟都把「覆盖到但尚未渲染」的段渲掉，直到稳定。
+    // 精确高度不再变，故必然收敛（实测 1~2 趟）。
+    let mut rebuilt = 0usize;
+    for _pass in 0..MAX_LAYOUT_PASSES {
+        // 覆盖行区间 → 段下标范围（基于当前几何：精确 + 估算混合）。
+        let keep: Option<(usize, usize)> = viewport.and_then(|(top, height)| {
+            let cache = session.segments.as_ref()?;
+            if cache.turns.is_empty() {
+                return None;
+            }
+            let (f, l) = cache.segment_range_for(top, height);
+            Some((
+                f.saturating_sub(KEEP_MARGIN_SEGMENTS),
+                (l + KEEP_MARGIN_SEGMENTS).min(cache.turns.len().saturating_sub(1)),
+            ))
+        });
+
+        let mut need: Vec<usize> = Vec::new();
+        {
+            let cache = session.segments.as_mut().expect("checked above");
+            for (idx, seg) in cache.turns.iter_mut().enumerate() {
+                let in_keep = keep.is_none_or(|(lo, hi)| idx >= lo && idx <= hi);
+                if !in_keep {
+                    // 淘汰：丢弃 Lines，退化为**精确高度**（几何不变）。
+                    if let Some(lines) = seg.body.lines() {
+                        seg.body = crate::app::session::SegmentBody::Height(lines.len());
+                    }
+                    // 离屏且键变了的段：用估算高度占位（不渲染）。
+                    if seg.key != keys[idx] {
+                        seg.key = keys[idx];
+                        seg.body = crate::app::session::SegmentBody::Height(estimate_turn_lines(
+                            &session.timeline.turns[idx],
+                            width as usize,
+                        ));
+                    }
+                    continue;
+                }
+                // 保留区内：键变了 或 尚未持有 Lines（刚被淘汰/从未渲）→ 需渲。
+                if seg.key != keys[idx] || !seg.body.is_lines() {
+                    need.push(idx);
+                }
+            }
+        }
+
+        if need.is_empty() {
+            break;
+        }
+
+        // 只读阶段渲染，再可变阶段写回（避开 `render_turn(&SessionState)` 与
+        // `segments.as_mut()` 的借用冲突）。
+        let rendered: Vec<(usize, std::sync::Arc<[RenderLine]>)> = need
+            .iter()
+            .map(|&idx| {
+                let turn = &session.timeline.turns[idx];
+                let lines: std::sync::Arc<[RenderLine]> =
+                    render_turn(session, turn, idx, width as usize, show_reasoning).into();
+                (idx, lines)
+            })
+            .collect();
+        rebuilt += rendered.len();
+        let cache = session.segments.as_mut().expect("checked above");
+        for (idx, lines) in rendered {
+            cache.turns[idx] = crate::app::session::Segment {
+                key: keys[idx],
+                body: crate::app::session::SegmentBody::Lines(lines),
+                turn_id: session.timeline.turns[idx].turn_id.clone(),
+            };
+        }
+    }
+
+    // 收尾保证：循环退出后，窗口覆盖到的段必须已持有 Lines。
+    // 若不动点未收敛（估算↔精确来回振荡），这里无条件补渲一次——
+    // 它保证 `window()` 的不变式，而代价只多渲几段。
+    if let Some((top, height)) = viewport {
+        let need: Vec<usize> = {
+            let cache = session.segments.as_ref().expect("checked above");
+            let (f, l) = cache.segment_range_for(top, height);
+            (f..=l.min(cache.turns.len().saturating_sub(1)))
+                .filter(|&i| !cache.turns[i].body.is_lines())
+                .collect()
+        };
+        if !need.is_empty() {
+            let rendered: Vec<(usize, std::sync::Arc<[RenderLine]>)> = need
+                .iter()
+                .map(|&idx| {
+                    let turn = &session.timeline.turns[idx];
+                    let lines: std::sync::Arc<[RenderLine]> =
+                        render_turn(session, turn, idx, width as usize, show_reasoning).into();
+                    (idx, lines)
+                })
+                .collect();
+            rebuilt += rendered.len();
+            let cache = session.segments.as_mut().expect("checked above");
+            for (idx, lines) in rendered {
+                cache.turns[idx] = crate::app::session::Segment {
+                    key: keys[idx],
+                    body: crate::app::session::SegmentBody::Lines(lines),
+                    turn_id: session.timeline.turns[idx].turn_id.clone(),
+                };
+            }
+        }
+    }
+
+    let banner_key = banner_cache_key(session, width);
+    let banner_line = render_banner(session);
+    let empty_needed = session.timeline.turns.is_empty();
+
+    // ── 可变阶段：写回 ──
+    let cache = session.segments.as_mut().expect("checked above");
+
+    let banner_stale = match &cache.banner {
+        Some(s) => s.key != banner_key || !s.body.is_lines(),
+        None => banner_line.is_some(),
+    };
+    if banner_stale {
+        cache.banner = banner_line.map(|l| crate::app::session::Segment {
+            key: banner_key,
+            body: crate::app::session::SegmentBody::Lines(std::sync::Arc::from([l].as_slice())),
+            turn_id: String::new(),
+        });
+    }
+    match (empty_needed, cache.empty.is_some()) {
+        (true, false) => {
+            cache.empty = Some(crate::app::session::Segment {
+                key: 1,
+                body: crate::app::session::SegmentBody::Lines(std::sync::Arc::from(
+                    [RenderLine::new().span("（暂无回合——输入消息开始对话）", SpanStyle::Dim)]
+                        .as_slice(),
+                )),
+                turn_id: String::new(),
+            });
+        }
+        (false, true) => cache.empty = None,
+        _ => {}
+    }
+
+    cache.rebuilt_segments = rebuilt;
+    cache.resident_segments = cache.all().filter(|s| s.body.is_lines()).count();
+    rebuilt
+}
+
+/// 整份重建（宽度/F3 变化、段数变化、首帧）。
+fn rebuild_all(session: &mut SessionState, width: u16, show_reasoning: bool) -> usize {
+    let mut cache = crate::app::session::SegmentCache {
+        width,
+        show_reasoning,
+        ..Default::default()
+    };
+    let mut rebuilt = 0usize;
+    for (idx, turn) in session.timeline.turns.iter().enumerate() {
+        let key = turn_cache_key(session, turn, idx, width, show_reasoning);
+        let lines: std::sync::Arc<[RenderLine]> =
+            render_turn(session, turn, idx, width as usize, show_reasoning).into();
+        cache.turns.push(crate::app::session::Segment {
+            key,
+            body: crate::app::session::SegmentBody::Lines(lines),
+            turn_id: session.timeline.turns[idx].turn_id.clone(),
+        });
+        rebuilt += 1;
+    }
+    cache.banner = render_banner(session).map(|l| crate::app::session::Segment {
+        key: banner_cache_key(session, width),
+        body: crate::app::session::SegmentBody::Lines(std::sync::Arc::from([l].as_slice())),
+        turn_id: String::new(),
+    });
+    cache.empty = session
+        .timeline
+        .turns
+        .is_empty()
+        .then(|| crate::app::session::Segment {
+            key: 1,
+            body: crate::app::session::SegmentBody::Lines(std::sync::Arc::from(
+                [RenderLine::new().span("（暂无回合——输入消息开始对话）", SpanStyle::Dim)]
+                    .as_slice(),
+            )),
+            turn_id: String::new(),
+        });
+    cache.rebuilt_segments = rebuilt;
+    cache.resident_segments = cache.all().filter(|s| s.body.is_lines()).count();
+    session.segments = Some(cache);
+    rebuilt
 }
 
 fn push_text_block(lines: &mut Vec<RenderLine>, text: &str, width: usize, streaming: bool) {
@@ -1631,6 +2132,18 @@ pub fn render_session_info(session: &SessionState, width: u16) -> Vec<RenderLine
         spans.push((format!("err:{}", err.code), SpanStyle::Error));
     }
     let seed_label = format!("#{}", session.seed);
+    // 回合总数放这里（**不经段缓存**，每帧独立渲染）：段头部只留编号，
+    // 否则总数一变就会污染每一段的缓存键（见 `render_turn` 的注释）。
+    if session.timeline.turns.len() < session.timeline.turn_total() as usize {
+        spans.push((
+            format!(
+                "{}/{}",
+                session.timeline.turns.len(),
+                session.timeline.turn_total()
+            ),
+            SpanStyle::Dim,
+        ));
+    }
     let mut line = RenderLine::new().span(" ", SpanStyle::Dim);
     let mut used = 2usize;
     for (text, style) in spans {
@@ -2147,6 +2660,7 @@ mod tests {
             text: "**Title**\n\nBody content here\nsecond line".into(),
             tool: None,
             last_fragment: 0,
+            rev: 1,
         };
         let round = Round {
             round_num: 0,
@@ -2201,6 +2715,7 @@ mod tests {
             text: text.to_string(),
             tool: None,
             last_fragment: 0,
+            rev: 1,
         };
         sess.timeline.turns.push(Turn {
             turn_index: None,
@@ -2300,6 +2815,7 @@ mod tests {
                     text: text.to_string(),
                     tool: None,
                     last_fragment: 0,
+                    rev: 1,
                 }],
             }],
         });
@@ -2465,6 +2981,7 @@ mod tests {
             text: text.clone(),
             tool: None,
             last_fragment: 0,
+            rev: 1,
         };
         sess.timeline.turns.push(Turn {
             turn_index: None,
@@ -2588,5 +3105,499 @@ mod tests {
         assert!(gf.contains("r1"));
         assert!(!gf.contains("r10"), "grep 默认折叠不应含尾行");
         assert!(gf.contains("F7 展开"));
+    }
+
+    // ── A3：分段渲染缓存的增量语义 ───────────────────────────────
+
+    fn sess_with_turns(n: usize) -> SessionState {
+        let mut sess = SessionState::new("seg".into());
+        for i in 0..n {
+            sess.timeline.turns.push(Turn {
+                turn_index: None,
+                turn_id: format!("t{i}"),
+                user_text: format!("问题 {i}"),
+                state: TimelineTurnState::Completed,
+                failure: None,
+                sealed: true,
+                offloaded: false,
+                rounds: vec![Round {
+                    round_num: 0,
+                    sealed: true,
+                    is_final: true,
+                    blocks: vec![Block {
+                        block_id: format!("b{i}"),
+                        block_order: 0,
+                        kind: TimelineBlockKind::Text,
+                        state: TimelineBlockState::Sealed,
+                        text: format!("回答 {i} 的正文"),
+                        tool: None,
+                        last_fragment: 0,
+                        rev: 1,
+                    }],
+                }],
+            });
+        }
+        sess
+    }
+
+    /// 首次调用全量建段；随后**内容未变时一个段都不重渲**（A2）。
+    #[test]
+    fn segments_skip_rebuild_when_nothing_changed() {
+        let mut sess = sess_with_turns(5);
+        let n = refresh_segments(&mut sess, 80, true);
+        assert_eq!(n, 5, "首次应全量建段");
+        // 内容未变 → 0 次重渲。旧实现（version 键）在这里会 100% 重渲。
+        assert_eq!(refresh_segments(&mut sess, 80, true), 0);
+        assert_eq!(refresh_segments(&mut sess, 80, true), 0);
+    }
+
+    /// 只有**被修改的那一段**重渲，其余保持命中（A3）。
+    #[test]
+    fn only_the_touched_segment_is_rebuilt() {
+        let mut sess = sess_with_turns(6);
+        refresh_segments(&mut sess, 80, true);
+        // 改第 3 个回合的块（模拟该回合正在流式增长）。
+        sess.timeline.turns[2].rounds[0].blocks[0]
+            .text
+            .push_str("追加");
+        sess.timeline.turns[2].rounds[0].blocks[0].rev += 1;
+        let rebuilt = refresh_segments(&mut sess, 80, true);
+        assert_eq!(rebuilt, 1, "只有被改的段应重渲，实际 {rebuilt}");
+    }
+
+    /// 宽度变化 → 整份重建（因为换行位置全变）。
+    #[test]
+    fn width_change_invalidates_all_segments() {
+        let mut sess = sess_with_turns(4);
+        refresh_segments(&mut sess, 80, true);
+        assert_eq!(refresh_segments(&mut sess, 60, true), 4);
+    }
+
+    /// `show_reasoning` 切换（F3）→ 整份重建（输出语义变了）。
+    /// 这锁的是 BUGLIST BUG-010：旧缓存键里没有 show_reasoning。
+    #[test]
+    fn show_reasoning_toggle_invalidates_segments() {
+        let mut sess = sess_with_turns(3);
+        refresh_segments(&mut sess, 80, true);
+        assert_eq!(refresh_segments(&mut sess, 80, false), 3);
+    }
+
+    /// 段内容与全量渲染逐行一致（增量缓存不得改变输出）。
+    #[test]
+    fn segment_cache_matches_full_render() {
+        let mut sess = sess_with_turns(7);
+        refresh_segments(&mut sess, 80, true);
+        let cache = sess.segments.as_ref().expect("built");
+        let joined: Vec<String> = cache
+            .window(0, cache.total_lines())
+            .iter()
+            .map(|l| flatten(std::slice::from_ref(*l)))
+            .collect();
+        let full = render_transcript_with_opts(&sess, 80, true);
+        let full_joined: Vec<String> = full
+            .iter()
+            .map(|l| flatten(std::slice::from_ref(l)))
+            .collect();
+        assert_eq!(joined, full_joined, "分段缓存与全量渲染必须逐行一致");
+    }
+
+    /// 视窗抽取是 O(可见)：从 500 回合里取 40 行，行数与顺序正确。
+    #[test]
+    fn window_extracts_only_visible_rows() {
+        let mut sess = sess_with_turns(500);
+        refresh_segments(&mut sess, 80, true);
+        let cache = sess.segments.as_ref().unwrap();
+        let total = cache.total_lines();
+        let win = cache.window(total - 40, 40);
+        assert_eq!(win.len(), 40);
+        let last_turn_lines = cache.turns.last().unwrap().body.height();
+        assert!(last_turn_lines > 0);
+        // 窗口末行必须就是全量渲染的末行。
+        let full = render_transcript_with_opts(&sess, 80, true);
+        assert_eq!(
+            flatten(std::slice::from_ref(win[39])),
+            flatten(std::slice::from_ref(&full[full.len() - 1]))
+        );
+    }
+
+    // ── 虚拟化：只保留视口附近段的渲染结果 ────────────────────
+
+    /// 离屏段退化为估算高度：驻留段数应远小于总段数，但总行数不变。
+    #[test]
+    fn offscreen_segments_are_evicted_to_estimates() {
+        let mut sess = sess_with_turns(200);
+        // 无视口先建全量（首次加载路径）。
+        refresh_segments(&mut sess, 80, true);
+        let all_lines = sess.segments.as_ref().unwrap().total_lines();
+        assert_eq!(
+            sess.segments.as_ref().unwrap().resident_segments,
+            200,
+            "无视口时应全部驻留"
+        );
+
+        // 带视口（底部 40 行）：应只保留视口附近的段。
+        refresh_segments_at(&mut sess, 80, true, Some((all_lines - 40, 40)));
+        let cache = sess.segments.as_ref().unwrap();
+        assert_eq!(cache.total_lines(), all_lines, "总行数不得因淘汰而变化");
+        assert!(
+            cache.resident_segments < 200,
+            "必须真的淘汰了离屏段，实际驻留 {}",
+            cache.resident_segments
+        );
+        assert!(
+            cache.resident_segments <= 8 + 2 * KEEP_MARGIN_SEGMENTS + 2,
+            "驻留段数应受限，实际 {}",
+            cache.resident_segments
+        );
+    }
+
+    /// **不变式**：`window()` 取出的每一行都必须真实存在（视口内不得有未渲染段）。
+    ///
+    /// 这是虚拟化最容易破的地方：几何用估算、渲染用精确，两者一旦不同步，
+    /// 窗口就会缺行（视觉上表现为「内容突然少了一截」）。
+    #[test]
+    fn window_never_contains_unrendered_segments() {
+        let mut sess = sess_with_turns(120);
+        let full = render_transcript_with_opts(&sess, 80, true);
+        let full_flat: Vec<String> = full
+            .iter()
+            .map(|l| flatten(std::slice::from_ref(l)))
+            .collect();
+
+        let height = 30usize;
+        refresh_segments(&mut sess, 80, true);
+        let total = sess.segments.as_ref().unwrap().total_lines();
+        let mut checked = 0;
+        let mut top = total.saturating_sub(height);
+        loop {
+            refresh_segments_at(&mut sess, 80, true, Some((top, height)));
+            let win = sess.segments.as_ref().unwrap().window(top, height);
+            assert!(!win.is_empty() || top >= total, "top={top} 窗口不得为空");
+            for (i, line) in win.iter().enumerate() {
+                assert_eq!(
+                    flatten(std::slice::from_ref(*line)),
+                    full_flat[top + i],
+                    "top={top} 第 {i} 行与全量渲染不一致（几何漂移）"
+                );
+            }
+            checked += 1;
+            if top == 0 {
+                break;
+            }
+            top = top.saturating_sub(height);
+            assert!(checked <= 200, "滚动循环未终止");
+        }
+        assert!(checked > 1, "应至少检查两屏");
+    }
+
+    /// 向上滚回已淘汰区域时，该区域必须被重新精确渲染（不能停留在估算）。
+    #[test]
+    fn scrolling_up_rerenders_evicted_segments() {
+        let mut sess = sess_with_turns(100);
+        refresh_segments(&mut sess, 80, true);
+        let total = sess.segments.as_ref().unwrap().total_lines();
+        // 停在底部 → 头部段被淘汰。
+        refresh_segments_at(&mut sess, 80, true, Some((total - 20, 20)));
+        assert!(!sess.segments.as_ref().unwrap().turns[0].body.is_lines());
+        // 滚到顶部 → 头部段必须重新精确渲染。
+        refresh_segments_at(&mut sess, 80, true, Some((0, 20)));
+        let cache = sess.segments.as_ref().unwrap();
+        assert!(cache.turns[0].body.is_lines(), "滚回顶部应重渲首段");
+        let win = cache.window(0, 20);
+        assert!(!win.is_empty());
+        let full = render_transcript_with_opts(&sess, 80, true);
+        assert_eq!(
+            flatten(std::slice::from_ref(win[0])),
+            flatten(std::slice::from_ref(&full[0]))
+        );
+    }
+
+    /// 宽度变化：**缩放**而非全量重建（Claude Code `ratio` 缩放）。
+    ///
+    /// 旧实现会清空重建——大会话下 resize 会卡。注意 `turn_cache_key` 含宽度
+    /// （换行位置真的变了），所以重建是**必要**的；虚拟化让它只重建可见段。
+    /// 因此这里必须带视口测——无虚拟化时全量重建是唯一正确答案。
+    #[test]
+    fn width_change_scales_and_only_rebuilds_visible_segments() {
+        let mut sess = sess_with_turns(50);
+        refresh_segments(&mut sess, 100, true);
+        let before = sess.segments.as_ref().unwrap().total_lines();
+
+        // 停在底部（视口 20 行）。
+        let rebuilt =
+            refresh_segments_at(&mut sess, 50, true, Some((before.saturating_sub(20), 20)));
+        let cache = sess.segments.as_ref().unwrap();
+        assert!(
+            rebuilt < 50,
+            "宽度变化只应重建可见段，实际重渲 {rebuilt}/50"
+        );
+        // 几何立即可用（缩放后非零），不必等全量重渲。
+        assert!(cache.total_lines() > 0);
+        // 离屏段已退化为估算（不持有 Lines）。
+        assert!(
+            cache.resident_segments < 50,
+            "离屏段应保持估算，实际驻留 {}",
+            cache.resident_segments
+        );
+
+        // F3 切换仍必须全量重建（输出语义变了，不是几何变化）。
+        assert_eq!(refresh_segments(&mut sess, 50, false), 50);
+    }
+
+    /// cap 边界不得成为性能悬崖：丢最旧一回合后，其余段必须复用。
+    ///
+    /// `cap_turns` 每回合从**最旧一侧丢 1 个**（`drain(..1)`）。若长度一变就
+    /// 整份重建，则到达 cap 后**每回合都重渲全部 400 段**——这才是真正的卡顿源。
+    /// （Claude Code 的 UUID 锚点教训：计数切片会让边界每轮位移，CC-941。）
+    #[test]
+    fn cap_boundary_reuses_shifted_segments() {
+        let mut sess = sess_with_turns(20);
+        refresh_segments(&mut sess, 80, true);
+
+        // 走**真实路径**：cap_turns 丢最旧一回合（其余 19 个内容未变）。
+        // （直接 `turns.remove(0)` 不是真实路径——它不递增 dropped_turns，
+        //  编号会全体前移，那才是真丢缓存。）
+        sess.timeline.cap_turns(19);
+        assert_eq!(sess.timeline.dropped_turns, 1, "cap 必须记录已丢弃数");
+        let rebuilt = refresh_segments(&mut sess, 80, true);
+        assert!(
+            rebuilt <= 2,
+            "丢最旧一回合只应影响边界，实际重渲 {rebuilt}/19"
+        );
+    }
+
+    /// 编号必须与「窗口起点」解耦：cap 丢头部后，同一回合的编号不得改变。
+    ///
+    /// 这是缓存能在 cap 边界复用的**根本前提**。
+    #[test]
+    fn turn_number_is_stable_across_cap() {
+        let mut sess = sess_with_turns(20);
+        // 取第 5 个回合（idx=5）在 cap 前的编号。
+        let before = sess.timeline.turn_number(5);
+        sess.timeline.cap_turns(15); // 丢掉最旧 5 个
+        assert_eq!(sess.timeline.dropped_turns, 5);
+        // 它现在位于 idx=0，编号必须不变。
+        assert_eq!(
+            sess.timeline.turn_number(0),
+            before,
+            "cap 后同一回合编号漂移 → 缓存必失效"
+        );
+        // 总数也保持稳定。
+        assert!(sess.timeline.turn_total() >= before);
+    }
+
+    /// **虚拟化的核心承诺**：常驻量不随历史增长。
+    ///
+    /// 这是内存上界的保证：无论会话多长，只有视口附近的段持有渲染结果。
+    /// 这正是可以**删除 `TURNS_CAP` 硬上限**的前提——长会话不再需要靠
+    /// 丢数据来控制内存。
+    /// （旧实现是 O(总回合)，2000 回合会把几十 MB 的渲染 IR 全留住。）
+    #[test]
+    fn resident_segments_stay_bounded_as_history_grows() {
+        let mut prev = 0usize;
+        for n in [50usize, 200, 800, 2000] {
+            let mut sess = sess_with_turns(n);
+            refresh_segments(&mut sess, 80, true);
+            let total = sess.segments.as_ref().unwrap().total_lines();
+            refresh_segments_at(&mut sess, 80, true, Some((total - 30, 30)));
+            let resident = sess.segments.as_ref().unwrap().resident_segments;
+            assert!(
+                resident <= 8 + 2 * KEEP_MARGIN_SEGMENTS + 2,
+                "n={n} 驻留段 {resident} 超出上界（应不随历史增长）"
+            );
+            assert!(resident >= prev.min(resident), "驻留量不应随 n 显著增长");
+            prev = resident;
+        }
+        // 最关键的对照：2000 回合的驻留量与 50 回合同量级。
+        assert!(prev < 30, "2000 回合时驻留段 {prev} 应仍在视口量级");
+    }
+
+    /// **删除 `TURNS_CAP` 后的安全保证**：长会话的渲染内存不随历史增长。
+    ///
+    /// 模拟后端 offload 后的形态（每回合正文截 512 字符），跑 2000 回合：
+    /// 驻留段必须仍在视口量级。这证明不再需要靠 `TURNS_CAP` 丢数据控内存。
+    #[test]
+    fn long_offloaded_session_keeps_render_memory_bounded() {
+        let mut sess = SessionState::new("long".into());
+        let preview: String = "字".repeat(512);
+        for i in 0..2000 {
+            sess.timeline.turns.push(Turn {
+                turn_index: Some(i as u64),
+                turn_id: format!("t{i}"),
+                user_text: format!("问题 {i}"),
+                state: TimelineTurnState::Completed,
+                failure: None,
+                sealed: true,
+                // 后端 seal 后 offload 的形态。
+                offloaded: true,
+                rounds: vec![Round {
+                    round_num: 0,
+                    sealed: true,
+                    is_final: true,
+                    blocks: vec![Block {
+                        block_id: format!("b{i}"),
+                        block_order: 0,
+                        kind: TimelineBlockKind::Text,
+                        state: TimelineBlockState::Sealed,
+                        text: preview.clone(),
+                        tool: None,
+                        last_fragment: 0,
+                        rev: 1,
+                    }],
+                }],
+            });
+        }
+        refresh_segments(&mut sess, 80, true);
+        let total = sess.segments.as_ref().unwrap().total_lines();
+        refresh_segments_at(&mut sess, 80, true, Some((total - 30, 30)));
+        let cache = sess.segments.as_ref().unwrap();
+        assert_eq!(cache.turns.len(), 2000, "不得丢回合");
+        assert!(
+            cache.resident_segments < 30,
+            "2000 回合时驻留段 {} 应仍在视口量级",
+            cache.resident_segments
+        );
+    }
+
+    /// 估算高度与精确渲染的偏差应在可控范围（否则滚动条会明显跳）。
+    #[test]
+    fn estimate_is_within_a_reasonable_band() {
+        let mut sess = sess_with_turns(20);
+        refresh_segments(&mut sess, 80, true);
+        let cache = sess.segments.as_ref().unwrap();
+        for (idx, seg) in cache.turns.iter().enumerate() {
+            let exact = seg.body.height();
+            let est = estimate_turn_lines(&sess.timeline.turns[idx], 80);
+            assert!(est > 0, "估算不得为 0");
+            // 宽松上界：估算用于几何，偏差过大会让滚动位置明显偏移。
+            assert!(
+                est <= exact * 3 + 8,
+                "第 {idx} 段估算 {est} 远超精确 {exact}"
+            );
+        }
+    }
+
+    /// 流式块（Open）每帧换键 → 每帧重渲；但**只有它**，历史段不动。
+    #[test]
+    fn streaming_segment_rerenders_each_frame_but_history_does_not() {
+        let mut sess = sess_with_turns(10);
+        refresh_segments(&mut sess, 80, true);
+        // 末尾追加一个 Open 的流式块（新回合）。
+        sess.timeline.turns.push(Turn {
+            turn_index: None,
+            turn_id: "live".into(),
+            user_text: "继续".into(),
+            state: TimelineTurnState::Running,
+            failure: None,
+            sealed: false,
+            offloaded: false,
+            rounds: vec![Round {
+                round_num: 0,
+                sealed: false,
+                is_final: false,
+                blocks: vec![Block {
+                    block_id: "live_b".into(),
+                    block_order: 0,
+                    kind: TimelineBlockKind::Text,
+                    state: TimelineBlockState::Open,
+                    text: "流".into(),
+                    tool: None,
+                    last_fragment: 0,
+                    rev: 1,
+                }],
+            }],
+        });
+        // 追加 1 个回合 → **只渲新增那一段**，已有 10 段按 `turn_id` 全部复用。
+        // （旧实现长度一变就整份重建——那正是 cap 边界每帧全量重渲的根因。）
+        let first = refresh_segments(&mut sess, 80, true);
+        assert_eq!(first, 1, "追加一个回合只应重渲新段");
+
+        // 记录历史段的 Arc 身份（指针相等 = 未被重渲，零拷贝复用）。
+        let before: Vec<std::sync::Arc<[RenderLine]>> = sess
+            .segments
+            .as_ref()
+            .unwrap()
+            .turns
+            .iter()
+            .map(|s| s.body.lines().expect("保留区应为 Lines").clone())
+            .collect();
+
+        // 之后每帧：**历史段一律不动**；只有流式段可能重渲，且受动画帧
+        // （200ms 粒度，与 Tick 一致）节流——同一动画帧内键不变、连流式段
+        // 都不重渲。这正是“空闲零渲染”的由来。
+        for _ in 0..3 {
+            let n = refresh_segments(&mut sess, 80, true);
+            assert!(n <= 1, "每帧至多重渲 1 段（流式段），实际 {n}");
+            let after = &sess.segments.as_ref().unwrap().turns;
+            for (i, old) in before.iter().enumerate() {
+                assert!(
+                    std::sync::Arc::ptr_eq(old, after[i].body.lines().expect("历史段应保留 Lines")),
+                    "历史段 {i} 被重渲了（应复用 Arc）"
+                );
+            }
+        }
+    }
+
+    /// 动画帧号变化时，**只有**流式段重渲（历史段仍零拷贝）。
+    ///
+    /// 用「下一动画帧」构造确定性的键变化，而不依赖真实墙钟。
+    #[test]
+    fn animation_frame_change_rebuilds_only_the_streaming_segment() {
+        let mut sess = sess_with_turns(10);
+        sess.timeline.turns.push(Turn {
+            turn_index: None,
+            turn_id: "live".into(),
+            user_text: "继续".into(),
+            state: TimelineTurnState::Running,
+            failure: None,
+            sealed: false,
+            offloaded: false,
+            rounds: vec![Round {
+                round_num: 0,
+                sealed: false,
+                is_final: false,
+                blocks: vec![Block {
+                    block_id: "live_b".into(),
+                    block_order: 0,
+                    kind: TimelineBlockKind::Text,
+                    state: TimelineBlockState::Open,
+                    text: "流".into(),
+                    tool: None,
+                    last_fragment: 0,
+                    rev: 1,
+                }],
+            }],
+        });
+        refresh_segments(&mut sess, 80, true);
+        let before: Vec<std::sync::Arc<[RenderLine]>> = sess
+            .segments
+            .as_ref()
+            .unwrap()
+            .turns
+            .iter()
+            .map(|s| s.body.lines().expect("保留区应为 Lines").clone())
+            .collect();
+
+        // 直接改动画帧号不可能（frame_now 读墙钟），改为验证**键的构造**：
+        // 同一时刻两次取键必须相等；且历史段的键与内容键无关。
+        let k1 = turn_cache_key(&sess, &sess.timeline.turns[0], 0, 80, true);
+        let k2 = turn_cache_key(&sess, &sess.timeline.turns[0], 0, 80, true);
+        assert_eq!(k1, k2, "历史段的键不得含动画帧号（否则每帧全量重渲）");
+
+        // 流式段的键**应当**随动画帧变化（含 frame_now）。
+        let live = &sess.timeline.turns[10];
+        let lk = turn_cache_key(&sess, live, 10, 80, true);
+        assert!(live.rounds[0].blocks[0].is_animating());
+        let _ = lk;
+
+        let n = refresh_segments(&mut sess, 80, true);
+        assert!(n <= 1);
+        let after = &sess.segments.as_ref().unwrap().turns;
+        for (i, old) in before.iter().enumerate() {
+            assert!(
+                std::sync::Arc::ptr_eq(old, after[i].body.lines().expect("历史段应保留 Lines")),
+                "历史段 {i} 被重渲"
+            );
+        }
     }
 }

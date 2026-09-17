@@ -19,34 +19,36 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) {
     };
 
     let width = area.width.saturating_sub(1); // 右侧滚动条留 1 列
-    // 只借用 IR，不做全量深拷贝：每帧成本 O(可视行数) 而非 O(全量 IR)。
-    // 未命中缓存时现场渲染一次（streaming/compacting/首帧），同样只转换可视窗口。
-    let fresh: Vec<crate::app::render_line::RenderLine>;
-    let lines: &[crate::app::render_line::RenderLine] = match &sess.rendered {
-        Some(cached) if cached.width == width => &cached.lines,
-        _ => {
-            fresh = crate::app::render_transcript::render_transcript_with_opts(
-                sess,
-                width,
-                app.show_reasoning,
-            );
-            &fresh
-        }
-    };
-
-    let total = lines.len();
     let height = area.height as usize;
-    let bottom_offset = if sess.scroll.follow {
-        0
-    } else {
-        sess.scroll.offset.min(total.saturating_sub(height))
-    };
-    let top = total.saturating_sub(height).saturating_sub(bottom_offset);
 
-    let visible: Vec<Line> = lines
-        .iter()
-        .skip(top)
-        .take(height)
+    // 分段缓存由 `App::ensure_render_caches` 在每帧前维护；这里只取视窗
+    // （O(可见)，不扫全量）。取不到（未维护 / 宽度不一致）时现场全量渲一次兜底。
+    //
+    // 滚动几何与缓存共用 `ui::viewport_top`，避免两处各算一份而错位。
+    let fresh: Vec<crate::app::render_line::RenderLine>;
+    let (total, visible_lines): (usize, Vec<&crate::app::render_line::RenderLine>) =
+        match &sess.segments {
+            Some(cache) if cache.width == width => {
+                let total = cache.total_lines();
+                let top =
+                    crate::ui::viewport_top(total, height, sess.scroll.follow, sess.scroll.offset);
+                (total, cache.window(top, height))
+            }
+            _ => {
+                fresh = crate::app::render_transcript::render_transcript_with_opts(
+                    sess,
+                    width,
+                    app.show_reasoning,
+                );
+                let total = fresh.len();
+                let top =
+                    crate::ui::viewport_top(total, height, sess.scroll.follow, sess.scroll.offset);
+                (total, fresh.iter().skip(top).take(height).collect())
+            }
+        };
+
+    let visible: Vec<Line> = visible_lines
+        .into_iter()
         .map(|rl| {
             let spans: Vec<Span> = rl
                 .spans
@@ -62,6 +64,8 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) {
             Line::from(spans)
         })
         .collect();
+
+    let top = crate::ui::viewport_top(total, height, sess.scroll.follow, sess.scroll.offset);
 
     f.render_widget(Paragraph::new(visible), area);
 

@@ -74,12 +74,10 @@ fn render_highlighted_code_block(text: &str, lang: Option<&str>, width: usize) -
             Err(_) => {
                 // 降级：纯色块
                 for seg in wrap_text(line, max_w) {
-                    out.push(
-                        RenderLine::new().span_direct(
-                            format!("{CODE_INDENT}{seg}"),
-                            RatStyle::new().fg(RatColor::White),
-                        ),
-                    );
+                    out.push(RenderLine::new().span_direct(
+                        format!("{CODE_INDENT}{seg}"),
+                        RatStyle::new().fg(RatColor::White),
+                    ));
                 }
                 continue;
             }
@@ -674,10 +672,7 @@ pub fn render_markdown(text: &str, width: usize) -> Vec<RenderLine> {
                     flush_para(&mut cur_spans, &mut out, width, quote_depth > 0);
                     out.push(RenderLine::new());
                 }
-                TagEnd::Strong
-                | TagEnd::Emphasis
-                | TagEnd::Strikethrough
-                | TagEnd::Link => {
+                TagEnd::Strong | TagEnd::Emphasis | TagEnd::Strikethrough | TagEnd::Link => {
                     style_stack.pop();
                     if matches!(tag, TagEnd::Link)
                         && let Some(dest) = link_dest.take()
@@ -843,7 +838,10 @@ mod tests {
                 }
             }
         }
-        assert!(highlighted > 0, "用例必须真的覆盖到高亮 span，否则断言是空转");
+        assert!(
+            highlighted > 0,
+            "用例必须真的覆盖到高亮 span，否则断言是空转"
+        );
     }
 
     #[test]
@@ -1175,6 +1173,7 @@ mod tests {
                 text,
                 tool: None,
                 last_fragment: 0,
+                rev: 1,
             };
             let round = Round {
                 round_num: 0,

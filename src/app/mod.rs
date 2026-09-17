@@ -52,8 +52,20 @@ use session::{
 /// 重新聚焦时 re-baseline 重建 transcript）。对照 opencode sync 的
 /// "进入会话全量重取 + 滑动窗口" 策略。
 const ACTIVE_MODELS: usize = 4;
-/// 单会话内存中的回合窗口上限（timeline 是服务端权威，内存只是视窗）。
-const TURNS_CAP: usize = 400;
+// 单会话内存回合**不设硬上限**。
+//
+// 历史上这里有个 `TURNS_CAP = 400` 的计数切片。删除它的理由：
+//
+// 1. **内存边界已由两层机制提供**：
+//    - 后端：seal 后 offload 壳化（正文截 512、`tool.output`/`diff` 清空、
+//      全文落 `ringing-offload` sidecar）。实测 daemon 快照 5e34cca4：
+//      102 回合 / 71 已 offload，每回合 140KB → 10KB（14×）。
+//    - 前端：`SegmentCache` 只保留视口附近段的渲染结果，其余退化为估算高度。
+// 2. **计数切片会丢数据且违反「丢弃必须可见」**：整回合消失，比后端 offload
+//    的「保留 512 字符预览 + 全文可回取」差。
+// 3. **它是性能悬崖**：`cap_turns` 每回合从头部丢 1 个，配合旧的
+//    `turn_idx` 编号会让每个回合的缓存键都失效（实测丢 1 个 → 19/19 全量重渲）。
+//    现已改用稳定编号 `turn_number()` 消解；`cap_turns` 函数保留作兜底能力。
 
 /// app 后台任务回传的结果。
 // 大变体承载完整协议响应；Box 化属性能优化，推迟到独立任务（不影响正确性）。
@@ -333,7 +345,7 @@ impl App {
             AppMsg::Resize => {
                 // 宽度变化 → 渲染缓存全部失效。
                 for s in self.sessions.values_mut() {
-                    s.rendered = None;
+                    s.segments = None;
                 }
             }
             AppMsg::Tick => self.handle_tick(),
@@ -460,7 +472,6 @@ impl App {
                 if let Some(terminal) = sess.timeline.apply(&entry) {
                     streaming_done(sess, Some(&terminal.turn_id));
                 }
-                sess.timeline.cap_turns(TURNS_CAP);
                 sync_streaming_from_timeline(sess);
                 if !sess.scroll.follow {
                     // 非跟随模式：内容增长等价于视口上移。
@@ -477,14 +488,13 @@ impl App {
                 let first_load = !sess.ready;
                 sess.needs_rebaseline = false;
                 sess.timeline.replace_from_page(&page);
-                sess.timeline.cap_turns(TURNS_CAP);
                 sess.ready = true;
                 sync_streaming_from_timeline(sess);
                 if first_load || was_follow {
                     sess.scroll.follow = true;
                     sess.scroll.offset = 0;
                 }
-                sess.rendered = None;
+                sess.segments = None;
                 // 子代理：重扫工具卡 + 终态兑底推导。
                 self.handle_subagent_rebaseline(&seed);
             }
@@ -792,12 +802,12 @@ impl App {
                 };
                 if let Some(sess) = self.sessions.get_mut(&target) {
                     sess.dashboard = Some(snapshot);
-                    sess.rendered = None;
+                    sess.segments = None;
                 } else if self.sessions.contains_key(&snapshot.seed)
                     && let Some(sess) = self.sessions.get_mut(&snapshot.seed)
                 {
                     sess.dashboard = Some(snapshot);
-                    sess.rendered = None;
+                    sess.segments = None;
                 }
                 // replaceable 空快照（tasks=[]）时：老 daemon/丢帧后仍为空，主动回退 service 拉取。
                 let needs_fallback = self
@@ -1088,7 +1098,7 @@ impl App {
                                     && dash.documents.is_empty()
                                     && dash.recent_edits.is_empty();
                                 sess.dashboard = Some(dash);
-                                sess.rendered = None;
+                                sess.segments = None;
                                 needs_fetch = is_empty;
                             }
                             None => {
@@ -1113,7 +1123,7 @@ impl App {
                         if let Some(m) = model {
                             let _ = m;
                         }
-                        sess.rendered = None;
+                        sess.segments = None;
                     }
                     if needs_fetch {
                         self.fetch_dashboard(bootstrap_seed);
@@ -1223,7 +1233,7 @@ impl App {
                     sess.timeline.replace_from_page(&page);
                     sess.scroll.follow = true;
                     sess.scroll.offset = 0;
-                    sess.rendered = None;
+                    sess.segments = None;
                 }
             }
             ActionResult::LoadOlder { seed, result } => {
@@ -1232,8 +1242,7 @@ impl App {
                     // prepend 而非 replace：已加载的窗口内容保留；
                     // offset（距底行数）不变，视口内容相对稳定。
                     sess.timeline.prepend_older(&page);
-                    sess.timeline.cap_turns(TURNS_CAP);
-                    sess.rendered = None;
+                    sess.segments = None;
                 } else if let Some(sess) = self.sessions.get_mut(&seed) {
                     sess.loading_older = false;
                 }
@@ -1265,7 +1274,7 @@ impl App {
                                 || !dash.documents.is_empty())
                         {
                             sess.dashboard = Some(dash);
-                            sess.rendered = None;
+                            sess.segments = None;
                         }
                     }
                     Err(_e) => {}
@@ -1363,7 +1372,7 @@ impl App {
             Some(GlobalKey::ToggleReasoning) => {
                 self.show_reasoning = !self.show_reasoning;
                 for s in self.sessions.values_mut() {
-                    s.rendered = None;
+                    s.segments = None;
                 }
                 return;
             }
@@ -1443,9 +1452,20 @@ impl App {
         }
     }
 
-    /// 每帧前维护：焦点变化时执行 LRU 内存回收；只为 active 会话重建
-    /// 渲染缓存（后台标签的缓存已被丢弃，聚焦时按需重建一次）。
-    pub fn ensure_render_caches(&mut self, width: u16) {
+    /// 每帧前维护：焦点变化时执行 LRU 内存回收；只为 active 会话维护渲染缓存。
+    ///
+    /// 四个关键点（对应 A1/A2/A3 + 虚拟化）：
+    ///
+    /// - **A1 宽度对齐**：内容宽取自 `ui::transcript_viewport`（与
+    ///   `transcript::draw` 同一事实源），而不是终端全宽。历史缺陷就是两者
+    ///   永不相等 → 缓存 100% 失效 → 每帧两次全量渲染。
+    /// - **A2 无变化不重渲**：只在内容键变化（或存在动画段）时才动；空闲
+    ///   帧不重建任何段。
+    /// - **A3 分段缓存**：按回合分段，只重渲键变了的段，其余复用 `Arc`。
+    ///   流式只重渲正在增长的那一段，不再扫全量历史。
+    /// - **虚拟化**：只保留视口附近段的渲染结果，离屏段退化为估算高度；
+    ///   滚动几何由高度之和给出，无需渲染全量历史。
+    pub fn ensure_render_caches(&mut self, area: ratatui::layout::Rect) {
         let Some(active) = self.view_seed() else {
             return;
         };
@@ -1453,35 +1473,18 @@ impl App {
             self.touch_focus(&active);
             self.last_focused = Some(active.clone());
         }
+        let show_reasoning = self.show_reasoning;
+        let show_workspace = self.show_workspace;
+        let composer_height = crate::ui::composer::height(self);
+        let (width, height) = crate::ui::transcript_viewport(area, composer_height, show_workspace);
         let Some(sess) = self.sessions.get_mut(&active) else {
             return;
         };
-        // 流式/运行中工具需动画：即使 version 未变也定期重绘（对齐 opencode Spinner 60fps，tui 侧 500ms Tick 驱动）
-        let streaming = sess.timeline.is_streaming()
-            || sess.timeline.turns.iter().any(|t| {
-                t.rounds.iter().any(|r| {
-                    r.blocks.iter().any(|b| {
-                        b.tool
-                            .as_ref()
-                            .is_some_and(|tl| tl.state == qaqh_client::TimelineToolState::Running)
-                    })
-                })
-            });
-        let need = match &sess.rendered {
-            Some(cached) => {
-                cached.version != sess.timeline.version || cached.width != width || streaming
-            }
-            None => true,
-        };
-        if need {
-            let lines =
-                render_transcript::render_transcript_with_opts(sess, width, self.show_reasoning);
-            sess.rendered = Some(session::RenderedTranscript {
-                version: sess.timeline.version,
-                width,
-                lines,
-            });
-        }
+        // 视口顶端行号需先知道总行数，而总行数来自缓存本身（估算高度也算）。
+        // 首帧缓存为空时用 0——`rebuild_all` 会渲染全量，下一帧即收敛。
+        let total = sess.segments.as_ref().map_or(0, |c| c.total_lines());
+        let top = crate::ui::viewport_top(total, height, sess.scroll.follow, sess.scroll.offset);
+        render_transcript::refresh_segments_at(sess, width, show_reasoning, Some((top, height)));
     }
 }
 

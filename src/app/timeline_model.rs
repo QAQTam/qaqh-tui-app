@@ -223,6 +223,12 @@ pub struct Block {
     pub tool: Option<ToolCard>,
     /// TextDelta 的单调 fragment 计数（BlockCheckpoint 不重置）。
     pub(crate) last_fragment: u64,
+    /// 渲染修订号：**只要该块的可见内容可能变化就自增**。
+    ///
+    /// 渲染缓存以 `(block_id, rev, width, …)` 为键——rev 未变即内容未变，
+    /// 可直接复用上帧的 `Arc<[RenderLine]>`，不必重跑 markdown/syntect。
+    /// 用显式计数而非内容哈希：哈希是 O(text)，而这里要的是 O(1)。
+    pub(crate) rev: u64,
 }
 
 impl Block {
@@ -235,11 +241,29 @@ impl Block {
             text: b.text,
             tool: b.tool.map(ToolCard::from),
             last_fragment: 0,
+            rev: 1,
         }
     }
 
     pub fn is_streaming(&self) -> bool {
         self.state == TimelineBlockState::Open
+    }
+
+    /// 标记内容已变（任何可能影响渲染的写入之后调用）。
+    fn touch(&mut self) {
+        self.rev = self.rev.wrapping_add(1);
+    }
+
+    /// 该块是否含“随时间变化的字形”（spinner / ▌ 光标 / 进度条）。
+    ///
+    /// 这类块**不得进缓存**：其输出依赖墙钟而非内容，缓存会把动画冻住。
+    pub fn is_animating(&self) -> bool {
+        if self.state == TimelineBlockState::Open {
+            return true;
+        }
+        self.tool
+            .as_ref()
+            .is_some_and(|t| t.state == TimelineToolState::Running)
     }
 }
 
@@ -322,6 +346,11 @@ pub struct TimelineModel {
     pub turns: Vec<Turn>,
     pub has_more: bool,
     pub total_turns: usize,
+    /// 已从窗口头部丢弃的回合数（`cap_turns`）。
+    ///
+    /// 回合显示编号靠它保持稳定：编号 = `dropped_turns + idx + 1`。
+    /// 若用裸下标，`cap_turns` 后所有编号集体前移 → 缓存键全失效。
+    pub dropped_turns: usize,
     /// T-08：服务端的物化窗口**未覆盖到历史开头**——更早的回合存在（daemon
     /// 归档里），但当前没有深翻页接口能取到。与 `has_more` 分工明确：
     /// `has_more` = 「还能再往前翻一页（且那页非空）」，本字段 = 「翻到底了，
@@ -485,6 +514,7 @@ impl TimelineModel {
                     if *fragment_seq > block.last_fragment || (is_fresh && *fragment_seq == 0) {
                         block.text.push_str(delta);
                         block.last_fragment = *fragment_seq;
+                        block.touch();
                     } else {
                         changed = false;
                     }
@@ -515,6 +545,7 @@ impl TimelineModel {
                     if !text.is_empty() {
                         block.text = text.clone();
                     }
+                    block.touch();
                 } else {
                     missing_block_drops += 1;
                     changed = false;
@@ -526,6 +557,7 @@ impl TimelineModel {
                 let card = ToolCard::from(tool.clone());
                 if let Some(block) = Self::find_block_mut(round, block_id) {
                     block.tool = Some(card);
+                    block.touch();
                 } else {
                     missing_block_drops += 1;
                     changed = false;
@@ -551,6 +583,7 @@ impl TimelineModel {
                             retain_utf8_tail(&mut tool.progress, MAX_PROGRESS_LEN)
                         };
                         tool.progress_truncated |= *truncated || local_truncated;
+                        block.touch();
                     } else {
                         missing_block_drops += 1;
                         changed = false;
@@ -565,6 +598,7 @@ impl TimelineModel {
                 let round = Self::find_round_mut(turn, round_num);
                 if let Some(block) = Self::find_block_mut(round, block_id) {
                     block.state = TimelineBlockState::Sealed;
+                    block.touch();
                 } else {
                     missing_block_drops += 1;
                     changed = false;
@@ -649,13 +683,41 @@ impl TimelineModel {
     /// 内存中回合滑动窗口上限（对照 opencode sync 的 messages limit=100 +
     /// 窗口外裁剪）。超出时从最旧一侧丢弃并置 has_more=true——加载更早仍可用
     /// （before_turn 锚点取内存窗口首回合，服务端始终是权威历史）。
+    /// 裁剪内存回合窗口至 `max`（**当前无生产调用者**）。
+    ///
+    /// 保留原因：这是唯一能主动释放 `turns` 的入口，作为极端情况（如 daemon
+    /// 未启用 offload 且会话异常长）的兜底手段。
+    ///
+    /// ⚠ 若重新启用：`dropped_turns` 必须随之递增（已内建），否则回合编号会
+    /// 集体前移、渲染缓存全失效（见 `turn_number`）。
+    #[allow(dead_code)]
     pub fn cap_turns(&mut self, max: usize) {
         if max > 0 && self.turns.len() > max {
             let drop = self.turns.len() - max;
             self.turns.drain(..drop);
+            // 单调计数：回合编号靠它保持稳定（见 `turn_number`）。
+            self.dropped_turns += drop;
             self.has_more = true;
             self.bump();
         }
+    }
+
+    /// 某回合的**稳定**显示编号（1-based）。
+    ///
+    /// 不能用 `idx + 1`：`cap_turns` 丢头部后所有编号会集体前移，导致
+    /// 缓存键全失效（每回合全量重渲，实测 19/19 → 197ms 悬崖）。
+    /// 优先用后端给的全局序号；实时事件不带（实测 100% 缺失）时用
+    /// 「已丢弃数 + 窗口内下标」推算——两者都与窗口起点无关。
+    pub fn turn_number(&self, idx: usize) -> u64 {
+        match self.turns.get(idx).and_then(|t| t.turn_index) {
+            Some(gi) => gi + 1,
+            None => (self.dropped_turns + idx + 1) as u64,
+        }
+    }
+
+    /// 会话总回合数（含已从窗口丢弃的）。
+    pub fn turn_total(&self) -> u64 {
+        self.total_turns.max(self.dropped_turns + self.turns.len()) as u64
     }
 
     pub fn last_turn_id(&self) -> Option<&str> {

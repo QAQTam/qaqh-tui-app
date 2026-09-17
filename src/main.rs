@@ -130,8 +130,11 @@ async fn run_tui(no_spawn: bool) -> Result<()> {
             if app.quit {
                 break;
             }
-            let width = terminal.size()?.width;
-            app.ensure_render_caches(width);
+            // 渲染缓存键必须与 ui::draw 实际使用的 transcript 内容宽一致
+            // （ui::mod 的 transcript_content_width 是唯一事实源）。
+            let area =
+                ratatui::layout::Rect::new(0, 0, terminal.size()?.width, terminal.size()?.height);
+            app.ensure_render_caches(area);
             terminal.draw(|f| ui::draw(f, &app))?;
 
             let Some(msg) = app_rx.recv().await else {

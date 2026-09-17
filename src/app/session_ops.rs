@@ -386,7 +386,7 @@ impl App {
 
         for (seed, s) in self.sessions.iter_mut() {
             if seed != active {
-                s.rendered = None;
+                s.segments = None;
             }
         }
 
@@ -399,7 +399,7 @@ impl App {
         for (seed, s) in self.sessions.iter_mut() {
             if !keep.contains(seed) && s.ready && !s.needs_rebaseline {
                 s.timeline = timeline_model::TimelineModel::default();
-                s.rendered = None;
+                s.segments = None;
                 s.ready = false;
                 s.needs_rebaseline = true;
                 s.scroll.follow = true;

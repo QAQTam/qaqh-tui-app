@@ -77,7 +77,7 @@ impl App {
         };
         if let Some(sess) = self.sessions.get_mut(&seed) {
             sess.mode = next; // 乐观更新
-            sess.rendered = None;
+            sess.segments = None;
         }
         self.spawn_api(move |api, tx| async move {
             let result = api
@@ -315,7 +315,7 @@ impl App {
             let Some(sess) = self.view_session() else {
                 return;
             };
-            let total = sess.rendered.as_ref().map(|r| r.lines.len()).unwrap_or(0);
+            let total = sess.segments.as_ref().map(|c| c.total_lines()).unwrap_or(0);
             (
                 total,
                 sess.scroll.offset >= total.saturating_sub(1),
@@ -384,7 +384,7 @@ impl App {
             } else {
                 sess.expanded_tools.insert(id);
             }
-            sess.rendered = None;
+            sess.segments = None;
         }
     }
 }
