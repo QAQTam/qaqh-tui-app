@@ -3,6 +3,16 @@
 use super::*;
 
 impl App {
+    /// 标签/观测切换后调用：清掉不属于当前标签 seed 的 overlay。
+    ///
+    /// 判据见 [`Overlay::bound_seed`]——全局 overlay（设置/帮助/会话列表/cwd）保留。
+    /// 不这么做的话，`Ctrl+W` 弹出的 `Confirm(CloseTab(旧 seed))` 会在切标签后
+    /// 仍然吃 `y`，把确认动作落到那个已经不在前台的会话上。
+    pub(super) fn prune_overlays_for_active_seed(&mut self) {
+        let seed = self.active_seed();
+        prune_seed_bound_overlays(&mut self.overlays, seed.as_deref());
+    }
+
     pub fn open_session_list(&mut self) {
         if self
             .overlays
@@ -472,5 +482,111 @@ impl App {
             let n = self.overlays.len();
             self.overlays[n - 1] = overlay;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn confirm_close(seed: &str) -> Overlay {
+        Overlay::Confirm {
+            action: ConfirmAction::CloseTab(seed.into()),
+        }
+    }
+
+    fn attach(seed: &str) -> Overlay {
+        Overlay::AttachPath {
+            input: Vec::new(),
+            cursor: 0,
+            seed: seed.into(),
+        }
+    }
+
+    /// 回归：切标签后，绑在旧 seed 上的 overlay 必须消失。
+    ///
+    /// 证伪方式：去掉 `prune_overlays_for_active_seed()` 的调用（旧行为）——此时
+    /// `Confirm(CloseTab("a"))` 会留在栈里，切到标签 b 后按 `y` 仍然关闭 a。
+    /// 本测试直接锁住「切换后旧 seed 的 overlay 不在了」这个不变量。
+    #[test]
+    fn seed_bound_overlays_do_not_survive_a_tab_switch() {
+        let mut overlays = vec![
+            confirm_close("a"),
+            Overlay::Settings(crate::app::settings::SettingsState::default()),
+            attach("a"),
+        ];
+        prune_seed_bound_overlays(&mut overlays, Some("b"));
+        assert_eq!(
+            overlays.len(),
+            1,
+            "旧 seed 的确认/附件 overlay 必须被清掉：{overlays:?}"
+        );
+        assert!(
+            matches!(overlays[0], Overlay::Settings(_)),
+            "全局 overlay 不许被误伤：{overlays:?}"
+        );
+    }
+
+    /// 反方向：目标就是同一个 seed 时不清；没有活动标签（首页）时 seed 绑定的一律作废。
+    #[test]
+    fn pruning_is_seed_scoped_not_a_blanket_clear() {
+        let mut same = vec![confirm_close("a"), attach("a")];
+        prune_seed_bound_overlays(&mut same, Some("a"));
+        assert_eq!(same.len(), 2, "同 seed 的 overlay 不该被清：{same:?}");
+
+        let mut home = vec![confirm_close("a"), Overlay::Help];
+        prune_seed_bound_overlays(&mut home, None);
+        assert_eq!(
+            home.len(),
+            1,
+            "首页没有 seed，绑定的 overlay 作废：{home:?}"
+        );
+        assert!(matches!(home[0], Overlay::Help));
+    }
+
+    /// 判据本身（这是「别一刀切」的可执行说明）：哪些算 seed 绑定、哪些算全局。
+    #[test]
+    fn bound_seed_classifies_overlays() {
+        assert_eq!(confirm_close("a").bound_seed(), Some("a"));
+        assert_eq!(
+            Overlay::Confirm {
+                action: ConfirmAction::DeleteSession("x".into())
+            }
+            .bound_seed(),
+            Some("x")
+        );
+        assert_eq!(
+            Overlay::Confirm {
+                action: ConfirmAction::ArchiveSession("y".into())
+            }
+            .bound_seed(),
+            Some("y")
+        );
+        assert_eq!(attach("s").bound_seed(), Some("s"));
+
+        assert_eq!(
+            Overlay::Settings(crate::app::settings::SettingsState::default()).bound_seed(),
+            None,
+            "设置页是全局 overlay"
+        );
+        assert_eq!(Overlay::Help.bound_seed(), None);
+        assert_eq!(
+            Overlay::SessionList {
+                selected: 0,
+                show_archived: false
+            }
+            .bound_seed(),
+            None,
+            "会话列表是 daemon 全局的，不属于某个标签"
+        );
+        assert_eq!(
+            Overlay::CwdInput {
+                input: Vec::new(),
+                cursor: 0
+            }
+            .bound_seed(),
+            None,
+            "/new 的 cwd 输入此时还没有 seed"
+        );
     }
 }

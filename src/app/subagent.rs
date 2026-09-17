@@ -292,6 +292,9 @@ impl App {
         self.inspect = None;
         // 返回父会话：重置焦点触发 touch_focus / 渲染缓存重建。
         self.last_focused = None;
+        // 观测期间开的全局 overlay 留着；绑在别的 seed 上的（例如切进观测前留下的
+        // 确认框）不该在回到父标签后突然生效。
+        self.prune_overlays_for_active_seed();
     }
 
     // ── 发现与跟踪 ──

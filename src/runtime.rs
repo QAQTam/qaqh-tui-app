@@ -70,6 +70,12 @@ pub enum ConnEvent {
     Lost(String),
     /// 非致命问题提示（流断开重连中、事件过桥失败等）。
     StreamIssue { error: String },
+    /// 某条频道流重新 `Open`——`StreamIssue` 的对应恢复信号。
+    ///
+    /// 单独一个变体而不是复用 `Ready`：`Ready` 在 app 侧会触发全量 re-attach +
+    /// bootstrap（那是「重新协商/daemon 重启」的代价），而流重连成功只是
+    /// 「刚才那条告警可以撤了」。
+    StreamRecovered,
 }
 
 /// 运行时报文（app 消费）。
@@ -392,7 +398,12 @@ fn build_handlers(
             let msg_tx = msg_tx.clone();
             Arc::new(
                 move |_channel: WireChannel, status: ChannelStatus| match status {
-                    ChannelStatus::Open { .. } => note_daemon_activity(&last_open),
+                    ChannelStatus::Open { .. } => {
+                        note_daemon_activity(&last_open);
+                        // 流重连成功 → 撤掉 app 侧的流告警（否则 `ReadyWithIssue`
+                        // 会一直挂在状态栏上，直到下一次 daemon 重启）。
+                        let _ = msg_tx.send(RuntimeMsg::Conn(ConnEvent::StreamRecovered));
+                    }
                     ChannelStatus::Reconnecting { retry_ms, .. } => {
                         let _ = msg_tx.send(RuntimeMsg::Conn(ConnEvent::StreamIssue {
                             error: format!("连接断开，{retry_ms}ms 后重连"),

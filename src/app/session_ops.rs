@@ -6,12 +6,14 @@ impl App {
     pub fn open_session_tab(&mut self, seed: &str) {
         if self.tabs.iter().any(|s| s == seed) {
             self.active = self.tabs.iter().position(|s| s == seed).unwrap_or(0);
+            self.prune_overlays_for_active_seed();
             return;
         }
         self.tabs.push(seed.to_owned());
         self.sessions
             .insert(seed.to_owned(), SessionState::new(seed.to_owned()));
         self.active = self.tabs.len() - 1;
+        self.prune_overlays_for_active_seed();
         self.sync_tracked();
         // attach + bootstrap（timeline 流由 runtime 自动建立）。
         self.attach_and_bootstrap(seed.to_owned());
@@ -123,6 +125,8 @@ impl App {
             if self.active >= self.tabs.len() && self.active > 0 {
                 self.active = self.tabs.len() - 1;
             }
+            // 活动标签可能已经换成别的 seed：旧 seed 的确认/附件 overlay 作废。
+            self.prune_overlays_for_active_seed();
             self.sync_tracked();
         }
     }
@@ -358,6 +362,7 @@ impl App {
                 if self.inspecting() {
                     self.exit_inspect();
                 }
+                self.prune_overlays_for_active_seed();
                 return;
             }
             col += label_w;

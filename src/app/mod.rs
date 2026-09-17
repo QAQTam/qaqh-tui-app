@@ -184,7 +184,46 @@ impl ApiCtx {
 pub enum ConnPhase {
     Opening,
     Ready,
+    /// 连接本身还在（session 已协商、可继续收发），但有流报了非致命问题
+    /// （断开重连中 / timeline 流结束等）。
+    ///
+    /// 与 [`ConnPhase::Lost`] 是**两件事**：`Lost` 是「连不上 daemon，需要
+    /// 手动重连」，这里是「daemon 还连着，某条流在自愈」。所以它不能复用
+    /// `Ready`（告警会被静默丢弃，用户无从得知流有问题），也不能落到 `Lost`
+    /// （会误导用户去按 Ctrl+R 重连一条健康的连接）。
+    ReadyWithIssue,
     Lost,
+}
+
+impl ConnPhase {
+    /// `ConnEvent::StreamIssue` 到达后的相位（纯函数，便于回归测试）。
+    ///
+    /// 判据：
+    /// - `Ready` / `ReadyWithIssue` → `ReadyWithIssue`：流告警必须可见。
+    /// - `Lost` → 不变：失联的原因比流告警更重要，相位本身也已可见。
+    /// - `Opening` → 不变：还没协商出 session，「连接中」已经表达了状态。
+    pub fn with_stream_issue(&self) -> ConnPhase {
+        match self {
+            ConnPhase::Ready | ConnPhase::ReadyWithIssue => ConnPhase::ReadyWithIssue,
+            other => other.clone(),
+        }
+    }
+
+    /// `ConnEvent::StreamRecovered` 到达后的相位（纯函数，便于回归测试）。
+    ///
+    /// 只清掉流告警这一种状态——`Lost` / `Opening` 的可见性由它们自己的相位
+    /// 负责，不该被「某条流重连成功」抹掉。
+    pub fn with_stream_recovered(&self) -> ConnPhase {
+        match self {
+            ConnPhase::ReadyWithIssue => ConnPhase::Ready,
+            other => other.clone(),
+        }
+    }
+
+    /// 连接可用（含「可用但流有告警」）。
+    pub fn is_ready(&self) -> bool {
+        matches!(self, ConnPhase::Ready | ConnPhase::ReadyWithIssue)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -224,6 +263,51 @@ pub enum Overlay {
         input: Vec<char>,
         cursor: usize,
     },
+}
+
+impl ConfirmAction {
+    /// 该确认动作最终作用的会话 seed。
+    pub fn seed(&self) -> &str {
+        match self {
+            ConfirmAction::DeleteSession(seed)
+            | ConfirmAction::ArchiveSession(seed)
+            | ConfirmAction::CloseTab(seed) => seed,
+        }
+    }
+}
+
+impl Overlay {
+    /// 该 overlay 绑定的会话 seed；`None` = 全局 overlay，与活动标签无关。
+    ///
+    /// 判据是「它的确认/提交动作会落到哪个 seed 上」，不是「它看起来像不像弹窗」：
+    ///
+    /// - **seed 绑定**：`Confirm`（三个动作都携带 seed，按 `y` 直接作用于那个
+    ///   seed）与 `AttachPath`（附件上传落在某个会话上）。切标签后它们就是过期
+    ///   指令——确认类 overlay 绝不能跨标签生效。
+    /// - **全局**：`SessionList`（daemon 全局会话列表）、`Settings`（全局配置）、
+    ///   `Help`、`CwdInput`（`/new` 的 cwd，此时还没有 seed）。它们与当前标签
+    ///   无关，切标签**不该**把它们关掉——一刀切清空会误伤设置页这类全局面板。
+    pub fn bound_seed(&self) -> Option<&str> {
+        match self {
+            Overlay::Confirm { action } => Some(action.seed()),
+            Overlay::AttachPath { seed, .. } => Some(seed),
+            Overlay::SessionList { .. }
+            | Overlay::Settings(_)
+            | Overlay::Help
+            | Overlay::CwdInput { .. } => None,
+        }
+    }
+}
+
+/// 清掉「不属于 `seed`」的 seed 绑定 overlay（纯函数，便于回归测试）。
+///
+/// 全局 overlay（`bound_seed() == None`）原样保留且保持相对顺序；删掉的若是栈顶，
+/// 下面那层自然接管——渲染与按键路由都取 `overlays.last()`，两处一致。
+pub fn prune_seed_bound_overlays(overlays: &mut Vec<Overlay>, seed: Option<&str>) {
+    overlays.retain(|o| match o.bound_seed() {
+        None => true,
+        Some(bound) => Some(bound) == seed,
+    });
 }
 
 use self::settings::{FieldKind, SettingsState};
@@ -613,7 +697,21 @@ impl App {
                 self.conn_error = Some(reason);
             }
             ConnEvent::StreamIssue { error } => {
-                self.conn_error = Some(error);
+                // 相位：Ready 家族升到 ReadyWithIssue（见 `with_stream_issue`）。
+                self.conn_phase = self.conn_phase.with_stream_issue();
+                // 原因：`Lost` 的原因（为什么失联）比「某条流在重连」更重要，
+                // 别把它覆盖掉——失联相位下原因已经在状态栏里给用户看着。
+                if self.conn_phase != ConnPhase::Lost {
+                    self.conn_error = Some(error);
+                }
+            }
+            ConnEvent::StreamRecovered => {
+                // 流恢复：只清流告警，失联/连接中不受影响。
+                let next = self.conn_phase.with_stream_recovered();
+                if next != self.conn_phase {
+                    self.conn_phase = next;
+                    self.conn_error = None;
+                }
             }
         }
     }
@@ -1018,9 +1116,9 @@ impl App {
                 ..
             } => {
                 // 去重：同一 tool_call 只保留一个面板。
-                sess.pending_permissions
-                    .retain(|p| p.tool_call_id != tool_call_id);
-                sess.pending_permissions.push(PermissionPanel {
+                // 且已解决过的 tool_call 不再入队——补投（`ToolStarted` 之后才到的
+                // 权限请求）不得复活幽灵面板，见 `SessionState::queue_permission`。
+                sess.queue_permission(PermissionPanel {
                     tool_call_id,
                     tool_name,
                     reason,
@@ -1036,16 +1134,14 @@ impl App {
             ToolEvent::ToolStarted {
                 tool_call_id, name, ..
             } => {
-                sess.pending_permissions
-                    .retain(|p| p.tool_call_id != tool_call_id);
+                sess.resolve_permission(&tool_call_id);
                 if let Some(s) = sess.streaming.as_mut() {
                     s.phase = StreamPhase::ToolCalling;
                     s.tool_name = Some(name);
                 }
             }
             ToolEvent::ToolFinished { tool_call_id, .. } => {
-                sess.pending_permissions
-                    .retain(|p| p.tool_call_id != tool_call_id);
+                sess.resolve_permission(&tool_call_id);
             }
             ToolEvent::ToolNotice { level, message, .. } => {
                 self.toast(level, format!("[tool] {message}"));
@@ -1107,8 +1203,10 @@ impl App {
                         }
                         let tool = b.tool_state().unwrap_or_default();
                         if let Some(perm) = tool.pending_permission {
-                            // bootstrap 恢复挂起权限（详情等 tool 事件补全）。
-                            sess.pending_permissions.push(PermissionPanel {
+                            // bootstrap 恢复挂起权限（详情等 tool 事件补全）。走
+                            // queue_permission：快照可能落后于我们的应答，已解决的
+                            // id 不许被旧快照复活。
+                            sess.queue_permission(PermissionPanel {
                                 tool_call_id: perm,
                                 tool_name: "（恢复中）".into(),
                                 reason: String::new(),
@@ -1404,6 +1502,8 @@ impl App {
             if self.inspecting() {
                 self.exit_inspect();
             }
+            // 上一条标签遗留的确认/附件 overlay 属于旧 seed：不能跟着切过来。
+            self.prune_overlays_for_active_seed();
             return;
         }
 
