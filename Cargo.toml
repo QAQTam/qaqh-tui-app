@@ -30,16 +30,9 @@ tokio = { version = "1", features = [
     "time",
     "io-util",
 ] }
-reqwest = { version = "0.13", default-features = false, features = [
-    "json",
-    "stream",
-    "multipart",
-    "native-tls",
-] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 uuid = { version = "1", features = ["v4"] }
-sha2 = "0.10"
 unicode-width = "0.2"
 anyhow = "1"
 thiserror = "2"
@@ -47,9 +40,6 @@ futures = "0.3"
 chrono = "0.4"
 pulldown-cmark = { version = "0.12", default-features = false }
 syntect = "5"
-
-[target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.60", features = ["Win32_System_Threading"] }
 
 # ── 本地 ratatui 工作树（main @ e02e2a62）──────────────────────────────
 # 上游已合并「宽字符仅样式变化时尾部单元格残留」的修复（ratatui#2743 / 7babd829），
