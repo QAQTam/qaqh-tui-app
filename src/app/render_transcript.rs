@@ -1321,11 +1321,18 @@ fn shell_meta_from_raw(raw: &str) -> Option<(Option<i32>, bool, String)> {
 /// 不说的话用户会把「只剩尾巴」当成完整输出——与回合级的
 /// `◌ 已归档：以下内容为预览`（见 `render_turn`）同一条设计原则。
 ///
-/// 每张卡**只出一行**、内容不随帧变化（不刷屏，稳定可读）；位置在正文之前，
-/// 且仅在进度**确实上屏**时给出（否则就是在为看不见的东西报警）。
-const PROGRESS_TRUNCATED_MARK: &str = "◌ 进度前段已丢弃：以下为末尾片段";
+/// 措辞不用方位词「以下」：回合级那条的「以下」指**可见内容**，这里指**缺口**
+/// （丢掉的在视野之外），同词异义容易读成「下面这段是残缺的」。
+///
+/// 每张卡**只出一行**、内容不随帧变化（不刷屏，稳定可读）；位置在正文与折叠
+/// hint **之后**（footer 挨着 footer，读者不必跨正文拼读）；且仅在进度**确实
+/// 上屏**时给出（否则就是在为看不见的东西报警）。
+const PROGRESS_TRUNCATED_MARK: &str = "进度前段已丢弃（仅保留末尾）";
 
 /// 进度截断标注行（前缀沿用卡片内的注记风格：`┃ ✗` / `┃ ⚠` → `┃ ◌`）。
+///
+/// ◌ 只由前缀给出：曾把 ◌ 也写进 `PROGRESS_TRUNCATED_MARK`，渲染成
+/// ` ┃ ◌ ◌ 进度前段已丢弃…`（`truncation_mark_renders_single_glyph` 锁住）。
 fn progress_truncated_line(is_block: bool) -> RenderLine {
     let pfx = if is_block { " ┃ ◌ " } else { "    ◌ " };
     RenderLine::new()
@@ -1948,9 +1955,6 @@ fn push_tool_card(
         // 此时标注它「前段已丢弃」是噪音（用户看到的正文并没有缺）。
         let src_from_progress = !tool.progress.trim().is_empty() && src == tool.progress;
         if !src.trim().is_empty() {
-            if src_from_progress && tool.progress_truncated {
-                lines.push(progress_truncated_line(is_block));
-            }
             let max_lines = 8usize;
             let expanded_limit = 24usize;
             let total_raw_lines = src.lines().count();
@@ -1987,6 +1991,7 @@ fn push_tool_card(
             };
             let overflow = needs_collapse;
             let line_prefix = if is_block { " ┃ │ " } else { "    │ " };
+            let body_start = lines.len();
             let mut shown_lines = 0usize;
             for out in display_text.lines() {
                 if out.is_empty() {
@@ -2013,6 +2018,10 @@ fn push_tool_card(
                     break;
                 }
             }
+            // 正文到此为止。`▌`（流式实时光标）与截断标注都必须落在这之后：
+            // 前者要回到**最后一行正文**（落在 footer 上会把注记画成流内容），
+            // 后者与折叠 hint 相邻（footer 挨着 footer，读者不必跨正文拼读）。
+            let body_end = lines.len();
             if overflow {
                 let mut hint_text = if expanded {
                     "F7 收起".to_string()
@@ -2035,8 +2044,12 @@ fn push_tool_card(
                         .span(hint_text, SpanStyle::Dim),
                 );
             }
+            if src_from_progress && tool.progress_truncated {
+                lines.push(progress_truncated_line(is_block));
+            }
             if is_running
-                && let Some(last) = lines.last_mut()
+                && body_end > body_start
+                && let Some(last) = lines.get_mut(body_end - 1)
                 && let Some(span) = last.spans.last_mut()
             {
                 span.text.push('▌');
@@ -2063,16 +2076,8 @@ fn push_tool_card(
             } else {
                 combined
             };
-            // 非 shell：progress 拼在 output 之后。折叠时只留**头部**
-            // （`collapse_output` 取前 `max_lines` 行），进度可能整段被折掉 →
-            // 只有进度确实可见时才标注截断（同上，不给看不见的内容报警）。
-            if tool.progress_truncated
-                && !tool.progress.trim().is_empty()
-                && (!overflow || expanded)
-            {
-                lines.push(progress_truncated_line(is_block));
-            }
             let line_prefix = if is_block { " ┃ │ " } else { "    │ " };
+            let body_start = lines.len();
             let mut shown_lines = 0usize;
             for out in display
                 .lines()
@@ -2090,6 +2095,8 @@ fn push_tool_card(
                     }
                 }
             }
+            // 同 shell 分支：`▌` 落回最后一行正文，截断标注排在 hint 之后。
+            let body_end = lines.len();
             if overflow {
                 let hint = if expanded { "F7 收起" } else { "F7 展开" };
                 lines.push(
@@ -2098,9 +2105,26 @@ fn push_tool_card(
                         .span(hint, SpanStyle::Dim),
                 );
             }
+            // 非 shell：progress 拼在 output 之后。折叠时只留**头部**
+            // （`collapse_output` 取前 `max_lines` 行），进度可能整段被折掉 →
+            // 只有进度确实可见时才标注（同上，不给看不见的内容报警）。
+            //
+            // **取舍**：折叠丢的是可恢复的**显示**（`F7 展开` 已把这件事画出来，
+            // 按一下就能取回），不属 B1 要盯的**不可逆丢弃**；而本标注盯的
+            // `progress_truncated` 是不可逆的（缓冲前段已从内存里丢掉）。所以
+            // 「output 前缀被折叠」不标注——两者都在 footer 里，不会互相淹没。
+            // `progress` 为空时不标注：标注指的是那段进度，没有进度就无从标注
+            // （wire 侧理论上不会出现 flag 为真而 progress 为空，这里只是防御）。
+            if tool.progress_truncated
+                && !tool.progress.trim().is_empty()
+                && (!overflow || expanded)
+            {
+                lines.push(progress_truncated_line(is_block));
+            }
             if is_running
                 && !overflow
-                && let Some(last) = lines.last_mut()
+                && body_end > body_start
+                && let Some(last) = lines.get_mut(body_end - 1)
                 && let Some(span) = last.spans.last_mut()
             {
                 span.text.push('▌');
@@ -3128,20 +3152,21 @@ mod tests {
         );
     }
 
-    /// CNB issue #4 缺陷 2（B1「丢弃必须可见」）：`progress_truncated` 此前是**死字段**
-    /// ——`timeline_model.rs` 只写、全仓无生产读取，于是进度被丢头保尾时用户看到
-    /// 的「只剩尾巴」和完整输出长得一模一样。本测试锁住消费面：截断必须上屏。
-    ///
-    /// 变异验证（实测）：删掉 `push_tool_card` 里 `progress_truncated_line` 的推送
-    /// → 本测试红。
-    #[test]
-    fn truncated_progress_is_marked_in_tool_card() {
+    /// 单行拼接（**不加分隔符**）：`flatten` 把每个 span 用 `\n` 连起来，
+    /// 会把「前缀里的 ◌」和「文案里的 ◌」分开，从而看不见重复字形。
+    fn joined(l: &RenderLine) -> String {
+        l.spans.iter().map(|s| s.text.as_str()).collect()
+    }
+
+    /// 流式 bash 卡：progress 20 行（>8 行 → 走折叠），截断标志可控。
+    /// wire 语义：`progress_truncated` = writer 已丢弃过 progress 的前段。
+    fn streaming_bash_card(id: &str, truncated: bool) -> ToolCard {
         let mut progress = String::new();
         for i in 1..=20 {
             progress.push_str(&format!("line{i}\n"));
         }
-        let tool = ToolCard {
-            tool_call_id: "c-trunc".into(),
+        ToolCard {
+            tool_call_id: id.into(),
             name: "bash".into(),
             state: TimelineToolState::Running,
             summary: None,
@@ -3149,28 +3174,107 @@ mod tests {
             output: None,
             diff: None,
             progress,
-            // wire 语义：writer 已丢弃过 progress 的前段。
-            progress_truncated: true,
+            progress_truncated: truncated,
             failure: None,
             permission: None,
-        };
+        }
+    }
+
+    /// CNB issue #4 缺陷 2（B1「丢弃必须可见」）：`progress_truncated` 此前是**死字段**
+    /// ——`timeline_model.rs` 只写、全仓无生产读取，于是进度被丢头保尾时用户看到
+    /// 的「只剩尾巴」和完整输出长得一模一样。本测试锁住消费面：截断必须上屏。
+    ///
+    /// 两张卡而非一张：`flatten` 拍平整棵树，单卡 fixture 分不清「每卡一行」和
+    /// 「全局一行」（PR #18 审查指出旧断言可被绕过）。
+    ///
+    /// 变异验证（实测）：删掉 `push_tool_card` 里 `progress_truncated_line` 的推送
+    /// → 本测试红；把标注提到卡片循环外只出一行 → 也红。
+    #[test]
+    fn truncated_progress_is_marked_per_card() {
+        let a = streaming_bash_card("c-trunc-a", true);
+        let b = streaming_bash_card("c-trunc-b", true);
         let mut lines = Vec::new();
-        push_tool_card(&mut lines, &tool, 80, false);
-        let flat = flatten(&lines);
-        assert!(
-            flat.contains(PROGRESS_TRUNCATED_MARK),
-            "进度被截断必须可见（B1），实测：{flat}"
-        );
-        // 提示必须**只出一行**（不刷屏）且不随帧变化。
+        push_tool_card(&mut lines, &a, 80, false);
+        push_tool_card(&mut lines, &b, 80, false);
         let marked = lines
             .iter()
-            .filter(|l| {
-                l.spans
-                    .iter()
-                    .any(|s| s.text.contains(PROGRESS_TRUNCATED_MARK))
-            })
+            .filter(|l| joined(l).contains(PROGRESS_TRUNCATED_MARK))
             .count();
-        assert_eq!(marked, 1, "截断标注每张卡只应出现一次，实测 {marked} 次");
+        assert_eq!(
+            marked,
+            2,
+            "两张截断卡各出一行（不是全局一行），实测 {marked} 行：{}",
+            flatten(&lines)
+        );
+    }
+
+    /// 标注行只能有一个 ◌：它由前缀给出。曾把 ◌ 也写进 `PROGRESS_TRUNCATED_MARK`，
+    /// 渲染成 ` ┃ ◌ ◌ 进度前段已丢弃…`（PR #18 审查实测；旧断言用 `flatten`，
+    /// span 间的 `\n` 恰好把两个 ◌ 分开了，所以漏检）。
+    ///
+    /// 变异验证（实测）：把 `◌ ` 加回 `PROGRESS_TRUNCATED_MARK` 开头 → 本测试红。
+    #[test]
+    fn truncation_mark_renders_single_glyph() {
+        let tool = streaming_bash_card("c-glyph", true);
+        let mut lines = Vec::new();
+        push_tool_card(&mut lines, &tool, 80, false);
+        let line = lines
+            .iter()
+            .map(joined)
+            .find(|t| t.contains(PROGRESS_TRUNCATED_MARK))
+            .unwrap_or_else(|| panic!("应有截断标注行，实测：{}", flatten(&lines)));
+        assert!(
+            line.contains("◌ 进度前段已丢弃（仅保留末尾）"),
+            "标注应为「◌ + 文案」，实测：{line}"
+        );
+        assert!(!line.contains("◌ ◌"), "◌ 重复了，实测：{line}");
+    }
+
+    /// 标注排在折叠 hint **之后**：两者都是这张卡的 footer，读者不必跨正文拼读
+    /// （PR #18 审查：旧版把标注夹在头部、hint 留在尾部）。
+    ///
+    /// 变异验证（实测）：把标注推回正文之前 → 本测试红。
+    #[test]
+    fn truncation_mark_follows_collapse_hint() {
+        let tool = streaming_bash_card("c-order", true);
+        let mut lines = Vec::new();
+        push_tool_card(&mut lines, &tool, 80, false);
+        // bash 属默认展开工具（`is_default_expanded`），故 hint 是「F7 收起」。
+        let hint_idx = lines
+            .iter()
+            .position(|l| joined(l).contains("F7 "))
+            .unwrap_or_else(|| panic!("20 行进度应触发折叠 hint：{}", flatten(&lines)));
+        let mark_idx = lines
+            .iter()
+            .position(|l| joined(l).contains(PROGRESS_TRUNCATED_MARK))
+            .expect("截断标注应上屏");
+        assert!(
+            mark_idx > hint_idx,
+            "标注应在 hint 之后：hint@{hint_idx} 标注@{mark_idx}\n{}",
+            flatten(&lines)
+        );
+    }
+
+    /// `▌`（流式实时光标）必须贴在**最后一行正文**上：footer（折叠 hint / 截断
+    /// 标注）是注记，光标落在注记行上会把注记画成流内容（PR #18 审查指出旧版
+    /// `▌` 留在末行）。
+    ///
+    /// 变异验证（实测）：把 `▌` 的落点改回 `lines.last_mut()` → 光标落到标注行 → 红。
+    #[test]
+    fn streaming_cursor_stays_on_last_body_line() {
+        let tool = streaming_bash_card("c-cursor", true);
+        let mut lines = Vec::new();
+        push_tool_card(&mut lines, &tool, 80, false);
+        let idx = lines
+            .iter()
+            .position(|l| joined(l).contains('▌'))
+            .unwrap_or_else(|| panic!("Running 卡应有实时光标，实测：{}", flatten(&lines)));
+        let text = joined(&lines[idx]);
+        assert!(text.contains("line20"), "▌ 应贴最后一行正文，实测：{text}");
+        assert!(
+            !text.contains("F7") && !text.contains(PROGRESS_TRUNCATED_MARK),
+            "▌ 不得落在 footer 行上，实测：{text}"
+        );
     }
 
     /// 反向闸 1：未截断的进度不得挂标注——否则每个正常流式工具都被标成残缺。

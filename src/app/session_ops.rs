@@ -435,6 +435,32 @@ impl App {
 /// 注意 `Err` 分支**不适用**本函数：传输失败（超时/HTTP 非 2xx）是**结果未知**，
 /// 命令可能已在后端执行，晚到的 `Created` 仍会经 `causation_id` 回来；提前撤销
 /// 反而会丢掉那次自动开标签页。故只有终态拒绝才撤销，`Err` 仍留给 15s 兜底。
+///
+/// # ⚠ 待办（PR #18 审查阻断项，未完成）
+///
+/// **调用点没有全链路回归锁**：本函数自身的测试（下方 `mod tests`）在函数体被改回
+/// 旧行为时会红，但把 `mod.rs` 里那一行调用**整个删掉**（撤销逻辑完全没接上）
+/// 时，`cargo test --all-targets` 仍然全绿——「155 全绿」掩盖了这个空洞。
+///
+/// 补法（**必须等 PR #17 `fix/subagent-lifecycle` 合并后再做**，那套测试基建是它
+/// 引入的，本分支没有，重复造会与 #17 冲突、破坏合并顺序）：
+///
+/// ```ignore
+/// #[test]
+/// fn rejected_create_ack_from_handler_clears_pending_create() {
+///     let mut app = App::new_for_test();          // #17：Runtime::stub_for_test
+///     app.pending_creates.insert("cmd-1".into(), Instant::now());
+///     app.handle(AppMsg::Action(ActionResult::CommandAck {
+///         seed: None,
+///         label: "新会话",
+///         result: Ok(RingingCommandAck { command_id: "cmd-1".into(), ..rejected() }),
+///     }));
+///     assert!(app.pending_creates.is_empty(), "handler 必须真的调用了撤销");
+/// }
+/// ```
+///
+/// 断言点是 `pending_creates.is_empty()`（即状态栏 `· creating…` 的消失），
+/// 不是「函数返回值」——只有打穿 handler 才锁得住这一层。
 pub(super) fn apply_rejected_ack(
     pending_creates: &mut HashMap<String, Instant>,
     label: &str,
@@ -467,6 +493,11 @@ pub(super) fn apply_rejected_ack(
 mod tests {
     use super::*;
     use qaqh_client::{RingingCommandAck, RingingCommandAckStatus};
+
+    // ⚠ 覆盖边界（PR #18 审查阻断项）：这里测的是 `apply_rejected_ack` 本身，
+    // **不覆盖 `App::handle` 的调用点**——把 `mod.rs` 里那行调用删掉，本模块
+    // 全绿。全链路测试待 PR #17（`App::new_for_test` / `Runtime::stub_for_test`）
+    // 合并后补，样例见 `apply_rejected_ack` 的「待办」小节。
 
     fn ack(command_id: &str, status: RingingCommandAckStatus) -> RingingCommandAck {
         RingingCommandAck {
