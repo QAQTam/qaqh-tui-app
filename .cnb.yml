@@ -2,6 +2,11 @@
 # 1) main.push：构建/推送 NPC 镜像 + Linux CI（test/clippy/fmt）
 # 2) $：NPC 事件（issue/PR 评论）用自定义镜像；不指定 model = 平台默认免费模型
 # 3) pull_request：NPC 自动代码审查（reviewer 角色提示词）
+# 4) api_trigger：手动/API 触发的 Linux CI，**任意分支可用**，用于在合并前验证 CI 本身
+#
+# ⚠ Linux CI 依赖两个兄弟仓库（`../qaqh-backend`、`../ratatui`），而 CNB 的仓库根是
+# `/workspace`，相对路径会解析成 `/ratatui` 等不存在的目录 → 依赖解析阶段即失败。
+# 因此 CI 必须先按固定 rev 拉取这两个仓库，逻辑集中在 `scripts/ci-linux.sh`。
 
 main:
   push:
@@ -17,18 +22,21 @@ main:
       docker:
         image: rust:1.98.1
       stages:
-        - name: test
-          script: |
-            apt-get update && apt-get install -y --no-install-recommends pkg-config libssl-dev
-            cargo test --all-targets
-        - name: clippy
-          script: |
-            apt-get update && apt-get install -y --no-install-recommends pkg-config libssl-dev
-            rustup component add clippy
-            cargo clippy --all-targets -- -D warnings
+        - name: test+clippy+fmt
+          script: bash scripts/ci-linux.sh
 
 # NPC 事件：自定义镜像（Ubuntu 26.04 + Rust 1.98.1 + OpenSSL dev）
 $:
+  # 手动/API 触发：`cnb build start-build --repo <repo> --branch <分支> --event api_trigger`
+  # 用途是在**合并前**验证 CI 本身（PR 事件只跑 NPC 审查，不跑 Linux CI）。
+  api_trigger:
+    - name: linux-ci
+      docker:
+        image: rust:1.98.1
+      stages:
+        - name: test+clippy+fmt
+          script: bash scripts/ci-linux.sh
+
   issue.comment@npc:
     - docker:
         image: ${CNB_DOCKER_REGISTRY}/${CNB_REPO_SLUG_LOWERCASE}:npc-ubuntu26-rust1981
