@@ -419,12 +419,9 @@ impl App {
             match result {
                 Ok((bytes, media)) => {
                     // 上传走 qaqh-client（multipart 组装在 client 侧），返回的
-                    // ContentRef 过桥回本仓镜像类型。
-                    let uploaded = api
-                        .client
-                        .upload_content(&seed, &media, bytes)
-                        .await
-                        .map_err(|e| e.to_string());
+                    // ContentRef 过桥回本仓镜像类型。没有连接（测试替身）时
+                    // `upload_content` 立刻返回 Err——`seed` 仍然照实回传。
+                    let uploaded = api.upload_content(&seed, &media, bytes).await;
                     let _ = tx.send(AppMsg::Action(ActionResult::Uploaded {
                         seed,
                         path,

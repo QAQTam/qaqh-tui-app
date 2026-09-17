@@ -132,10 +132,19 @@ pub enum AppMsg {
 /// （`query`/`action`）全由 `qaqh-client` 一处承担，凭据热更新因此也只有一份。
 #[derive(Clone)]
 pub struct ApiCtx {
-    pub client: Arc<qaqh_client::Client>,
+    /// `None` = 没有连接（只有 [`crate::runtime::Runtime::stub_for_test`] 的测试
+    /// 替身会这样）。任务照常运行，取用连接时立刻返回 `Err`，而不是去碰 daemon。
+    pub client: Option<Arc<qaqh_client::Client>>,
 }
 
 impl ApiCtx {
+    /// 取出连接；没有连接时给出可读的错误（测试替身路径）。
+    fn client(&self) -> Result<&Arc<qaqh_client::Client>, String> {
+        self.client
+            .as_ref()
+            .ok_or_else(|| "无连接（测试替身）".to_string())
+    }
+
     /// 发送 Ringing 命令（返回权威类型的 ack）。
     ///
     /// T-01 阶段二后本仓不再持有协议镜像，故这里不再过桥——命令与回执都是
@@ -147,7 +156,7 @@ impl ApiCtx {
         command: qaqh_client::RingingCommand,
         options: qaqh_client::CommandOptions,
     ) -> Result<qaqh_client::RingingCommandAck, String> {
-        self.client
+        self.client()?
             .send_command(seed, command, options)
             .await
             .map_err(|e| e.to_string())
@@ -165,7 +174,7 @@ impl ApiCtx {
         limit: u32,
     ) -> Result<qaqh_client::TimelinePage, String> {
         // 类型已权威化：不再有过桥这一步，返回的就是 `qaqh_client` 的类型。
-        self.client
+        self.client()?
             .fetch_timeline_page(seed, before_index, Some(limit))
             .await
             .map_err(|e| e.to_string())
@@ -176,7 +185,47 @@ impl ApiCtx {
         &self,
         seed: &str,
     ) -> Result<qaqh_client::RingingSessionBootstrap, String> {
-        self.client.bootstrap(seed).await.map_err(|e| e.to_string())
+        self.client()?
+            .bootstrap(seed)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    /// 服务面查询（`session.list` / `session.activity` / `todo.status`…）。
+    pub async fn query(&self, request: QueryRequest) -> Result<serde_json::Value, String> {
+        self.client()?
+            .query(request)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    /// 服务面动作（`config.save` / `profile.apply` …）。
+    pub async fn action(&self, request: ActionRequest) -> Result<serde_json::Value, String> {
+        self.client()?
+            .action(request)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    /// 命令回执轮询（ACK ≠ 完成）。
+    pub async fn command_status(&self, command_id: &str) -> Result<RingingCommandStatus, String> {
+        self.client()?
+            .command_status(command_id)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    /// 上传附件内容（multipart 组装在 client 侧）。
+    pub async fn upload_content(
+        &self,
+        seed: &str,
+        media_type: &str,
+        data: Vec<u8>,
+    ) -> Result<qaqh_client::ContentRef, String> {
+        self.client()?
+            .upload_content(seed, media_type, data)
+            .await
+            .map_err(|e| e.to_string())
     }
 }
 
@@ -231,6 +280,10 @@ pub struct StreamIssues {
 
 impl StreamIssues {
     /// 记一条告警；返回该流此前是否**不在**告警集合里。
+    ///
+    /// 返回值是**为可测性保留的观察值**：生产代码不看它（调用点只关心账本状态，
+    /// 相位由 [`reconcile_conn`] 统一推导），测试用它断言「同一条流重复告警不算
+    /// 新增」。不要把它当成「调用方需要知道是否新增」的契约。
     pub fn raise(&mut self, stream: StreamKey, message: String) -> bool {
         let already = self.messages.contains_key(&stream);
         if already {
@@ -242,7 +295,8 @@ impl StreamIssues {
         !already
     }
 
-    /// 该流恢复：只移除**它自己**那条告警；返回它此前是否在告警集合里。
+    /// 该流恢复：只移除**它自己**那条告警；返回它此前是否在告警集合里
+    /// （同样是为可测性保留的观察值，生产代码不看）。
     pub fn clear(&mut self, stream: &StreamKey) -> bool {
         let existed = self.messages.remove(stream).is_some();
         if existed {
@@ -363,25 +417,25 @@ impl Overlay {
 
     /// `AttachPath` 按 Enter 的提交动作：目标 seed + 去空白后的路径。
     ///
+    /// 取 `AttachPath` 的**字段**而不是 `&self`：只有 Enter 分支需要它，且只可能是
+    /// `AttachPath`——放在 `overlay_key` 的 `match` 之前会让每次按键（包括输入路径
+    /// 的每个字符）都白做一次 `String` 分配，也让「只有 AttachPath 有这个动作」
+    /// 这件事变成运行期判断。
+    ///
     /// - 目标 seed **恒取 overlay 自己存的那个**——这是附件目标 seed 的单一事实源，
     ///   与 [`Overlay::bound_seed`] 的判据一致（判据说属于谁，执行就落在谁身上）；
-    /// - 空路径（或纯空白）→ `None`：不提交；
-    /// - 非 `AttachPath` → `None`。
-    pub fn attach_submit(&self) -> Option<AttachSubmit> {
-        match self {
-            Overlay::AttachPath { input, seed, .. } => {
-                let path = input.iter().collect::<String>().trim().to_owned();
-                (!path.is_empty()).then(|| AttachSubmit {
-                    target_seed: seed.clone(),
-                    path,
-                })
-            }
-            _ => None,
-        }
+    /// - 空路径（或纯空白）→ `None`：不提交。
+    pub fn attach_submit(input: &[char], seed: &str) -> Option<AttachSubmit> {
+        let path = input.iter().collect::<String>().trim().to_owned();
+        (!path.is_empty()).then(|| AttachSubmit {
+            target_seed: seed.to_owned(),
+            path,
+        })
     }
 }
 
-/// 附件上传的目标：**只能**由 [`Overlay::attach_submit`] 产生。
+/// 附件上传的目标：**只能**由 [`Overlay::attach_submit`] 产生（`overlay_key` 的
+/// `AttachPath` Enter 分支是唯一调用点）。
 ///
 /// 这样「上传挂到哪个会话」不可能与 overlay 的身份漂移：上传入口拿不到
 /// `active_seed()`，只有一个来源。判据（`bound_seed()`）、剪枝（切标签即关闭）、
@@ -476,6 +530,19 @@ impl App {
                 .ok()
                 .map(|p| p.to_string_lossy().into_owned()),
         )
+    }
+
+    /// **测试用构造**：没有连接的 `Runtime` 替身 + 一条可观察的 `AppMsg` 通道。
+    ///
+    /// 返回 `(App, rx)`：测试从 `rx` 读回后台任务投递的结果（例如
+    /// `ActionResult::Uploaded { seed, .. }` 里的归属 seed）。只用于 `App` 层
+    /// 按键/事件路径的单测——`overlay_key`、`handle`、`upload_attachment` 这些
+    /// 以前只能靠纯函数间接覆盖的路径。
+    #[cfg(test)]
+    pub fn new_for_test() -> (Self, tokio::sync::mpsc::UnboundedReceiver<AppMsg>) {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let app = Self::new_with_cwd(Runtime::stub_for_test(), tx, None);
+        (app, rx)
     }
 
     pub fn new_with_cwd(
@@ -1530,13 +1597,16 @@ impl App {
 
     /// app → daemon 异步出口的唯一入口：集中克隆 client/msg_tx 并 spawn。
     /// 今后如需统一超时/退避/取消/指标，只需叠加在此处。
+    ///
+    /// 没有连接（测试替身）时**任务照起**：取用连接的那一步会返回 `Err`，结果照常
+    /// 经 `AppMsg::Action` 回来——「上传目标是哪个 seed」这类归属信息因此仍可断言。
     pub(super) fn spawn_api<F, Fut>(&self, task: F)
     where
         F: FnOnce(ApiCtx, tokio::sync::mpsc::UnboundedSender<AppMsg>) -> Fut + Send + 'static,
         Fut: std::future::Future<Output = ()> + Send,
     {
         let api = ApiCtx {
-            client: self.runtime.client(),
+            client: self.runtime.client_opt(),
         };
         let tx = self.msg_tx.clone();
         tokio::spawn(async move { task(api, tx).await });

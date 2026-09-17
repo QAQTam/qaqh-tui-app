@@ -118,7 +118,10 @@ pub enum RuntimeMsg {
 
 /// 生命周期属主。持有当前 `Client`（可在 T-03 手动重连时原地替换）。
 pub struct Runtime {
-    client: RwLock<Arc<Client>>,
+    /// 当前客户端。**只有测试替身**（[`Runtime::stub_for_test`]）会是 `None`：
+    /// 生产路径 `start` / `rebuild` 始终有值，所以 [`Runtime::client`] 可以 `expect`；
+    /// 「没有连接也要照跑」的路径走 [`Runtime::client_opt`]。
+    client: RwLock<Option<Arc<Client>>>,
     msg_tx: mpsc::UnboundedSender<RuntimeMsg>,
     /// app 当前跟踪的 seed 集（重连后据此恢复 timeline 流）。
     tracked: std::sync::Mutex<HashSet<String>>,
@@ -145,7 +148,7 @@ impl Runtime {
         let client = Self::connect(&msg_tx, &last_open, launch_daemon_if_missing).await?;
 
         let runtime = Arc::new_cyclic(|weak| Self {
-            client: RwLock::new(client.clone()),
+            client: RwLock::new(Some(client.clone())),
             msg_tx: msg_tx.clone(),
             tracked: std::sync::Mutex::new(HashSet::new()),
             rebuilding: AtomicBool::new(false),
@@ -192,7 +195,37 @@ impl Runtime {
     /// 同步返回：`spawn_api` 需要在**非 async** 上下文里拿到它，而且把
     /// `&self` 借进 spawned task 是不允许的。
     pub fn client(&self) -> Arc<Client> {
+        self.client_opt()
+            .expect("runtime client（只有测试替身没有连接，生产路径不该走到这里）")
+    }
+
+    /// 当前客户端；没有连接时返回 `None`（只有 [`Runtime::stub_for_test`] 会这样）。
+    ///
+    /// 给「没有连接也要走完」的路径用：`spawn_api`（任务照起，取用连接时才失败）
+    /// 与 [`Runtime::set_tracked_seeds`]（没有连接就没有 timeline 流可建/可撤）。
+    pub fn client_opt(&self) -> Option<Arc<Client>> {
         self.client.read().expect("client lock").clone()
+    }
+
+    /// **测试替身**：没有连接的 `Runtime`，供 `App` 层按键/事件路径的单测使用
+    /// （见 `App::new_for_test`）。
+    ///
+    /// 只保证「不 panic 地走完同步路径」：`client_opt()` 返回 `None`，`spawn_api`
+    /// 起的任务照常运行、取用连接时才失败（返回 `Err`），不去碰真 daemon。
+    #[cfg(test)]
+    pub fn stub_for_test() -> Arc<Self> {
+        let (msg_tx, _rx) = mpsc::unbounded_channel();
+        Arc::new_cyclic(|weak| Self {
+            client: RwLock::new(None),
+            msg_tx,
+            tracked: std::sync::Mutex::new(HashSet::new()),
+            rebuilding: AtomicBool::new(false),
+            generation: AtomicU64::new(0),
+            launch_daemon_if_missing: false,
+            last_open: Arc::new(std::sync::Mutex::new(Instant::now())),
+            stalled: Arc::new(AtomicBool::new(false)),
+            self_arc: weak.clone(),
+        })
     }
 
     /// app 维护的 open 标签页/子代理 seed 集合。
@@ -210,7 +243,10 @@ impl Runtime {
         }
         let msg_tx = self.msg_tx.clone();
         let generation = self.generation.load(Ordering::SeqCst);
-        let client = self.client();
+        // 测试替身没有连接：跟踪集合已经更新，等 `Ready` 重新 diff 即可。
+        let Some(client) = self.client_opt() else {
+            return;
+        };
         tokio::spawn(async move {
             for seed in to_remove {
                 client.deactivate_timeline(&seed).await;
@@ -222,7 +258,9 @@ impl Runtime {
     }
 
     pub async fn shutdown(&self) {
-        self.client().close();
+        if let Some(client) = self.client_opt() {
+            client.close();
+        }
     }
 
     /// **手动重连**（T-03）：关掉当前客户端并重建一个，随后恢复跟踪的 timeline。
@@ -243,8 +281,10 @@ impl Runtime {
     }
 
     async fn rebuild_inner(&self) -> Result<(), String> {
-        let old = self.client();
-        old.close();
+        // 重建是生产路径（T-03 手动重连）：没有连接就没什么可关的，直接建新的。
+        if let Some(old) = self.client_opt() {
+            old.close();
+        }
         // 让旧任务先退出，避免两套流短暂并存。
         tokio::time::sleep(Duration::from_millis(80)).await;
 
@@ -253,7 +293,7 @@ impl Runtime {
             .map_err(|e| e.to_string())?;
 
         let generation = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
-        *self.client.write().expect("client lock") = new.clone();
+        *self.client.write().expect("client lock") = Some(new.clone());
         self.stalled.store(false, Ordering::SeqCst);
         *self.last_open.lock().expect("last_open lock") = Instant::now();
 

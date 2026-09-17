@@ -674,11 +674,17 @@ impl SessionState {
         self.pending_permissions.first()
     }
 
-    /// 挂起权限入队的**唯一入口**：已解决过的 tool_call_id 不再入队。
+    /// **实时**权限请求的入队口（`ToolPermissionRequested`）：已解决过的
+    /// tool_call_id 不再入队，同一 id 重复到达时以最新一条替换（详情靠后续
+    /// tool 事件补全）。
     ///
-    /// 两个调用点都走这里——实时事件（`ToolPermissionRequested`）与 bootstrap
-    /// 快照恢复；快照也可能是我们应答之前的旧视图，同样不能复活幽灵面板。
-    /// 同一 id 重复到达时以最新一条替换（详情靠后续 tool 事件补全）。
+    /// bootstrap 快照恢复**不走这里**——快照是旧视图，走
+    /// [`SessionState::restore_permission_from_snapshot`]（只补不换，免得用
+    /// 「（恢复中）」占位符覆盖实时事件带来的详情）。两条路径共用「已解决的 id
+    /// 不再入队」这一条判据（都查 [`RespondedPermissions`]）。
+    ///
+    /// 返回是否入队（`false` = 已解决，被拒）。生产代码不需要这个值，保留是为了
+    /// 让测试能直接断言「补投被丢弃」。
     pub fn queue_permission(&mut self, panel: PermissionPanel) -> bool {
         if self.responded_permissions.contains(&panel.tool_call_id) {
             return false;

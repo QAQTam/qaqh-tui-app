@@ -8,19 +8,43 @@ use crate::app::{App, ConnPhase};
 use crate::ui::theme;
 use qaqh_client::NoticeLevel;
 
-/// 左侧「 ⚠ ready·流告警」前缀（约 12 列）+ epoch（约 9 列）的预留列数。
-pub const LEFT_PREFIX_RESERVE: usize = 24;
+// ── 原因文案的显示预算 ──────────────────────────────────────────────
+//
+// 两个相位分设预算：它们**不是**同一类信息。
+//
+// 下面的两个 *_PREFIX_RESERVE 是「该相位下左端除原因文案外的显示列上界」，
+// 按最坏情况取（含 ` · creating…` 的 12 列），**不是**精确值：
+// - `ReadyWithIssue` 前缀「 ⚠ ready·流告警」12 列 + 原因前空格 1 列 + creating… 12 列
+//   = 25；该相位**不显示 epoch**（见 [`shows_epoch`]）。
+// - `Lost` 前缀「 ✗ lost · Ctrl+R 重连」19 列 + 1 + 12 = 32。
+// 右侧宽度用 `draw()` 实测的 `right_w`（用量/百分比/活动标签/丢弃计数/时钟，
+// 8~70 列，`dropped_summary` 带中文时最宽），不再猜一个固定预留常量。
 
-/// 流告警文案的显示预算（列）。
+/// `ReadyWithIssue` 下左端除原因文案外的列数上界（最坏情况，含 creating…）。
+pub const READY_ISSUE_PREFIX_RESERVE: usize = 25;
+/// `Lost` 下左端除原因文案外的列数上界（最坏情况，含 creating…）。
+pub const LOST_PREFIX_RESERVE: usize = 32;
+
+/// 流告警（`ReadyWithIssue`）原因文案的显示预算。
 ///
-/// 按**实测**的右侧宽度算，而不是猜一个常量：右侧用量/百分比/活动标签/丢弃计数/
-/// 时钟加起来是 8~70 列（`dropped_summary` 带中文时最宽）。固定预留（例如 58 列）
-/// 在 80 列终端上反而比旧的 `Lost` 分支更窄。下限 6 列（还能认出「有东西」），
+/// 告警文案可以短——它只是「某条流在自愈」的旁注，下限 6 列够认出「有东西」，
 /// 上限 30 列（再长也没有信息量）。
 pub fn issue_budget(width: usize, right_w: usize) -> usize {
     width
-        .saturating_sub(right_w + LEFT_PREFIX_RESERVE)
+        .saturating_sub(right_w + READY_ISSUE_PREFIX_RESERVE)
         .clamp(6, 30)
+}
+
+/// 失联（`Lost`）原因文案的显示预算。
+///
+/// **下限刻意抬高**（20 列）：失联原因是本 issue 最需要可诊断的信息——T-03 的
+/// 重连入口就靠它给用户上下文。若与告警文案共用 6 列下限，80 列终端 + 右侧较宽
+/// （长 `dropped_summary`）时用户只能看到 6 列，等于没有原因。代价是极窄终端下
+/// 左端可能超出区域宽度、挤掉中间 toast——这是刻意的取舍：失联时诊断信息优先。
+pub fn lost_issue_budget(width: usize, right_w: usize) -> usize {
+    width
+        .saturating_sub(right_w + LOST_PREFIX_RESERVE)
+        .clamp(20, 40)
 }
 
 /// epoch 只在 `Ready` 显示（纯函数，便于回归测试）。
@@ -42,19 +66,21 @@ pub fn shows_epoch(phase: &ConnPhase) -> bool {
 ///   在告警」这个集合非空的事实，集合清空即消失，不做逐条时效追踪。
 /// - `Lost`：连不上 daemon → 给出重连入口 + 原因。
 ///
-/// `issue_budget` 是原因文案的显示列上限（见 [`issue_budget`]）。
+/// 原因文案的显示列上限**按相位取**：告警用 [`issue_budget`]（可以短），失联用
+/// [`lost_issue_budget`]（下限 20 列，见那里的取舍）。调用方只给区域宽度与右侧
+/// 实测宽度，选预算这件事留在函数里，免得两个调用点各写一套。
 pub fn conn_spans(
     phase: &ConnPhase,
     conn_error: Option<&str>,
-    issue_budget: usize,
+    width: usize,
+    right_w: usize,
 ) -> Vec<Span<'static>> {
+    let budget = match phase {
+        ConnPhase::Lost => lost_issue_budget(width, right_w),
+        _ => issue_budget(width, right_w),
+    };
     let issue_text = |err: Option<&str>, style| {
-        err.map(|e| {
-            Span::styled(
-                format!(" {}", crate::app::truncate_str(e, issue_budget)),
-                style,
-            )
-        })
+        err.map(|e| Span::styled(format!(" {}", crate::app::truncate_str(e, budget)), style))
     };
     match phase {
         ConnPhase::Ready => vec![Span::styled(" ● ready", theme::ok())],
@@ -114,12 +140,9 @@ pub fn draw(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
     right.push(Span::styled(format!(" · {now} "), theme::dim()));
     let right_w: usize = right.iter().map(|s| s.content.chars().count()).sum();
 
-    // 左侧：连接指示（告警文案预算用右侧实测宽度，不再靠常量猜）。
-    let mut left: Vec<Span> = conn_spans(
-        &app.conn_phase,
-        app.conn_error.as_deref(),
-        issue_budget(width, right_w),
-    );
+    // 左侧：连接指示（原因文案的预算按相位取，宽度用右侧实测值，不靠常量猜）。
+    let mut left: Vec<Span> =
+        conn_spans(&app.conn_phase, app.conn_error.as_deref(), width, right_w);
     if shows_epoch(&app.conn_phase) {
         let ep = if app.epoch.len() > 8 {
             &app.epoch[..8]
@@ -198,7 +221,7 @@ mod tests {
             ConnPhase::ReadyWithIssue,
             "Ready 收到流告警必须离开 Ready 相位"
         );
-        let shown = text(&conn_spans(&phase, error.as_deref(), 30));
+        let shown = text(&conn_spans(&phase, error.as_deref(), 80, 8));
         assert!(
             shown.contains("连接断开"),
             "流告警文案必须在状态栏可见，实际：{shown:?}"
@@ -208,7 +231,7 @@ mod tests {
         issues.clear(&stream);
         let (phase, error) = reconcile_conn(&phase, &issues, error);
         assert_eq!(phase, ConnPhase::Ready);
-        let cleared = text(&conn_spans(&phase, error.as_deref(), 30));
+        let cleared = text(&conn_spans(&phase, error.as_deref(), 80, 8));
         assert!(
             !cleared.contains("连接断开"),
             "恢复后不得残留流告警，实际：{cleared:?}"
@@ -221,7 +244,8 @@ mod tests {
         let issue = text(&conn_spans(
             &ConnPhase::ReadyWithIssue,
             Some("流已关闭"),
-            30,
+            80,
+            8,
         ));
         assert!(issue.contains("ready"), "实际：{issue:?}");
         assert!(
@@ -229,7 +253,7 @@ mod tests {
             "流告警不得暗示失联/重连，实际：{issue:?}"
         );
 
-        let lost = text(&conn_spans(&ConnPhase::Lost, Some("与 daemon 失联"), 30));
+        let lost = text(&conn_spans(&ConnPhase::Lost, Some("与 daemon 失联"), 80, 8));
         assert!(
             lost.contains("lost") && lost.contains("Ctrl+R"),
             "实际：{lost:?}"
@@ -284,12 +308,14 @@ mod tests {
     /// 证伪方式：改回「固定预留常量」的旧写法（`width - 58` 夹 [6,30]）——
     /// 右侧很窄（8 列）时旧写法给 22，本测试要求 30；右侧很宽（54 列）时旧写法
     /// 仍给 22，本测试要求 6。两个方向都会变红。
+    ///
+    /// 期望值按 [`READY_ISSUE_PREFIX_RESERVE`] 算：`width - right_w - 25` 夹 [6,30]。
     #[test]
     fn issue_budget_follows_measured_right_width() {
         assert_eq!(issue_budget(200, 10), 30, "宽终端封顶 30 列");
         assert_eq!(issue_budget(80, 8), 30, "右侧很窄时预算不被常量压掉");
         assert_eq!(issue_budget(80, 54), 6, "右侧很宽时保底 6 列");
-        assert_eq!(issue_budget(60, 25), 11);
+        assert_eq!(issue_budget(60, 25), 10, "60-25-25");
         assert_eq!(issue_budget(40, 25), 6);
         assert!(
             issue_budget(100, 10) >= issue_budget(70, 10),
@@ -305,7 +331,9 @@ mod tests {
     #[test]
     fn issue_text_respects_the_budget() {
         let long = "连接断开，3000ms 后重连并且这条文案特别长长长长长长长长长长长长";
-        let shown = text(&conn_spans(&ConnPhase::ReadyWithIssue, Some(long), 8));
+        // 小预算场景：60 列 - 右侧 27 列 - 前缀 25 列 = 8。
+        assert_eq!(issue_budget(60, 27), 8);
+        let shown = text(&conn_spans(&ConnPhase::ReadyWithIssue, Some(long), 60, 27));
         let tail = shown
             .strip_prefix(" ⚠ ready·流告警 ")
             .expect("前缀")
@@ -316,5 +344,40 @@ mod tests {
             tail.chars().count()
         );
         assert!(shown.starts_with(" ⚠ ready·流告警"), "实际：{shown:?}");
+    }
+
+    /// **阻断 2（PR #20 第二轮复审）**：失联原因不能被压到 6 列。
+    ///
+    /// 80 列终端 + 右侧较宽（长 `dropped_summary`，实测可到 54~70 列）时，若 `Lost`
+    /// 与流告警共用同一个 6 列下限，用户只看到 6 列——而失联原因是本 issue 最需要
+    /// 可诊断的信息（T-03 的重连入口靠它给上下文）。
+    ///
+    /// 证伪方式：让 `Lost` 也走 `issue_budget`（返工前的写法）→ 下面
+    /// `lost_issue_budget(80, 54) == 20` 与「原因至少 20 列」两条同时变红。
+    #[test]
+    fn lost_reason_keeps_a_readable_budget_when_the_right_side_is_wide() {
+        let long = "与 daemon 失联（20s 内无任何频道连接）——按 R 重连";
+        // 同一场景：告警可以短（下限 6），失联必须有 20 列。
+        assert_eq!(issue_budget(80, 54), 6);
+        assert_eq!(lost_issue_budget(80, 54), 20);
+
+        let lost = text(&conn_spans(&ConnPhase::Lost, Some(long), 80, 54));
+        let tail = lost
+            .strip_prefix(" ✗ lost · Ctrl+R 重连 ")
+            .expect("失联前缀")
+            .to_owned();
+        assert!(
+            tail.chars().count() >= 20,
+            "失联原因必须保有可诊断的宽度，实际 {} 列：{tail:?}",
+            tail.chars().count()
+        );
+
+        // 宽终端上给得更多（上限 40）；窄终端保底 20。
+        assert_eq!(lost_issue_budget(200, 10), 40);
+        assert_eq!(lost_issue_budget(40, 10), 20);
+        assert!(
+            lost_issue_budget(80, 54) > issue_budget(80, 54),
+            "失联的下限必须严格高于流告警"
+        );
     }
 }
