@@ -32,7 +32,7 @@ use ratatui::crossterm::event::{KeyEvent, MouseEvent};
 
 use crate::app::slash::SlashCmd;
 use crate::protocol::ConfigDto;
-use crate::runtime::{ConnEvent, Runtime, RuntimeMsg};
+use crate::runtime::{ConnEvent, Runtime, RuntimeMsg, StreamKey};
 use qaqh_client::TimelinePage;
 use qaqh_client::{ActionRequest, QueryRequest};
 use qaqh_client::{
@@ -132,10 +132,19 @@ pub enum AppMsg {
 /// （`query`/`action`）全由 `qaqh-client` 一处承担，凭据热更新因此也只有一份。
 #[derive(Clone)]
 pub struct ApiCtx {
-    pub client: Arc<qaqh_client::Client>,
+    /// `None` = 没有连接（只有 [`crate::runtime::Runtime::stub_for_test`] 的测试
+    /// 替身会这样）。任务照常运行，取用连接时立刻返回 `Err`，而不是去碰 daemon。
+    pub client: Option<Arc<qaqh_client::Client>>,
 }
 
 impl ApiCtx {
+    /// 取出连接；没有连接时给出可读的错误（测试替身路径）。
+    fn client(&self) -> Result<&Arc<qaqh_client::Client>, String> {
+        self.client
+            .as_ref()
+            .ok_or_else(|| "无连接（测试替身）".to_string())
+    }
+
     /// 发送 Ringing 命令（返回权威类型的 ack）。
     ///
     /// T-01 阶段二后本仓不再持有协议镜像，故这里不再过桥——命令与回执都是
@@ -147,7 +156,7 @@ impl ApiCtx {
         command: qaqh_client::RingingCommand,
         options: qaqh_client::CommandOptions,
     ) -> Result<qaqh_client::RingingCommandAck, String> {
-        self.client
+        self.client()?
             .send_command(seed, command, options)
             .await
             .map_err(|e| e.to_string())
@@ -165,7 +174,7 @@ impl ApiCtx {
         limit: u32,
     ) -> Result<qaqh_client::TimelinePage, String> {
         // 类型已权威化：不再有过桥这一步，返回的就是 `qaqh_client` 的类型。
-        self.client
+        self.client()?
             .fetch_timeline_page(seed, before_index, Some(limit))
             .await
             .map_err(|e| e.to_string())
@@ -176,7 +185,47 @@ impl ApiCtx {
         &self,
         seed: &str,
     ) -> Result<qaqh_client::RingingSessionBootstrap, String> {
-        self.client.bootstrap(seed).await.map_err(|e| e.to_string())
+        self.client()?
+            .bootstrap(seed)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    /// 服务面查询（`session.list` / `session.activity` / `todo.status`…）。
+    pub async fn query(&self, request: QueryRequest) -> Result<serde_json::Value, String> {
+        self.client()?
+            .query(request)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    /// 服务面动作（`config.save` / `profile.apply` …）。
+    pub async fn action(&self, request: ActionRequest) -> Result<serde_json::Value, String> {
+        self.client()?
+            .action(request)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    /// 命令回执轮询（ACK ≠ 完成）。
+    pub async fn command_status(&self, command_id: &str) -> Result<RingingCommandStatus, String> {
+        self.client()?
+            .command_status(command_id)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    /// 上传附件内容（multipart 组装在 client 侧）。
+    pub async fn upload_content(
+        &self,
+        seed: &str,
+        media_type: &str,
+        data: Vec<u8>,
+    ) -> Result<qaqh_client::ContentRef, String> {
+        self.client()?
+            .upload_content(seed, media_type, data)
+            .await
+            .map_err(|e| e.to_string())
     }
 }
 
@@ -184,7 +233,109 @@ impl ApiCtx {
 pub enum ConnPhase {
     Opening,
     Ready,
+    /// 连接本身还在（session 已协商、可继续收发），但有流报了非致命问题
+    /// （断开重连中 / timeline 流结束等）。
+    ///
+    /// 与 [`ConnPhase::Lost`] 是**两件事**：`Lost` 是「连不上 daemon，需要
+    /// 手动重连」，这里是「daemon 还连着，某条流在自愈」。所以它不能复用
+    /// `Ready`（告警会被静默丢弃，用户无从得知流有问题），也不能落到 `Lost`
+    /// （会误导用户去按 Ctrl+R 重连一条健康的连接）。
+    ReadyWithIssue,
     Lost,
+}
+
+impl ConnPhase {
+    /// 结合「当前是否有流处于告警」重算相位（纯函数，便于回归测试）。
+    ///
+    /// 判据：
+    /// - `Ready` 家族：有告警 → `ReadyWithIssue`，告警清空 → `Ready`。
+    /// - `Lost` → 不变：失联的原因比流告警更重要，相位本身也已可见。
+    /// - `Opening` → 不变：还没协商出 session，「连接中」已经表达了状态。
+    pub fn with_stream_issues(&self, any_issue: bool) -> ConnPhase {
+        match self {
+            ConnPhase::Ready | ConnPhase::ReadyWithIssue => {
+                if any_issue {
+                    ConnPhase::ReadyWithIssue
+                } else {
+                    ConnPhase::Ready
+                }
+            }
+            other => other.clone(),
+        }
+    }
+}
+
+/// 「当前有哪些流在告警」的账本：流身份 → 最近一条告警文案。
+///
+/// **按流记账，而不是一个全局布尔**：某条 timeline 流断开的同时另一条频道流恰好
+/// 重连成功，不能把前者的告警当成「一切正常」清掉（反向顺序下文案还会串成后者）。
+///
+/// 同一 `StreamKey` 重复告警只**覆盖**文案并把它挪到最新，不堆积条目。
+#[derive(Debug, Clone, Default)]
+pub struct StreamIssues {
+    /// 最近告警在后的顺序（[`StreamIssues::latest`] 取末位）。
+    order: Vec<StreamKey>,
+    messages: HashMap<StreamKey, String>,
+}
+
+impl StreamIssues {
+    /// 记一条告警；返回该流此前是否**不在**告警集合里。
+    ///
+    /// 返回值是**为可测性保留的观察值**：生产代码不看它（调用点只关心账本状态，
+    /// 相位由 [`reconcile_conn`] 统一推导），测试用它断言「同一条流重复告警不算
+    /// 新增」。不要把它当成「调用方需要知道是否新增」的契约。
+    pub fn raise(&mut self, stream: StreamKey, message: String) -> bool {
+        let already = self.messages.contains_key(&stream);
+        if already {
+            // 同一条流重复告警：只覆盖文案并挪到最新，顺序表里不堆积重复项。
+            self.order.retain(|k| k != &stream);
+        }
+        self.order.push(stream.clone());
+        self.messages.insert(stream, message);
+        !already
+    }
+
+    /// 该流恢复：只移除**它自己**那条告警；返回它此前是否在告警集合里
+    /// （同样是为可测性保留的观察值，生产代码不看）。
+    pub fn clear(&mut self, stream: &StreamKey) -> bool {
+        let existed = self.messages.remove(stream).is_some();
+        if existed {
+            self.order.retain(|k| k != stream);
+        }
+        existed
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.messages.is_empty()
+    }
+
+    /// 最近一条告警文案（状态栏展示用）。
+    pub fn latest(&self) -> Option<&str> {
+        let stream = self.order.last()?;
+        self.messages.get(stream).map(String::as_str)
+    }
+}
+
+/// 由「当前有哪些流在告警」重算可见的连接指示（纯函数，便于回归测试）。
+///
+/// 返回 `(相位, conn_error)`：
+/// - 相位由 [`ConnPhase::with_stream_issues`] 给出；
+/// - `Lost` 相位下 `conn_error` **原样保留**——那是「为什么失联」，比「某条流在
+///   重连」重要，不能被流告警覆盖（失联分支靠它给用户原因）；
+/// - 其余相位下 `conn_error` 恒等于账本里最近一条告警（没有告警就是 `None`），
+///   所以某条流恢复后不会残留它自己的旧文案。
+pub fn reconcile_conn(
+    phase: &ConnPhase,
+    issues: &StreamIssues,
+    conn_error: Option<String>,
+) -> (ConnPhase, Option<String>) {
+    let phase = phase.with_stream_issues(!issues.is_empty());
+    let error = if phase == ConnPhase::Lost {
+        conn_error
+    } else {
+        issues.latest().map(str::to_owned)
+    };
+    (phase, error)
 }
 
 #[derive(Debug, Clone)]
@@ -226,6 +377,94 @@ pub enum Overlay {
     },
 }
 
+impl ConfirmAction {
+    /// 该确认动作最终作用的会话 seed。
+    pub fn seed(&self) -> &str {
+        match self {
+            ConfirmAction::DeleteSession(seed)
+            | ConfirmAction::ArchiveSession(seed)
+            | ConfirmAction::CloseTab(seed) => seed,
+        }
+    }
+}
+
+impl Overlay {
+    /// 该 overlay 绑定的会话 seed；`None` = 全局 overlay，与活动标签无关。
+    ///
+    /// 判据是「它的确认/提交动作会落到哪个 seed 上」，不是「它看起来像不像弹窗」：
+    ///
+    /// - **seed 绑定**：`Confirm`（三个动作都携带 seed，按 `y` 直接作用于那个
+    ///   seed）与 `AttachPath`（附件上传落在某个会话上）。切标签后它们就是过期
+    ///   指令——确认类 overlay 绝不能跨标签生效。
+    /// - **全局**：`SessionList`（daemon 全局会话列表）、`Settings`（全局配置）、
+    ///   `Help`、`CwdInput`（`/new` 的 cwd，此时还没有 seed）。它们与当前标签
+    ///   无关，切标签**不该**把它们关掉——一刀切清空会误伤设置页这类全局面板。
+    ///
+    /// `AttachPath` 的判据与执行必须同源：它的上传目标由
+    /// [`Overlay::attach_submit`] 给出，取的就是这里的 `seed`（不是提交那一刻的
+    /// 活动标签）。此前 `bound_seed()` 说「属于 seed X」而上传查 `active_seed()`，
+    /// 两条路径结论相反，`AttachPath.seed` 沦为死字段。
+    pub fn bound_seed(&self) -> Option<&str> {
+        match self {
+            Overlay::Confirm { action } => Some(action.seed()),
+            Overlay::AttachPath { seed, .. } => Some(seed),
+            Overlay::SessionList { .. }
+            | Overlay::Settings(_)
+            | Overlay::Help
+            | Overlay::CwdInput { .. } => None,
+        }
+    }
+
+    /// `AttachPath` 按 Enter 的提交动作：目标 seed + 去空白后的路径。
+    ///
+    /// 取 `AttachPath` 的**字段**而不是 `&self`：只有 Enter 分支需要它，且只可能是
+    /// `AttachPath`——放在 `overlay_key` 的 `match` 之前会让每次按键（包括输入路径
+    /// 的每个字符）都白做一次 `String` 分配，也让「只有 AttachPath 有这个动作」
+    /// 这件事变成运行期判断。
+    ///
+    /// - 目标 seed **恒取 overlay 自己存的那个**——这是附件目标 seed 的单一事实源，
+    ///   与 [`Overlay::bound_seed`] 的判据一致（判据说属于谁，执行就落在谁身上）；
+    /// - 空路径（或纯空白）→ `None`：不提交。
+    pub fn attach_submit(input: &[char], seed: &str) -> Option<AttachSubmit> {
+        let path = input.iter().collect::<String>().trim().to_owned();
+        (!path.is_empty()).then(|| AttachSubmit {
+            target_seed: seed.to_owned(),
+            path,
+        })
+    }
+}
+
+/// 附件上传的目标：**只能**由 [`Overlay::attach_submit`] 产生（`overlay_key` 的
+/// `AttachPath` Enter 分支是唯一调用点）。
+///
+/// 这样「上传挂到哪个会话」不可能与 overlay 的身份漂移：上传入口拿不到
+/// `active_seed()`，只有一个来源。判据（`bound_seed()`）、剪枝（切标签即关闭）、
+/// 执行（用存量 seed 上传）三条路径由此自洽。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttachSubmit {
+    target_seed: String,
+    path: String,
+}
+
+impl AttachSubmit {
+    /// 拆成 `(目标 seed, 路径)`——上传入口只通过它取值。
+    pub fn into_parts(self) -> (String, String) {
+        (self.target_seed, self.path)
+    }
+}
+
+/// 清掉「不属于 `seed`」的 seed 绑定 overlay（纯函数，便于回归测试）。
+///
+/// 全局 overlay（`bound_seed() == None`）原样保留且保持相对顺序；删掉的若是栈顶，
+/// 下面那层自然接管——渲染与按键路由都取 `overlays.last()`，两处一致。
+pub fn prune_seed_bound_overlays(overlays: &mut Vec<Overlay>, seed: Option<&str>) {
+    overlays.retain(|o| match (o.bound_seed(), seed) {
+        (None, _) => true,
+        (Some(bound), Some(active)) => bound == active,
+        (Some(_), None) => false,
+    });
+}
+
 use self::settings::{FieldKind, SettingsState};
 
 pub struct App {
@@ -241,6 +480,8 @@ pub struct App {
     pub conn_phase: ConnPhase,
     pub epoch: String,
     pub conn_error: Option<String>,
+    /// 处于告警状态的流账本（相位与 `conn_error` 由它推导，见 [`reconcile_conn`]）。
+    pub stream_issues: StreamIssues,
 
     pub toasts: VecDeque<Toast>,
     /// 新建会话的 command_id → 发起时间（等 causation_id 关联）。
@@ -291,6 +532,19 @@ impl App {
         )
     }
 
+    /// **测试用构造**：没有连接的 `Runtime` 替身 + 一条可观察的 `AppMsg` 通道。
+    ///
+    /// 返回 `(App, rx)`：测试从 `rx` 读回后台任务投递的结果（例如
+    /// `ActionResult::Uploaded { seed, .. }` 里的归属 seed）。只用于 `App` 层
+    /// 按键/事件路径的单测——`overlay_key`、`handle`、`upload_attachment` 这些
+    /// 以前只能靠纯函数间接覆盖的路径。
+    #[cfg(test)]
+    pub fn new_for_test() -> (Self, tokio::sync::mpsc::UnboundedReceiver<AppMsg>) {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let app = Self::new_with_cwd(Runtime::stub_for_test(), tx, None);
+        (app, rx)
+    }
+
     pub fn new_with_cwd(
         runtime: Arc<Runtime>,
         msg_tx: tokio::sync::mpsc::UnboundedSender<AppMsg>,
@@ -307,6 +561,7 @@ impl App {
             conn_phase: ConnPhase::Opening,
             epoch: String::new(),
             conn_error: None,
+            stream_issues: StreamIssues::default(),
             toasts: VecDeque::new(),
             pending_creates: HashMap::new(),
             session_list_cache: Vec::new(),
@@ -331,23 +586,6 @@ impl App {
             inspect: None,
             subagent_seeds: HashSet::new(),
         }
-    }
-
-    /// 测试用 App：运行时为不连 daemon 的桩（[`Runtime::stub_for_test`]）。
-    /// 需要回归的判据都在 app 侧状态上（如被拒 ack 的 pending create 撤销），
-    /// 无需真 daemon。
-    ///
-    /// 桩没有 `Client`：测试**不得**触发 [`App::spawn_api`]（会 panic）。
-    /// 需要前置状态时直接写 `pending_creates` / `sessions` 等字段。
-    #[cfg(test)]
-    pub(crate) fn new_for_test() -> Self {
-        let (app_tx, _app_rx) = tokio::sync::mpsc::unbounded_channel();
-        let (rt_tx, _rt_rx) = tokio::sync::mpsc::unbounded_channel();
-        Self::new_with_cwd(
-            Runtime::stub_for_test(rt_tx),
-            app_tx,
-            Some("/tmp".to_string()),
-        )
     }
 
     // ───────────────────────── 消息入口 ─────────────────────────
@@ -567,6 +805,10 @@ impl App {
                     self.epoch = epoch.clone();
                 }
                 self.conn_error = None;
+                // 新 session（首次协商 / 租约重建 / daemon 重启）：所有流都随旧
+                // client 作废，告警账本整体清空——否则旧代遗留的 timeline 告警
+                // 会永久挂在状态栏上（那条流再也不会发 `Open` 来撤自己）。
+                self.stream_issues = StreamIssues::default();
                 // 重 open（租约重建 / daemon 重启）：重新 attach 全部 open seeds
                 // 并 re-baseline；epoch 变化时 timeline 流自行重放。
                 // 子代理 seed 走 SessionAttach（无 actor 副作用，运行中的子代理
@@ -629,10 +871,29 @@ impl App {
                 self.conn_phase = ConnPhase::Lost;
                 self.conn_error = Some(reason);
             }
-            ConnEvent::StreamIssue { error } => {
-                self.conn_error = Some(error);
+            ConnEvent::StreamIssue { stream, error } => {
+                // 按流记账：只把**这条**流标成告警，相位/文案由账本统一推导。
+                self.stream_issues.raise(stream, error);
+                self.reconcile_conn_view();
+            }
+            ConnEvent::StreamRecovered { stream } => {
+                // 只撤这条流自己的告警——别的流仍在自愈时必须继续显示告警，
+                // 否则「A 流断开 + B 流重连成功」会把 A 的告警静默吞掉。
+                self.stream_issues.clear(&stream);
+                self.reconcile_conn_view();
             }
         }
+    }
+
+    /// 依据流告警账本刷新相位与 `conn_error`（唯一入口，规则见 [`reconcile_conn`]）。
+    fn reconcile_conn_view(&mut self) {
+        let (phase, error) = reconcile_conn(
+            &self.conn_phase,
+            &self.stream_issues,
+            self.conn_error.take(),
+        );
+        self.conn_phase = phase;
+        self.conn_error = error;
     }
 
     fn handle_envelope(&mut self, env: qaqh_client::RingingEventEnvelope) {
@@ -1035,9 +1296,9 @@ impl App {
                 ..
             } => {
                 // 去重：同一 tool_call 只保留一个面板。
-                sess.pending_permissions
-                    .retain(|p| p.tool_call_id != tool_call_id);
-                sess.pending_permissions.push(PermissionPanel {
+                // 且已解决过的 tool_call 不再入队——补投（`ToolStarted` 之后才到的
+                // 权限请求）不得复活幽灵面板，见 `SessionState::queue_permission`。
+                sess.queue_permission(PermissionPanel {
                     tool_call_id,
                     tool_name,
                     reason,
@@ -1053,16 +1314,14 @@ impl App {
             ToolEvent::ToolStarted {
                 tool_call_id, name, ..
             } => {
-                sess.pending_permissions
-                    .retain(|p| p.tool_call_id != tool_call_id);
+                sess.resolve_permission(&tool_call_id);
                 if let Some(s) = sess.streaming.as_mut() {
                     s.phase = StreamPhase::ToolCalling;
                     s.tool_name = Some(name);
                 }
             }
             ToolEvent::ToolFinished { tool_call_id, .. } => {
-                sess.pending_permissions
-                    .retain(|p| p.tool_call_id != tool_call_id);
+                sess.resolve_permission(&tool_call_id);
             }
             ToolEvent::ToolNotice { level, message, .. } => {
                 self.toast(level, format!("[tool] {message}"));
@@ -1124,8 +1383,10 @@ impl App {
                         }
                         let tool = b.tool_state().unwrap_or_default();
                         if let Some(perm) = tool.pending_permission {
-                            // bootstrap 恢复挂起权限（详情等 tool 事件补全）。
-                            sess.pending_permissions.push(PermissionPanel {
+                            // bootstrap 恢复挂起权限（详情等 tool 事件补全）。只补不换：
+                            // 快照可能落后于实时事件，不许用「（恢复中）」占位符覆盖
+                            // 已有面板的详情，也不许复活已解决的 id。
+                            sess.restore_permission_from_snapshot(PermissionPanel {
                                 tool_call_id: perm,
                                 tool_name: "（恢复中）".into(),
                                 reason: String::new(),
@@ -1248,6 +1509,13 @@ impl App {
                             content,
                         });
                         self.toast(NoticeLevel::Info, "附件已上传".to_string());
+                    } else {
+                        // 上传途中目标会话被关闭（异步竞态）：上传成功也无处可挂，
+                        // 必须说出来而不是静默丢弃。
+                        self.toast(
+                            NoticeLevel::Error,
+                            format!("附件已上传但目标会话已关闭：{seed}"),
+                        );
                     }
                 }
                 Err(e) => {
@@ -1339,13 +1607,16 @@ impl App {
 
     /// app → daemon 异步出口的唯一入口：集中克隆 client/msg_tx 并 spawn。
     /// 今后如需统一超时/退避/取消/指标，只需叠加在此处。
+    ///
+    /// 没有连接（测试替身）时**任务照起**：取用连接的那一步会返回 `Err`，结果照常
+    /// 经 `AppMsg::Action` 回来——「上传目标是哪个 seed」这类归属信息因此仍可断言。
     pub(super) fn spawn_api<F, Fut>(&self, task: F)
     where
         F: FnOnce(ApiCtx, tokio::sync::mpsc::UnboundedSender<AppMsg>) -> Fut + Send + 'static,
         Fut: std::future::Future<Output = ()> + Send,
     {
         let api = ApiCtx {
-            client: self.runtime.client(),
+            client: self.runtime.client_opt(),
         };
         let tx = self.msg_tx.clone();
         tokio::spawn(async move { task(api, tx).await });
@@ -1431,6 +1702,8 @@ impl App {
             if self.inspecting() {
                 self.exit_inspect();
             }
+            // 上一条标签遗留的确认/附件 overlay 属于旧 seed：不能跟着切过来。
+            self.prune_overlays_for_active_seed();
             return;
         }
 
@@ -1572,7 +1845,7 @@ mod tests {
     /// 旧代码 → 本测试红，实测残留 `["cmd-create-1"]`。
     #[test]
     fn rejected_create_ack_from_handler_clears_pending_create() {
-        let mut app = App::new_for_test();
+        let (mut app, _rx) = App::new_for_test();
         app.pending_creates
             .insert("cmd-create-1".to_string(), Instant::now());
 
@@ -1603,7 +1876,7 @@ mod tests {
     /// 新建的标签页永不自动打开。
     #[test]
     fn accepted_create_ack_from_handler_keeps_pending_create() {
-        let mut app = App::new_for_test();
+        let (mut app, _rx) = App::new_for_test();
         app.pending_creates
             .insert("cmd-create-2".to_string(), Instant::now());
 
@@ -1626,7 +1899,7 @@ mod tests {
     /// 反向闸（同一条 handler）：别的命令被拒不得误伤新建会话的 pending。
     #[test]
     fn rejected_ack_for_other_command_from_handler_keeps_pending_create() {
-        let mut app = App::new_for_test();
+        let (mut app, _rx) = App::new_for_test();
         app.pending_creates
             .insert("cmd-create-3".to_string(), Instant::now());
 
@@ -1640,6 +1913,280 @@ mod tests {
             app.pending_creates.len(),
             1,
             "无关命令的拒绝不得撤销 pending create"
+        );
+    }
+
+    fn channel(c: qaqh_client::Channel) -> StreamKey {
+        StreamKey::Channel(c)
+    }
+
+    fn timeline(seed: &str) -> StreamKey {
+        StreamKey::Timeline(seed.into())
+    }
+
+    /// 阻断项 1 的回归：告警必须**按流**记账。
+    ///
+    /// 场景：seed A 的 timeline 流断开（告警），随后另一条流（session 频道）重连
+    /// 成功（恢复信号）——A 的告警必须还在、相位仍是 `ReadyWithIssue`，文案也不能
+    /// 串成后者的。证伪方式：把账本退回「一个全局布尔 + 直接清 conn_error」（旧
+    /// 行为），本测试会变成 `Ready` 且无文案。
+    #[test]
+    fn stream_alert_is_cleared_only_by_its_own_recovery() {
+        let mut issues = StreamIssues::default();
+        issues.raise(timeline("A"), "timeline[A] 断开，3000ms 后重连".into());
+        let (phase, error) = reconcile_conn(&ConnPhase::Ready, &issues, None);
+        assert_eq!(phase, ConnPhase::ReadyWithIssue);
+        assert!(
+            error.as_deref().unwrap_or_default().contains("timeline[A]"),
+            "首次告警文案必须可见：{error:?}"
+        );
+
+        // 另一条流恢复：不能把 A 的告警吞掉。
+        assert!(
+            !issues.clear(&channel(qaqh_client::Channel::Conversation)),
+            "这条流本来就没有告警，clear 应当报告「原本不在账本里」"
+        );
+        let (phase, error) = reconcile_conn(&phase, &issues, error);
+        assert_eq!(
+            phase,
+            ConnPhase::ReadyWithIssue,
+            "别的流重连成功不得清掉 A 的告警"
+        );
+        assert!(
+            error.as_deref().unwrap_or_default().contains("timeline[A]"),
+            "文案不得串成别人的：{error:?}"
+        );
+
+        // A 自己恢复：这才是清空的时机。
+        assert!(issues.clear(&timeline("A")), "A 此前在账本里");
+        let (phase, error) = reconcile_conn(&phase, &issues, error);
+        assert_eq!(phase, ConnPhase::Ready);
+        assert!(error.is_none());
+    }
+
+    /// 多条流同时告警：全部清完才回到 `Ready`，文案取最近一条。
+    #[test]
+    fn ready_is_restored_only_when_every_stream_recovers() {
+        let mut issues = StreamIssues::default();
+        issues.raise(
+            channel(qaqh_client::Channel::Control),
+            "control 断开".into(),
+        );
+        issues.raise(timeline("A"), "timeline[A] 断开".into());
+        let (phase, error) = reconcile_conn(&ConnPhase::Ready, &issues, None);
+        assert_eq!(phase, ConnPhase::ReadyWithIssue);
+        assert_eq!(error.as_deref(), Some("timeline[A] 断开"), "取最近一条");
+
+        issues.clear(&channel(qaqh_client::Channel::Control));
+        let (phase, error) = reconcile_conn(&phase, &issues, error);
+        assert_eq!(phase, ConnPhase::ReadyWithIssue, "还剩 timeline[A] 没恢复");
+        assert_eq!(
+            error.as_deref(),
+            Some("timeline[A] 断开"),
+            "不能残留已经恢复那条流的文案"
+        );
+
+        issues.clear(&timeline("A"));
+        let (phase, error) = reconcile_conn(&phase, &issues, error);
+        assert_eq!(phase, ConnPhase::Ready);
+        assert!(error.is_none());
+    }
+
+    /// 同一 `StreamKey` 重复告警只覆盖文案，不堆积条目。
+    #[test]
+    fn repeated_issue_for_same_stream_overwrites() {
+        let mut issues = StreamIssues::default();
+        let key = timeline("A");
+        assert!(
+            issues.raise(key.clone(), "第一次".into()),
+            "首次算新出现的流"
+        );
+        assert!(
+            !issues.raise(key.clone(), "第二次".into()),
+            "同一条流重复告警不算新增"
+        );
+        assert_eq!(issues.messages.len(), 1, "账本条目不堆积");
+        assert_eq!(issues.order.len(), 1, "顺序表也不堆积");
+        assert_eq!(issues.latest(), Some("第二次"), "覆盖为最新文案");
+    }
+
+    /// 建议项 4：`Lost` 期间收到流事件，相位仍是 `Lost`，失联原因不被覆盖/清掉。
+    #[test]
+    fn lost_phase_keeps_its_reason_across_stream_events() {
+        let mut issues = StreamIssues::default();
+        issues.raise(timeline("A"), "timeline[A] 断开".into());
+        let reason = "与 daemon 失联（20s 内无任何频道连接）——按 R 重连".to_string();
+
+        let (phase, error) = reconcile_conn(&ConnPhase::Lost, &issues, Some(reason.clone()));
+        assert_eq!(phase, ConnPhase::Lost);
+        assert_eq!(
+            error.as_deref(),
+            Some(reason.as_str()),
+            "流告警不得覆盖失联原因"
+        );
+
+        // 某条流恢复：失联相位与原因都不动。
+        issues.clear(&timeline("A"));
+        let (phase, error) = reconcile_conn(&phase, &issues, error);
+        assert_eq!(phase, ConnPhase::Lost);
+        assert!(
+            error.is_some(),
+            "Lost 分支靠 conn_error 给用户原因，不许被流恢复信号清掉"
+        );
+    }
+
+    /// `Opening`：流告警不改相位（「连接中」已经表达了状态）。
+    #[test]
+    fn opening_phase_ignores_stream_alerts() {
+        let mut issues = StreamIssues::default();
+        issues.raise(channel(qaqh_client::Channel::Tool), "tool 断开".into());
+        let (phase, _) = reconcile_conn(&ConnPhase::Opening, &issues, None);
+        assert_eq!(phase, ConnPhase::Opening);
+    }
+
+    // ───────── App 层接线（端到端：经 App::handle 投递真实事件） ─────────
+
+    use ratatui::crossterm::event::{KeyCode, KeyModifiers};
+
+    fn conn(ev: ConnEvent) -> AppMsg {
+        AppMsg::Runtime(RuntimeMsg::Conn(ev))
+    }
+
+    fn key(code: KeyCode, modifiers: KeyModifiers) -> AppMsg {
+        AppMsg::Key(KeyEvent::new(code, modifiers))
+    }
+
+    fn app_with_tabs(
+        seeds: &[&str],
+        active: usize,
+    ) -> (App, tokio::sync::mpsc::UnboundedReceiver<AppMsg>) {
+        let (mut app, rx) = App::new_for_test();
+        for seed in seeds {
+            app.tabs.push((*seed).to_string());
+            app.sessions
+                .insert((*seed).to_string(), SessionState::new((*seed).to_string()));
+        }
+        app.active = active;
+        (app, rx)
+    }
+
+    /// **App 层接线**（复审第一轮「建议 4」的原话）：`Lost` 期间收到流事件，
+    /// 相位仍是 `Lost`、失联原因既不被清掉也不被覆盖。
+    ///
+    /// 证伪方式：把 `Lost` 分支改成「先清 conn_error」（旧行为）、或让
+    /// `reconcile_conn_view` 无条件取账本文案（去掉 `Lost` 保护）——两条断言变红。
+    #[test]
+    fn handle_conn_keeps_lost_reason_across_stream_events() {
+        let (mut app, _rx) = App::new_for_test();
+        let reason = "与 daemon 失联（20s 内无任何频道连接）——按 R 重连";
+
+        app.handle(conn(ConnEvent::Lost(reason.into())));
+        assert_eq!(app.conn_phase, ConnPhase::Lost);
+        assert_eq!(app.conn_error.as_deref(), Some(reason));
+
+        // 某条流重连成功：失联相位与原因都不许动。
+        app.handle(conn(ConnEvent::StreamRecovered {
+            stream: channel(qaqh_client::Channel::Control),
+        }));
+        assert_eq!(
+            app.conn_phase,
+            ConnPhase::Lost,
+            "流恢复信号不得把失联相位抹成正常"
+        );
+        assert!(
+            app.conn_error.is_some(),
+            "Lost 分支靠 conn_error 给用户原因，不许被清掉"
+        );
+
+        // 新到的流告警同样不许覆盖失联原因。
+        app.handle(conn(ConnEvent::StreamIssue {
+            stream: timeline("A"),
+            error: "timeline[A] 断开，3000ms 后重连".into(),
+        }));
+        assert_eq!(app.conn_phase, ConnPhase::Lost);
+        assert_eq!(
+            app.conn_error.as_deref(),
+            Some(reason),
+            "流告警不得覆盖失联原因"
+        );
+    }
+
+    /// **App 层接线**：新 session（`Ready`）清空流告警账本。
+    ///
+    /// 不这么做的话，旧 client 遗留的 timeline 告警（那条流再也不会发 `Open` 来撤
+    /// 自己）会把相位永久钉在 `ReadyWithIssue`。此前这一行只有「接线靠编译」的保证。
+    ///
+    /// 证伪方式：删掉 `Ready` 分支里的 `self.stream_issues = StreamIssues::default();`
+    /// ——`stream_issues.is_empty()` 断言立刻变红（相位也回不到 `Ready`）。
+    #[test]
+    fn handle_conn_ready_clears_the_stream_issue_ledger() {
+        let (mut app, _rx) = App::new_for_test();
+
+        // 连接就绪 → 某条流告警 → 相位进入 ReadyWithIssue。
+        app.handle(conn(ConnEvent::Ready {
+            epoch: "e1".into(),
+            epoch_changed: false,
+        }));
+        assert_eq!(app.conn_phase, ConnPhase::Ready);
+        app.handle(conn(ConnEvent::StreamIssue {
+            stream: timeline("A"),
+            error: "timeline[A] 断开".into(),
+        }));
+        assert_eq!(app.conn_phase, ConnPhase::ReadyWithIssue);
+        assert!(!app.stream_issues.is_empty());
+
+        // 新 session（epoch 变化）：账本整体作废，相位回 Ready。
+        app.handle(conn(ConnEvent::Ready {
+            epoch: "e2".into(),
+            epoch_changed: true,
+        }));
+        assert!(
+            app.stream_issues.is_empty(),
+            "新 session 后旧代遗留的流告警必须清空"
+        );
+        assert_eq!(app.conn_phase, ConnPhase::Ready);
+        assert!(app.conn_error.is_none());
+    }
+
+    /// **缺陷 2 的端到端版**：按 Alt+数字切标签时，绑旧 seed 的 `Confirm` 必须真的
+    /// 从栈里消失，全局层留下；随后按 `y` 不会作用到旧 seed。
+    ///
+    /// 证伪方式：去掉 Alt+tab 分支里的 `prune_overlays_for_active_seed()`——确认框
+    /// 留在栈里，`y` 会把 `CloseTab("A")` 落到 A 上（A 从 tabs 消失）。
+    ///
+    /// 断言分工（避免高估本用例）：前两条（栈里没有确认框、全局层留下）是**不变量**，
+    /// 同一个变异下先红；最后那条按 `y` 是**后果**断言，说明这个不变量坏了会怎样伤害
+    /// 用户，它不会独立于前两条失败。
+    #[test]
+    fn alt_tab_prunes_the_previous_seeds_confirm_overlay() {
+        let (mut app, _rx) = app_with_tabs(&["A", "B"], 0);
+        // Ctrl+W 的确认框（绑 A）+ 一个全局层（帮助）——全局层不许被误伤。
+        app.overlays.push(Overlay::Confirm {
+            action: ConfirmAction::CloseTab("A".into()),
+        });
+        app.overlays.push(Overlay::Help);
+
+        // Alt+2 → 切到标签 B
+        app.handle(key(KeyCode::Char('2'), KeyModifiers::ALT));
+        assert_eq!(app.active, 1, "Alt+2 应切到标签 B");
+        assert!(
+            !app.overlays
+                .iter()
+                .any(|o| matches!(o, Overlay::Confirm { .. })),
+            "旧 seed 的确认框必须被剪掉：{:?}",
+            app.overlays
+        );
+        assert!(
+            matches!(app.overlays.as_slice(), [Overlay::Help]),
+            "全局层必须留下：{:?}",
+            app.overlays
+        );
+
+        // 再按 y：确认框已不在栈里，不该关掉 A。
+        app.handle(key(KeyCode::Char('y'), KeyModifiers::NONE));
+        assert!(
+            app.tabs.iter().any(|t| t == "A"),
+            "切标签后按 y 不得作用到旧 seed 的确认动作（A 被关了）"
         );
     }
 }

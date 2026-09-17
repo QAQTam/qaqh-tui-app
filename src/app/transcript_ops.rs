@@ -154,10 +154,8 @@ impl App {
                     for _ in 0..30 {
                         tokio::time::sleep(Duration::from_millis(100)).await;
                         if let Ok(status) = api
-                            .client
                             .command_status(&command_id)
                             .await
-                            .map_err(|e| e.to_string())
                             // 终态 = 成功/失败/拒绝（与旧镜像的 `is_terminal` 同义；
                             // 权威类型不提供该辅助方法）。
                             && matches!(

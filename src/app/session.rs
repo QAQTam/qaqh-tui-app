@@ -1,6 +1,6 @@
 //! 单会话状态：timeline 模型、流式相位、挂起交互面板、composer、滚动。
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -138,6 +138,45 @@ pub struct PermissionPanel {
     pub risk: PermissionRisk,
     pub consequence: String,
     pub trust_folder: bool,
+}
+
+/// 「已经解决掉」的权限请求 id 历史（有界 FIFO）。
+///
+/// 为什么需要它：daemon 的三个频道各自投递，`ToolPermissionRequested` 完全可能
+/// 在 `ToolStarted` **之后**才到（补投/乱序）。旧实现只按 tool_call_id 从
+/// `pending_permissions` 里 `retain` 再 `push`，于是补投会把已经应答过的请求
+/// 重新塞回去——用户看到一个「幽灵面板」，而 `active_permission()` 取
+/// `pending_permissions.first()`，它还会把真正该处理的 ask 挤到后面。
+///
+/// 有界的原因：需要记住的只是「同一个 tool_call 的事件乱序窗口」，量级是个位数；
+/// [`RespondedPermissions::CAP`] 给到 256 足够覆盖任何现实的补投，同时保证集合
+/// 不随会话长度无界增长。超出容量时淘汰最旧的 id（那时它的补投窗口早已关闭）。
+/// 会话关闭时整个 `SessionState` 被移除，历史随之丢弃，不跨会话泄漏。
+#[derive(Debug, Clone, Default)]
+pub struct RespondedPermissions {
+    seen: HashSet<String>,
+    order: VecDeque<String>,
+}
+
+impl RespondedPermissions {
+    /// 容量上限（见类型注释）。
+    pub const CAP: usize = 256;
+
+    pub fn insert(&mut self, tool_call_id: &str) {
+        if !self.seen.insert(tool_call_id.to_owned()) {
+            return;
+        }
+        self.order.push_back(tool_call_id.to_owned());
+        while self.order.len() > Self::CAP {
+            if let Some(oldest) = self.order.pop_front() {
+                self.seen.remove(&oldest);
+            }
+        }
+    }
+
+    pub fn contains(&self, tool_call_id: &str) -> bool {
+        self.seen.contains(tool_call_id)
+    }
 }
 
 // ───────────────────────── Composer ─────────────────────────
@@ -550,6 +589,8 @@ pub struct SessionState {
     pub pending_ask: Option<AskPanel>,
     pub pending_plan: Option<PlanPanel>,
     pub pending_permissions: Vec<PermissionPanel>,
+    /// 已解决的权限请求 id（防「幽灵面板」补投，见 [`RespondedPermissions`]）。
+    pub responded_permissions: RespondedPermissions,
     pub skills: Option<SkillsStatus>,
     /// workspace 面板数据（bootstrap control state + DashboardSnapshot 推送）。
     pub dashboard: Option<qaqh_client::DomainDashboardSnapshot>,
@@ -591,6 +632,7 @@ impl SessionState {
             pending_ask: None,
             pending_plan: None,
             pending_permissions: Vec::new(),
+            responded_permissions: RespondedPermissions::default(),
             skills: None,
             dashboard: None,
             compact_anim: None,
@@ -630,6 +672,58 @@ impl SessionState {
     /// 优先级：permission > ask > plan（winui 语义）。
     pub fn active_permission(&self) -> Option<&PermissionPanel> {
         self.pending_permissions.first()
+    }
+
+    /// **实时**权限请求的入队口（`ToolPermissionRequested`）：已解决过的
+    /// tool_call_id 不再入队，同一 id 重复到达时以最新一条替换（详情靠后续
+    /// tool 事件补全）。
+    ///
+    /// bootstrap 快照恢复**不走这里**——快照是旧视图，走
+    /// [`SessionState::restore_permission_from_snapshot`]（只补不换，免得用
+    /// 「（恢复中）」占位符覆盖实时事件带来的详情）。两条路径共用「已解决的 id
+    /// 不再入队」这一条判据（都查 [`RespondedPermissions`]）。
+    ///
+    /// 返回是否入队（`false` = 已解决，被拒）。生产代码不需要这个值，保留是为了
+    /// 让测试能直接断言「补投被丢弃」。
+    pub fn queue_permission(&mut self, panel: PermissionPanel) -> bool {
+        if self.responded_permissions.contains(&panel.tool_call_id) {
+            return false;
+        }
+        self.pending_permissions
+            .retain(|p| p.tool_call_id != panel.tool_call_id);
+        self.pending_permissions.push(panel);
+        true
+    }
+
+    /// 权限已解决（用户应答 / 工具已开始 / 已结束）：面板下架并记入历史。
+    pub fn resolve_permission(&mut self, tool_call_id: &str) {
+        self.pending_permissions
+            .retain(|p| p.tool_call_id != tool_call_id);
+        self.responded_permissions.insert(tool_call_id);
+    }
+
+    /// bootstrap 快照恢复挂起权限：**只补不换**。
+    ///
+    /// 与实时事件入口（[`SessionState::queue_permission`]）的区别在「同 id 已存在」
+    /// 时怎么办：快照可能是**旧**视图（`tool_state` 的 pending 字段只带 id），
+    /// 用它覆盖实时事件带来的面板会把工具名/理由/风险等级换成「（恢复中）」占位符，
+    /// 还会把该面板挪到队尾、改变 `active_permission()` 的优先级。所以这里只在
+    /// 「内存里没有这个 id」时补一条；已解决的 id 同样不再入队。
+    ///
+    /// 返回是否真的补了面板。
+    pub fn restore_permission_from_snapshot(&mut self, panel: PermissionPanel) -> bool {
+        if self.responded_permissions.contains(&panel.tool_call_id) {
+            return false;
+        }
+        if self
+            .pending_permissions
+            .iter()
+            .any(|p| p.tool_call_id == panel.tool_call_id)
+        {
+            return false;
+        }
+        self.pending_permissions.push(panel);
+        true
     }
 
     pub fn is_waiting_user(&self) -> bool {
@@ -935,5 +1029,155 @@ mod tests {
         );
         sync_streaming_from_timeline_at(&mut s, now);
         assert_eq!(s.streaming.as_ref().map(|s| s.turn_id.as_str()), Some("t2"));
+    }
+
+    // ───────────── 权限面板：已响应后不得被补投复活（幽灵面板回归） ─────────────
+
+    fn perm(tool_call_id: &str) -> PermissionPanel {
+        PermissionPanel {
+            tool_call_id: tool_call_id.into(),
+            tool_name: "bash".into(),
+            reason: String::new(),
+            paths: Vec::new(),
+            category: PermissionCategory::Read,
+            level: 0,
+            risk: PermissionRisk::Medium,
+            consequence: String::new(),
+            trust_folder: false,
+        }
+    }
+
+    /// 回归：同一 tool_call_id 在已响应后不得重新入队。
+    ///
+    /// 证伪方式：把 `queue_permission` 里的 `responded_permissions.contains` 判断
+    /// 去掉（旧行为：只 retain + push）——`assert!(!...queue_permission(...))` 立刻
+    /// 变红，`active_permission()` 也会重新拿到那个幽灵面板。
+    #[test]
+    fn responded_permission_is_not_requeued() {
+        let mut s = SessionState::new("seed".into());
+        assert!(s.queue_permission(perm("c1")));
+        s.resolve_permission("c1"); // 用户按 a/d 应答
+        assert!(s.active_permission().is_none(), "应答后面板必须下架");
+
+        assert!(
+            !s.queue_permission(perm("c1")),
+            "已响应的 tool_call_id 不得重新入队"
+        );
+        assert!(s.active_permission().is_none(), "幽灵面板不许出现");
+        assert_ne!(s.activity_label(), "permission");
+
+        // 别的 tool_call 不受影响（集合是按 id 判定的，不是一刀切丢弃）。
+        assert!(s.queue_permission(perm("c2")));
+        assert_eq!(
+            s.active_permission().map(|p| p.tool_call_id.as_str()),
+            Some("c2")
+        );
+    }
+
+    /// 回归：真实事故序列——权限请求 → 工具已开始（面板下架）→ 权限请求补投到。
+    #[test]
+    fn late_permission_after_tool_started_does_not_resurrect_panel() {
+        let mut s = SessionState::new("seed".into());
+        assert!(s.queue_permission(perm("c1")));
+        // ToolStarted / ToolFinished 走的就是 resolve_permission。
+        s.resolve_permission("c1");
+        assert!(
+            !s.queue_permission(perm("c1")),
+            "补投必须被丢弃，否则它会挤掉真正该处理的 ask"
+        );
+        assert!(s.active_permission().is_none());
+    }
+
+    /// 反方向：没被解决过的同 id 重放仍然只保留一个面板，并刷新为最新一条。
+    #[test]
+    fn same_tool_call_redelivery_still_replaces_panel() {
+        let mut s = SessionState::new("seed".into());
+        assert!(s.queue_permission(perm("c1")));
+        let mut updated = perm("c1");
+        updated.reason = "新的理由".into();
+        assert!(s.queue_permission(updated));
+        assert_eq!(
+            s.pending_permissions.len(),
+            1,
+            "同一 tool_call 只留一个面板"
+        );
+        assert_eq!(
+            s.active_permission().map(|p| p.reason.as_str()),
+            Some("新的理由")
+        );
+    }
+
+    /// 历史必须有界（否则长会话里 `responded_permissions` 无界增长）。
+    ///
+    /// 这里直接读私有字段（同模块单测），不额外暴露只为测试存在的 API。
+    #[test]
+    fn responded_history_is_bounded() {
+        let mut hist = RespondedPermissions::default();
+        let total = RespondedPermissions::CAP + 32;
+        for i in 0..total {
+            hist.insert(&format!("c{i}"));
+        }
+        assert_eq!(hist.seen.len(), RespondedPermissions::CAP, "容量必须封顶");
+        assert!(
+            hist.contains(&format!("c{}", total - 1)),
+            "最新的 id 必须记住"
+        );
+        assert!(!hist.contains("c0"), "最旧的 id 被淘汰");
+        let oldest_survivor = format!("c{}", total - RespondedPermissions::CAP);
+
+        // 重复 insert 必须幂等：既不增长，也**不淘汰别的 id**。
+        // （只断言 `seen.len()` 是恒真的——`seen` 是 HashSet，重复插入本就不会变大；
+        // 判别力在顺序表上：把已存在的 id 当新条目 push 会挤掉最旧的幸存者。）
+        hist.insert(&format!("c{}", total - 1));
+        assert_eq!(hist.order.len(), RespondedPermissions::CAP, "顺序表不堆积");
+        assert!(
+            hist.contains(&oldest_survivor),
+            "重复 insert 不得淘汰别的 id（{oldest_survivor} 被挤掉了）"
+        );
+    }
+
+    /// 建议项 1（PR #20 二轮）：晚到的 bootstrap 快照「只补不换」。
+    ///
+    /// 证伪方式：把 `restore_permission_from_snapshot` 换回 `queue_permission`
+    /// （旧行为）——「已有面板不覆盖」与「详情不得被占位符降级」两条断言同时变红。
+    #[test]
+    fn late_snapshot_never_downgrades_live_panels() {
+        let mut s = SessionState::new("seed".into());
+        let mut live = perm("c1");
+        live.reason = "需要写文件".into();
+        live.risk = PermissionRisk::High;
+        assert!(s.queue_permission(live));
+        assert!(s.queue_permission(perm("c2")));
+
+        // 快照晚到：只带 c1，且只有「（恢复中）」占位详情。
+        let mut snapshot = perm("c1");
+        snapshot.tool_name = "（恢复中）".into();
+        snapshot.reason = String::new();
+        assert!(
+            !s.restore_permission_from_snapshot(snapshot),
+            "已有面板不得被快照覆盖"
+        );
+        assert_eq!(s.pending_permissions.len(), 2, "快照里没有的条目不得被挤掉");
+        assert_eq!(
+            s.active_permission().map(|p| p.tool_call_id.as_str()),
+            Some("c1"),
+            "优先级（队首）不变"
+        );
+        assert_eq!(
+            s.active_permission().map(|p| p.reason.as_str()),
+            Some("需要写文件"),
+            "详情不得被「（恢复中）」占位符降级"
+        );
+        assert_eq!(
+            s.active_permission().map(|p| p.risk),
+            Some(PermissionRisk::High)
+        );
+
+        // 快照里有、内存里没有的：补上（恢复语义仍然成立）。
+        assert!(s.restore_permission_from_snapshot(perm("c9")));
+        assert!(s.pending_permissions.iter().any(|p| p.tool_call_id == "c9"));
+        // 已解决的 id 不被快照复活。
+        s.resolve_permission("c9");
+        assert!(!s.restore_permission_from_snapshot(perm("c9")));
     }
 }
