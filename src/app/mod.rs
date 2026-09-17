@@ -32,7 +32,7 @@ use ratatui::crossterm::event::{KeyEvent, MouseEvent};
 
 use crate::app::slash::SlashCmd;
 use crate::protocol::ConfigDto;
-use crate::runtime::{ConnEvent, Runtime, RuntimeMsg, StreamKey};
+use crate::runtime::{ConnEvent, Runtime, RuntimeMsg, StreamKey, TimelineLostReason};
 use qaqh_client::TimelinePage;
 use qaqh_client::{ActionRequest, QueryRequest};
 use qaqh_client::{
@@ -521,6 +521,31 @@ pub struct App {
     pub(crate) subagent_seeds: HashSet<String>,
 }
 
+/// `TimelineLost` 的处置结论。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TimelineLostEffect {
+    /// 会话确实不存在（404）：子代理收口为 `Closed` 并停止跟踪。
+    CloseSubagent,
+    /// 其他错误：**保留原状态**，只给出可见提示。
+    Notice,
+}
+
+/// `TimelineLost` 的判据（纯函数，便于回归）。
+///
+/// 只有「seed 属于子代理」**且**「原因确为会话不存在（404）」才收口；任何
+/// 网络抖动（401/超时/流结束）都不足以证明会话消失，误判会把仍在运行的子代理
+/// 标成 `Closed` 并停掉它的 timeline 流（issue #2 缺陷 1）。
+pub(crate) fn timeline_lost_effect(
+    is_subagent: bool,
+    reason: &TimelineLostReason,
+) -> TimelineLostEffect {
+    if is_subagent && *reason == TimelineLostReason::SessionMissing {
+        TimelineLostEffect::CloseSubagent
+    } else {
+        TimelineLostEffect::Notice
+    }
+}
+
 impl App {
     pub fn new(runtime: Arc<Runtime>, msg_tx: tokio::sync::mpsc::UnboundedSender<AppMsg>) -> Self {
         Self::new_with_cwd(
@@ -753,15 +778,22 @@ impl App {
                 // 子代理：重扫工具卡 + 终态兑底推导。
                 self.handle_subagent_rebaseline(&seed);
             }
-            RuntimeMsg::TimelineLost { seed, error } => {
-                if self.subagent_seeds.contains(&seed) {
-                    // 子代理会话已消失（404）：静默标记关闭，不再重试。
-                    self.mark_subagent_closed(&seed);
-                    return;
-                }
+            RuntimeMsg::TimelineLost { seed, reason } => self.handle_timeline_lost(&seed, &reason),
+        }
+    }
+
+    /// timeline 流丢失：只有 404（会话不存在）才收口子代理，其余保留现状并提示。
+    fn handle_timeline_lost(&mut self, seed: &str, reason: &TimelineLostReason) {
+        match timeline_lost_effect(self.subagent_seeds.contains(seed), reason) {
+            TimelineLostEffect::CloseSubagent => {
+                // 子代理会话已消失（404）：静默标记关闭，不再重试。
+                self.mark_subagent_closed(seed);
+            }
+            TimelineLostEffect::Notice => {
+                // 401/超时/网络错/流结束：会话可能还活着——状态不动，但必须可见。
                 self.toast(
                     NoticeLevel::Error,
-                    format!("timeline 断开[{seed}]: {error}"),
+                    format!("timeline 断开[{seed}]: {}", reason.describe()),
                 );
             }
         }
@@ -925,13 +957,16 @@ impl App {
                     SessionStateEvent::Closed
                     | SessionStateEvent::Archived
                     | SessionStateEvent::Deleted => {
-                        if self.tabs.contains(&seed) {
+                        // 无条件走一遍：daemon 主动关的**父**会话未必是本地标签
+                        // （父本身是子代理时尤其如此），但它的子代理必须跟着回收。
+                        let was_tab = self.tabs.contains(&seed);
+                        self.close_tab_by_seed(&seed);
+                        if was_tab {
                             let verb = match state {
                                 SessionStateEvent::Archived => "已归档",
                                 SessionStateEvent::Deleted => "已删除",
                                 _ => "已关闭",
                             };
-                            self.close_tab_by_seed(&seed);
                             self.toast(NoticeLevel::Info, format!("会话 {seed} {verb}"));
                         }
                         self.session_list_at = None; // 触发会话列表刷新
@@ -2187,6 +2222,148 @@ mod tests {
         assert!(
             app.tabs.iter().any(|t| t == "A"),
             "切标签后按 y 不得作用到旧 seed 的确认动作（A 被关了）"
+        );
+    }
+
+    use crate::app::subagent::{SubagentEntry, SubagentState};
+    use crate::runtime::TimelineLostReason;
+
+    /// 父标签 + 一个正在跟踪（Running）的子代理。
+    fn app_with_running_subagent() -> (App, String) {
+        let (mut app, _rx) = App::new_for_test();
+        let sub = "seed-sub".to_string();
+        app.sessions
+            .insert(sub.clone(), SessionState::new(sub.clone()));
+        app.subagent_seeds.insert(sub.clone());
+        let mut parent = SessionState::new("parent".into());
+        parent.subagents.push(SubagentEntry {
+            tool_call_id: "c1".into(),
+            seed: Some(sub.clone()),
+            name: "explore".into(),
+            state: SubagentState::Running,
+        });
+        app.sessions.insert("parent".into(), parent);
+        (app, sub)
+    }
+
+    fn subagent_state(app: &App, seed: &str) -> SubagentState {
+        app.sessions["parent"]
+            .subagents
+            .iter()
+            .find(|e| e.seed.as_deref() == Some(seed))
+            .expect("子代理条目存在")
+            .state
+    }
+
+    /// issue #2 缺陷 1：非 404 的失败**不得**把仍在运行的子代理误标 `Closed`，
+    /// 且必须留下可见提示（旧实现只按「是不是子代理」判定 → 静默收口）。
+    #[test]
+    fn timeline_lost_keeps_subagent_on_non_404_and_warns() {
+        let (mut app, sub) = app_with_running_subagent();
+        app.handle_runtime(RuntimeMsg::TimelineLost {
+            seed: sub.clone(),
+            reason: TimelineLostReason::Other(
+                "HTTP 401: /ringing/v1/sessions/seed-sub/timeline".into(),
+            ),
+        });
+        assert_eq!(
+            subagent_state(&app, &sub),
+            SubagentState::Running,
+            "401/超时/网络错只说明这条流断了，会话可能还活着"
+        );
+        assert!(
+            app.subagent_seeds.contains(&sub),
+            "非 404 不得停止该 seed 的 timeline 跟踪"
+        );
+        assert!(
+            app.toasts
+                .iter()
+                .any(|t| t.level == NoticeLevel::Error && t.text.contains(&sub)),
+            "非 404 必须有可见提示（不能像旧实现那样 return 掉）"
+        );
+    }
+
+    /// 404 = 会话确实不存在：这才收口为 `Closed` 并停止跟踪。
+    #[test]
+    fn timeline_lost_closes_subagent_on_404() {
+        let (mut app, sub) = app_with_running_subagent();
+        app.handle_runtime(RuntimeMsg::TimelineLost {
+            seed: sub.clone(),
+            reason: TimelineLostReason::SessionMissing,
+        });
+        assert_eq!(subagent_state(&app, &sub), SubagentState::Closed);
+        assert!(!app.subagent_seeds.contains(&sub));
+    }
+
+    /// 判据矩阵：只有「子代理 + 404」收口；非子代理 seed 一律只提示。
+    #[test]
+    fn timeline_lost_effect_requires_404_and_subagent() {
+        assert_eq!(
+            timeline_lost_effect(true, &TimelineLostReason::SessionMissing),
+            TimelineLostEffect::CloseSubagent
+        );
+        assert_eq!(
+            timeline_lost_effect(true, &TimelineLostReason::Other("boom".into())),
+            TimelineLostEffect::Notice
+        );
+        assert_eq!(
+            timeline_lost_effect(false, &TimelineLostReason::SessionMissing),
+            TimelineLostEffect::Notice
+        );
+    }
+
+    /// issue #2 缺陷 3 的端到端路径（「后端主动关父」）：daemon 关掉一个
+    /// **不是本地标签**的父会话时，`handle_control` 也必须走一遍回收——旧实现
+    /// 被 `if self.tabs.contains(&seed)` 挡在门外，子代理永远留在跟踪集里。
+    ///
+    /// 这里刻意让父**本身也是子代理**（嵌套）：它挂在 `root` 名下，不在 tabs。
+    #[test]
+    fn closed_event_for_non_tab_parent_reclaims_subagents() {
+        let (mut app, _rx) = App::new_for_test();
+        let mut parent = SessionState::new("parent".into());
+        parent.subagents.push(SubagentEntry {
+            tool_call_id: "c1".into(),
+            seed: Some("sub".into()),
+            name: "explore".into(),
+            state: SubagentState::Running,
+        });
+        app.sessions.insert("parent".into(), parent);
+        app.sessions
+            .insert("sub".into(), SessionState::new("sub".into()));
+        for s in ["parent", "sub"] {
+            app.subagent_seeds.insert(s.into());
+        }
+        let mut root = SessionState::new("root".into());
+        root.subagents.push(SubagentEntry {
+            tool_call_id: "c0".into(),
+            seed: Some("parent".into()),
+            name: "nested".into(),
+            state: SubagentState::Running,
+        });
+        app.sessions.insert("root".into(), root);
+        assert!(
+            !app.tabs.contains(&"parent".to_string()),
+            "前提：父不是本地标签"
+        );
+
+        app.handle_control(
+            "parent".into(),
+            None,
+            ControlEvent::SessionStateChanged {
+                seed: "parent".into(),
+                state: SessionStateEvent::Closed,
+            },
+        );
+
+        assert!(
+            !app.subagent_seeds.contains("sub") && !app.subagent_seeds.contains("parent"),
+            "daemon 主动关父时必须回收它自己与它的子代理"
+        );
+        assert!(!app.sessions.contains_key("sub"));
+        assert_eq!(
+            app.sessions["root"].subagents[0].state,
+            SubagentState::Closed,
+            "会话已消失 → 挂在 root 名下的父条目收口为 Closed"
         );
     }
 }
