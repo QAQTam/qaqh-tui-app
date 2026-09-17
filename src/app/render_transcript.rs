@@ -2492,7 +2492,10 @@ mod tests {
         assert_eq!(
             keys,
             ["zeta", "alpha", "mid"],
-            "保序生效时为原文顺序；退化成字典序会得到 [alpha, mid, zeta]"
+            "本仓的渲染顺序由 qaqh-client 的 serde_json `preserve_order` 经 feature \
+             相加传递而来（不是本仓自选）。此处变红=**上游 feature 变了**，不是本仓\
+             写错：请重新决策下面两条渲染断言——要么接受字典序并同步改断言，要么\
+             让 qaqh-client 保留 preserve_order。字典序下这里会得到 [alpha, mid, zeta]。"
         );
     }
 
@@ -2519,15 +2522,72 @@ mod tests {
         assert_eq!(preview, "[zeta=z, alpha=a, mid=m]");
     }
 
+    /// 回归锁（PR #16 审查建议 1）：`format_args_preview` 的 **3-key 截断边界**同样
+    /// 受保序支配——循环里 `parts.len() >= 3` 就 `break`，key 顺序一变，被截掉的
+    /// 就是另一个 key。这是该函数里唯一有副作用的边界，而上一条 3-key 用例正好
+    /// 用满 3 个 key，绕开了它。
+    ///
+    /// 判别力：原文顺序下保留前 3 个（zeta/alpha/mid）并丢弃第 4 个 beta；字典序下
+    /// 会保留 alpha/beta/mid 而丢弃 zeta——两者不同，故下面三条断言在字典序下必红。
+    #[test]
+    fn format_args_preview_truncates_to_first_three_keys_in_source_order() {
+        let preview = format_args_preview(r#"{"zeta":"z","alpha":"a","mid":"m","beta":"b"}"#);
+        assert_eq!(preview, "[zeta=z, alpha=a, mid=m]");
+        assert!(
+            !preview.contains("beta"),
+            "第 4 个 key 应被截断丢弃（保序下 beta 排在第 4）：{preview}"
+        );
+        assert_ne!(
+            preview, "[alpha=a, beta=b, mid=m]",
+            "字典序下会保留 alpha/beta/mid——本断言用于证明用例确有判别力"
+        );
+    }
+
     /// 结论钉住：**exec 工具卡的渲染与 key 顺序无关**。
     ///
-    /// 与上面两条相反，exec 走 shell 专用分支：标题 `exec_command_summary` 与输出
-    /// `extract_shell_output_text` 都只用 `obj.get(...)` 定点取值；参数预览对 exec
-    /// 又被显式跳过（`skip_args_preview = exec_summary.is_some()`）。因此同一份内容
-    /// 的两种 key 排列必须渲染出完全相同的行——这既是结论，也是防止将来有人把
-    /// exec 改成整表遍历的守卫。
+    /// 与上面几条相反，exec 走 shell 专用分支：标题 `exec_command_summary`、输出
+    /// `extract_shell_output_text`、状态 `shell_meta_from_raw` 都只用 `obj.get(...)`
+    /// 定点取值；参数预览对 exec 又被显式跳过
+    /// （`skip_args_preview = exec_summary.is_some()`）。因此同一份内容的两种 key
+    /// 排列必须渲染出完全相同的行。
+    ///
+    /// 形态刻意选成 **Block**（`is_block = output_len > 4`，故 `tool.output` 用 5 行
+    /// 的缩进 JSON 信封）——PR #16 审查指出：单行 output 会落进 Inline 分支，那本是
+    /// 最不受顺序影响的形态，用它当守卫等于没测。
+    ///
+    /// 参数也刻意给 4 个 key 且两卡顺序互逆：一旦 `skip_args_preview` 被误开，
+    /// 两卡的 `⌗` 行会各按自己的顺序渲染 → 相等断言与 `cwd=` 探针同时变红。
     #[test]
     fn exec_tool_card_render_is_key_order_independent() {
+        // 两卡内容完全相同，仅 key 顺序互逆。
+        let args_a = r#"{"argv":["ls","-la"],"cwd":"/tmp","timeout_ms":5,"shell":"bash"}"#;
+        let args_b = r#"{"shell":"bash","timeout_ms":5,"cwd":"/tmp","argv":["ls","-la"]}"#;
+        // `tool.output` 是**原始**串，`output_len` 按原始串行数算；缩进信封才能进 Block。
+        let out_a = r#"{
+  "status": "completed",
+  "exit_code": 0,
+  "output": "l1\nl2\nl3\nl4\nl5\nl6\n"
+}"#;
+        let out_b = r#"{
+  "output": "l1\nl2\nl3\nl4\nl5\nl6\n",
+  "exit_code": 0,
+  "status": "completed"
+}"#;
+
+        // 探针依据：`format_args_preview` 只收 String/Number/Bool，数组（`argv`）落进
+        // `_ => {}` 被丢弃；故 `⌗` 行若真的渲染出来，出现的必是 `cwd=` 而非 `argv=`。
+        // 这条断言同时钉住「探针字符串本身有效」，避免探针失效后静默放行。
+        assert_eq!(
+            format_args_preview(args_a),
+            "[cwd=/tmp, timeout_ms=5, shell=bash]",
+            "探针前提：⌗ 行会渲染 cwd=（argv 是数组，被丢弃）"
+        );
+        assert_ne!(
+            format_args_preview(args_a),
+            format_args_preview(args_b),
+            "两卡顺序互逆，⌗ 行若渲染出来必然不同——这正是本用例判别力的来源"
+        );
+
         let card = |args: &str, output: &str| ToolCard {
             tool_call_id: "c-exec".into(),
             name: "exec".into(),
@@ -2541,22 +2601,23 @@ mod tests {
             failure: None,
             permission: None,
         };
-        let a = card(
-            r#"{"argv":["ls","-la"],"cwd":"/tmp"}"#,
-            r#"{"status":"completed","exit_code":0,"output":"hello\n"}"#,
-        );
-        let b = card(
-            r#"{"cwd":"/tmp","argv":["ls","-la"]}"#,
-            r#"{"output":"hello\n","exit_code":0,"status":"completed"}"#,
-        );
         let mut lines_a = Vec::new();
         let mut lines_b = Vec::new();
-        push_tool_card(&mut lines_a, &a, 100, false);
-        push_tool_card(&mut lines_b, &b, 100, false);
+        push_tool_card(&mut lines_a, &card(args_a, out_a), 100, false);
+        push_tool_card(&mut lines_b, &card(args_b, out_b), 100, false);
         let flat_a = flatten(&lines_a);
-        assert_eq!(flat_a, flatten(&lines_b), "exec 卡渲染不应随 key 顺序变化");
+
+        assert!(
+            flat_a.contains('┃'),
+            "应走 Block 分支（output_len > 4），否则本用例落回 Inline 形态而失去意义：{flat_a}"
+        );
         assert!(flat_a.contains("ls -la"), "argv 应进标题：{flat_a}");
-        assert!(flat_a.contains("hello"), "输出应透出：{flat_a}");
+        assert!(flat_a.contains("l6"), "输出应透出：{flat_a}");
+        assert!(
+            !flat_a.contains("cwd="),
+            "exec 的 ⌗ 参数预览必须被跳过（skip_args_preview）：{flat_a}"
+        );
+        assert_eq!(flat_a, flatten(&lines_b), "exec 卡渲染不应随 key 顺序变化");
     }
 
     /// 回归：process 的 JSON 不再以单行长串形式出现。
