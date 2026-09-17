@@ -79,14 +79,22 @@ cargo test --all-targets
 
 echo
 echo "== cargo clippy =="
+# 官方 rust 镜像只带 rustc/cargo，clippy 与 rustfmt 都要显式补装，否则
+# `cargo clippy` / `cargo fmt` 会报 "'cargo-xxx' is not installed for the toolchain"
+# （实测：`rust:1.98.1` 上 cargo fmt 就是这么挂的）。
 if command -v rustup >/dev/null 2>&1; then
-    rustup component add clippy >/dev/null 2>&1 || true
+    rustup component add clippy rustfmt >/dev/null 2>&1 || true
 fi
 cargo clippy --all-targets -- -D warnings
 
 echo
 echo "== fmt（仅本仓）=="
-# 注意：不能裸跑 `cargo fmt --all` —— 它会连带格式化兄弟仓库里别人的工作树。
+# 注意：**不能**裸跑 `cargo fmt --all` —— 它会连带格式化兄弟仓库里别人的工作树
+# （`../qaqh-backend` 在 HEAD 上本就不是 fmt-clean）。不带 `--all` 只检查本包。
+if ! cargo fmt --version >/dev/null 2>&1; then
+    echo "✗ rustfmt 不可用——请确认上面的 'rustup component add clippy rustfmt' 成功" >&2
+    exit 1
+fi
 cargo fmt --check
 
 echo
