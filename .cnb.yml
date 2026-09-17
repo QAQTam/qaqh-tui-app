@@ -21,6 +21,11 @@ main:
     - name: linux-ci
       docker:
         image: rust:1.98.1
+      env:
+        # 严格模式：兄弟仓库目录已存在时也要校验 rev（不符就地修正，修不了则失败）。
+        # 挡住「clone 成功但 checkout 失败」留下的半成品目录让 CI 用错版本。
+        # 本机开发不设此变量 → 只告警、不动开发者的工作树。
+        STRICT_DEPS: "1"
       stages:
         - name: test+clippy+fmt
           script: bash scripts/ci-linux.sh
@@ -33,6 +38,8 @@ $:
     - name: linux-ci
       docker:
         image: rust:1.98.1
+      env:
+        STRICT_DEPS: "1"
       stages:
         - name: test+clippy+fmt
           script: bash scripts/ci-linux.sh
