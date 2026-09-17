@@ -1322,6 +1322,7 @@ impl App {
             ToolEvent::ToolPermissionRequested {
                 tool_call_id,
                 tool_name,
+                action_summary,
                 reason,
                 paths,
                 category,
@@ -1336,6 +1337,7 @@ impl App {
                 sess.queue_permission(PermissionPanel {
                     tool_call_id,
                     tool_name,
+                    action_summary,
                     reason,
                     paths,
                     category,
@@ -1424,6 +1426,7 @@ impl App {
                             sess.restore_permission_from_snapshot(PermissionPanel {
                                 tool_call_id: perm,
                                 tool_name: "（恢复中）".into(),
+                                action_summary: None,
                                 reason: String::new(),
                                 paths: vec![],
                                 category: PermissionCategory::Read,

@@ -76,7 +76,18 @@ fn push_wrapped(
 
 fn draw_permission(f: &mut Frame, perm: &PermissionPanel, area: Rect) {
     let w = 64u16.min(area.width.saturating_sub(4));
-    let content_lines = 10usize + perm.paths.len().min(6);
+    let inner_w = w.saturating_sub(2) as usize;
+    let action_width = inner_w.saturating_sub("执行: ".width());
+    let action_lines = perm
+        .action_summary
+        .as_deref()
+        .map(|summary| {
+            crate::app::render_line::wrap_text(summary, action_width)
+                .len()
+                .min(8)
+        })
+        .unwrap_or(0);
+    let content_lines = 10usize + action_lines + perm.paths.len().min(6);
     let h = (content_lines as u16 + 4).min(area.height.saturating_sub(2));
     let rect = centered_rect(w, h, area);
     f.render_widget(Clear, rect);
@@ -98,6 +109,9 @@ fn draw_permission(f: &mut Frame, perm: &PermissionPanel, area: Rect) {
         inner_w,
         theme::accent(),
     );
+    if let Some(action) = &perm.action_summary {
+        push_wrapped(&mut lines, "执行: ", action, inner_w, theme::warn());
+    }
     if !perm.reason.is_empty() {
         push_wrapped(&mut lines, "原因: ", &perm.reason, inner_w, Style::new());
     }
@@ -332,5 +346,49 @@ fn draw_plan(f: &mut Frame, panel: &PlanPanel, area: Rect) {
         if x < rect.x + rect.width - 1 {
             f.set_cursor_position((x, y));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    #[test]
+    fn permission_modal_renders_exec_action_summary() {
+        let panel = PermissionPanel {
+            tool_call_id: "c1".into(),
+            tool_name: "exec".into(),
+            action_summary: Some(
+                r#"command: "cargo test" · args: ["--all"] · cwd: "/repo""#.into(),
+            ),
+            reason: "Level 4: 'exec' requires confirmation.".into(),
+            paths: vec!["/repo".into()],
+            category: qaqh_client::PermissionCategory::Exec,
+            level: 4,
+            risk: qaqh_client::PermissionRisk::High,
+            consequence: "May affect external resources.".into(),
+            trust_folder: false,
+        };
+
+        let backend = TestBackend::new(100, 40);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| draw_permission(frame, &panel, frame.area()))
+            .expect("draw permission");
+
+        let rendered: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        let compact: String = rendered.chars().filter(|ch| !ch.is_whitespace()).collect();
+        assert!(compact.contains("执行:"), "{rendered}");
+        assert!(rendered.contains("cargo test"), "{rendered}");
+        assert!(rendered.contains("--all"), "{rendered}");
+        assert!(rendered.contains("/repo"), "{rendered}");
     }
 }
