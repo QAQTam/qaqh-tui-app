@@ -102,7 +102,20 @@ TUI 现用的 `service(method: &str, params)` 是**泛型逃生口**（`http.rs`
 2. app 层引用点机械替换（`crate::protocol::X` → `qaqh_client::X`）。
 3. 删除 `transport/http.rs` 的 `service()` 泛型口。
 
-**验收**：`rg "crate::protocol"` 零命中；`cargo clippy --all-targets` 零 warning。
+**验收（2026-09-17 修订）**：原判据「`rg "crate::protocol"` 零命中」**字面永不成立**，已废弃——
+实际落地方案是把 `protocol/` 从 9 文件 2481 行**收缩为纯 re-export 面**
+（`src/protocol/mod.rs` 141 行，只再导出权威 crate 的类型），而非整目录删除；
+app 层仍以 `crate::protocol::ConfigDto` 这类路径引用（5 处：`ui/settings.rs:20`、
+`app/settings.rs:11/714/800`、`app/mod.rs:34`），这是**刻意的间接层**，不是残留。
+
+现判据：
+
+1. `src/protocol/` 下**不存在任何 wire 镜像类型**（手抄的 serde 结构体）——只有 re-export；
+2. 自建传输轮子符号零命中：`rg "SseDecoder|supervisor_action|stream_rebuild|timeline_manager|refresh_credentials|build_envelope" src/`；
+3. `src/transport/` 目录不存在；
+4. `cargo clippy --all-targets -- -D warnings` 零 warning。
+
+（2026-09-17 实测：4 条全部成立。）
 
 ## 5. 工作量与风险
 

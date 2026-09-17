@@ -1,11 +1,42 @@
-# Buglist — qaqh-tui-app
+# Buglist — qaqh-tui-app（CodeGraph 静态排查）
 
 > 范围：仅通过 CodeGraph/源码静态排查，未读取 docs。  
 > 状态标记：`[confirmed]` 有明确代码路径；`[suspicious]` 有明显反常但未复现；`[unverified]` 推测，需进一步验证。
 
 ---
 
+## ⚠ 归档说明（2026-09-17）
+
+本文件原为仓库根目录的 `BUGLIST.md`，是项目里的**第三本账**（自述「未读取 docs」，与
+`docs/buglist/` 的 T-xx 编号**零交集**）。现已归档到 `docs/buglist/` 并冻结，理由与去向：
+
+- **未解决事项统一登记在** [`docs/todo/2026-09-17-未解决事项-todo.md`](../todo/2026-09-17-未解决事项-todo.md)；
+  本文件的条目已在那边重新编号为 `U-xx` 并附 issue 链接。
+- **本文件正文保持原样**（作为发现时的原始证据留档），但下列条目经代码复测**不成立或已降级**，
+  阅读时请以右侧结论为准：
+
+| 条目 | 原标记 | 复测结论（2026-09-17） |
+|---|---|---|
+| BUG-001 第 3 点「大量代码块/工具块被整块挤掉」 | `[confirmed]` | **不成立**。`MD_BLOCK_LINE_CAP` 是**单块内**截断，且带「（内容省略 N 行）」可见标注；全函数无整行级 `truncate` 或全局上限，后续块不会被挤掉 |
+| BUG-001 第 1 点（缓存冻结） | `[confirmed]` | **成立但入口不同**：`apply()` 里每条变更都 `bump()`，所述机制在那条路径不成立；真实可复现入口是 `CompactStarted/Progress/Finished`（既不 bump version 也不清缓存 → 压缩动画冻结）。**已由 `77dd2fd` 修复** |
+| BUG-002 主述「renderer 与 App 对 top overlay 判断不一致」 | `[suspicious]` | **不成立**。两处都取 `overlays.last()`（`ui/overlays.rs:14`、`overlay_ops.rs:127`）。真实残留是**切标签不清 overlay**（`ConfirmAction` 会作用到旧 seed）→ todo 台账 **U-02** |
+| BUG-003 第 1 点「窗口期内用户没有任何反馈」 | `[confirmed]` | **不成立**。`ui/status_bar.rs:40` 在 `pending_creates` 非空时显示 `· creating…` |
+| BUG-003 第 2 点「command_id 复用不会去重」 | `[confirmed]` | **不成立**。`session_ops.rs:73` 每次 `Uuid::new_v4()`，全仓唯一 insert 点 |
+| BUG-004「`/` 菜单高亮漂移」 | `[confirmed]` | **当前不可达**。slash 命令仅 3 个，`take(6)` 永不截断 → 降级为潜在项（todo 台账 **U-16**） |
+| BUG-005 点 1（`Ready` 旧 epoch 反噬） | `[confirmed]` | **存疑**。`runtime.rs:299-320` 有 generation 守卫 |
+| BUG-005 点 2（`StreamIssue` 不显示） | `[confirmed]` | **成立，未修** → todo 台账 **U-02** |
+| BUG-006（权限面板幽灵） | `[suspicious]` | **结构成立**（无 `seen_responded`），可达性需 daemon 行为确认 → todo 台账 **U-02** |
+| BUG-007（子代理失败误标 Closed） | `[confirmed]` | **成立，未修**。行号实为 `mod.rs:501`（非 `:491`）→ todo 台账 **U-01** |
+| BUG-008（关父 tab 不回收子代理） | `[confirmed]` | **部分成立**。回收逻辑存在，但被 `if let Some(pos) = tabs.position(...)` 罩住 → todo 台账 **U-01** |
+| BUG-009（Draft 并发覆盖） | `[suspicious]` | **待后端语义确认**（`ConfigSave{fields}` 是否 merge patch）→ todo 台账 **U-17** |
+| BUG-010（`show_reasoning` 与缓存冲突） | `[confirmed]` | **成立**，**已由 `77dd2fd` 修复**（含回归锁） |
+
+> 另注：本文件写作时的行号锚定在 `33253a5`；`77dd2fd` 之后部分行号已漂移。
+
+---
+
 ## 已确认问题
+
 
 ### BUG-001 `screenshots/render_spotlight` 损坏：冻结 / 不滚动 / 工具区块丢失 `[confirmed]`
 
