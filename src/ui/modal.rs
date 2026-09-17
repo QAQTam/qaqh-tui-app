@@ -363,10 +363,10 @@ mod tests {
             action_summary: Some(
                 r#"command: "cargo test" · args: ["--all"] · cwd: "/repo""#.into(),
             ),
-            reason: "Level 4: 'exec' requires confirmation.".into(),
+            reason: "Level 3: 'exec' requires confirmation.".into(),
             paths: vec!["/repo".into()],
             category: qaqh_client::PermissionCategory::Exec,
-            level: 4,
+            level: 3,
             risk: qaqh_client::PermissionRisk::High,
             consequence: "May affect external resources.".into(),
             trust_folder: false,
