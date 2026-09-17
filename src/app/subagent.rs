@@ -216,7 +216,11 @@ pub fn apply_status(sess: &mut SessionState, name: &str, tag: &str) -> Option<St
 
 /// 从子代理自身的 timeline 推导终态（SubagentStatus 缺失时的兜底，
 /// 覆盖 TUI 中途接入 / 事件丢失的场景）。子代理只有一个任务回合：
-/// 全部回合已 sealed 且非流式 → 终态。
+/// 全部回合已 **sealed** 且非 Running → 终态。
+///
+/// `sealed` 是比 `state != Running` 更保守的闸门：timeline 快照可能滞后于
+/// daemon 的真实封口/reopen 时序，窗口期内非 sealed 的回合不应被推导成终态，
+/// 否则会提前 `untrack` 掉仍在更新的 timeline 流（见 issue #2 的 U-29）。
 pub fn derive_terminal(sub: &SessionState) -> Option<SubagentState> {
     if sub.timeline.turns.is_empty() || sub.timeline.is_streaming() {
         return None;
@@ -225,7 +229,7 @@ pub fn derive_terminal(sub: &SessionState) -> Option<SubagentState> {
         .timeline
         .turns
         .iter()
-        .all(|t: &Turn| t.state != TimelineTurnState::Running);
+        .all(|t: &Turn| t.sealed && t.state != TimelineTurnState::Running);
     if !finished {
         return None;
     }
@@ -630,10 +634,52 @@ mod tests {
 
     #[test]
     fn derive_terminal_requires_sealed_turns() {
+        use crate::app::timeline_model::Turn;
+
+        fn turn(state: TimelineTurnState, sealed: bool) -> Turn {
+            Turn {
+                turn_id: "t1".into(),
+                turn_index: Some(1),
+                user_text: String::new(),
+                state,
+                failure: None,
+                sealed,
+                offloaded: false,
+                rounds: Vec::new(),
+            }
+        }
+
         // 空 timeline：未开始，不推导。
-        let sub = SessionState::new("sub".into());
+        let mut sub = SessionState::new("sub".into());
         assert_eq!(derive_terminal(&sub), None);
-        // 带 turn 的情形由 timeline_model 集成行为覆盖，这里只锁空表语义。
+
+        // 新闸门：Completed 但尚未 sealed 的回合不得推导终态——快照可能滞后，
+        // 提前 untrack 会停掉仍在更新的 timeline 流。
+        sub.timeline
+            .turns
+            .push(turn(TimelineTurnState::Completed, false));
+        assert_eq!(
+            derive_terminal(&sub),
+            None,
+            "unsealed Completed turn must not derive terminal"
+        );
+
+        // 同一回合封口后才允许推导。
+        sub.timeline.turns[0].sealed = true;
+        assert_eq!(derive_terminal(&sub), Some(SubagentState::Completed));
+
+        // 任一 Running 回合都阻断终态（sealed 也不例外）。
+        sub.timeline
+            .turns
+            .push(turn(TimelineTurnState::Running, true));
+        assert_eq!(derive_terminal(&sub), None);
+
+        // Failed / Cancelled 封口后推导为 Error。
+        sub.timeline.turns.pop();
+        sub.timeline.turns[0].state = TimelineTurnState::Failed;
+        assert_eq!(derive_terminal(&sub), Some(SubagentState::Error));
+        sub.timeline.turns[0].state = TimelineTurnState::Cancelled;
+        assert_eq!(derive_terminal(&sub), Some(SubagentState::Error));
     }
 
     /// issue #2 缺陷 2：派生终态（`SubagentStatus` 缺失时的兜底）必须与
