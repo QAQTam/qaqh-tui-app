@@ -739,10 +739,14 @@ pub fn refresh_segments_at(
     if let Some((top, height)) = viewport {
         let need: Vec<usize> = {
             let cache = session.segments.as_ref().expect("checked above");
-            let (f, l) = cache.segment_range_for(top, height);
-            (f..=l.min(cache.turns.len().saturating_sub(1)))
-                .filter(|&i| !cache.turns[i].body.is_lines())
-                .collect()
+            if cache.turns.is_empty() {
+                Vec::new()
+            } else {
+                let (f, l) = cache.segment_range_for(top, height);
+                (f..=l.min(cache.turns.len() - 1))
+                    .filter(|&i| !cache.turns[i].body.is_lines())
+                    .collect()
+            }
         };
         if !need.is_empty() {
             let rendered: Vec<(usize, std::sync::Arc<[RenderLine]>)> = need
@@ -3655,6 +3659,12 @@ mod tests {
         // 内容未变 → 0 次重渲。旧实现（version 键）在这里会 100% 重渲。
         assert_eq!(refresh_segments(&mut sess, 80, true), 0);
         assert_eq!(refresh_segments(&mut sess, 80, true), 0);
+    }
+
+    #[test]
+    fn empty_session_with_viewport_does_not_index_zero() {
+        let mut sess = SessionState::new("empty".into());
+        assert_eq!(refresh_segments_at(&mut sess, 80, true, Some((0, 20))), 0);
     }
 
     /// 只有**被修改的那一段**重渲，其余保持命中（A3）。
