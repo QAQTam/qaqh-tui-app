@@ -1,11 +1,12 @@
-# qaqh-tui-app NPC 运行环境：Ubuntu 26.04 LTS + Rust 1.98.1 + gcc-15 + cmake + OpenSSL dev
-# tui-app 为跨平台终端应用（crossterm + reqwest/native-tls），Linux 云端可全量编译与测试。
-# 构建后推送 CNB 制品库，供 issue.comment@npc / pull_request.comment@npc 事件引用。
+# qaqh-tui-app NPC 运行环境：Ubuntu 26.04 LTS + Rust 1.98.1 + gcc-15 + cmake
+# tui-app 的传输层由 qaqh-client 提供；其 reqwest 走 rustls（aws-lc-rs），
+# 不再依赖 OpenSSL / native-tls。构建后推送 CNB 制品库，供 NPC 事件引用。
 FROM ubuntu:26.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 
-# 基础工具链 + OpenSSL 头文件（reqwest native-tls 在 Linux 的链接依赖）+ NPC 运行时依赖
+# 基础工具链 + NPC 运行时依赖（aws-lc-sys/onig_sys 等需要 cmake/pkg-config；
+# qaqh-client 已切 rustls，不再安装 libssl-dev）
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         ca-certificates \
@@ -50,11 +51,11 @@ RUN npm install -g @cnbcool/cnb-cli skills \
 ENV TZ=Asia/Shanghai
 RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone
 
-# 冒烟断言：环境不对即 fail 构建（含 openssl-sys 链接前置条件的 pkg-config 验证）
+# 冒烟断言：环境不对即 fail 构建
 RUN cargo --version | grep -q 1.98.1 \
     && gcc-15 --version | head -1 \
     && cmake --version | head -1 \
-    && pkg-config --exists openssl \
+    && pkg-config --version \
     && node -v \
     && bash --version | head -1 \
     && echo "[qaqh-tui-npc-env] smoke check passed"
