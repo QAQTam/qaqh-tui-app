@@ -100,7 +100,9 @@ pub enum RuntimeMsg {
 
 /// 生命周期属主。持有当前 `Client`（可在 T-03 手动重连时原地替换）。
 pub struct Runtime {
-    client: RwLock<Arc<Client>>,
+    /// 当前客户端。`None` 只出现在测试桩（[`Runtime::stub_for_test`]）——
+    /// 生产路径经 [`Runtime::start`] 建立，恒为 `Some`。
+    client: RwLock<Option<Arc<Client>>>,
     msg_tx: mpsc::UnboundedSender<RuntimeMsg>,
     /// app 当前跟踪的 seed 集（重连后据此恢复 timeline 流）。
     tracked: std::sync::Mutex<HashSet<String>>,
@@ -127,7 +129,7 @@ impl Runtime {
         let client = Self::connect(&msg_tx, &last_open, launch_daemon_if_missing).await?;
 
         let runtime = Arc::new_cyclic(|weak| Self {
-            client: RwLock::new(client.clone()),
+            client: RwLock::new(Some(client.clone())),
             msg_tx: msg_tx.clone(),
             tracked: std::sync::Mutex::new(HashSet::new()),
             rebuilding: AtomicBool::new(false),
@@ -152,6 +154,23 @@ impl Runtime {
         Ok(runtime)
     }
 
+    /// 不连 daemon 的运行时桩（**仅供测试**）：只保留 app 侧跟踪集语义，
+    /// timeline 激活/停用等网络副作用一律跳过。
+    #[cfg(test)]
+    pub(crate) fn stub_for_test(msg_tx: mpsc::UnboundedSender<RuntimeMsg>) -> Arc<Self> {
+        Arc::new_cyclic(|weak| Self {
+            client: RwLock::new(None),
+            msg_tx,
+            tracked: std::sync::Mutex::new(HashSet::new()),
+            rebuilding: AtomicBool::new(false),
+            generation: AtomicU64::new(0),
+            launch_daemon_if_missing: false,
+            last_open: Arc::new(std::sync::Mutex::new(Instant::now())),
+            stalled: Arc::new(AtomicBool::new(false)),
+            self_arc: weak.clone(),
+        })
+    }
+
     async fn connect(
         msg_tx: &mpsc::UnboundedSender<RuntimeMsg>,
         last_open: &Arc<std::sync::Mutex<Instant>>,
@@ -174,6 +193,12 @@ impl Runtime {
     /// 同步返回：`spawn_api` 需要在**非 async** 上下文里拿到它，而且把
     /// `&self` 借进 spawned task 是不允许的。
     pub fn client(&self) -> Arc<Client> {
+        self.live_client()
+            .expect("runtime 尚未持有 client（仅测试桩会走到这里）")
+    }
+
+    /// 已建立的客户端；未连接（测试桩）时为 `None`。
+    fn live_client(&self) -> Option<Arc<Client>> {
         self.client.read().expect("client lock").clone()
     }
 
@@ -235,7 +260,7 @@ impl Runtime {
             .map_err(|e| e.to_string())?;
 
         let generation = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
-        *self.client.write().expect("client lock") = new.clone();
+        *self.client.write().expect("client lock") = Some(new.clone());
         self.stalled.store(false, Ordering::SeqCst);
         *self.last_open.lock().expect("last_open lock") = Instant::now();
 

@@ -333,6 +333,23 @@ impl App {
         }
     }
 
+    /// 测试用 App：运行时为不连 daemon 的桩（[`Runtime::stub_for_test`]）。
+    /// 需要回归的判据都在 app 侧状态上（如被拒 ack 的 pending create 撤销），
+    /// 无需真 daemon。
+    ///
+    /// 桩没有 `Client`：测试**不得**触发 [`App::spawn_api`]（会 panic）。
+    /// 需要前置状态时直接写 `pending_creates` / `sessions` 等字段。
+    #[cfg(test)]
+    pub(crate) fn new_for_test() -> Self {
+        let (app_tx, _app_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (rt_tx, _rt_rx) = tokio::sync::mpsc::unbounded_channel();
+        Self::new_with_cwd(
+            Runtime::stub_for_test(rt_tx),
+            app_tx,
+            Some("/tmp".to_string()),
+        )
+    }
+
     // ───────────────────────── 消息入口 ─────────────────────────
 
     pub fn handle(&mut self, msg: AppMsg) {
@@ -1142,8 +1159,18 @@ impl App {
                         // `causation_id == command_id` 的 `Created` 事件。不撤销
                         // pending create 的话，状态栏的 `· creating…` 会一直挂到
                         // 15s 过期（`handle_tick`），用户以为还在创建。
-                        let msg =
-                            session_ops::apply_rejected_ack(&mut self.pending_creates, label, &ack);
+                        //
+                        // 是否 create 命令按 `seed.is_none()` 判：wire 层
+                        // `RingingCommandEnvelope::validate` 要求 seed 缺失时命令
+                        // 必须是 `SessionCreate`（`qaqh-ringing/src/envelope.rs:177`），
+                        // 故这是权威判据，不靠 label 猜。
+                        let is_create = seed.is_none();
+                        let msg = session_ops::apply_rejected_ack(
+                            &mut self.pending_creates,
+                            label,
+                            &ack,
+                            is_create,
+                        );
                         self.toast(NoticeLevel::Error, msg.clone());
                         if let Some(seed) = seed
                             && let Some(sess) = self.sessions.get_mut(&seed)
@@ -1516,4 +1543,103 @@ pub fn guess_media_type(path: &str) -> String {
         _ => "text/plain",
     }
     .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use qaqh_client::{RingingCommandAck, RingingCommandAckStatus};
+
+    fn create_ack(command_id: &str, status: RingingCommandAckStatus) -> RingingCommandAck {
+        RingingCommandAck {
+            command_id: command_id.to_string(),
+            status,
+            code: Some("rate_limited".into()),
+            message: Some("too many sessions".into()),
+            retry_after_ms: Some(500),
+        }
+    }
+
+    /// CNB issue #4 缺陷 1 的**全链路**回归锁（PR #18 二轮复审阻断项）。
+    ///
+    /// 此前只测了 `session_ops::apply_rejected_ack` 本身，把本文件 handler 里那行
+    /// 调用换回旧行为（只 toast、不撤销）时**全绿**——本次主修复唯一生效的那层
+    /// 没有网。本测试打穿 `App::handle` → `handle_action`，锁的是**状态栏
+    /// `· creating…` 的消失**（`ui/status_bar.rs:40` 读的就是 `pending_creates`），
+    /// 不是函数返回值。
+    ///
+    /// 变异验证（实测）：把 `handle_action` 里的 `apply_rejected_ack` 调用换回
+    /// 旧代码 → 本测试红，实测残留 `["cmd-create-1"]`。
+    #[test]
+    fn rejected_create_ack_from_handler_clears_pending_create() {
+        let mut app = App::new_for_test();
+        app.pending_creates
+            .insert("cmd-create-1".to_string(), Instant::now());
+
+        app.handle(AppMsg::Action(ActionResult::CommandAck {
+            seed: None,
+            label: "新会话",
+            result: Ok(create_ack(
+                "cmd-create-1",
+                RingingCommandAckStatus::Rejected,
+            )),
+        }));
+
+        assert!(
+            app.pending_creates.is_empty(),
+            "handler 必须真的撤销 pending create（否则状态栏 creating… 挂满 15s），实测残留 {:?}",
+            app.pending_creates.keys().collect::<Vec<_>>()
+        );
+        let toast = app.toasts.back().expect("被拒必须有失败提示");
+        assert!(
+            toast.text.contains("未创建"),
+            "提示要说清会话没建成，实测：{}",
+            toast.text
+        );
+    }
+
+    /// 反向闸（同一条 handler）：`Accepted` 不是失败，不得撤销 pending create——
+    /// 命令已进入 actor，`Created` 事件还会经 `causation_id` 回来，提前撤销会让
+    /// 新建的标签页永不自动打开。
+    #[test]
+    fn accepted_create_ack_from_handler_keeps_pending_create() {
+        let mut app = App::new_for_test();
+        app.pending_creates
+            .insert("cmd-create-2".to_string(), Instant::now());
+
+        app.handle(AppMsg::Action(ActionResult::CommandAck {
+            seed: None,
+            label: "新会话",
+            result: Ok(create_ack(
+                "cmd-create-2",
+                RingingCommandAckStatus::Accepted,
+            )),
+        }));
+
+        assert_eq!(
+            app.pending_creates.len(),
+            1,
+            "Accepted 不得撤销 pending create（标签页还要靠它自动打开）"
+        );
+    }
+
+    /// 反向闸（同一条 handler）：别的命令被拒不得误伤新建会话的 pending。
+    #[test]
+    fn rejected_ack_for_other_command_from_handler_keeps_pending_create() {
+        let mut app = App::new_for_test();
+        app.pending_creates
+            .insert("cmd-create-3".to_string(), Instant::now());
+
+        app.handle(AppMsg::Action(ActionResult::CommandAck {
+            seed: Some("seed-x".into()),
+            label: "撤销回合",
+            result: Ok(create_ack("cmd-other-9", RingingCommandAckStatus::Rejected)),
+        }));
+
+        assert_eq!(
+            app.pending_creates.len(),
+            1,
+            "无关命令的拒绝不得撤销 pending create"
+        );
+    }
 }

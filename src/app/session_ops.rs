@@ -436,41 +436,41 @@ impl App {
 /// 命令可能已在后端执行，晚到的 `Created` 仍会经 `causation_id` 回来；提前撤销
 /// 反而会丢掉那次自动开标签页。故只有终态拒绝才撤销，`Err` 仍留给 15s 兜底。
 ///
-/// # ⚠ 待办（PR #18 审查阻断项，未完成）
+/// # 测试分层（PR #18 二轮复审阻断项，已闭环）
 ///
-/// **调用点没有全链路回归锁**：本函数自身的测试（下方 `mod tests`）在函数体被改回
-/// 旧行为时会红，但把 `mod.rs` 里那一行调用**整个删掉**（撤销逻辑完全没接上）
-/// 时，`cargo test --all-targets` 仍然全绿——「155 全绿」掩盖了这个空洞。
+/// 两层都要有，缺一层就漏：
 ///
-/// 补法（**必须等 PR #17 `fix/subagent-lifecycle` 合并后再做**，那套测试基建是它
-/// 引入的，本分支没有，重复造会与 #17 冲突、破坏合并顺序）：
+/// 1. **本函数**：下方 `mod tests` 锁「拒绝 → 撤销 + 文案」。
+/// 2. **调用点**：`mod.rs` 的 `tests::rejected_create_ack_from_handler_clears_pending_create`
+///    打穿 `App::handle` → `handle_action`，锁状态栏 `· creating…` 的消失。
+///    只测第 1 层时，把调用那一行换回旧行为（只 toast、不撤销）会**全绿**——
+///    「全绿」掩盖主修复唯一生效的那层没有网。
 ///
-/// ```ignore
-/// #[test]
-/// fn rejected_create_ack_from_handler_clears_pending_create() {
-///     let mut app = App::new_for_test();          // #17：Runtime::stub_for_test
-///     app.pending_creates.insert("cmd-1".into(), Instant::now());
-///     app.handle(AppMsg::Action(ActionResult::CommandAck {
-///         seed: None,
-///         label: "新会话",
-///         result: Ok(RingingCommandAck { command_id: "cmd-1".into(), ..rejected() }),
-///     }));
-///     assert!(app.pending_creates.is_empty(), "handler 必须真的调用了撤销");
-/// }
-/// ```
+/// 第 2 层依赖 `App::new_for_test` + `Runtime::stub_for_test`（桩 runtime 无
+/// `Client`）；本仓该基建与 PR #17（`fix/subagent-lifecycle`）同形，合并时是
+/// 普通文本冲突，取任一即可。
 ///
-/// 断言点是 `pending_creates.is_empty()`（即状态栏 `· creating…` 的消失），
-/// 不是「函数返回值」——只有打穿 handler 才锁得住这一层。
+/// # `is_create`：提示文案的判据是「命令种类」，不是「撤销成功」
+///
+/// 「（会话未创建）」此前只在 `remove` 命中时追加（PR #18 二轮复审建议 1）：
+/// ack 迟到 >15s 时 `handle_tick` 已清掉那条 pending，用户会看到「被拒绝」却
+/// **没有**「未创建」——而会话确实没建成，提示反而缺失。现按**该 ack 是否属于
+/// create 命令**判断，与本地 pending 是否还在无关。
+///
+/// 判据的权威来源是 wire 层不变式：`RingingCommandEnvelope::validate` 要求
+/// **seed 缺失时命令必须是 `SessionCreate`**（`qaqh-ringing/src/envelope.rs:177-186`，
+/// 否则报 `missing_seed`），而 `send_command` 发前必过 `validate`。故调用方用
+/// `seed.is_none()` 即可判定，无需猜 label。
 pub(super) fn apply_rejected_ack(
     pending_creates: &mut HashMap<String, Instant>,
     label: &str,
     ack: &qaqh_client::RingingCommandAck,
+    is_create: bool,
 ) -> String {
-    let aborted_create = if ack.status == qaqh_client::RingingCommandAckStatus::Rejected {
-        pending_creates.remove(&ack.command_id).is_some()
-    } else {
-        false
-    };
+    let rejected = ack.status == qaqh_client::RingingCommandAckStatus::Rejected;
+    if rejected {
+        pending_creates.remove(&ack.command_id);
+    }
     let detail = format!(
         "{} {}",
         ack.code.as_deref().unwrap_or_default(),
@@ -482,7 +482,7 @@ pub(super) fn apply_rejected_ack(
     } else {
         format!("{label} 被拒绝: {detail}")
     };
-    if aborted_create {
+    if rejected && is_create {
         // 与状态栏的 `creating…` 必须同时消失，否则用户仍不知道会话到底建没建。
         msg.push_str("（会话未创建）");
     }
@@ -494,10 +494,10 @@ mod tests {
     use super::*;
     use qaqh_client::{RingingCommandAck, RingingCommandAckStatus};
 
-    // ⚠ 覆盖边界（PR #18 审查阻断项）：这里测的是 `apply_rejected_ack` 本身，
-    // **不覆盖 `App::handle` 的调用点**——把 `mod.rs` 里那行调用删掉，本模块
-    // 全绿。全链路测试待 PR #17（`App::new_for_test` / `Runtime::stub_for_test`）
-    // 合并后补，样例见 `apply_rejected_ack` 的「待办」小节。
+    // 覆盖分层（见 `apply_rejected_ack` 的「测试分层」小节）：本模块只锁函数本身，
+    // **调用点**由 `app::tests::rejected_create_ack_from_handler_clears_pending_create`
+    // 打穿 `App::handle` 覆盖——两层缺一层就会漏（只测本模块时，把 `mod.rs` 里那行
+    // 调用换回旧行为会全绿）。
 
     fn ack(command_id: &str, status: RingingCommandAckStatus) -> RingingCommandAck {
         RingingCommandAck {
@@ -527,6 +527,7 @@ mod tests {
             &mut pending,
             "新会话",
             &ack("cmd-create-1", RingingCommandAckStatus::Rejected),
+            true,
         );
         assert!(
             pending.is_empty(),
@@ -552,6 +553,7 @@ mod tests {
             &mut pending,
             "新会话",
             &ack("cmd-create-2", RingingCommandAckStatus::Accepted),
+            true,
         );
         assert_eq!(
             pending.len(),
@@ -572,8 +574,30 @@ mod tests {
             &mut pending,
             "撤销回合",
             &ack("cmd-other-9", RingingCommandAckStatus::Rejected),
+            false,
         );
         assert_eq!(pending.len(), 1, "无关命令的拒绝不得撤销 pending create");
         assert!(msg.contains("撤销回合"), "文案仍应归属该命令，实测：{msg}");
+    }
+
+    /// PR #18 二轮复审建议 1（迟到 ack 缺口）：`（会话未创建）` 的判据是「该 ack
+    /// 是否属于 create 命令」，**不是**「撤销是否命中」。ack 迟到 >15s 时 pending
+    /// 已被 `handle_tick` 清掉——此时会话确实没建成，提示不能反而缺失。
+    ///
+    /// 变异验证（实测）：把判据改回 `rejected && removed`（旧行为）→ 本测试红。
+    #[test]
+    fn late_rejected_create_ack_still_says_not_created() {
+        // pending 已被 15s retain 清掉：迟到 ack 命中不了任何条目。
+        let mut pending: HashMap<String, Instant> = HashMap::new();
+        let msg = apply_rejected_ack(
+            &mut pending,
+            "新会话",
+            &ack("cmd-create-late", RingingCommandAckStatus::Rejected),
+            true,
+        );
+        assert!(
+            msg.contains("未创建"),
+            "迟到 ack 下会话同样没建成，提示不得缺失，实测：{msg}"
+        );
     }
 }

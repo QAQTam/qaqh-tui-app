@@ -1929,31 +1929,33 @@ fn push_tool_card(
         let raw_output = tool.output.as_deref().unwrap_or("");
         let unwrapped = extract_shell_output_text(raw_output);
         let shell_meta = shell_meta_from_raw(raw_output);
-        let src = if tool.state == TimelineToolState::Running {
+        // 正文来源在**取值处**一并确定，不用 `src == tool.progress` 事后做整串
+        // 值比较：那种判据在 `src` 被任何规整（trim / 换行归一）后都会静默失配，
+        // 标注随之消失（PR #18 二轮复审建议 2）。
+        //
+        // 截断标注只在进度**真的上屏**时给——工具已结束且拿到了完整 `output` 时，
+        // progress 只是被取代的中间态，此时标注它「前段已丢弃」是噪音。
+        let (src, src_from_progress) = if tool.state == TimelineToolState::Running {
             if !tool.progress.trim().is_empty() {
-                tool.progress.clone()
+                (tool.progress.clone(), true)
             } else {
-                unwrapped.clone().unwrap_or_default()
+                (unwrapped.clone().unwrap_or_default(), false)
             }
         } else if let Some(ref inner) = unwrapped {
             if !inner.trim().is_empty() {
-                inner.clone()
+                (inner.clone(), false)
             } else if !tool.progress.trim().is_empty() {
-                tool.progress.clone()
+                (tool.progress.clone(), true)
             } else {
-                String::new()
+                (String::new(), false)
             }
         } else if !tool.progress.trim().is_empty() {
-            tool.progress.clone()
+            (tool.progress.clone(), true)
         } else if !raw_output.trim().is_empty() {
-            raw_output.to_string()
+            (raw_output.to_string(), false)
         } else {
-            String::new()
+            (String::new(), false)
         };
-        // 正文是否来自 progress 缓冲：截断标注只在进度**真的上屏**时给——
-        // 工具已结束且拿到了完整 `output` 时，progress 只是被取代的中间态，
-        // 此时标注它「前段已丢弃」是噪音（用户看到的正文并没有缺）。
-        let src_from_progress = !tool.progress.trim().is_empty() && src == tool.progress;
         if !src.trim().is_empty() {
             let max_lines = 8usize;
             let expanded_limit = 24usize;
@@ -2067,6 +2069,13 @@ fn push_tool_card(
             }
         }
         combined.push_str(&tool.progress);
+        // progress 在 `combined` 里的起始行号。`display` 与 `combined` 行号同源
+        // ——折叠时 `display` 就是 `combined` 的前 `max_lines` 行——故可直接比。
+        // （在 `display` 取走 `combined` 之前算好。）
+        let progress_start_line = combined
+            .lines()
+            .count()
+            .saturating_sub(tool.progress.lines().count());
         if !combined.trim().is_empty() {
             let max_lines = 4usize;
             let max_chars = max_lines * width.saturating_sub(6).max(20);
@@ -2078,10 +2087,13 @@ fn push_tool_card(
             };
             let line_prefix = if is_block { " ┃ │ " } else { "    │ " };
             let body_start = lines.len();
+            // 「进度真的上屏」= 正文里确实渲染出了属于 progress 段的行。
+            let mut progress_shown = false;
             let mut shown_lines = 0usize;
-            for out in display
+            for (line_idx, out) in display
                 .lines()
                 .take(if overflow && !expanded { max_lines } else { 24 })
+                .enumerate()
             {
                 for seg in wrap_text(out, width.saturating_sub(6)) {
                     lines.push(
@@ -2089,6 +2101,9 @@ fn push_tool_card(
                             .span(line_prefix, SpanStyle::Dim)
                             .span(seg, SpanStyle::Dim),
                     );
+                    if line_idx >= progress_start_line {
+                        progress_shown = true;
+                    }
                     shown_lines += 1;
                     if shown_lines > 24 {
                         break;
@@ -2098,6 +2113,12 @@ fn push_tool_card(
             // 同 shell 分支：`▌` 落回最后一行正文，截断标注排在 hint 之后。
             let body_end = lines.len();
             if overflow {
+                // ⚠ 既有缺陷（非本 PR 引入，PR #18 二轮复审建议 3 要求登记）：
+                // 对**默认展开**的工具（`is_default_expanded`，如 read），生效态
+                // `expanded = expanded_raw ^ true` 与默认视图相反，于是默认显示 24 行
+                // 却提示「F7 收起」，按一次 F7 反而只剩 4 行并提示「F7 展开」——
+                // 文案与视图方向的直觉相反。改它要同时理顺 `overflow` 判据与
+                // `display` 的选取，超出本缺陷范围，另行登记。
                 let hint = if expanded { "F7 收起" } else { "F7 展开" };
                 lines.push(
                     RenderLine::new()
@@ -2105,20 +2126,21 @@ fn push_tool_card(
                         .span(hint, SpanStyle::Dim),
                 );
             }
-            // 非 shell：progress 拼在 output 之后。折叠时只留**头部**
-            // （`collapse_output` 取前 `max_lines` 行），进度可能整段被折掉 →
-            // 只有进度确实可见时才标注（同上，不给看不见的内容报警）。
+            // 非 shell：progress 拼在 output **之后**，而 `collapse_output` 留的是
+            // **头部**，故判据不能是 `overflow` / `expanded` 的布尔组合（PR #18
+            // 二轮复审阻断 2：`(!overflow || expanded)` 方向装反——`expanded` 只是
+            // 「不折叠」，展示窗口仍有 24 行上限，长 output 时进度整段在窗口之外，
+            // 于是给看不见的内容报警）。这里直接按**实际渲染出的正文**判断
+            // （`progress_shown`），与 shell 分支的 `src_from_progress` 同一语义：
+            // 只有进度确实上屏才标注。
             //
             // **取舍**：折叠丢的是可恢复的**显示**（`F7 展开` 已把这件事画出来，
             // 按一下就能取回），不属 B1 要盯的**不可逆丢弃**；而本标注盯的
             // `progress_truncated` 是不可逆的（缓冲前段已从内存里丢掉）。所以
             // 「output 前缀被折叠」不标注——两者都在 footer 里，不会互相淹没。
-            // `progress` 为空时不标注：标注指的是那段进度，没有进度就无从标注
-            // （wire 侧理论上不会出现 flag 为真而 progress 为空，这里只是防御）。
-            if tool.progress_truncated
-                && !tool.progress.trim().is_empty()
-                && (!overflow || expanded)
-            {
+            // 该取舍在 `progress_shown` 里天然成立：`progress` 为空时
+            // `progress_start_line` 落在行号范围之外，永远为 false。
+            if tool.progress_truncated && progress_shown {
                 lines.push(progress_truncated_line(is_block));
             }
             if is_running
@@ -3354,6 +3376,71 @@ mod tests {
             flat.contains(PROGRESS_TRUNCATED_MARK),
             "非 shell 工具的截断进度也必须可见，实测：{flat}"
         );
+    }
+
+    /// PR #18 二轮复审**阻断 2**：非 shell 分支的闸门必须看「进度是否真的上屏」，
+    /// 不能是 `overflow` / `expanded` 的布尔组合。
+    ///
+    /// `read` 属默认展开工具（`is_default_expanded`），故 `expanded` 是**生效态**
+    /// = `expanded_raw ^ true`，与传入的 `expanded_raw` 相反。复审给的组合在这里
+    /// 变成可执行的锁（另补一列复审未覆盖、但能区分「保守闸门」与「按上屏判断」
+    /// 的用例）：
+    ///
+    /// | 组合（`read`） | 进度可见 | 期望标注 |
+    /// |---|---|---|
+    /// | 30 行 output + `expanded_raw=false`（生效=展开） | 否（超出 24 行窗口） | 无 |
+    /// | 30 行 output + `expanded_raw=true`（生效=折叠） | 否（只留头部 4 行） | 无 |
+    /// | 短 output + `expanded_raw=false` | 是 | 有 |
+    /// | 短 output + `expanded_raw=true` | 是 | 有 |
+    /// | **6 行 output + `expanded_raw=false`（生效=展开）** | **是（窗口内）** | **有** |
+    ///
+    /// 最后一行是关键：`overflow=true`（6+1 行 > 4）但进度落在 24 行窗口内、**确实
+    /// 可见**。若闸门退化成「只看 `!overflow`」，这条会漏标（B1 意义上的漏报），
+    /// 本测试红。
+    ///
+    /// 变异验证（实测）：① 把闸门写回 `(!overflow || expanded)` → 第 1 行误报 → 红；
+    /// ② 改成只看 `!overflow` → 第 5 行漏报 → 红。
+    #[test]
+    fn non_shell_truncation_mark_follows_what_is_actually_shown() {
+        let long = (1..=30)
+            .map(|i| format!("out line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let six = (1..=6)
+            .map(|i| format!("out line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let cases: [(&str, bool, bool); 5] = [
+            (long.as_str(), false, false),
+            (long.as_str(), true, false),
+            ("short output", false, true),
+            ("short output", true, true),
+            (six.as_str(), false, true),
+        ];
+        for (output, expanded_raw, expect_mark) in cases {
+            let tool = ToolCard {
+                tool_call_id: "c-read-gate".into(),
+                name: "read".into(),
+                state: TimelineToolState::Succeeded,
+                summary: None,
+                args_json: None,
+                output: Some(output.to_string()),
+                diff: None,
+                progress: "tail only\n".into(),
+                progress_truncated: true,
+                failure: None,
+                permission: None,
+            };
+            let mut lines = Vec::new();
+            push_tool_card(&mut lines, &tool, 80, expanded_raw);
+            let flat = flatten(&lines);
+            assert_eq!(
+                flat.contains(PROGRESS_TRUNCATED_MARK),
+                expect_mark,
+                "output={}行 expanded_raw={expanded_raw} 期望标注={expect_mark}\n{flat}",
+                output.lines().count()
+            );
+        }
     }
 
     #[test]
