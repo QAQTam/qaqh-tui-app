@@ -1939,4 +1939,150 @@ mod tests {
         let (phase, _) = reconcile_conn(&ConnPhase::Opening, &issues, None);
         assert_eq!(phase, ConnPhase::Opening);
     }
+
+    // ───────── App 层接线（端到端：经 App::handle 投递真实事件） ─────────
+
+    use ratatui::crossterm::event::{KeyCode, KeyModifiers};
+
+    fn conn(ev: ConnEvent) -> AppMsg {
+        AppMsg::Runtime(RuntimeMsg::Conn(ev))
+    }
+
+    fn key(code: KeyCode, modifiers: KeyModifiers) -> AppMsg {
+        AppMsg::Key(KeyEvent::new(code, modifiers))
+    }
+
+    fn app_with_tabs(
+        seeds: &[&str],
+        active: usize,
+    ) -> (App, tokio::sync::mpsc::UnboundedReceiver<AppMsg>) {
+        let (mut app, rx) = App::new_for_test();
+        for seed in seeds {
+            app.tabs.push((*seed).to_string());
+            app.sessions
+                .insert((*seed).to_string(), SessionState::new((*seed).to_string()));
+        }
+        app.active = active;
+        (app, rx)
+    }
+
+    /// **App 层接线**（复审第一轮「建议 4」的原话）：`Lost` 期间收到流事件，
+    /// 相位仍是 `Lost`、失联原因既不被清掉也不被覆盖。
+    ///
+    /// 证伪方式：把 `Lost` 分支改成「先清 conn_error」（旧行为）、或让
+    /// `reconcile_conn_view` 无条件取账本文案（去掉 `Lost` 保护）——两条断言变红。
+    #[test]
+    fn handle_conn_keeps_lost_reason_across_stream_events() {
+        let (mut app, _rx) = App::new_for_test();
+        let reason = "与 daemon 失联（20s 内无任何频道连接）——按 R 重连";
+
+        app.handle(conn(ConnEvent::Lost(reason.into())));
+        assert_eq!(app.conn_phase, ConnPhase::Lost);
+        assert_eq!(app.conn_error.as_deref(), Some(reason));
+
+        // 某条流重连成功：失联相位与原因都不许动。
+        app.handle(conn(ConnEvent::StreamRecovered {
+            stream: channel(qaqh_client::Channel::Control),
+        }));
+        assert_eq!(
+            app.conn_phase,
+            ConnPhase::Lost,
+            "流恢复信号不得把失联相位抹成正常"
+        );
+        assert!(
+            app.conn_error.is_some(),
+            "Lost 分支靠 conn_error 给用户原因，不许被清掉"
+        );
+
+        // 新到的流告警同样不许覆盖失联原因。
+        app.handle(conn(ConnEvent::StreamIssue {
+            stream: timeline("A"),
+            error: "timeline[A] 断开，3000ms 后重连".into(),
+        }));
+        assert_eq!(app.conn_phase, ConnPhase::Lost);
+        assert_eq!(
+            app.conn_error.as_deref(),
+            Some(reason),
+            "流告警不得覆盖失联原因"
+        );
+    }
+
+    /// **App 层接线**：新 session（`Ready`）清空流告警账本。
+    ///
+    /// 不这么做的话，旧 client 遗留的 timeline 告警（那条流再也不会发 `Open` 来撤
+    /// 自己）会把相位永久钉在 `ReadyWithIssue`。此前这一行只有「接线靠编译」的保证。
+    ///
+    /// 证伪方式：删掉 `Ready` 分支里的 `self.stream_issues = StreamIssues::default();`
+    /// ——`stream_issues.is_empty()` 断言立刻变红（相位也回不到 `Ready`）。
+    #[test]
+    fn handle_conn_ready_clears_the_stream_issue_ledger() {
+        let (mut app, _rx) = App::new_for_test();
+
+        // 连接就绪 → 某条流告警 → 相位进入 ReadyWithIssue。
+        app.handle(conn(ConnEvent::Ready {
+            epoch: "e1".into(),
+            epoch_changed: false,
+        }));
+        assert_eq!(app.conn_phase, ConnPhase::Ready);
+        app.handle(conn(ConnEvent::StreamIssue {
+            stream: timeline("A"),
+            error: "timeline[A] 断开".into(),
+        }));
+        assert_eq!(app.conn_phase, ConnPhase::ReadyWithIssue);
+        assert!(!app.stream_issues.is_empty());
+
+        // 新 session（epoch 变化）：账本整体作废，相位回 Ready。
+        app.handle(conn(ConnEvent::Ready {
+            epoch: "e2".into(),
+            epoch_changed: true,
+        }));
+        assert!(
+            app.stream_issues.is_empty(),
+            "新 session 后旧代遗留的流告警必须清空"
+        );
+        assert_eq!(app.conn_phase, ConnPhase::Ready);
+        assert!(app.conn_error.is_none());
+    }
+
+    /// **缺陷 2 的端到端版**：按 Alt+数字切标签时，绑旧 seed 的 `Confirm` 必须真的
+    /// 从栈里消失，全局层留下；随后按 `y` 不会作用到旧 seed。
+    ///
+    /// 证伪方式：去掉 Alt+tab 分支里的 `prune_overlays_for_active_seed()`——确认框
+    /// 留在栈里，`y` 会把 `CloseTab("A")` 落到 A 上（A 从 tabs 消失）。
+    ///
+    /// 断言分工（避免高估本用例）：前两条（栈里没有确认框、全局层留下）是**不变量**，
+    /// 同一个变异下先红；最后那条按 `y` 是**后果**断言，说明这个不变量坏了会怎样伤害
+    /// 用户，它不会独立于前两条失败。
+    #[test]
+    fn alt_tab_prunes_the_previous_seeds_confirm_overlay() {
+        let (mut app, _rx) = app_with_tabs(&["A", "B"], 0);
+        // Ctrl+W 的确认框（绑 A）+ 一个全局层（帮助）——全局层不许被误伤。
+        app.overlays.push(Overlay::Confirm {
+            action: ConfirmAction::CloseTab("A".into()),
+        });
+        app.overlays.push(Overlay::Help);
+
+        // Alt+2 → 切到标签 B
+        app.handle(key(KeyCode::Char('2'), KeyModifiers::ALT));
+        assert_eq!(app.active, 1, "Alt+2 应切到标签 B");
+        assert!(
+            !app.overlays
+                .iter()
+                .any(|o| matches!(o, Overlay::Confirm { .. })),
+            "旧 seed 的确认框必须被剪掉：{:?}",
+            app.overlays
+        );
+        assert!(
+            matches!(app.overlays.as_slice(), [Overlay::Help]),
+            "全局层必须留下：{:?}",
+            app.overlays
+        );
+
+        // 再按 y：确认框已不在栈里，不该关掉 A。
+        app.handle(key(KeyCode::Char('y'), KeyModifiers::NONE));
+        assert!(
+            app.tabs.iter().any(|t| t == "A"),
+            "切标签后按 y 不得作用到旧 seed 的确认动作（A 被关了）"
+        );
+    }
 }
