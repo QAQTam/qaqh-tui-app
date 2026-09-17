@@ -8,16 +8,19 @@ use crate::app::{App, ConnPhase};
 use crate::ui::theme;
 use qaqh_client::NoticeLevel;
 
+/// 左侧「 ⚠ ready·流告警」前缀（约 12 列）+ epoch（约 9 列）的预留列数。
+pub const LEFT_PREFIX_RESERVE: usize = 24;
+
 /// 流告警文案的显示预算（列）。
 ///
-/// 前缀「 ⚠ ready·流告警」约 12 列、epoch 约 9 列，右侧还有用量/活动/时钟
-/// （约 30 列）——固定截 30 列会在 80 列终端上把中间 toast 挤没。这里按区域宽度
-/// 收缩：给右侧留 [`RIGHT_RESERVE`] 列，下限 6 列（还能认出是「有东西」），
+/// 按**实测**的右侧宽度算，而不是猜一个常量：右侧用量/百分比/活动标签/丢弃计数/
+/// 时钟加起来是 8~70 列（`dropped_summary` 带中文时最宽）。固定预留（例如 58 列）
+/// 在 80 列终端上反而比旧的 `Lost` 分支更窄。下限 6 列（还能认出「有东西」），
 /// 上限 30 列（再长也没有信息量）。
-pub const RIGHT_RESERVE: usize = 58;
-
-pub fn issue_budget(width: usize) -> usize {
-    width.saturating_sub(RIGHT_RESERVE).clamp(6, 30)
+pub fn issue_budget(width: usize, right_w: usize) -> usize {
+    width
+        .saturating_sub(right_w + LEFT_PREFIX_RESERVE)
+        .clamp(6, 30)
 }
 
 /// epoch 只在 `Ready` 显示（纯函数，便于回归测试）。
@@ -34,7 +37,9 @@ pub fn shows_epoch(phase: &ConnPhase) -> bool {
 /// 三个相位的语义各不相同，视觉上也不许混淆：
 /// - `Ready`：连接健康。
 /// - `ReadyWithIssue`：连接可用，但有流在自愈 → 给出告警文案，**不**给重连提示
-///   （连接是好的，按 Ctrl+R 也只会被告知无需重连）。
+///   （连接是好的，按 Ctrl+R 也只会被告知无需重连）。文案是「最近一条流告警」，
+///   可能已经过期（那条流刚重连成功、或 `Lost` 正在路上）——它只描述「此刻还有流
+///   在告警」这个集合非空的事实，集合清空即消失，不做逐条时效追踪。
 /// - `Lost`：连不上 daemon → 给出重连入口 + 原因。
 ///
 /// `issue_budget` 是原因文案的显示列上限（见 [`issue_budget`]）。
@@ -73,36 +78,9 @@ pub fn conn_spans(
 
 pub fn draw(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
     let width = area.width as usize;
-    let mut left: Vec<Span> = conn_spans(
-        &app.conn_phase,
-        app.conn_error.as_deref(),
-        issue_budget(width),
-    );
-    if shows_epoch(&app.conn_phase) {
-        let ep = if app.epoch.len() > 8 {
-            &app.epoch[..8]
-        } else {
-            &app.epoch
-        };
-        left.push(Span::styled(format!(" {ep}"), theme::dim()));
-    }
-    if !app.pending_creates.is_empty() {
-        left.push(Span::styled(" · creating…", theme::dim()));
-    }
 
-    // 中间：最新 toast。
-    let mut middle: Vec<Span> = Vec::new();
-    if let Some(toast) = app.toasts.back() {
-        let style = match toast.level {
-            NoticeLevel::Info => theme::dim(),
-            NoticeLevel::Warn => theme::warn(),
-            NoticeLevel::Error => theme::err(),
-        };
-        let text = crate::app::truncate_str(&toast.text, width.saturating_sub(60).max(20));
-        middle.push(Span::styled(format!(" {text}"), style));
-    }
-
-    // 右侧：用量 / 活动 / 时钟。
+    // 右侧：用量 / 活动 / 时钟。**先算它**——左侧流告警文案的预算要扣掉右侧的
+    // 实际宽度（用量+百分比+活动+丢弃计数+时钟，实测 8~70 列）。
     let mut right: Vec<Span> = Vec::new();
     if let Some(sess) = app.active_session() {
         if let Some(usage) = sess.usage.as_ref() {
@@ -134,8 +112,38 @@ pub fn draw(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
     }
     let now = chrono::Local::now().format("%H:%M");
     right.push(Span::styled(format!(" · {now} "), theme::dim()));
-
     let right_w: usize = right.iter().map(|s| s.content.chars().count()).sum();
+
+    // 左侧：连接指示（告警文案预算用右侧实测宽度，不再靠常量猜）。
+    let mut left: Vec<Span> = conn_spans(
+        &app.conn_phase,
+        app.conn_error.as_deref(),
+        issue_budget(width, right_w),
+    );
+    if shows_epoch(&app.conn_phase) {
+        let ep = if app.epoch.len() > 8 {
+            &app.epoch[..8]
+        } else {
+            &app.epoch
+        };
+        left.push(Span::styled(format!(" {ep}"), theme::dim()));
+    }
+    if !app.pending_creates.is_empty() {
+        left.push(Span::styled(" · creating…", theme::dim()));
+    }
+
+    // 中间：最新 toast。
+    let mut middle: Vec<Span> = Vec::new();
+    if let Some(toast) = app.toasts.back() {
+        let style = match toast.level {
+            NoticeLevel::Info => theme::dim(),
+            NoticeLevel::Warn => theme::warn(),
+            NoticeLevel::Error => theme::err(),
+        };
+        let text = crate::app::truncate_str(&toast.text, width.saturating_sub(60).max(20));
+        middle.push(Span::styled(format!(" {text}"), style));
+    }
+
     let left_w: usize = left.iter().map(|s| s.content.chars().count()).sum();
     let mid_budget = width.saturating_sub(left_w + right_w);
     let mid_w: usize = middle.iter().map(|s| s.content.chars().count()).sum();
@@ -271,13 +279,26 @@ mod tests {
         assert!(!shows_epoch(&ConnPhase::Lost));
     }
 
-    /// 告警文案按区域宽度收缩（80 列终端上固定 30 列会把中间 toast 挤掉）。
+    /// 告警文案预算按区域宽度与**实测**右侧宽度收缩。
+    ///
+    /// 证伪方式：改回「固定预留常量」的旧写法（`width - 58` 夹 [6,30]）——
+    /// 右侧很窄（8 列）时旧写法给 22，本测试要求 30；右侧很宽（54 列）时旧写法
+    /// 仍给 22，本测试要求 6。两个方向都会变红。
     #[test]
-    fn issue_budget_shrinks_on_narrow_terminals() {
-        assert_eq!(issue_budget(200), 30, "宽终端封顶 30 列");
-        assert_eq!(issue_budget(80), 22);
-        assert_eq!(issue_budget(40), 6, "窄终端保底 6 列");
-        assert!(issue_budget(100) >= issue_budget(70), "预算随宽度单调不减");
+    fn issue_budget_follows_measured_right_width() {
+        assert_eq!(issue_budget(200, 10), 30, "宽终端封顶 30 列");
+        assert_eq!(issue_budget(80, 8), 30, "右侧很窄时预算不被常量压掉");
+        assert_eq!(issue_budget(80, 54), 6, "右侧很宽时保底 6 列");
+        assert_eq!(issue_budget(60, 25), 11);
+        assert_eq!(issue_budget(40, 25), 6);
+        assert!(
+            issue_budget(100, 10) >= issue_budget(70, 10),
+            "预算随宽度单调不减"
+        );
+        assert!(
+            issue_budget(80, 70) <= issue_budget(80, 10),
+            "右侧越宽，留给告警文案的越少"
+        );
     }
 
     /// 证伪方式：把 `conn_spans` 里的截断改回硬编码 30——小预算下断言变红。

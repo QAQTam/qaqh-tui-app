@@ -137,6 +137,9 @@ impl App {
         let Some(top) = self.overlays.last().cloned() else {
             return false;
         };
+        // AttachPath 的提交目标只从 overlay 自己取（单一事实源，见 `AttachSubmit`）：
+        // 在这里就定下来，Enter 分支不再有任何别的 seed 可查。
+        let attach_submit = top.attach_submit();
 
         match top {
             Overlay::Help => {
@@ -264,13 +267,11 @@ impl App {
                         self.overlays.pop();
                     }
                     KeyCode::Enter => {
-                        let path: String = input.iter().collect();
                         self.overlays.pop();
-                        let path = path.trim().to_owned();
-                        if !path.is_empty() {
-                            self.upload_attachment(path);
+                        // 空路径 → None（不提交）；目标 seed 由 overlay 携带。
+                        if let Some(submit) = attach_submit {
+                            self.upload_attachment(submit);
                         }
-                        let _ = seed;
                     }
                     KeyCode::Backspace => {
                         if cursor > 0 {
@@ -501,6 +502,73 @@ mod tests {
             cursor: 0,
             seed: seed.into(),
         }
+    }
+
+    fn attach_with_path(seed: &str, path: &str) -> Overlay {
+        Overlay::AttachPath {
+            input: path.chars().collect(),
+            cursor: path.chars().count(),
+            seed: seed.into(),
+        }
+    }
+
+    /// 阻断项（PR #20 二轮）：附件提交的目标 seed 只能来自 overlay 自己。
+    ///
+    /// 证伪方式：把 `attach_submit` 的目标换成别的来源（活动标签 / 空串）→ 第一条
+    /// 断言变红。把 Enter 分支改回 `upload_attachment(path)` + `active_seed()`
+    /// （旧行为）会让 `AttachPath.seed` 重新变成死字段（`let _ = seed`），也就是
+    /// 判据说「属于 seed a」而执行挂到活动标签——那正是本测试锁住的单一事实源。
+    #[test]
+    fn attach_submit_targets_its_own_seed() {
+        let submit = attach_with_path("a", "/tmp/shot.png")
+            .attach_submit()
+            .expect("非空路径应提交");
+        let (target, path) = submit.into_parts();
+        assert_eq!(target, "a", "目标 seed 必须取 overlay 存的那个");
+        assert_eq!(path, "/tmp/shot.png");
+
+        // 空 / 纯空白路径不提交（沿用旧行为）。
+        assert!(attach("a").attach_submit().is_none());
+        assert!(attach_with_path("a", "   ").attach_submit().is_none());
+        // 路径两端空白被去掉。
+        assert_eq!(
+            attach_with_path("a", "  /tmp/x.png ")
+                .attach_submit()
+                .map(|s| s.into_parts()),
+            Some(("a".to_string(), "/tmp/x.png".to_string()))
+        );
+
+        // 别的 overlay 没有这个动作，按键路由不会误触发上传。
+        assert!(Overlay::Help.attach_submit().is_none());
+        assert!(confirm_close("a").attach_submit().is_none());
+    }
+
+    /// 剪枝判据与提交目标必须自洽：切到别的标签后 `AttachPath` 已被剪掉，不存在
+    /// 「提交到别的标签」的窗口；只要它还在，目标就恒为自己那个 seed。
+    ///
+    /// 证伪方式：把 `bound_seed()` 对 `AttachPath` 改回 `None`（审查给过的备选
+    /// 方案），或把剪枝改回 no-op——`overlays.is_empty()` 立刻变红。
+    #[test]
+    fn attach_target_and_pruning_agree_on_the_seed() {
+        let mut overlays = vec![attach_with_path("a", "/tmp/x.png")];
+        assert_eq!(
+            overlays[0].attach_submit().map(|s| s.into_parts().0),
+            Some("a".to_string())
+        );
+
+        prune_seed_bound_overlays(&mut overlays, Some("b"));
+        assert!(
+            overlays.is_empty(),
+            "切到别的标签后 AttachPath 必须被剪掉：{overlays:?}"
+        );
+        assert!(
+            overlays
+                .iter()
+                .filter_map(|o| o.attach_submit())
+                .next()
+                .is_none(),
+            "没有 overlay 就没有可提交的目标"
+        );
     }
 
     /// 回归：切标签后，绑在旧 seed 上的 overlay 必须消失。

@@ -696,6 +696,30 @@ impl SessionState {
         self.responded_permissions.insert(tool_call_id);
     }
 
+    /// bootstrap 快照恢复挂起权限：**只补不换**。
+    ///
+    /// 与实时事件入口（[`SessionState::queue_permission`]）的区别在「同 id 已存在」
+    /// 时怎么办：快照可能是**旧**视图（`tool_state` 的 pending 字段只带 id），
+    /// 用它覆盖实时事件带来的面板会把工具名/理由/风险等级换成「（恢复中）」占位符，
+    /// 还会把该面板挪到队尾、改变 `active_permission()` 的优先级。所以这里只在
+    /// 「内存里没有这个 id」时补一条；已解决的 id 同样不再入队。
+    ///
+    /// 返回是否真的补了面板。
+    pub fn restore_permission_from_snapshot(&mut self, panel: PermissionPanel) -> bool {
+        if self.responded_permissions.contains(&panel.tool_call_id) {
+            return false;
+        }
+        if self
+            .pending_permissions
+            .iter()
+            .any(|p| p.tool_call_id == panel.tool_call_id)
+        {
+            return false;
+        }
+        self.pending_permissions.push(panel);
+        true
+    }
+
     pub fn is_waiting_user(&self) -> bool {
         self.activity == Some(ActivityState::WaitingUser)
             || !self.pending_permissions.is_empty()
@@ -1079,7 +1103,7 @@ mod tests {
 
     /// 历史必须有界（否则长会话里 `responded_permissions` 无界增长）。
     ///
-    /// 这里直接读私有字段 `seen`（同模块单测），不额外暴露只为测试存在的 API。
+    /// 这里直接读私有字段（同模块单测），不额外暴露只为测试存在的 API。
     #[test]
     fn responded_history_is_bounded() {
         let mut hist = RespondedPermissions::default();
@@ -1093,9 +1117,61 @@ mod tests {
             "最新的 id 必须记住"
         );
         assert!(!hist.contains("c0"), "最旧的 id 被淘汰");
+        let oldest_survivor = format!("c{}", total - RespondedPermissions::CAP);
 
-        // 重复 insert 不会撑大集合。
+        // 重复 insert 必须幂等：既不增长，也**不淘汰别的 id**。
+        // （只断言 `seen.len()` 是恒真的——`seen` 是 HashSet，重复插入本就不会变大；
+        // 判别力在顺序表上：把已存在的 id 当新条目 push 会挤掉最旧的幸存者。）
         hist.insert(&format!("c{}", total - 1));
-        assert_eq!(hist.seen.len(), RespondedPermissions::CAP);
+        assert_eq!(hist.order.len(), RespondedPermissions::CAP, "顺序表不堆积");
+        assert!(
+            hist.contains(&oldest_survivor),
+            "重复 insert 不得淘汰别的 id（{oldest_survivor} 被挤掉了）"
+        );
+    }
+
+    /// 建议项 1（PR #20 二轮）：晚到的 bootstrap 快照「只补不换」。
+    ///
+    /// 证伪方式：把 `restore_permission_from_snapshot` 换回 `queue_permission`
+    /// （旧行为）——「已有面板不覆盖」与「详情不得被占位符降级」两条断言同时变红。
+    #[test]
+    fn late_snapshot_never_downgrades_live_panels() {
+        let mut s = SessionState::new("seed".into());
+        let mut live = perm("c1");
+        live.reason = "需要写文件".into();
+        live.risk = PermissionRisk::High;
+        assert!(s.queue_permission(live));
+        assert!(s.queue_permission(perm("c2")));
+
+        // 快照晚到：只带 c1，且只有「（恢复中）」占位详情。
+        let mut snapshot = perm("c1");
+        snapshot.tool_name = "（恢复中）".into();
+        snapshot.reason = String::new();
+        assert!(
+            !s.restore_permission_from_snapshot(snapshot),
+            "已有面板不得被快照覆盖"
+        );
+        assert_eq!(s.pending_permissions.len(), 2, "快照里没有的条目不得被挤掉");
+        assert_eq!(
+            s.active_permission().map(|p| p.tool_call_id.as_str()),
+            Some("c1"),
+            "优先级（队首）不变"
+        );
+        assert_eq!(
+            s.active_permission().map(|p| p.reason.as_str()),
+            Some("需要写文件"),
+            "详情不得被「（恢复中）」占位符降级"
+        );
+        assert_eq!(
+            s.active_permission().map(|p| p.risk),
+            Some(PermissionRisk::High)
+        );
+
+        // 快照里有、内存里没有的：补上（恢复语义仍然成立）。
+        assert!(s.restore_permission_from_snapshot(perm("c9")));
+        assert!(s.pending_permissions.iter().any(|p| p.tool_call_id == "c9"));
+        // 已解决的 id 不被快照复活。
+        s.resolve_permission("c9");
+        assert!(!s.restore_permission_from_snapshot(perm("c9")));
     }
 }

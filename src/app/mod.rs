@@ -232,13 +232,14 @@ pub struct StreamIssues {
 impl StreamIssues {
     /// 记一条告警；返回该流此前是否**不在**告警集合里。
     pub fn raise(&mut self, stream: StreamKey, message: String) -> bool {
-        let fresh = !self.messages.contains_key(&stream);
-        if !fresh {
+        let already = self.messages.contains_key(&stream);
+        if already {
+            // 同一条流重复告警：只覆盖文案并挪到最新，顺序表里不堆积重复项。
             self.order.retain(|k| k != &stream);
         }
         self.order.push(stream.clone());
         self.messages.insert(stream, message);
-        fresh
+        !already
     }
 
     /// 该流恢复：只移除**它自己**那条告警；返回它此前是否在告警集合里。
@@ -344,6 +345,11 @@ impl Overlay {
     /// - **全局**：`SessionList`（daemon 全局会话列表）、`Settings`（全局配置）、
     ///   `Help`、`CwdInput`（`/new` 的 cwd，此时还没有 seed）。它们与当前标签
     ///   无关，切标签**不该**把它们关掉——一刀切清空会误伤设置页这类全局面板。
+    ///
+    /// `AttachPath` 的判据与执行必须同源：它的上传目标由
+    /// [`Overlay::attach_submit`] 给出，取的就是这里的 `seed`（不是提交那一刻的
+    /// 活动标签）。此前 `bound_seed()` 说「属于 seed X」而上传查 `active_seed()`，
+    /// 两条路径结论相反，`AttachPath.seed` 沦为死字段。
     pub fn bound_seed(&self) -> Option<&str> {
         match self {
             Overlay::Confirm { action } => Some(action.seed()),
@@ -354,6 +360,43 @@ impl Overlay {
             | Overlay::CwdInput { .. } => None,
         }
     }
+
+    /// `AttachPath` 按 Enter 的提交动作：目标 seed + 去空白后的路径。
+    ///
+    /// - 目标 seed **恒取 overlay 自己存的那个**——这是附件目标 seed 的单一事实源，
+    ///   与 [`Overlay::bound_seed`] 的判据一致（判据说属于谁，执行就落在谁身上）；
+    /// - 空路径（或纯空白）→ `None`：不提交；
+    /// - 非 `AttachPath` → `None`。
+    pub fn attach_submit(&self) -> Option<AttachSubmit> {
+        match self {
+            Overlay::AttachPath { input, seed, .. } => {
+                let path = input.iter().collect::<String>().trim().to_owned();
+                (!path.is_empty()).then(|| AttachSubmit {
+                    target_seed: seed.clone(),
+                    path,
+                })
+            }
+            _ => None,
+        }
+    }
+}
+
+/// 附件上传的目标：**只能**由 [`Overlay::attach_submit`] 产生。
+///
+/// 这样「上传挂到哪个会话」不可能与 overlay 的身份漂移：上传入口拿不到
+/// `active_seed()`，只有一个来源。判据（`bound_seed()`）、剪枝（切标签即关闭）、
+/// 执行（用存量 seed 上传）三条路径由此自洽。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttachSubmit {
+    target_seed: String,
+    path: String,
+}
+
+impl AttachSubmit {
+    /// 拆成 `(目标 seed, 路径)`——上传入口只通过它取值。
+    pub fn into_parts(self) -> (String, String) {
+        (self.target_seed, self.path)
+    }
 }
 
 /// 清掉「不属于 `seed`」的 seed 绑定 overlay（纯函数，便于回归测试）。
@@ -361,9 +404,10 @@ impl Overlay {
 /// 全局 overlay（`bound_seed() == None`）原样保留且保持相对顺序；删掉的若是栈顶，
 /// 下面那层自然接管——渲染与按键路由都取 `overlays.last()`，两处一致。
 pub fn prune_seed_bound_overlays(overlays: &mut Vec<Overlay>, seed: Option<&str>) {
-    overlays.retain(|o| match o.bound_seed() {
-        None => true,
-        Some(bound) => Some(bound) == seed,
+    overlays.retain(|o| match (o.bound_seed(), seed) {
+        (None, _) => true,
+        (Some(bound), Some(active)) => bound == active,
+        (Some(_), None) => false,
     });
 }
 
@@ -1272,10 +1316,10 @@ impl App {
                         }
                         let tool = b.tool_state().unwrap_or_default();
                         if let Some(perm) = tool.pending_permission {
-                            // bootstrap 恢复挂起权限（详情等 tool 事件补全）。走
-                            // queue_permission：快照可能落后于我们的应答，已解决的
-                            // id 不许被旧快照复活。
-                            sess.queue_permission(PermissionPanel {
+                            // bootstrap 恢复挂起权限（详情等 tool 事件补全）。只补不换：
+                            // 快照可能落后于实时事件，不许用「（恢复中）」占位符覆盖
+                            // 已有面板的详情，也不许复活已解决的 id。
+                            sess.restore_permission_from_snapshot(PermissionPanel {
                                 tool_call_id: perm,
                                 tool_name: "（恢复中）".into(),
                                 reason: String::new(),
@@ -1388,6 +1432,13 @@ impl App {
                             content,
                         });
                         self.toast(NoticeLevel::Info, "附件已上传".to_string());
+                    } else {
+                        // 上传途中目标会话被关闭（异步竞态）：上传成功也无处可挂，
+                        // 必须说出来而不是静默丢弃。
+                        self.toast(
+                            NoticeLevel::Error,
+                            format!("附件已上传但目标会话已关闭：{seed}"),
+                        );
                     }
                 }
                 Err(e) => {

@@ -292,9 +292,10 @@ impl App {
         self.inspect = None;
         // 返回父会话：重置焦点触发 touch_focus / 渲染缓存重建。
         self.last_focused = None;
-        // 观测期间开的全局 overlay 留着；绑在别的 seed 上的（例如切进观测前留下的
-        // 确认框）不该在回到父标签后突然生效。
-        self.prune_overlays_for_active_seed();
+        // 这里**不**剪 overlay：`inspect` 不改变活动标签，而所有会改变它的路径
+        // （Alt+数字/方向、点击标签、open_session_tab、close_tab_by_seed）自己
+        // 已经剪过；唯一由 Esc 进入的这条路径还要先过 `overlay_key`，那时 overlay
+        // 栈必然为空。原先这里那次调用在任何可达状态下都删不掉东西（no-op）。
     }
 
     // ── 发现与跟踪 ──
