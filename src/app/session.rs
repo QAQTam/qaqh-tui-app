@@ -454,8 +454,6 @@ pub struct SessionState {
     pub needs_rebaseline: bool,
     /// 加载更早：in-flight 去重。
     pub loading_older: bool,
-    /// 已展开的工具输出（tool_call_id 集合，折叠态默认收起超长输出）
-    pub expanded_tools: std::collections::HashSet<String>,
     /// §4.2 运行组展开态：(turn_id, round_num)。展开 = 组内卡片列表可见；
     /// 收起 = 一行组行（失败例外：组内最后一张 Failed 卡始终内联）。
     pub expanded_groups: std::collections::HashSet<(String, u32)>,
@@ -495,7 +493,6 @@ impl SessionState {
             ready: false,
             needs_rebaseline: false,
             loading_older: false,
-            expanded_tools: std::collections::HashSet::new(),
             expanded_groups: std::collections::HashSet::new(),
             subagents: Vec::new(),
         }

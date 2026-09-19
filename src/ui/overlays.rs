@@ -197,7 +197,7 @@ fn draw_help(f: &mut Frame, area: Rect) {
         ("F3", "活动区（ActivityBar）显隐"),
         ("F4", "workspace 侧栏（todo 列表）开/关"),
         ("F6", "todo 详情展开/折叠"),
-        ("F7", "工具输出展开/折叠（长输出/diff）"),
+        ("F7", "工具运行组展开/折叠（最近一组；失败卡始终内联）"),
         ("F1", "本帮助"),
         ("Ctrl+C ×2 / Ctrl+Q", "退出"),
     ];

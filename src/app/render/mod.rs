@@ -125,7 +125,7 @@ pub(crate) fn refresh(
             for (block, bseg) in blocks.zip(tseg.content.iter_mut()) {
                 // Height(0) = 折叠组中间块（§4.2）：0 行即精确，重渲会泄漏完整卡。
                 if !bseg.body.is_rendered() && bseg.body.height() > 0 {
-                    render_block_into(bseg, session, block, width);
+                    render_block_into(bseg, block, width);
                     stats.rebuilt_blocks += 1;
                     rendered += 1;
                 }
@@ -167,7 +167,7 @@ pub(crate) fn refresh(
             for (block, bseg) in blocks.zip(tseg.content.iter_mut()) {
                 // Height(0) = 折叠组中间块（§4.2）：0 行即精确，重渲会泄漏完整卡。
                 if !bseg.body.is_rendered() && bseg.body.height() > 0 {
-                    render_block_into(bseg, session, block, width);
+                    render_block_into(bseg, block, width);
                     stats.rebuilt_blocks += 1;
                 }
             }
@@ -272,7 +272,7 @@ fn lines_body(lines: Vec<RenderLine>) -> BlockBody {
 }
 
 /// 渲染一个块并挂上动画槽位（Slots 出带——锁 8 生产端唯一入口）。
-fn render_block_into(bseg: &mut BlockSeg, session: &SessionState, block: &Block, width: u16) {
+fn render_block_into(bseg: &mut BlockSeg, block: &Block, width: u16) {
     // T7：Open text 块走流式增量（纯文本+光标；seal 才上 markdown/syntect）。
     // 走到这里 body 必然未渲染 ⇒ 无可续 stream（增量在对齐期完成、evict 已弃）
     // ⇒ 从全文初始化。
@@ -281,12 +281,7 @@ fn render_block_into(bseg: &mut BlockSeg, session: &SessionState, block: &Block,
         return;
     }
     let mut sink = AnimSink::Slots(Vec::new());
-    let lines = render_block_lines(
-        &session.expanded_tools,
-        block,
-        usize::from(width),
-        &mut sink,
-    );
+    let lines = render_block_lines(block, usize::from(width), &mut sink);
     bseg.body = lines_body(lines);
     bseg.anim = sink.into_vec();
     bseg.stream = None; // 不变式护栏：全量体不携带流式状态
@@ -347,14 +342,14 @@ fn empty_seg() -> BlockSeg {
     }
 }
 
-fn render_block_seg(session: &SessionState, block: &Block, width: u16, key: u64) -> BlockSeg {
+fn render_block_seg(block: &Block, width: u16, key: u64) -> BlockSeg {
     let mut seg = BlockSeg {
         key,
         body: BlockBody::Height(0),
         anim: Vec::new(),
         stream: None,
     };
-    render_block_into(&mut seg, session, block, width);
+    render_block_into(&mut seg, block, width);
     seg
 }
 
@@ -363,7 +358,7 @@ fn render_block_seg(session: &SessionState, block: &Block, width: u16, key: u64)
 ///
 /// - 折叠态：首块 = 组行（key 含组签名）；中间块 = Height(0)；组内最后一张
 ///   Failed 卡**内联**（错误不许藏，用原块 key 走完整渲染路径）。
-/// - 展开态：卡片列表（per-card expanded_tools 语义照旧）。
+/// - 展开态：卡片列表（W-02：卡片正文窗口恒定，无卡片级展开位）。
 #[allow(clippy::too_many_arguments)]
 fn flush_tool_group(
     turn: &Turn,
@@ -408,7 +403,7 @@ fn flush_tool_group(
             if Some(i) == last_failed {
                 continue; // 失败例外：单独内联（下方）
             }
-            let key = seg::block_cache_key(b, width, false) ^ sig;
+            let key = seg::block_cache_key(b, width) ^ sig;
             let body = if i == 0 {
                 BlockBody::Lines(
                     vec![crate::app::render_transcript::render_group_line(
@@ -445,7 +440,7 @@ fn flush_tool_group(
         }
         if let Some(i) = last_failed {
             let b = group[i];
-            let key = seg::block_cache_key(b, width, false);
+            let key = seg::block_cache_key(b, width);
             let seg = match old_by_id.remove(b.block_id.as_str()) {
                 Some(s) if s.key == key => s,
                 _ => BlockSeg {
@@ -459,11 +454,7 @@ fn flush_tool_group(
         }
     } else {
         for b in group.iter() {
-            let expanded = b
-                .tool
-                .as_ref()
-                .is_some_and(|t| session.expanded_tools.contains(&t.tool_call_id));
-            let key = seg::block_cache_key(b, width, expanded);
+            let key = seg::block_cache_key(b, width);
             let seg = match old_by_id.remove(b.block_id.as_str()) {
                 Some(s) if s.key == key => s,
                 Some(mut stale) => {
@@ -561,11 +552,7 @@ fn align_turn_seg(
                 stats,
             );
             // 组外单块：T1 工具 / 文本 / reasoning(0行) / notice——原路径。
-            let expanded = block
-                .tool
-                .as_ref()
-                .is_some_and(|t| session.expanded_tools.contains(&t.tool_call_id));
-            let key = seg::block_cache_key(block, width, expanded);
+            let key = seg::block_cache_key(block, width);
             let seg = match old_content_by_id.remove(block.block_id.as_str()) {
                 Some(s) if s.key == key => s,
                 Some(mut stale) => {
@@ -1169,18 +1156,14 @@ mod tests {
             TimelineBlockState::Open,
             "x",
         );
-        let k_open = seg::block_cache_key(&b, 80, false);
+        let k_open = seg::block_cache_key(&b, 80);
         b.state = TimelineBlockState::Sealed;
-        assert_ne!(
-            seg::block_cache_key(&b, 80, false),
-            k_open,
-            "state 必须进键"
-        );
-        // rev / 宽度 / 展开态同理（防回退）。
-        let k0 = seg::block_cache_key(&b, 80, false);
+        assert_ne!(seg::block_cache_key(&b, 80), k_open, "state 必须进键");
+        // rev / 宽度同理（防回退）。
+        let k0 = seg::block_cache_key(&b, 80);
         b.rev += 1;
-        assert_ne!(seg::block_cache_key(&b, 80, false), k0);
-        assert_ne!(seg::block_cache_key(&b, 100, false), k0);
+        assert_ne!(seg::block_cache_key(&b, 80), k0);
+        assert_ne!(seg::block_cache_key(&b, 100), k0);
 
         // 集成：refresh 后 seal 一个流式块 → 恰好一个块重渲。
         let mut sess = fixture_session();
@@ -2021,49 +2004,39 @@ mod tests {
         s
     }
 
-    /// T9 验收主体：宽 × F3 × 工具展开 × 动画帧 的等价矩阵 + 淘汰态窗口对照。
+    /// T9 验收主体：宽 × F3 × 动画帧 的等价矩阵 + 淘汰态窗口对照。
     /// 失败 = M1 管线与旧全量渲染不再等价，必须先修后行。
+    ///
+    /// W-02：原矩阵还有一个「工具展开」维度（`expanded_tools`）——卡片级展开态
+    /// 已删除、正文窗口恒定，该维度随之消失。
     #[test]
     fn m1_acceptance_equivalence_matrix() {
         for w in [40usize, 100] {
-            for expand in [false, true] {
-                for frame in [0u64, 7] {
-                    let ww = w as u16;
-                    let mut sess = fixture_rich();
-                    if expand {
-                        let ids: Vec<String> = sess
-                            .timeline
-                            .turns
-                            .iter()
-                            .flat_map(|t| t.rounds.iter().flat_map(|r| r.blocks.iter()))
-                            .filter(|b| b.kind == TimelineBlockKind::Tool)
-                            .map(|b| b.tool.as_ref().expect("tool").tool_call_id.clone())
-                            .collect();
-                        sess.expanded_tools.extend(ids);
-                    }
-                    let ctx = format!("w={w} expand={expand} frame={frame}");
-                    // oracle 烘焙与槽位覆盖必须同帧（锁 1 同款前提）。
-                    anim::frame_override::set(frame);
+            for frame in [0u64, 7] {
+                let ww = w as u16;
+                let sess = fixture_rich();
+                let ctx = format!("w={w} frame={frame}");
+                // oracle 烘焙与槽位覆盖必须同帧（锁 1 同款前提）。
+                anim::frame_override::set(frame);
 
-                    // 全量几何口径：缓存行（占位）+ 槽位覆盖 == oracle。
-                    let mut cache = TranscriptCache::new(ww);
-                    refresh(&sess, ww, None, &mut cache);
-                    let old = render_transcript_with_opts(&sess, ww);
-                    assert_lines_eq(&flatten_with_anim(&cache, frame), &old, &ctx);
+                // 全量几何口径：缓存行（占位）+ 槽位覆盖 == oracle。
+                let mut cache = TranscriptCache::new(ww);
+                refresh(&sess, ww, None, &mut cache);
+                let old = render_transcript_with_opts(&sess, ww);
+                assert_lines_eq(&flatten_with_anim(&cache, frame), &old, &ctx);
 
-                    // 淘汰态窗口对照：先建全量几何，再模拟滚到底淘汰离屏，
-                    // 窗口行必须与 oracle 尾部区间逐行一致。
-                    let total = cache.total_lines();
-                    refresh(&sess, ww, bottom_vp(total), &mut cache);
-                    let win = flatten_with_anim(&cache, frame);
-                    let top = total - win.len();
-                    assert_lines_eq(
-                        &win,
-                        &old[top..total],
-                        &format!("{ctx} [淘汰窗口 {top}..{total}]"),
-                    );
-                    anim::frame_override::clear();
-                }
+                // 淘汰态窗口对照：先建全量几何，再模拟滚到底淘汰离屏，
+                // 窗口行必须与 oracle 尾部区间逐行一致。
+                let total = cache.total_lines();
+                refresh(&sess, ww, bottom_vp(total), &mut cache);
+                let win = flatten_with_anim(&cache, frame);
+                let top = total - win.len();
+                assert_lines_eq(
+                    &win,
+                    &old[top..total],
+                    &format!("{ctx} [淘汰窗口 {top}..{total}]"),
+                );
+                anim::frame_override::clear();
             }
         }
     }
