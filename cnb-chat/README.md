@@ -44,7 +44,8 @@ python3 cnb-chat/cnb_chat.py selftest        # 离线自测（不触网）
 
 ## 自测
 
-`selftest` 是**不触网**的纯逻辑用例（32 项）：增量 id 全序比较、投递过滤、`parse_since`、
+`selftest` 是**不触网**的纯逻辑用例（33 项；复核：`python3 cnb-chat/cnb_chat.py selftest | grep -cE '^  (ok|FAIL)'`
+——这个数字手写会漂，改用例时请一并改这里）：增量 id 全序比较、投递过滤、`parse_since`、
 渲染截断标注、游标往返与损坏退化，以及**读失败路径**（把最底层的 `cnb_json` 打桩成瞬时
 失败，跑真实的 `fetch_*` → `_paged` → `poll_once` 全链路）。存在理由：本工具的失败模式
 大多是**静默漏消息**而非报错，必须有可证伪的用例钉住边界。
