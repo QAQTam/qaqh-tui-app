@@ -422,7 +422,18 @@ fn flush_tool_group(
                 BlockBody::Height(0) // 组中间块：折叠态零行
             };
             let seg = match old_by_id.remove(b.block_id.as_str()) {
-                Some(s) if s.key == key => s,
+                Some(mut s) if s.key == key => {
+                    // 组行是 O(1) 的便宜物化：**复用时不得沿用淘汰后的 `Height` 占位**。
+                    //
+                    // 否则：淘汰把 `Lines(组行, 1 行)` 转成 `Height(1)`（保高度、丢内容）
+                    // → 下次对齐按键复用 → 物化循环发现「未渲染且高度>0」，用
+                    // `render_block_into` 按**单块**重渲——而它不认识「组」，会把组首块
+                    // 渲成整张卡（1 行 → 2 行），总行数随滚动漂移（锁 2 / W-09）。
+                    if !s.body.is_rendered() {
+                        s.body = body;
+                    }
+                    s
+                }
                 _ => BlockSeg {
                     key,
                     body,
@@ -1016,15 +1027,13 @@ mod tests {
     /// `offscreen_eviction_counts_blocks` 的**两个位置**（底/顶）作弱化替代，
     /// 中间滚动位置的漂移无人覆盖。plan §3.7 的锁 2 即此。
     ///
-    /// ⚠ **当前 `#[ignore]`：本锁一写出来就是红的**——补回当轮即抓到一处真实的
-    /// 估算漂移：被淘汰的**折叠工具组**估算 2 行、实际渲染 1 行（`estimates.rs` vs
-    /// `render_block_lines`），于是每淘汰一张成功卡，其后内容整体下移 1 行。
-    /// `sweep_fixture(120)` 实测：`total` 647 → 649/650/652…，**21 个滚动位置全部
-    /// 漂移**，漂移回合全部是「文本 + `Succeeded` 工具卡」形态，逐块核对为
-    /// `content=[2,1]`（精确）vs `content=[2,2]`（估算）。
-    /// 按 plan §3.7 的既有做法（先写锁 → `#[ignore]` 落地 → 修复后摘除）暂挂；
-    /// 修复登记 issue #22 · W-09（估算需对齐 W-02 定的新正文高度规则）。
-    #[ignore = "W-09：淘汰后总行数漂移（折叠工具组估 2 实 1）——估算对齐后摘除"]
+    /// ⚠ **本锁一写出来就是红的**，它抓到的是：折叠组的**首块被淘汰后**，`evict_turn`
+    /// 把 `Lines(组行, 1 行)` 转成 `Height(1)`（保高度、丢内容）；下次对齐按键复用这个
+    /// 占位，物化循环发现「未渲染且高度>0」后用 `render_block_into` 按**单块**重渲——
+    /// 而它不认识「组」，把组首块渲成整张卡（1 行 → 2 行）→ 总行数随滚动漂移。
+    /// `sweep_fixture(120)` 实测 **21 个滚动位置全部漂移**（`total` 647 → 649/650/652…）。
+    ///
+    /// 修法见 `flush_tool_group`：组行是 O(1) 的便宜物化，复用时不得沿用淘汰占位。
     #[test]
     fn window_never_contains_unrendered_segments() {
         let sess = sweep_fixture(120);
@@ -1059,6 +1068,38 @@ mod tests {
             assert!(checked <= 200, "滚动循环未终止");
         }
         assert!(checked > 1, "应至少检查两屏，实际 {checked}");
+    }
+
+    /// **首帧几何（W-11）**：生产首帧是「空缓存 + 视口」——此时视口外的块只有估算
+    /// 高度，总行数因此不得偏离全量渲染，否则滚动条与滚动位置随物化漂移。
+    ///
+    /// ⚠ **当前 `#[ignore]`：实测偏离 +53 行（700 vs 647）**，`sweep_fixture(120)` 按形态拆分：
+    ///
+    /// | 形态 | 偏差 | 成因 |
+    /// |---|---|---|
+    /// | 纯文本 3 行 | 0 | 估 = 实 |
+    /// | markdown 代码块 + 工具卡 | +26 / 30 回合 | 文本块按**原始行**折行估 3，markdown 实渲 2 |
+    /// | 单张 Failed 工具卡 | +27 / 30 回合 | 工具卡估 3，实渲 2（卡片头 + 体） |
+    /// | 超长单行 | 0 | 估 = 实 |
+    ///
+    /// 即估算与实渲在 **markdown / 工具卡**两条渲染器上系统性不一致。修法不是改常数，
+    /// 而是让估算复用渲染器的高度口径（单一事实源），或改布局语义（首次见到即冻结高度）
+    /// ——两者都是设计取舍，另立 W-11 决策，不在补锁的范围内。
+    #[ignore = "W-11：首帧估算偏离 +53 行（markdown / 工具卡两条渲染器）——估算精确化后摘除"]
+    #[test]
+    fn first_frame_estimate_matches_full_render() {
+        let sess = sweep_fixture(120);
+        let mut exact = TranscriptCache::new(80);
+        refresh(&sess, 80, None, &mut exact);
+        let total = exact.total_lines();
+
+        let mut fresh = TranscriptCache::new(80);
+        refresh(&sess, 80, Some((0, 30)), &mut fresh);
+        assert_eq!(
+            fresh.total_lines(),
+            total,
+            "首帧估算不得偏离全量渲染的总行数"
+        );
     }
 
     // ── 锁 3：流式 delta 只重渲一个块（且不惊动邻居的 Arc 身份） ────
