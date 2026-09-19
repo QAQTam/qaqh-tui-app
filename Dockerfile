@@ -1,4 +1,4 @@
-# qaqh-tui-app NPC 运行环境：Ubuntu 26.04 LTS + Rust 1.98.1 + gcc-15 + cmake
+# qaqh-tui-app NPC 运行环境：Ubuntu 26.04 LTS + Rust 1.98.0 + gcc-15 + cmake
 # tui-app 的传输层由 qaqh-client 提供；其 reqwest 走 rustls（aws-lc-rs），
 # 不再依赖 OpenSSL / native-tls。构建后推送 CNB 制品库，供 NPC 事件引用。
 FROM ubuntu:26.04
@@ -34,12 +34,12 @@ RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
     && rm -rf /var/lib/apt/lists/* \
     && node -v && npm -v
 
-# Rust 1.98.1 固定工具链
+# Rust 1.98.0 固定工具链（对齐 rust-toolchain.toml；U-28）
 ENV RUSTUP_HOME=/usr/local/rustup \
     CARGO_HOME=/usr/local/cargo \
     PATH=/usr/local/cargo/bin:${PATH}
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-    | sh -s -- -y --no-modify-path --profile minimal --default-toolchain 1.98.1 \
+    | sh -s -- -y --no-modify-path --profile minimal --default-toolchain 1.98.0 \
     && rustup component add clippy rustfmt \
     && cargo --version && rustc --version
 
@@ -52,7 +52,7 @@ ENV TZ=Asia/Shanghai
 RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone
 
 # 冒烟断言：环境不对即 fail 构建
-RUN cargo --version | grep -q 1.98.1 \
+RUN cargo --version | grep -q 1.98.0 \
     && gcc-15 --version | head -1 \
     && cmake --version | head -1 \
     && pkg-config --version \

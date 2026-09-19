@@ -9,6 +9,8 @@
 #   - 解析改回 `grep | head | sed` 贪婪版 → 用例 2/3 红
 #   - 解析失败改回「假装 fallback」   → 用例 1 红
 #   - prepare() 对已有目录直接 return 0 → 用例 4/5 红
+#   - count_behind() 把「算不出来」也打印一个数（如空串/0）→ 用例 11 红
+#   - count_behind() 数反方向（`ref..HEAD`）→ 用例 9 红
 #
 # 用法：bash scripts/tests/ci-linux-parse-test.sh
 
@@ -98,6 +100,42 @@ if tc=$(resolve_toolchain "$d"); then
 else
     ok "解析失败时：正确进入 else 分支（未被 set -e 静默中止）"
 fi
+
+echo
+echo "== count_behind(): U-30 漂移报告的核心计算 =="
+
+# 用例 9：落后 N 个提交必须数对（真 origin：bare + seed 推 3 个 + clone 后回退到首个）
+origin="$TMP/origin.git"; git init -q --bare "$origin"
+git -C "$origin" symbolic-ref HEAD refs/heads/main   # 免去 clone 时的「远程 HEAD 不存在」警告
+seed="$TMP/seed"; git init -q "$seed"
+for m in c1 c2 c3; do
+    git -C "$seed" -c user.email=t@t -c user.name=t commit -q --allow-empty -m "$m"
+done
+git -C "$seed" branch -M main
+git -C "$seed" remote add origin "$origin"
+git -C "$seed" push -q origin main
+
+work="$TMP/work"; git clone -q "$origin" "$work"
+root=$(git -C "$seed" rev-list --max-parents=0 HEAD)
+git -C "$work" reset -q --hard "$root"      # HEAD 回到 c1，origin/main 仍在 c3
+
+if got=$(count_behind "$work" origin/main); then
+    [ "$got" = "2" ] && ok "落后 2 个提交：数对了" || bad "落后 2 个提交：期望 2，实得 '$got'"
+else bad "落后 2 个提交：本应成功"; fi
+
+# 用例 10：HEAD 与 ref 一致 → 0（防「永远报落后」的假阳）
+git -C "$work" reset -q --hard origin/main
+if got=$(count_behind "$work" origin/main); then
+    [ "$got" = "0" ] && ok "一致时报 0" || bad "一致时：期望 0，实得 '$got'"
+else bad "一致时：本应成功"; fi
+
+# 用例 11：不可用时必须**非零退出且不打印任何东西**
+# （否则 report_drift 会把空串当成 0，静默把「算不出来」报成「没有落后」）
+if got=$(count_behind "$TMP/does-not-exist" HEAD 2>/dev/null); then
+    bad "无效目录：本应失败，却打印了 '$got'"
+elif [ -n "$got" ]; then
+    bad "无效目录：失败时不得打印任何东西，实得 '$got'"
+else ok "无效目录：按预期失败且无输出"; fi
 
 echo
 echo "通过 $pass / 失败 $fail"
