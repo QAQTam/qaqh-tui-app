@@ -481,15 +481,24 @@ use self::settings::{FieldKind, SettingsState};
 /// 主循环帧统计（`QAQH_TUI_DEBUG=1` 展示）。
 ///
 /// 由 `main.rs` 主循环每秒结算一次：把「wire 事件率」与「终端实际刷新率」
-/// 两个数字分开——前者来自 SSE，后者才是用户看到的观感上限。
+/// 两个数字分开，再把整帧耗时拆成三段——渲染管线 / 终端写入 / 事件处理，
+/// 用于定位观感瓶颈到底在应用侧还是终端侧。
 #[derive(Debug, Clone, Copy, Default)]
 pub struct FrameStats {
     /// 最近一秒完成的帧数（每帧 = 一次 `terminal.draw`）。
     pub fps: u32,
     /// 最近一秒消费的运行时消息数（`AppMsg::Runtime`；≈ timeline 事件率）。
     pub events_per_s: u32,
-    /// 最近一秒的平均整帧耗时（`ensure_render_caches` + `terminal.draw`）。
+    /// 最近一秒的平均整帧耗时（`ref_us + term_us`）。
     pub draw_us: u64,
+    /// 其中：`ensure_render_caches`（渲染管线：段对齐 + 物化 + 淘汰）。
+    pub ref_us: u64,
+    /// 其中：`terminal.draw`（`ui::draw` + ratatui diff + 终端写入/刷新）。
+    pub term_us: u64,
+    /// 其中：`app.handle`（每帧平均；批量事件合计摊到帧）。
+    pub handle_us: u64,
+    /// 最近一秒内单次 refresh 的最大重渲块数（⟂ 峰值）。
+    pub peak_rebuilt: u32,
 }
 
 pub struct App {

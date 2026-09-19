@@ -132,6 +132,10 @@ async fn run_tui(no_spawn: bool) -> Result<()> {
     let mut frames: u32 = 0;
     let mut events: u32 = 0;
     let mut draw_us: u64 = 0;
+    let mut ref_us_sum: u64 = 0;
+    let mut term_us_sum: u64 = 0;
+    let mut handle_us_sum: u64 = 0;
+    let mut peak_rebuilt: u32 = 0;
     let mut stats_at = std::time::Instant::now();
     let loop_result: Result<()> = async {
         loop {
@@ -142,11 +146,23 @@ async fn run_tui(no_spawn: bool) -> Result<()> {
             // （ui::mod 的 transcript_content_width 是唯一事实源）。
             let area =
                 ratatui::layout::Rect::new(0, 0, terminal.size()?.width, terminal.size()?.height);
-            let frame_t0 = std::time::Instant::now();
+            let ref_t0 = std::time::Instant::now();
             app.ensure_render_caches(area);
+            let ref_us = ref_t0.elapsed().as_micros() as u64;
+            let term_t0 = std::time::Instant::now();
             terminal.draw(|f| ui::draw(f, &app))?;
-            draw_us += frame_t0.elapsed().as_micros() as u64;
+            let term_us = term_t0.elapsed().as_micros() as u64;
+            ref_us_sum += ref_us;
+            term_us_sum += term_us;
+            draw_us += ref_us + term_us;
             frames += 1;
+            if let Some(n) = app
+                .active_session()
+                .and_then(|s| s.block_cache.as_ref())
+                .map(|c| c.stats.rebuilt_blocks)
+            {
+                peak_rebuilt = peak_rebuilt.max(n as u32);
+            }
 
             // M4（T15）：Ctrl+T 浮层按 `e` 置位 → 帧间挂起终端交给 $PAGER。
             if let Some(text) = app.pending_pager.take() {
@@ -159,26 +175,39 @@ async fn run_tui(no_spawn: bool) -> Result<()> {
             if matches!(&msg, AppMsg::Runtime(_)) {
                 events += 1;
             }
+            let handle_t0 = std::time::Instant::now();
             app.handle(msg);
+            handle_us_sum += handle_t0.elapsed().as_micros() as u64;
             // 排空积压（一帧内合并多个事件）。
             while let Ok(msg) = app_rx.try_recv() {
                 if matches!(&msg, AppMsg::Runtime(_)) {
                     events += 1;
                 }
+                let handle_t0 = std::time::Instant::now();
                 app.handle(msg);
+                handle_us_sum += handle_t0.elapsed().as_micros() as u64;
                 if app.quit {
                     break;
                 }
             }
             if stats_at.elapsed() >= std::time::Duration::from_secs(1) {
+                let f = u64::from(frames.max(1));
                 app.frame_stats = FrameStats {
                     fps: frames,
                     events_per_s: events,
-                    draw_us: draw_us / u64::from(frames.max(1)),
+                    draw_us: draw_us / f,
+                    ref_us: ref_us_sum / f,
+                    term_us: term_us_sum / f,
+                    handle_us: handle_us_sum / f,
+                    peak_rebuilt,
                 };
                 frames = 0;
                 events = 0;
                 draw_us = 0;
+                ref_us_sum = 0;
+                term_us_sum = 0;
+                handle_us_sum = 0;
+                peak_rebuilt = 0;
                 stats_at = std::time::Instant::now();
             }
         }

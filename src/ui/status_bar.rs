@@ -103,21 +103,32 @@ pub fn conn_spans(
 }
 
 /// M0 观测：渲染缓存统计的展示单元（纯函数，便于测试）。
-/// `⟂n`=上次 refresh 重渲块数；`res n`=驻留块数；`nµs`=上次重建耗时。
-fn render_stats_span(rebuilt: usize, resident: usize, render_us: u64) -> Span<'static> {
+/// `⟂a/b`=上次 refresh 重渲块数 / 最近一秒峰值；`res n`=驻留块数；`nµs`=上次重建耗时。
+fn render_stats_span(
+    rebuilt: usize,
+    peak_rebuilt: u32,
+    resident: usize,
+    render_us: u64,
+) -> Span<'static> {
     Span::styled(
-        format!(" · ⟂{rebuilt} res{resident} {render_us}µs"),
+        format!(" · ⟂{rebuilt}/{peak_rebuilt} res{resident} {render_us}µs"),
         theme::dim(),
     )
 }
 
 /// M1 观测：主循环帧统计的展示单元（纯函数，便于测试）。
-/// `n fps`=最近一秒帧数；`evn/s`=运行时消息率；`drawnµs`=整帧平均耗时。
+/// `nfps`=最近一秒帧数；`evn/s`=运行时消息率；`dnµs`=整帧平均耗时，
+/// 括号内三段拆分：`ref`=渲染管线、`term`=终端写入、`h`=事件处理。
 fn frame_stats_span(stats: &crate::app::FrameStats) -> Span<'static> {
     Span::styled(
         format!(
-            " · {}fps ev{}/s draw{}µs",
-            stats.fps, stats.events_per_s, stats.draw_us
+            " · {}fps ev{}/s d{}µs (ref{} term{} h{})",
+            stats.fps,
+            stats.events_per_s,
+            stats.draw_us,
+            stats.ref_us,
+            stats.term_us,
+            stats.handle_us
         ),
         theme::dim(),
     )
@@ -168,6 +179,7 @@ pub fn draw(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
             if let Some(cache) = sess.block_cache.as_ref() {
                 right.push(render_stats_span(
                     cache.stats.rebuilt_blocks,
+                    app.frame_stats.peak_rebuilt,
                     cache.stats.resident_blocks,
                     cache.stats.render_us,
                 ));
@@ -245,19 +257,26 @@ mod tests {
     /// M0 观测：debug 段的格式必须稳定（解析/截图工具都依赖它）。
     #[test]
     fn render_stats_span_formats_debug_counters() {
-        let s = render_stats_span(3, 12, 4210);
-        assert_eq!(s.content.as_ref(), " · ⟂3 res12 4210µs");
+        let s = render_stats_span(3, 119, 12, 4210);
+        assert_eq!(s.content.as_ref(), " · ⟂3/119 res12 4210µs");
     }
 
-    /// M1 观测：帧统计格式稳定（fps / 事件率 / 整帧耗时三个数字）。
+    /// M1 观测：帧统计格式稳定（fps / 事件率 / 整帧耗时三段拆分）。
     #[test]
     fn frame_stats_span_formats_debug_counters() {
         let s = frame_stats_span(&crate::app::FrameStats {
             fps: 187,
             events_per_s: 203,
-            draw_us: 412,
+            draw_us: 2900,
+            ref_us: 400,
+            term_us: 2400,
+            handle_us: 50,
+            peak_rebuilt: 119,
         });
-        assert_eq!(s.content.as_ref(), " · 187fps ev203/s draw412µs");
+        assert_eq!(
+            s.content.as_ref(),
+            " · 187fps ev203/s d2900µs (ref400 term2400 h50)"
+        );
     }
 
     /// 回归：`Ready` 相位下的流告警必须可见，且恢复后必须消失。
