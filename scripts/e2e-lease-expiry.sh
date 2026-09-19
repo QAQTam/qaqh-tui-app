@@ -21,6 +21,7 @@
 #       本脚本**不构建、不改任何生产代码**（后端仓可正处在改造中，
 #       只要那个 daemon 二进制存在且能跑）。
 # 环境：`DAEMON` / `TUI` / `QAQH_BACKEND_ROOT` 可覆盖；`TTL_MS` / `RUN_SECS` 可调。
+#       `D`（工作目录）也可覆盖，但**必须落在 /tmp 下** —— 见下方守卫。
 #
 # 隔离：私有 data root（/tmp 下），不碰你正在用的 daemon 与会话。
 # ⚠ Linux 下 data root 的 basename 必须是 `qaqh`（Windows 才是 `.qaqh`）——
@@ -37,6 +38,15 @@ BACKEND_ROOT=${QAQH_BACKEND_ROOT:-$REPO_ROOT/../qaqh-backend}
 DAEMON=${DAEMON:-$BACKEND_ROOT/target/debug/qaqh-daemon}
 TUI=${TUI:-$REPO_ROOT/target/debug/qaqh-tui}
 D=${D:-/tmp/qaqh-e2e-lease}
+
+# ⚠ 守卫：`D` 可被环境覆盖，而下面要 `rm -rf "$D"`。兄弟脚本（e2e-restart.sh /
+# e2e-session-list.sh）把 `D` **硬编码**成 /tmp 路径，所以没有这个暴露面；本脚本
+# 让它可覆盖（为了能并行跑多份），就**必须**把这条守住 —— 否则 `D=/` 之类的
+# 误设会变成一次 `rm -rf /`。
+case "$D" in
+  /tmp/*|/var/tmp/*) ;;
+  *) echo "拒绝：D 必须落在 /tmp 或 /var/tmp 下（当前：$D）——本脚本会对它 rm -rf" >&2; exit 1 ;;
+esac
 TTL_MS=${TTL_MS:-3000}
 RUN_SECS=${RUN_SECS:-70}
 
