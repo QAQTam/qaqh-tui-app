@@ -1,11 +1,14 @@
 //! ActivityBar 活动区（§4.4）：main 与 composer 之间固定 1 行。
 //!
 //! **在 TranscriptCache 之外**：每帧独立重画（一行成本，无需 AnimSlot 机制）。
-//! 内容优先级：`思考 marquee > 运行中工具（icon + name + 摘要）> 空闲`——
+//! 内容优先级：`思考尾部窗口 > 运行中工具（icon + name + 摘要）> 空闲`——
 //! 多轮回合里思考与工具交替，本行永远回答「现在在干嘛」。
 //!
-//! - 思考行：无换行横向滚动（`anim::marquee` 复用，CJK 宽度纪律现成），
-//!   遇换行丢上一行只显**最新一行**；前缀 `anim::thinking_glyph`（M1 预留的
+//! - 思考行：**尾部窗口**（与 webui `ThinkingTicker` 同语义）——遇换行丢上一行
+//!   只显**最新一行**，再取该行最后 N 列：最新字符恒在右缘，旧字符向左滑出后
+//!   不再回来。**不循环、不按帧偏移**（历史教训：`anim::marquee` 环形滚动会让
+//!   短行平铺重复、长行滚出后绕回，且偏移 `frame % total` 随文本增长跳变——
+//!   观感即「同一段话反复重渲」）。前缀 `anim::thinking_glyph`（M1 预留的
 //!   `AnimKind::Thinking` 语义在这里落地）。
 //! - F3（`show_activity`）控制本行显隐；隐藏时布局回收该行（不占位）。
 //! - 子代理观测（Ctrl+↑）同一套：`active_session` 即当前查看会话，
@@ -65,13 +68,13 @@ pub(crate) fn activity_spans(app: &App, width: usize, frame: u64) -> Vec<Span<'s
         }
     }
 
-    // 优先级 1：思考 marquee。
+    // 优先级 1：思考尾部窗口（最新字符恒在右缘；不循环、与帧号无关）。
     if let Some(line) = thinking_last_line {
         let glyph = anim::thinking_glyph(frame);
         let budget = width.saturating_sub(glyph.chars().count() + 1).max(1);
         return vec![
             S::styled(format!("{glyph} "), crate::ui::theme::accent()),
-            S::styled(anim::marquee(line, budget, frame), crate::ui::theme::dim()),
+            S::styled(tail_cols(line, budget), crate::ui::theme::dim()),
         ];
     }
     // 优先级 2：运行中工具。
@@ -88,6 +91,25 @@ pub(crate) fn activity_spans(app: &App, width: usize, frame: u64) -> Vec<Span<'s
     }
     // 优先级 3：空闲。
     vec![S::styled(" · 空闲".to_string(), crate::ui::theme::dim())]
+}
+
+/// 取 `line` 的最后 `max` 个显示列（尾部窗口；CJK 安全：宽字符要么完整保留、
+/// 要么整体舍弃）。文本未变时输出逐帧稳定——帧号只驱动左侧 glyph。
+fn tail_cols(line: &str, max: usize) -> String {
+    use unicode_width::UnicodeWidthChar;
+    let max = max.max(1);
+    let mut w = 0usize;
+    let mut out: Vec<char> = Vec::new();
+    for c in line.chars().rev() {
+        let cw = c.width().unwrap_or(0);
+        if w + cw > max {
+            break;
+        }
+        w += cw;
+        out.push(c);
+    }
+    out.reverse();
+    out.into_iter().collect()
 }
 
 /// 按显示宽度截断（活动区单行纪律；CJK 安全由逐列累加保证）。
@@ -180,6 +202,46 @@ mod tests {
         let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(text.contains("思考最新行"), "应显示最新思考行：{text}");
         assert!(!text.contains("思考第一行"), "旧行必须被丢弃：{text}");
+    }
+
+    /// **尾部窗口回归**（机主实测："不是流动而是重复渲染"）：思考行必须
+    /// 短行不平铺、帧间稳定、长行锚定尾部。
+    ///
+    /// 证伪方式：换回 `anim::marquee` —— ①② 同时变红（短行被平铺重复、
+    /// 输出随帧号变化）。
+    #[test]
+    fn thinking_line_is_a_stable_tail_window_not_a_looping_marquee() {
+        // ① 短行：整行只出现一次（环形 marquee 会平铺重复）。
+        let app = app_with_running_turn(|m| running_reasoning(m, "短句"));
+        let text: String = activity_spans(&app, 60, 0)
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert_eq!(text.matches("短句").count(), 1, "短行不得平铺重复：{text}");
+
+        // ② 帧无关：**文本段**在不同帧完全一致（第 0 段是随帧变化的 spinner glyph）。
+        let text_at = |frame: u64| -> String {
+            activity_spans(&app, 60, frame)
+                .into_iter()
+                .skip(1)
+                .map(|s| s.content.to_string())
+                .collect()
+        };
+        assert_eq!(
+            text_at(3),
+            text_at(97),
+            "文本未变时尾部窗口必须逐帧稳定（marquee 会随帧偏移）"
+        );
+
+        // ③ 长行：窗口锚定尾部（最新字符可见、头部被裁掉）。
+        let long = format!("开头部分不应该出现{}最新结尾", "填充".repeat(40));
+        let app2 = app_with_running_turn(|m| running_reasoning(m, &long));
+        let text2: String = activity_spans(&app2, 30, 0)
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert!(text2.contains("最新结尾"), "尾部必须可见：{text2}");
+        assert!(!text2.contains("开头部分"), "头部必须被裁掉：{text2}");
     }
 
     #[test]

@@ -27,9 +27,11 @@ pub(crate) fn estimate_wrapped_lines(text: &str, width: usize) -> usize {
 pub(crate) fn estimate_block_lines(block: &Block, width: usize) -> usize {
     let w = width.max(1);
     match block.kind {
-        TimelineBlockKind::Text | TimelineBlockKind::Reasoning => {
-            estimate_wrapped_lines(&block.text, w)
-        }
+        TimelineBlockKind::Text => estimate_wrapped_lines(&block.text, w),
+        // D1：reasoning 退出 transcript 管线（`render_block_lines` 恒 0 行），
+        // 估算必须与实渲同值——否则物化瞬间高度跳变，且 Height>0 会触发
+        // 无谓物化（每个 delta 白跑一次全文折行估算）。
+        TimelineBlockKind::Reasoning => 0,
         TimelineBlockKind::Notice => estimate_wrapped_lines(&block.text, w.saturating_sub(2)),
         // §4.7：T1 工具恒单行；T2 折叠卡仍按 3 行估（阶段 2 精确化）。
         TimelineBlockKind::Tool => {
