@@ -957,6 +957,110 @@ mod tests {
         anim::frame_override::clear();
     }
 
+    // ── 锁 2：**任意滚动位置**的窗口逐行与全量渲染一致（几何不漂移）──
+
+    /// 锁 2 的夹具：回合数够深（能扫出多屏），四种形态轮转——纯文本 / 文本+工具卡 /
+    /// 工具卡 / 超长行，并混入归档回合。目的是让「估算高度」与「精确高度」
+    /// 有机会不一致（漂移只在这种情况下暴露）。
+    fn sweep_fixture(n: usize) -> SessionState {
+        let mut s = SessionState::new("seed".to_string());
+        for i in 0..n {
+            let blocks = match i % 4 {
+                0 => vec![blk(
+                    &format!("b{i}"),
+                    0,
+                    TimelineBlockKind::Text,
+                    TimelineBlockState::Sealed,
+                    "第一行\n第二行\n第三行",
+                )],
+                1 => vec![
+                    blk(
+                        &format!("b{i}"),
+                        0,
+                        TimelineBlockKind::Text,
+                        TimelineBlockState::Sealed,
+                        "```rust\nfn main() {}\n```",
+                    ),
+                    tool_blk(&format!("b{i}t"), 1, TimelineToolState::Succeeded),
+                ],
+                2 => vec![tool_blk(&format!("b{i}t"), 0, TimelineToolState::Failed)],
+                _ => vec![blk(
+                    &format!("b{i}"),
+                    0,
+                    TimelineBlockKind::Text,
+                    TimelineBlockState::Sealed,
+                    "这一行特别长用来测 CJK 宽字符在窄视口下的折行行为是否与全量渲染一致存在差异",
+                )],
+            };
+            let offloaded = i % 7 == 6;
+            s.timeline.turns.push(turn_of(
+                &format!("t{i}"),
+                &format!("问题 {i}"),
+                TimelineTurnState::Completed,
+                None,
+                offloaded,
+                blocks,
+            ));
+        }
+        s
+    }
+
+    /// **不变式**：`window()` 取出的每一行都必须真实存在，且**在任意滚动位置上**
+    /// 都与一次性全量渲染逐行一致（视口内不得有未渲染块、几何不得漂移）。
+    ///
+    /// 这是虚拟化最容易破的地方：几何用估算、渲染用精确，两者一旦不同步，
+    /// 窗口就会缺行或错位（视觉上表现为「内容突然少了一截」）。
+    ///
+    /// **2026-09-20 补回**：本锁在 M1 迁移（`4372e11`）中随旧 `SegmentCache` 路径
+    /// 一起被删（旧位置 `render_transcript.rs:3775`），此后只剩
+    /// `offscreen_eviction_counts_blocks` 的**两个位置**（底/顶）作弱化替代，
+    /// 中间滚动位置的漂移无人覆盖。plan §3.7 的锁 2 即此。
+    ///
+    /// ⚠ **当前 `#[ignore]`：本锁一写出来就是红的**——补回当轮即抓到一处真实的
+    /// 估算漂移：被淘汰的**折叠工具组**估算 2 行、实际渲染 1 行（`estimates.rs` vs
+    /// `render_block_lines`），于是每淘汰一张成功卡，其后内容整体下移 1 行。
+    /// `sweep_fixture(120)` 实测：`total` 647 → 649/650/652…，**21 个滚动位置全部
+    /// 漂移**，漂移回合全部是「文本 + `Succeeded` 工具卡」形态，逐块核对为
+    /// `content=[2,1]`（精确）vs `content=[2,2]`（估算）。
+    /// 按 plan §3.7 的既有做法（先写锁 → `#[ignore]` 落地 → 修复后摘除）暂挂；
+    /// 修复登记 issue #22 · W-09（估算需对齐 W-02 定的新正文高度规则）。
+    #[ignore = "W-09：淘汰后总行数漂移（折叠工具组估 2 实 1）——估算对齐后摘除"]
+    #[test]
+    fn window_never_contains_unrendered_segments() {
+        let sess = sweep_fixture(120);
+        let full = render_transcript_with_opts(&sess, 80);
+        let full_flat: Vec<String> = full.iter().map(|l| flatten(&[l])).collect();
+
+        let mut cache = TranscriptCache::new(80);
+        refresh(&sess, 80, None, &mut cache);
+        let total = cache.total_lines();
+        assert_eq!(total, full_flat.len(), "无视口总行数必须与全量渲染一致");
+
+        let height = 30usize;
+        let mut top = total.saturating_sub(height);
+        let mut checked = 0usize;
+        loop {
+            refresh(&sess, 80, Some((top, height)), &mut cache);
+            assert_eq!(cache.total_lines(), total, "淘汰不得改变总行数");
+            let win = cache.window(top, height);
+            assert!(!win.is_empty() || top >= total, "top={top} 窗口不得为空");
+            for (i, line) in win.iter().enumerate() {
+                assert_eq!(
+                    flatten(&[*line]),
+                    full_flat[top + i],
+                    "top={top} 第 {i} 行与全量渲染不一致（几何漂移）"
+                );
+            }
+            checked += 1;
+            if top == 0 {
+                break;
+            }
+            top = top.saturating_sub(height);
+            assert!(checked <= 200, "滚动循环未终止");
+        }
+        assert!(checked > 1, "应至少检查两屏，实际 {checked}");
+    }
+
     // ── 锁 3：流式 delta 只重渲一个块（且不惊动邻居的 Arc 身份） ────
     #[test]
     fn streaming_delta_renders_single_block() {
