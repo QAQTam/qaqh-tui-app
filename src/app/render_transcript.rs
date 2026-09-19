@@ -19,6 +19,22 @@ const REASONING_TAIL: usize = 2;
 /// 在预折行缓存里成倍放大，故设上限并在末尾如实标注省略行数（截断必须可见，
 /// 与 B1「丢弃可观测」同一设计原则）。
 const MD_BLOCK_LINE_CAP: usize = 500;
+/// 单卡正文（shell / 非 shell 两分支共用）的**源文本行**安全上界。
+///
+/// 展开态的语义是「看全部」（U-32 / W-02 裁决，2026-09-20）：原先的 24 行帽是
+/// 为「2500 张工具卡各自全展开」的时代设的，该场景已被 §4.2 运行组折叠消掉，
+/// 故上界抬到与 [`MD_BLOCK_LINE_CAP`] 同量级，只拦病态大输出（万行级单卡把
+/// 整卡 `Lines` 物化进渲染缓存）。**命中必须可见**（B1）。
+///
+/// 计数单位：**源文本行**。旧实现同时用「源行数」（`.take(24)`）与「折行后
+/// 行数」（`shown_lines > 24`）两个不同的 24，同一处帽子连单位都不自洽；这里
+/// 统一在 `.lines()` 上取帽，折行只影响屏幕行数。
+const TOOL_BODY_LINE_CAP: usize = 500;
+
+/// 安全帽命中时的可见标注（B1「丢弃必须可见」）。
+fn tool_body_cap_note(total: usize) -> String {
+    format!("已显示 {TOOL_BODY_LINE_CAP} / {total} 行 · 全文见 /export")
+}
 /// 工具输出保留的尾部行数（已由折叠逻辑替代，保留作历史阈值参考）。
 /// 单元格截断宽度。
 const ARG_PREVIEW: usize = 96;
@@ -1483,52 +1499,35 @@ fn push_tool_card_anim(
                 (String::new(), false)
             };
         if !src.trim().is_empty() {
-            let max_lines = 8usize;
-            let expanded_limit = 24usize;
+            // 运行中的实时尾窗（流式看尾部，旧行为保留）。
+            let running_window = 8usize;
             let total_raw_lines = src.lines().count();
-            let max_chars = max_lines * width.saturating_sub(6).max(20);
-            let needs_collapse = total_raw_lines > max_lines || src.chars().count() > max_chars;
-            let display_text = if tool.state == TimelineToolState::Running {
-                if total_raw_lines > max_lines {
+            // U-32 / W-02 裁决：**展开态 = 看全部**。24 行帽删除，只留
+            // [`TOOL_BODY_LINE_CAP`] 安全帽（命中带可见标注，见下方 footer）。
+            // 收起态（非默认展开工具）仍是尾部 8 行预览，但**不再挂 F7 文案**
+            // ——F7 是组级开关（§4.2 `expanded_groups`），卡片上的 F7 提示会
+            // 指向一个不存在的动作。
+            let capped = total_raw_lines > TOOL_BODY_LINE_CAP;
+            let collapsed_preview = !is_running && !expanded && total_raw_lines > running_window;
+            let display_text =
+                if (is_running || collapsed_preview) && total_raw_lines > running_window {
                     src.lines()
-                        .skip(total_raw_lines - max_lines)
+                        .skip(total_raw_lines - running_window)
                         .collect::<Vec<_>>()
                         .join("\n")
                 } else {
                     src.clone()
-                }
-            } else if needs_collapse && !expanded {
-                if total_raw_lines > max_lines {
-                    src.lines()
-                        .skip(total_raw_lines - max_lines)
-                        .collect::<Vec<_>>()
-                        .join("\n")
-                } else {
-                    let mut truncated: String =
-                        src.chars().take(max_chars.saturating_sub(1)).collect();
-                    truncated.push('…');
-                    truncated
-                }
-            } else if src.lines().count() > expanded_limit && !expanded {
-                src.lines()
-                    .take(expanded_limit)
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            } else {
-                src.clone()
-            };
-            let overflow = needs_collapse;
+                };
             let line_prefix = if is_block { " ┃ │ " } else { "    │ " };
             let body_start = lines.len();
-            let mut shown_lines = 0usize;
-            for out in display_text.lines() {
+            // 源文本行取帽（单位统一：折行只影响屏幕行数，不参与计数）。
+            for out in display_text.lines().take(TOOL_BODY_LINE_CAP) {
                 if out.is_empty() {
                     lines.push(
                         RenderLine::new()
                             .span(line_prefix, SpanStyle::Dim)
                             .span("", SpanStyle::Dim),
                     );
-                    shown_lines += 1;
                     continue;
                 }
                 for seg in wrap_text(out, width.saturating_sub(6)) {
@@ -1537,39 +1536,36 @@ fn push_tool_card_anim(
                             .span(line_prefix, SpanStyle::Dim)
                             .span(seg, SpanStyle::Dim),
                     );
-                    shown_lines += 1;
-                    if shown_lines >= expanded_limit {
-                        break;
-                    }
-                }
-                if shown_lines >= expanded_limit {
-                    break;
                 }
             }
-            // 正文到此为止。`▌`（流式实时光标）与截断标注都必须落在这之后：
-            // 前者要回到**最后一行正文**（落在 footer 上会把注记画成流内容），
-            // 后者与折叠 hint 相邻（footer 挨着 footer，读者不必跨正文拼读）。
+            // 正文到此为止。`▌`（流式实时光标）与标注都必须落在这之后：
+            // 前者要回到**最后一行正文**（落在 footer 上会把注记画成流内容）。
             let body_end = lines.len();
-            if overflow {
-                let mut hint_text = if expanded {
-                    "F7 收起".to_string()
-                } else {
-                    "F7 展开".to_string()
-                };
-                if !is_running && let Some((exit, truncated, _)) = shell_meta {
-                    if let Some(code) = exit
-                        && code != 0
-                    {
-                        hint_text.push_str(&format!(" · exit {code}"));
-                    }
-                    if truncated {
-                        hint_text.push_str(" · 截断");
-                    }
+            // footer：安全帽标注（B1）+ shell 终态元数据。
+            // **不再有 per-card 的「F7 收起/展开」**：F7 只切 §4.2 的组展开位，
+            // 卡片级 `expanded_tools` 在 M2 之后没有写入点——卡片上的 F7 文案
+            // 只会指向一个不存在的动作（U-32 的验收口径是「文案与实际一致」）。
+            let mut foot: Vec<String> = Vec::new();
+            if capped && expanded {
+                foot.push(tool_body_cap_note(total_raw_lines));
+            } else if collapsed_preview {
+                foot.push(format!("… 已折叠 {} 行", total_raw_lines - running_window));
+            }
+            if !is_running && let Some((exit, truncated, _)) = shell_meta {
+                if let Some(code) = exit
+                    && code != 0
+                {
+                    foot.push(format!("exit {code}"));
                 }
+                if truncated {
+                    foot.push("截断".to_string());
+                }
+            }
+            if !foot.is_empty() {
                 lines.push(
                     RenderLine::new()
                         .span(format!("{}  ", line_prefix), SpanStyle::Dim)
-                        .span(hint_text, SpanStyle::Dim),
+                        .span(foot.join(" · "), SpanStyle::Dim),
                 );
             }
             if src_from_progress && tool.progress_truncated {
@@ -1619,11 +1615,19 @@ fn push_tool_card_anim(
             .count()
             .saturating_sub(tool.progress.lines().count());
         if !combined.trim().is_empty() {
-            let max_lines = 4usize;
-            let max_chars = max_lines * width.saturating_sub(6).max(20);
-            let (shown_text, overflow) = collapse_output(&combined, max_lines, max_chars);
-            let display = if overflow && !expanded {
-                shown_text
+            // U-32 / W-02 裁决（2026-09-20）：**展开态 = 看全部**。24 行帽删除，
+            // 只留 [`TOOL_BODY_LINE_CAP`] 安全帽（命中带可见标注，见下方 footer）。
+            // 收起态（非默认展开工具）仍是头部 4 行预览，但**不再挂 F7 文案**
+            // ——F7 是 §4.2 的组级开关，卡片级 `expanded_tools` 在 M2 之后没有
+            // 生产写入点，卡片上的 F7 提示只会指向一个不存在的动作。
+            let preview_lines = 4usize;
+            let preview_chars = preview_lines * width.saturating_sub(6).max(20);
+            let total_raw_lines = combined.lines().count();
+            let capped = expanded && total_raw_lines > TOOL_BODY_LINE_CAP;
+            let collapsed_preview = !expanded
+                && (total_raw_lines > preview_lines || combined.chars().count() > preview_chars);
+            let display = if collapsed_preview {
+                collapse_output(&combined, preview_lines, preview_chars).0
             } else {
                 combined
             };
@@ -1631,12 +1635,8 @@ fn push_tool_card_anim(
             let body_start = lines.len();
             // 「进度真的上屏」= 正文里确实渲染出了属于 progress 段的行。
             let mut progress_shown = false;
-            let mut shown_lines = 0usize;
-            for (line_idx, out) in display
-                .lines()
-                .take(if overflow && !expanded { max_lines } else { 24 })
-                .enumerate()
-            {
+            // 源文本行取帽（单位统一：折行只影响屏幕行数，不参与计数）。
+            for (line_idx, out) in display.lines().take(TOOL_BODY_LINE_CAP).enumerate() {
                 for seg in wrap_text(out, width.saturating_sub(6)) {
                     lines.push(
                         RenderLine::new()
@@ -1646,40 +1646,32 @@ fn push_tool_card_anim(
                     if line_idx >= progress_start_line {
                         progress_shown = true;
                     }
-                    shown_lines += 1;
-                    if shown_lines > 24 {
-                        break;
-                    }
                 }
             }
-            // 同 shell 分支：`▌` 落回最后一行正文，截断标注排在 hint 之后。
+            // 正文到此为止。`▌`（流式实时光标）与标注都必须落在这之后。
             let body_end = lines.len();
-            if overflow {
-                // ⚠ 既有缺陷（非本 PR 引入，PR #18 二轮复审建议 3 要求登记）：
-                // 对**默认展开**的工具（`is_default_expanded`，如 read），生效态
-                // `expanded = expanded_raw ^ true` 与默认视图相反，于是默认显示 24 行
-                // 却提示「F7 收起」，按一次 F7 反而只剩 4 行并提示「F7 展开」——
-                // 文案与视图方向的直觉相反。改它要同时理顺 `overflow` 判据与
-                // `display` 的选取，超出本缺陷范围，另行登记。
-                let hint = if expanded { "F7 收起" } else { "F7 展开" };
+            // footer：安全帽 / 折叠预览的**可见标注**（B1「丢弃必须可见」）。
+            // **不再有 per-card 的「F7 收起/展开」**：见上方注释。
+            let mut foot: Vec<String> = Vec::new();
+            if capped {
+                foot.push(tool_body_cap_note(total_raw_lines));
+            } else if collapsed_preview && total_raw_lines > preview_lines {
+                foot.push(format!("已折叠 {} 行", total_raw_lines - preview_lines));
+            }
+            if !foot.is_empty() {
                 lines.push(
                     RenderLine::new()
                         .span(format!("{}  ", line_prefix), SpanStyle::Dim)
-                        .span(hint, SpanStyle::Dim),
+                        .span(foot.join(" · "), SpanStyle::Dim),
                 );
             }
-            // 非 shell：progress 拼在 output **之后**，而 `collapse_output` 留的是
-            // **头部**，故判据不能是 `overflow` / `expanded` 的布尔组合（PR #18
-            // 二轮复审阻断 2：`(!overflow || expanded)` 方向装反——`expanded` 只是
-            // 「不折叠」，展示窗口仍有 24 行上限，长 output 时进度整段在窗口之外，
-            // 于是给看不见的内容报警）。这里直接按**实际渲染出的正文**判断
-            // （`progress_shown`），与 shell 分支的 `src_from_progress` 同一语义：
-            // 只有进度确实上屏才标注。
+            // 非 shell：progress 拼在 output **之后**，而折叠预览留的是**头部**，
+            // 故判据不能是 `overflow` / `expanded` 的布尔组合（PR #18 二轮复审
+            // 阻断 2）。这里直接按**实际渲染出的正文**判断（`progress_shown`），
+            // 与 shell 分支的 `src_from_progress` 同一语义：只有进度确实上屏才标注。
             //
-            // **取舍**：折叠丢的是可恢复的**显示**（`F7 展开` 已把这件事画出来，
-            // 按一下就能取回），不属 B1 要盯的**不可逆丢弃**；而本标注盯的
-            // `progress_truncated` 是不可逆的（缓冲前段已从内存里丢掉）。所以
-            // 「output 前缀被折叠」不标注——两者都在 footer 里，不会互相淹没。
+            // **取舍**：折叠丢的是可恢复的**显示**，不属 B1 要盯的**不可逆丢弃**；
+            // 而本标注盯的 `progress_truncated` 是不可逆的（缓冲前段已从内存里丢掉）。
             // 该取舍在 `progress_shown` 里天然成立：`progress` 为空时
             // `progress_start_line` 落在行号范围之外，永远为 false。
             if tool.progress_truncated && progress_shown {
@@ -1693,7 +1685,6 @@ fn push_tool_card_anim(
                 );
             }
             if is_running
-                && !overflow
                 && body_end > body_start
                 && let Some(last) = lines.get_mut(body_end - 1)
                 && let Some(span) = last.spans.last_mut()
@@ -2552,27 +2543,29 @@ mod tests {
         assert!(!line.contains("◌ ◌"), "◌ 重复了，实测：{line}");
     }
 
-    /// 标注排在折叠 hint **之后**：两者都是这张卡的 footer，读者不必跨正文拼读
-    /// （PR #18 审查：旧版把标注夹在头部、hint 留在尾部）。
+    /// 标注排在正文**之后**：它是这张卡的 footer，读者不必跨正文拼读
+    /// （PR #18 审查：旧版把标注夹在头部、正文留在尾部）。
+    ///
+    /// W-02：卡片上原来的 per-card「F7 收起/展开」已删除（F7 是 §4.2 的组级
+    /// 开关），故本锁改为钉「标注在最后一行正文（`▌`）之后」。
     ///
     /// 变异验证（实测）：把标注推回正文之前 → 本测试红。
     #[test]
-    fn truncation_mark_follows_collapse_hint() {
+    fn truncation_mark_follows_body() {
         let tool = streaming_bash_card("c-order", true);
         let mut lines = Vec::new();
         push_tool_card(&mut lines, &tool, 80, false);
-        // bash 属默认展开工具（`is_default_expanded`），故 hint 是「F7 收起」。
-        let hint_idx = lines
+        let body_idx = lines
             .iter()
-            .position(|l| joined(l).contains("F7 "))
-            .unwrap_or_else(|| panic!("20 行进度应触发折叠 hint：{}", flatten(&lines)));
+            .position(|l| joined(l).contains('▌'))
+            .unwrap_or_else(|| panic!("Running 卡应有实时光标：{}", flatten(&lines)));
         let mark_idx = lines
             .iter()
             .position(|l| joined(l).contains(PROGRESS_TRUNCATED_MARK))
             .expect("截断标注应上屏");
         assert!(
-            mark_idx > hint_idx,
-            "标注应在 hint 之后：hint@{hint_idx} 标注@{mark_idx}\n{}",
+            mark_idx > body_idx,
+            "标注应在正文之后：正文@{body_idx} 标注@{mark_idx}\n{}",
             flatten(&lines)
         );
     }
@@ -2697,17 +2690,17 @@ mod tests {
     ///
     /// | 组合（`read`） | 进度可见 | 期望标注 |
     /// |---|---|---|
-    /// | 30 行 output + `expanded_raw=false`（生效=展开） | 否（超出 24 行窗口） | 无 |
+    /// | 30 行 output + `expanded_raw=false`（生效=展开） | **是**（W-02：展开即全文） | **有** |
     /// | 30 行 output + `expanded_raw=true`（生效=折叠） | 否（只留头部 4 行） | 无 |
     /// | 短 output + `expanded_raw=false` | 是 | 有 |
     /// | 短 output + `expanded_raw=true` | 是 | 有 |
-    /// | **6 行 output + `expanded_raw=false`（生效=展开）** | **是（窗口内）** | **有** |
+    /// | **6 行 output + `expanded_raw=false`（生效=展开）** | **是** | **有** |
     ///
-    /// 最后一行是关键：`overflow=true`（6+1 行 > 4）但进度落在 24 行窗口内、**确实
-    /// 可见**。若闸门退化成「只看 `!overflow`」，这条会漏标（B1 意义上的漏报），
-    /// 本测试红。
+    /// 第 1 行在 W-02 之前是「否 / 无」——展开态被 `.take(24)` 截断，进度整段落在
+    /// 窗口之外。去掉 24 行帽后进度**确实上屏**，故期望翻转为「有」；这正是本锁
+    /// 要钉的不变量：标注跟着「**实际渲染出的正文**」走，而不是跟着任何布尔组合走。
     ///
-    /// 变异验证（实测）：① 把闸门写回 `(!overflow || expanded)` → 第 1 行误报 → 红；
+    /// 变异验证（实测）：① 把闸门写回 `(!overflow || expanded)` → 第 2 行误报 → 红；
     /// ② 改成只看 `!overflow` → 第 5 行漏报 → 红。
     #[test]
     fn non_shell_truncation_mark_follows_what_is_actually_shown() {
@@ -2720,7 +2713,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         let cases: [(&str, bool, bool); 5] = [
-            (long.as_str(), false, false),
+            (long.as_str(), false, true),
             (long.as_str(), true, false),
             ("short output", false, true),
             ("short output", true, true),
@@ -2827,7 +2820,8 @@ mod tests {
         assert!(!is_default_expanded("glob"));
         assert!(!is_default_expanded("edit"));
 
-        // bash: 20 行输出，默认（raw=false）应直展全部（提示为“F7 收起”）
+        // bash: 20 行输出，默认（raw=false → 生效展开）应直展全部。
+        // W-02：卡片上**不再有** per-card F7 文案（F7 是 §4.2 的组级开关）。
         let long = (1..=20)
             .map(|i| format!("ROW{i:02}"))
             .collect::<Vec<_>>()
@@ -2861,8 +2855,11 @@ mod tests {
             .join("\n");
         assert!(flat.contains("ROW01"), "bash 默认展开应可见首行");
         assert!(flat.contains("ROW20"), "bash 默认展开应可见尾行");
-        assert!(flat.contains("F7 收起"), "bash 默认展开提示应为收起");
-        // raw=true 时应对视觉收起（仅尾 8 行）
+        assert!(
+            !flat.contains("F7"),
+            "卡片不应再挂 per-card F7 文案（F7 是组级开关）：{flat}"
+        );
+        // raw=true → 生效收起：尾部 8 行预览 + **可见**折叠标注
         let mut lines2 = Vec::new();
         push_tool_card(&mut lines2, &bash_tool, 80, true);
         let flat2: String = lines2
@@ -2872,7 +2869,14 @@ mod tests {
             .join("\n");
         assert!(!flat2.contains("ROW01"), "bash 收起态不应含首行");
         assert!(flat2.contains("ROW20"));
-        assert!(flat2.contains("F7 展开"));
+        assert!(
+            flat2.contains("已折叠 12 行"),
+            "收起态必须如实标注丢弃行数（B1）：{flat2}"
+        );
+        assert!(
+            !flat2.contains("F7"),
+            "卡片不应再挂 per-card F7 文案：{flat2}"
+        );
 
         // read: 非 shell 分支，10 行输出默认展开应全显（>4 行折叠阈）
         let read_out = (1..=10)
@@ -2904,6 +2908,7 @@ mod tests {
             .join("\n");
         assert!(rf.contains("r1"));
         assert!(rf.contains("r10"));
+        assert!(!rf.contains("F7"), "read 卡不应挂 per-card F7 文案：{rf}");
         // grep 默认仍折叠（raw false 即视觉收起，10 行应只显 4 行）
         let grep_tool = ToolCard {
             name: "grep".into(),
@@ -2919,7 +2924,83 @@ mod tests {
             .join("\n");
         assert!(gf.contains("r1"));
         assert!(!gf.contains("r10"), "grep 默认折叠不应含尾行");
-        assert!(gf.contains("F7 展开"));
+        assert!(
+            gf.contains("已折叠 6 行"),
+            "grep 折叠态必须如实标注丢弃行数（B1）：{gf}"
+        );
+        assert!(!gf.contains("F7"), "卡片不应再挂 per-card F7 文案：{gf}");
+    }
+
+    /// W-02（U-32）回归锁：**展开态 = 看全部**。
+    ///
+    /// 旧实现（缺陷）：展开态仍被 `.take(24)` 截断 —— 30 行输出只显示前 24 行，
+    /// 尾部 6 行**既无标注也拿不到**（按 F7 只会收到 4 行），却提示「F7 收起」。
+    /// 新实现：展开态全显；超过 [`TOOL_BODY_LINE_CAP`] 才截，且截断必须可见（B1）。
+    ///
+    /// 两态（≤24 / >24）+ 安全帽态三条断言，对应 issue #22 的 W-02 验收口径。
+    #[test]
+    fn expanded_tool_body_shows_all_lines_and_caps_visibly() {
+        let mk = |n: usize| -> ToolCard {
+            let out = (1..=n)
+                .map(|i| format!("L{i:04}"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            ToolCard {
+                tool_call_id: format!("c-read-{n}"),
+                name: "read".into(),
+                state: TimelineToolState::Succeeded,
+                summary: None,
+                args_json: Some(r#"{"filePath":"src/lib.rs"}"#.into()),
+                output: Some(out),
+                diff: None,
+                progress: String::new(),
+                progress_truncated: false,
+                progress_bytes_total: 0,
+                progress_stream: None,
+                failure: None,
+                permission: None,
+                display: None,
+            }
+        };
+        let flat_of = |n: usize| -> String {
+            let mut lines = Vec::new();
+            push_tool_card(&mut lines, &mk(n), 80, false); // raw=false → 默认展开
+            lines
+                .iter()
+                .flat_map(|l| l.spans.iter().map(|s| s.text.clone()))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+
+        // 态 1（≤24 行）：全显，无标注。
+        let under = flat_of(10);
+        assert!(under.contains("L0001") && under.contains("L0010"));
+        assert!(!under.contains("已显示"), "≤24 行不应有安全帽标注：{under}");
+
+        // 态 2（>24 行）：**尾部必须可见**（旧实现在此丢 L0025..L0030）。
+        let over = flat_of(30);
+        assert!(over.contains("L0001"), "首行应可见：{over}");
+        assert!(
+            over.contains("L0030"),
+            ">24 行时尾部必须可见（W-02 核心断言，旧实现此处红）：{over}"
+        );
+        assert!(
+            !over.contains("已显示"),
+            "30 行未触安全帽，不应有标注：{over}"
+        );
+
+        // 态 3（>安全帽）：恰好 TOOL_BODY_LINE_CAP 行 + **可见**标注（B1）。
+        let n = TOOL_BODY_LINE_CAP + 40;
+        let capped = flat_of(n);
+        assert!(capped.contains(&format!("L{TOOL_BODY_LINE_CAP:04}")));
+        assert!(
+            !capped.contains(&format!("L{:04}", TOOL_BODY_LINE_CAP + 1)),
+            "超出安全帽的行不应渲染"
+        );
+        assert!(
+            capped.contains(&tool_body_cap_note(n)),
+            "安全帽命中必须带可见标注（B1）：{capped}"
+        );
     }
 
     // ── A3：分段渲染缓存的增量语义 ───────────────────────────────

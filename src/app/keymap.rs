@@ -32,7 +32,9 @@ pub(crate) enum GlobalKey {
     ToggleWorkspace,
     /// F6：todo 详情。
     ToggleTodoDetail,
-    /// F7：工具卡展开。
+    /// F7：最近一个 T2 工具**运行组**展开/折叠（§4.2/§4.7；组内最后一张 Failed
+    /// 卡始终内联）。卡片级 `expanded_tools` 自 M2 起没有生产写入点——F7 不再是
+    /// per-card 开关，卡片上也不再有 F7 文案（U-32 / W-02）。
     ToggleToolExpand,
     /// Ctrl+R：手动重连（关闭并重建客户端）。仅在失联相位可用——见
     /// `App::request_reconnect`：健康的连接不该被一次误按推倒重来。
