@@ -332,7 +332,7 @@ fn turn_state_tag(s: TimelineTurnState) -> u64 {
 ///
 /// 只读 `rev` 计数与**枚举标签**，不哈希正文——O(块) 而非 O(文本)。
 /// 工具名承担「ToolView 分派」的角色（M2 引入 `ToolViewKind` 后替换）。
-pub(crate) fn block_cache_key(block: &Block, width: u16, expanded: bool) -> u64 {
+pub(crate) fn block_cache_key(block: &Block, width: u16) -> u64 {
     let mut h = FNV_OFFSET;
     h_u64(&mut h, 0x626c_6b30); // "blk0" 域分隔
     h_str(&mut h, &block.block_id);
@@ -341,7 +341,7 @@ pub(crate) fn block_cache_key(block: &Block, width: u16, expanded: bool) -> u64 
     h_u64(&mut h, block_kind_tag(block.kind));
     h_u64(&mut h, u64::from(width));
     if let Some(t) = &block.tool {
-        h_u64(&mut h, u64::from(expanded));
+        // W-02：卡片级展开态已删除（正文窗口恒定），故不再混入 expanded 位。
         h_str(&mut h, &t.name);
     }
     h

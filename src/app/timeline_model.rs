@@ -2335,12 +2335,7 @@ mod tests {
             rev: 1,
         };
         let mut sink = crate::app::render_transcript::AnimSink::Bake;
-        let lines = crate::app::render_transcript::render_block_lines(
-            &std::collections::HashSet::new(),
-            &block,
-            80,
-            &mut sink,
-        );
+        let lines = crate::app::render_transcript::render_block_lines(&block, 80, &mut sink);
         let flat: String = lines
             .iter()
             .flat_map(|l| l.spans.iter().map(|s| s.text.as_str()))
