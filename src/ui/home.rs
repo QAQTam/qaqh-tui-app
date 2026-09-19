@@ -300,6 +300,9 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) {
     // 这里原先还渲染「当前会话的 cwd」，但它的数据源 `SessionState::meta` 恒为
     // `None`（见 `SessionState::title` 的注），即那一格**一直渲染成空格**——
     // 一个永远为空的前缀加上一个孤零零的分隔符。G2 删除。
-    let hint = Line::from(vec![Span::styled("qaqh-tui 0.1.0", theme::dim())]);
+    let hint = Line::from(vec![Span::styled(
+        concat!("qaqh-tui ", env!("CARGO_PKG_VERSION")),
+        theme::dim(),
+    )]);
     f.render_widget(Paragraph::new(hint).wrap(Wrap { trim: true }), hint_area);
 }
