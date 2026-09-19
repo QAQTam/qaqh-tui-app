@@ -24,6 +24,11 @@ pub const SLASH_COMMANDS: &[SlashDef] = &[
         desc: "清空输入",
         hint: "/clear  清空当前输入",
     },
+    SlashDef {
+        name: "export",
+        desc: "导出会话",
+        hint: "/export [path]  导出当前会话为 Markdown（默认写入当前目录）",
+    },
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -31,6 +36,7 @@ pub enum SlashCmd {
     New { cwd: Option<String> },
     Help,
     Clear,
+    Export { path: Option<String> },
     Unknown(String),
 }
 
@@ -67,6 +73,15 @@ pub fn parse(input: &str) -> Option<SlashCmd> {
         }
         "help" => Some(SlashCmd::Help),
         "clear" => Some(SlashCmd::Clear),
+        "export" => {
+            let path = if raw_args.is_empty() {
+                None
+            } else {
+                let s = unquote(raw_args).trim().to_string();
+                if s.is_empty() { None } else { Some(s) }
+            };
+            Some(SlashCmd::Export { path })
+        }
         // 保留缩写：/n -> /new
         "n" => {
             let cwd = if raw_args.is_empty() {
@@ -192,6 +207,25 @@ mod tests {
                 cwd: Some("C:\\a b".into())
             })
         );
+    }
+
+    #[test]
+    fn parse_export() {
+        assert_eq!(parse("/export"), Some(SlashCmd::Export { path: None }));
+        assert_eq!(
+            parse("/export /tmp/out.md"),
+            Some(SlashCmd::Export {
+                path: Some("/tmp/out.md".into())
+            })
+        );
+        assert_eq!(
+            parse("/export \"my dir/out.md\""),
+            Some(SlashCmd::Export {
+                path: Some("my dir/out.md".into())
+            })
+        );
+        // 补全菜单自动包含 export（SLASH_COMMANDS 驱动）。
+        assert!(completions_for("/ex").iter().any(|d| d.name == "export"));
     }
 
     #[test]

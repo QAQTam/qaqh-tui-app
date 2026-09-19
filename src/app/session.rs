@@ -1,7 +1,6 @@
 //! 单会话状态：timeline 模型、流式相位、挂起交互面板、composer、滚动。
 
 use std::collections::{HashSet, VecDeque};
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::app::timeline_model::TimelineModel;
@@ -401,164 +400,6 @@ pub struct ScrollState {
 /// 单个回合可达上千行，所以取小值。
 pub(crate) const KEEP_MARGIN_SEGMENTS: usize = 8;
 
-/// 一段的渲染体：**要么**是精确的行，**要么**只是估算高度。
-///
-/// 这是虚拟化的关键：离屏段只留一个 `usize`，丢弃 `Arc<[RenderLine]>`。
-/// 实测真实会话 110 回合共 124690 行——全部驻留渲染结果是几十 MB，
-/// 而它们大多永远滚不到（Grok `evict_offscreen_render_caches` 同一动机）。
-#[derive(Debug, Clone)]
-pub enum SegmentBody {
-    /// 精确渲染结果（仅在视口附近保留）。
-    Lines(Arc<[crate::app::render_line::RenderLine]>),
-    /// 仅估算高度（离屏段；向上滚到时按需重渲）。
-    Height(usize),
-}
-
-impl SegmentBody {
-    pub fn height(&self) -> usize {
-        match self {
-            SegmentBody::Lines(l) => l.len(),
-            SegmentBody::Height(n) => *n,
-        }
-    }
-
-    pub fn lines(&self) -> Option<&Arc<[crate::app::render_line::RenderLine]>> {
-        match self {
-            SegmentBody::Lines(l) => Some(l),
-            SegmentBody::Height(_) => None,
-        }
-    }
-
-    pub(crate) fn is_lines(&self) -> bool {
-        matches!(self, SegmentBody::Lines(_))
-    }
-}
-
-/// 一个缓存段：内容键 + 渲染体。
-///
-/// `key` **不含宽度**：宽度变化时走「高度缩放 + 丢弃 Lines」而非全量重建
-/// （Claude Code `useVirtualScroll.ts` 的 `ratio` 缩放，注释记着实测：清空缓存
-/// 会让 resize 时 mount 范围膨胀到 190 项、每次 3ms 的 lexer+高亮 → 600ms 卡顿）。
-#[derive(Debug, Clone)]
-pub struct Segment {
-    pub key: u64,
-    pub body: SegmentBody,
-    /// 本段对应的回合 id（用于长度变化时按 id 对齐复用）。
-    ///
-    /// 不能只靠下标：`cap_turns` 从头部丢回合后，第 i 个位置换成了另一个回合。
-    /// 也不能只靠 `key`——key 含 `turn_idx`（头部编号会漂移），丢一个就会全变。
-    pub turn_id: String,
-}
-
-/// **分段**渲染缓存（A3 + 虚拟化）。
-///
-/// 历史问题：单块缓存以 `timeline.version` 为键，而 `version` 每次 delta 都
-/// `bump()` → 每帧全量重渲（含 markdown/syntect 与 reasoning normalize），
-/// 成本随历史线性增长。这里改为**按回合分段**：每段自带内容键，只有键变了的
-/// 段才重渲，其余段直接复用 `Arc`（零拷贝）。
-///
-/// 进一步的虚拟化：**只有视口附近的段才持有渲染结果**，离屏段退化为估算高度。
-#[derive(Debug, Clone, Default)]
-pub struct SegmentCache {
-    /// 渲染宽度（内容宽，含滚动条扣除）。与 `transcript::draw` 必须一致。
-    pub width: u16,
-    /// `show_reasoning`（F3）：影响 reasoning 块输出，必须进缓存身份。
-    pub show_reasoning: bool,
-    /// 每回合一段，与 `timeline.turns` 同序。
-    pub turns: Vec<Segment>,
-    /// 头部横幅段（更早回合折叠 / 够不到提示）。
-    pub banner: Option<Segment>,
-    /// 空会话占位段（无回合时的提示行）。
-    pub empty: Option<Segment>,
-    /// 最近一次重建中实际重渲的段数（观测用：验证增量是否真的发生）。
-    pub rebuilt_segments: usize,
-    /// 当前仍持有渲染结果的段数（观测用：验证淘汰真的发生了）。
-    pub resident_segments: usize,
-}
-
-impl SegmentCache {
-    /// 总行数（视窗定位/滚动条需要）。估算高度也计入——这就是虚拟化能
-    /// 在**不渲染**的前提下算出滚动几何的原因。
-    pub fn total_lines(&self) -> usize {
-        self.all().map(|s| s.body.height()).sum()
-    }
-
-    /// 按顺序枚举所有段。
-    pub(crate) fn all(&self) -> impl Iterator<Item = &Segment> {
-        self.banner
-            .iter()
-            .chain(self.turns.iter())
-            .chain(self.empty.iter())
-    }
-
-    /// 取可见窗口 `[top, top+height)` 的行切片。
-    ///
-    /// 返回的每项是 `&RenderLine`，指向段内的 `Arc`，无拷贝。
-    ///
-    /// **不变式**：`refresh_segments` 保证窗口覆盖的段均为 [`SegmentBody::Lines`]
-    /// （它按同一份高度几何渲染了窗口 + 余量）。若此处遇到估算段，说明
-    /// 不变式被破坏——调试构建下会断言失败。
-    pub fn window(&self, top: usize, height: usize) -> Vec<&crate::app::render_line::RenderLine> {
-        let mut out: Vec<&crate::app::render_line::RenderLine> = Vec::with_capacity(height);
-        let mut skip = top;
-        for seg in self.all() {
-            if out.len() >= height {
-                break;
-            }
-            // 无论是否已渲染，段都**占据几何空间**，必须先扣减 skip。
-            // （曾在此处漏减，导致窗口定位整体偏移。）
-            let h = seg.body.height();
-            let Some(lines) = seg.body.lines() else {
-                if skip >= h {
-                    skip -= h;
-                    continue;
-                }
-                // 视口落在未渲染段上：`refresh_segments_at` 的收尾保证不应让
-                // 这种情况发生。debug 下报错；release 下保守少渲几行，不崩。
-                debug_assert!(false, "窗口内出现未渲染的估算段（虚拟化不变式被破坏）");
-                skip = 0;
-                continue;
-            };
-            if skip >= lines.len() {
-                skip -= lines.len();
-                continue;
-            }
-            let start = skip;
-            skip = 0;
-            let take = (height - out.len()).min(lines.len() - start);
-            out.extend(lines[start..start + take].iter());
-        }
-        out
-    }
-
-    /// 覆盖行区间 `[top, top+height)` 的段下标范围（**仅含 turns**）。
-    ///
-    /// 供 `refresh_segments` 决定「哪些段要精确渲染」与「哪些可淘汰」。
-    /// 空段（高度 0）不占据区间。
-    pub(crate) fn segment_range_for(&self, top: usize, height: usize) -> (usize, usize) {
-        let banner_h = self.banner.as_ref().map_or(0, |s| s.body.height());
-        let bottom = top.saturating_add(height);
-        let mut acc = banner_h;
-        let mut first: Option<usize> = None;
-        let mut last: usize = 0;
-        for (i, seg) in self.turns.iter().enumerate() {
-            let h = seg.body.height();
-            if first.is_none() && acc + h > top {
-                first = Some(i);
-            }
-            if acc < bottom {
-                last = i;
-            }
-            acc += h;
-        }
-        match first {
-            // 视口完全在内容之下（空会话）或 turns 为空：退化为空范围。
-            None => (self.turns.len(), self.turns.len().saturating_sub(1)),
-            Some(f) => (f, last.max(f)),
-        }
-    }
-}
-
 // ───────────────────────── 会话状态 ─────────────────────────
 
 /// 压缩过程动画状态（由 Conversation 事件驱动；结束/重基线时清除）。
@@ -604,8 +445,9 @@ pub struct SessionState {
     pub last_error: Option<DomainError>,
     pub composer: Composer,
     pub scroll: ScrollState,
-    /// 分段渲染缓存（A3，transcript 的主渲染路径）。
-    pub segments: Option<SegmentCache>,
+    /// 块级渲染缓存（M1 `render::refresh`，T8 起为生产唯一来源；
+    /// 锁 8 动画出带的宿主）。
+    pub block_cache: Option<crate::app::render::TranscriptCache>,
     /// bootstrap / re-baseline 是否已就绪。
     pub ready: bool,
     /// 被 LRU 逐出 transcript 后，重新聚焦时需要 re-baseline。
@@ -614,6 +456,9 @@ pub struct SessionState {
     pub loading_older: bool,
     /// 已展开的工具输出（tool_call_id 集合，折叠态默认收起超长输出）
     pub expanded_tools: std::collections::HashSet<String>,
+    /// §4.2 运行组展开态：(turn_id, round_num)。展开 = 组内卡片列表可见；
+    /// 收起 = 一行组行（失败例外：组内最后一张 Failed 卡始终内联）。
+    pub expanded_groups: std::collections::HashSet<(String, u32)>,
     /// 本会话拉起的子代理（spawn 顺序；身份锚点 = timeline 工具卡 id）。
     pub subagents: Vec<super::subagent::SubagentEntry>,
 }
@@ -646,11 +491,12 @@ impl SessionState {
                 follow: true,
                 offset: 0,
             },
-            segments: None,
+            block_cache: None,
             ready: false,
             needs_rebaseline: false,
             loading_older: false,
             expanded_tools: std::collections::HashSet::new(),
+            expanded_groups: std::collections::HashSet::new(),
             subagents: Vec::new(),
         }
     }
@@ -917,6 +763,7 @@ mod tests {
 
     fn turn(id: &str, state: TimelineTurnState) -> Turn {
         Turn {
+            thinking: Default::default(),
             turn_index: None,
             turn_id: id.into(),
             user_text: "hi".into(),

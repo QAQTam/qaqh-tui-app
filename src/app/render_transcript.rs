@@ -1,9 +1,13 @@
 //! transcript 渲染器：TimelineModel → Vec<RenderLine>（预折行，缓存友好）。
 
+use crate::app::render::{AnimKind, AnimSlot};
 use crate::app::render_line::{RenderLine, SpanStyle, wrap_text};
-use crate::app::session::{KEEP_MARGIN_SEGMENTS, SessionState};
-use crate::app::timeline_model::Turn;
-use qaqh_client::{TimelineBlockKind, TimelineBlockState, TimelineToolState, TimelineTurnState};
+use crate::app::session::SessionState;
+use crate::app::timeline_model::{Block, Turn};
+use qaqh_client::{
+    TimelineBlockKind, TimelineFailure, TimelineToolBody, TimelineToolDisplay, TimelineToolHeader,
+    TimelineToolState, TimelineTurnState,
+};
 
 /// 推理块折叠时保留的尾部行数（历史常量，当前默认展开路径不再截尾，保留供 hide 回退）。
 #[allow(dead_code)]
@@ -50,183 +54,17 @@ fn fmt_ln(n: u32, w: usize) -> String {
     format!("{n:>width$}", width = w)
 }
 
-// ── Reasoning summary 特判：动词-ing 每句换行 ─────────────────────────────
-// summary 来自 OpenAI Responses `response.reasoning_summary_text.delta`，
-// 前端收到的是单段无换行的 gerund 句拼接（如 `Gathering ...feature.Synthesizing ...`，
-// 句间缺空格/缺换行）；传统 thinking 则已含换行或多段。我们仅对 summary 做句级换行。
-fn is_gerund_word(word: &str) -> bool {
-    let w = word.trim_matches(|c: char| !c.is_alphabetic());
-    if w.len() < 4 {
-        return false;
-    }
-    let lower = w.to_ascii_lowercase();
-    lower.ends_with("ing") && lower.chars().all(|c| c.is_ascii_alphabetic())
-}
-
-fn sentence_starts_with_gerund(sentence: &str) -> bool {
-    let trimmed = sentence.trim_start_matches(['•', '-', '"', '\'', '(', ' ']);
-    if let Some(first) = trimmed.split_whitespace().next() {
-        let w = first.trim_matches(|c: char| !c.is_alphabetic());
-        is_gerund_word(w)
-    } else {
-        false
-    }
-}
-
-fn is_cjk(ch: char) -> bool {
-    let cp = ch as u32;
-    // 简化：命中中日韩统一表意文字区段即可
-    (0x4E00..=0x9FFF).contains(&cp)
-        || (0x3400..=0x4DBF).contains(&cp)
-        || (0x3000..=0x303F).contains(&cp)
-        || (0xFF00..=0xFFEF).contains(&cp)
-}
-
-fn split_reasoning_sentences(text: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut current = String::new();
-    let chars: Vec<char> = text.chars().collect();
-    let n = chars.len();
-    let mut i = 0;
-    while i < n {
-        let c = chars[i];
-        current.push(c);
-        if c == '.' || c == '。' || c == '!' || c == '！' || c == '?' || c == '？' {
-            // 小数点保护：1.2 不拆
-            let prev_is_digit = i > 0 && chars[i - 1].is_ascii_digit();
-            let next_is_digit = i + 1 < n && chars[i + 1].is_ascii_digit();
-            if c == '.' && prev_is_digit && next_is_digit {
-                i += 1;
-                continue;
-            }
-            // 寻下一个非空格字符
-            let mut j = i + 1;
-            while j < n && chars[j].is_whitespace() && chars[j] != '\n' {
-                j += 1;
-            }
-            if j >= n {
-                let s = current.trim().to_string();
-                if !s.is_empty() {
-                    out.push(s);
-                }
-                current.clear();
-            } else {
-                let next = chars[j];
-                let is_boundary = if c == '.' {
-                    next.is_ascii_uppercase()
-                } else if c == '。' || c == '！' || c == '？' {
-                    true
-                } else {
-                    next.is_ascii_uppercase() || is_cjk(next)
-                };
-                // 缩写保护：".a" 小写不算句界
-                if is_boundary {
-                    let s = current.trim().to_string();
-                    if !s.is_empty() {
-                        out.push(s);
-                    }
-                    current.clear();
-                    // 跳过句间空白（已入下一句）
-                    i = j - 1;
-                }
-            }
-        }
-        i += 1;
-    }
-    if !current.trim().is_empty() {
-        out.push(current.trim().to_string());
-    }
-    out.retain(|s| !s.is_empty());
-    out
-}
-
-fn looks_like_reasoning_summary(text: &str) -> bool {
-    let t = text.trim();
-    if t.is_empty() || t.contains('\n') {
-        return false;
-    }
-    // 强信号：缺空格的句界 "feature.Synthesizing"
-    let has_missing_space = {
-        let ch: Vec<char> = t.chars().collect();
-        let mut found = false;
-        for idx in 0..ch.len().saturating_sub(1) {
-            if ch[idx] == '.' && ch[idx + 1].is_ascii_uppercase() {
-                found = true;
-                break;
-            }
-        }
-        found
-    };
-    let sentences = split_reasoning_sentences(t);
-    if has_missing_space {
-        if sentences.len() >= 2 && sentences.iter().any(|s| sentence_starts_with_gerund(s)) {
-            return true;
-        }
-        return sentences.len() >= 2;
-    }
-    if sentences.len() < 2 {
-        return false;
-    }
-    // 中文句：含 "。" 且多句即视为 summary
-    if t.contains('。') {
-        return sentences.len() >= 2;
-    }
-    let gerund_cnt = sentences
-        .iter()
-        .filter(|s| sentence_starts_with_gerund(s))
-        .count();
-    gerund_cnt >= 1 && gerund_cnt * 2 >= sentences.len()
-}
-
-fn normalize_reasoning_content(text: &str) -> String {
-    if looks_like_reasoning_summary(text) {
-        return split_reasoning_sentences(text).join("\n");
-    }
-    if text.contains('\n') {
-        // 段内仍可能藏 summary（如单段内拼接），逐段二次判别
-        let mut paras: Vec<String> = Vec::new();
-        for para in text.split('\n') {
-            if para.trim().is_empty() {
-                paras.push(String::new());
-            } else if looks_like_reasoning_summary(para) {
-                paras.extend(split_reasoning_sentences(para));
-            } else {
-                // 进一步：即便整段不像 summary，也尝试在缺空格场景下修复
-                // 只有当 split 后句数>1 且含 gerund 时才替换，避免误伤普通段
-                let split = split_reasoning_sentences(para);
-                if split.len() >= 2 && split.iter().any(|s| sentence_starts_with_gerund(s)) {
-                    paras.extend(split);
-                } else {
-                    paras.push(para.to_string());
-                }
-            }
-        }
-        // 若未发生任何分裂，直接返回原文避免无意义重组
-        let joined = paras.join("\n");
-        if joined != text {
-            return joined;
-        }
-        return text.to_string();
-    }
-    text.to_string()
-}
-
 #[allow(dead_code)]
 pub fn render_transcript(session: &SessionState, width: u16) -> Vec<RenderLine> {
-    // 兼容入口：show_reasoning=true 时展示全文（F3 切换由外层 App 控制缓存失效）
-    render_transcript_with_opts(session, width, true)
+    render_transcript_with_opts(session, width)
 }
 
-pub fn render_transcript_with_opts(
-    session: &SessionState,
-    width: u16,
-    show_reasoning: bool,
-) -> Vec<RenderLine> {
+pub fn render_transcript_with_opts(session: &SessionState, width: u16) -> Vec<RenderLine> {
     let width = width.max(20) as usize;
     let mut lines: Vec<RenderLine> = Vec::new();
 
     for (turn_idx, turn) in session.timeline.turns.iter().enumerate() {
-        lines.extend(render_turn(session, turn, turn_idx, width, show_reasoning));
+        lines.extend(render_turn(session, turn, turn_idx, width));
     }
 
     if session.timeline.turns.is_empty() {
@@ -239,9 +77,16 @@ pub fn render_transcript_with_opts(
 }
 
 /// 头部横幅：更早回合是否被折叠 / 是否根本够不到（T-08）。
+///
+/// M4（T13a）：「查看更早」按钮的 TUI 形态——无鼠标基础设施，按钮 =
+/// 显式键位提示 + 加载中状态反馈（PgUp 已可直接触发，见
+/// [`crate::app::transcript_ops`] 的 `page_up`）。
 pub(crate) fn render_banner(session: &SessionState) -> Option<RenderLine> {
+    if session.loading_older {
+        return Some(RenderLine::new().span("⋯ 正在加载更早回合…", SpanStyle::Dim));
+    }
     if session.timeline.has_more {
-        return Some(RenderLine::new().span("↑ 更早回合已折叠（PgUp 加载）", SpanStyle::Dim));
+        return Some(RenderLine::new().span("↑ 更早回合已折叠 — PgUp 加载更早", SpanStyle::Accent));
     }
     if session.timeline.truncated_before {
         // T-08：翻到头了，但历史并不止于此——服务端的物化窗口（timeline 从
@@ -260,130 +105,278 @@ pub(crate) fn render_banner(session: &SessionState) -> Option<RenderLine> {
 ///
 /// 这是分段渲染缓存的粒度单位：回合内任一块内容变化都会使其 `rev` 变化，
 /// 进而使 [`turn_cache_key`] 变化 → 只重渲这一段。
+/// 回合前置装饰：分隔头（状态/编号）+ offload 预览提示 + 用户输入。
+///
+/// 从 render_turn 内联段提取为独立函数：块级管线（`render/mod.rs`）与本文件的
+/// 整回合渲染**必须**逐行一致（lock `block_cache_matches_full_render`），
+/// 单一事实源是唯一可靠保证。
+pub(crate) fn render_turn_pre(turn: &Turn, num: u64, width: usize) -> Vec<RenderLine> {
+    let mut lines: Vec<RenderLine> = Vec::new();
+    // ── 回合分隔 ──
+    let state_tag = match turn.state {
+        TimelineTurnState::Running => "… running".to_string(),
+        TimelineTurnState::Completed => String::new(),
+        TimelineTurnState::Failed => turn
+            .failure
+            .as_ref()
+            .map(|f| format!("✗ {}", f.code))
+            .unwrap_or_else(|| "✗ failed".into()),
+        TimelineTurnState::Cancelled => "⊘ cancelled".into(),
+    };
+    // 编号用**稳定值**（见 `turn_number`）。
+    //
+    // ⚠ **不得**把 `turn_total()` 放进头部：它每新增一回合就变，而头部属于
+    // 段内容 → 每段 key 都会变 → 增量复用彻底失效（实测 cap 边界重渲 21/30）。
+    // 这就是「全局状态混进分段键」的反模式。总数改在会话信息行展示（不缓存）。
+    let mut header = RenderLine::new().span("──── ", SpanStyle::Dim);
+    header = header.span(format!("turn {num}"), SpanStyle::Dim);
+    if !state_tag.is_empty() {
+        let style = match turn.state {
+            TimelineTurnState::Failed => SpanStyle::Error,
+            TimelineTurnState::Cancelled => SpanStyle::Warn,
+            _ => SpanStyle::Dim,
+        };
+        header = header.span(format!(" · {state_tag}"), style);
+    }
+    // §4.6 聚合（B1 载体）：丢弃有计数——思考 body 不驻留，但段/行数进头。
+    if turn.thinking.segments > 0 {
+        header = header.span(
+            format!(
+                " · 思考 {} 段/{} 行",
+                turn.thinking.segments, turn.thinking.lines
+            ),
+            SpanStyle::Dim,
+        );
+    }
+    lines.push(header);
+
+    // T-06：offload 后常驻内存里只剩「预览壳」（正文截到 512 字符、
+    // tool.output/diff 清空）。不说的话用户会把残缺内容当成完整回合——
+    // 与 B1「丢弃必须可见」同一设计原则。
+    if turn.offloaded {
+        lines.push(
+            RenderLine::new()
+                .span("  ◌ ", SpanStyle::Warn)
+                .span("已归档：以下内容为预览", SpanStyle::Warn),
+        );
+    }
+
+    // ── 用户输入 ──
+    if !turn.user_text.is_empty() {
+        let wrapped = wrap_text(&turn.user_text, width.saturating_sub(2));
+        for (i, seg) in wrapped.into_iter().enumerate() {
+            let mut line = RenderLine::new();
+            line = line.span(if i == 0 { "❯ " } else { "  " }, SpanStyle::Accent);
+            line = line.span(seg, SpanStyle::User);
+            lines.push(line);
+        }
+    }
+    lines
+}
+
+/// 动画字形出口（plan §3.3 动画出带；锁 8）。
+///
+/// 共用渲染器（[`render_block_lines`] 一族是新旧路径的单源）按此出口决定
+/// 帧变字形的去向：
+/// - [`AnimSink::Bake`]：字形直接烘焙进行内——旧 `refresh_segments_at` 路径
+///   用（其缓存键含 `frame_now()`，动画段每帧重渲，行为与 M1 前一致）；
+/// - [`AnimSink::Slots`]：行内只写**占位空格**，字形坐标记入 [`AnimSlot`]，
+///   draw 期按当前帧覆盖 cell（块键无帧号 → 帧推进零 rebuild，锁 4）。
+///
+/// 占位纪律（reviewer §四.2 / plan §3.3）：槽位 cell 必须是渲染期预留的
+/// 占位空格；字形一律宽 1 = 占位宽 1，几何与烘焙模式逐 cell 对齐——draw
+/// 只覆盖这些 cell，绝不覆盖可能压着 CJK 半边的位置（锁 8）。
+pub(crate) enum AnimSink {
+    Bake,
+    Slots(Vec<AnimSlot>),
+}
+
+impl AnimSink {
+    /// 槽位字符：Bake → 当前帧字形；Slots → 占位空格并记录坐标。
+    /// `row`/`col` 为块内坐标（col 是该 cell 的起始显示列）。
+    fn cell(&mut self, kind: AnimKind, row: u16, col: u16) -> &'static str {
+        match self {
+            AnimSink::Bake => match kind {
+                AnimKind::Spinner => crate::app::anim::spinner_glyph(crate::app::anim::frame_now()),
+                AnimKind::Thinking => {
+                    crate::app::anim::thinking_glyph(crate::app::anim::frame_now())
+                }
+                AnimKind::Cursor => "▌",
+                // 无生产者（见 AnimKind 文档）；Bake 下不可达。
+                AnimKind::ProgressIndeterminate => "█",
+            },
+            AnimSink::Slots(out) => {
+                out.push(AnimSlot { row, col, kind });
+                " "
+            }
+        }
+    }
+
+    /// 取走槽位（Bake → 空）。
+    pub(crate) fn into_vec(self) -> Vec<AnimSlot> {
+        match self {
+            AnimSink::Bake => Vec::new(),
+            AnimSink::Slots(v) => v,
+        }
+    }
+}
+
+/// 单个内容块 → 行（Text/Reasoning/Tool/Notice 四分派）。
+/// `expanded_tools` 只在 Tool 分派被查询（F7 视觉展开态）。
+///
+/// M2（D1）：**Reasoning 恒 0 行**——思考退出 transcript 管线，活动回合的 body
+/// 由 Ctrl+T 浮层回放（§4.5），封口后聚合进回合头（§4.6）+ ActivityBar 承接实时。
+pub(crate) fn render_block_lines(
+    expanded_tools: &std::collections::HashSet<String>,
+    block: &Block,
+    width: usize,
+    anim: &mut AnimSink,
+) -> Vec<RenderLine> {
+    let mut lines: Vec<RenderLine> = Vec::new();
+    match block.kind {
+        TimelineBlockKind::Text => {
+            push_text_block(&mut lines, &block.text, width, block.is_streaming(), anim);
+        }
+        TimelineBlockKind::Reasoning => {}
+        TimelineBlockKind::Tool => {
+            if let Some(tool) = &block.tool {
+                // §4.7 分层：T1 工具永远单行（信息从 args 提炼），无 body。
+                if crate::app::render_transcript::is_t1_tool(&tool.name) {
+                    lines.push(crate::app::render_transcript::render_t1_line(
+                        &tool.name,
+                        tool.args_json.as_deref(),
+                        tool.display.as_ref().and_then(|d| d.summary.as_deref()),
+                        width,
+                    ));
+                    return lines;
+                }
+                let expanded = expanded_tools.contains(&tool.tool_call_id);
+                push_tool_card_anim(&mut lines, tool, width, expanded, anim);
+            }
+        }
+        TimelineBlockKind::Notice => {
+            for seg in wrap_text(&block.text, width.saturating_sub(2)) {
+                lines.push(
+                    RenderLine::new()
+                        .span("· ", SpanStyle::Dim)
+                        .span(seg, SpanStyle::Dim),
+                );
+            }
+        }
+    }
+    lines
+}
+
+/// 回合后置装饰：失败详情 + 尾部空行（无条件，保持旧行为）。
+pub(crate) fn render_turn_post(failure: Option<&TimelineFailure>, width: usize) -> Vec<RenderLine> {
+    let mut lines: Vec<RenderLine> = Vec::new();
+    if let Some(f) = failure {
+        for seg in wrap_text(
+            &format!("{}: {}", f.code, f.message),
+            width.saturating_sub(4),
+        ) {
+            lines.push(
+                RenderLine::new()
+                    .span("  ✗ ", SpanStyle::Error)
+                    .span(seg, SpanStyle::Error),
+            );
+        }
+    }
+    lines.push(RenderLine::new());
+    lines
+}
+
 fn render_turn(
     session: &SessionState,
     turn: &Turn,
     turn_idx: usize,
     width: usize,
-    show_reasoning: bool,
 ) -> Vec<RenderLine> {
-    let mut lines: Vec<RenderLine> = Vec::new();
-    {
-        // ── 回合分隔 ──
-        let state_tag = match turn.state {
-            TimelineTurnState::Running => "… running".to_string(),
-            TimelineTurnState::Completed => String::new(),
-            TimelineTurnState::Failed => turn
-                .failure
-                .as_ref()
-                .map(|f| format!("✗ {}", f.code))
-                .unwrap_or_else(|| "✗ failed".into()),
-            TimelineTurnState::Cancelled => "⊘ cancelled".into(),
-        };
-        // 编号用**稳定值**（见 `turn_number`）。
-        //
-        // ⚠ **不得**把 `turn_total()` 放进头部：它每新增一回合就变，而头部属于
-        // 段内容 → 每段 key 都会变 → 增量复用彻底失效（实测 cap 边界重渲 21/30）。
-        // 这就是「全局状态混进分段键」的反模式。总数改在会话信息行展示（不缓存）。
-        let num = session.timeline.turn_number(turn_idx);
-        let mut header = RenderLine::new().span("──── ", SpanStyle::Dim);
-        header = header.span(format!("turn {num}"), SpanStyle::Dim);
-        if !state_tag.is_empty() {
-            let style = match turn.state {
-                TimelineTurnState::Failed => SpanStyle::Error,
-                TimelineTurnState::Cancelled => SpanStyle::Warn,
-                _ => SpanStyle::Dim,
-            };
-            header = header.span(format!(" · {state_tag}"), style);
-        }
-        lines.push(header);
-
-        // T-06：offload 后常驻内存里只剩「预览壳」（正文截到 512 字符、
-        // tool.output/diff 清空）。不说的话用户会把残缺内容当成完整回合——
-        // 与 B1「丢弃必须可见」同一设计原则。
-        if turn.offloaded {
-            lines.push(
-                RenderLine::new()
-                    .span("  ◌ ", SpanStyle::Warn)
-                    .span("已归档：以下内容为预览", SpanStyle::Warn),
-            );
-        }
-
-        // ── 用户输入 ──
-        if !turn.user_text.is_empty() {
-            let wrapped = wrap_text(&turn.user_text, width.saturating_sub(2));
-            for (i, seg) in wrapped.into_iter().enumerate() {
-                let mut line = RenderLine::new();
-                line = line.span(if i == 0 { "❯ " } else { "  " }, SpanStyle::Accent);
-                line = line.span(seg, SpanStyle::User);
-                lines.push(line);
+    let num = session.timeline.turn_number(turn_idx);
+    let mut lines = render_turn_pre(turn, num, width);
+    // §4.2 运行组：与管线 `flush_tool_group` 同语义（锁 1 的等价口径前提）——
+    // 连续 T2 工具块折叠为组行（最后 Failed 卡内联），展开态为卡片列表。
+    for round in &turn.rounds {
+        let mut group: Vec<&Block> = Vec::new();
+        let group_expanded = session
+            .expanded_groups
+            .contains(&(turn.turn_id.clone(), round.round_num));
+        let flush = |group: &mut Vec<&Block>, lines: &mut Vec<RenderLine>| {
+            if group.is_empty() {
+                return;
             }
-        }
-
-        // ── rounds / blocks ──
-        for round in &turn.rounds {
-            for block in &round.blocks {
-                match block.kind {
-                    TimelineBlockKind::Text => {
-                        push_text_block(&mut lines, &block.text, width, block.is_streaming())
+            if !group_expanded {
+                let states: Vec<TimelineToolState> = group
+                    .iter()
+                    .filter_map(|b| b.tool.as_ref().map(|tc| tc.state))
+                    .collect();
+                let last_failed = group.iter().rposition(|b| {
+                    b.tool
+                        .as_ref()
+                        .is_some_and(|tc| tc.state == TimelineToolState::Failed)
+                });
+                for (i, _b) in group.iter().enumerate() {
+                    if Some(i) == last_failed {
+                        continue; // 失败例外：组行后内联
                     }
-                    TimelineBlockKind::Reasoning => push_reasoning_block(
-                        &mut lines,
-                        &block.text,
-                        width,
-                        block.is_streaming(),
-                        show_reasoning,
-                    ),
-                    TimelineBlockKind::Tool => {
-                        if let Some(tool) = &block.tool {
-                            let expanded = session.expanded_tools.contains(&tool.tool_call_id);
-                            push_tool_card(&mut lines, tool, width, expanded);
-                        }
+                    if i == 0 {
+                        lines.push(render_group_line(&states, group_expanded, width));
                     }
-                    TimelineBlockKind::Notice => {
-                        for seg in wrap_text(&block.text, width.saturating_sub(2)) {
-                            lines.push(
-                                RenderLine::new()
-                                    .span("· ", SpanStyle::Dim)
-                                    .span(seg, SpanStyle::Dim),
-                            );
-                        }
+                    // 中间块折叠态零行
+                }
+                if let Some(i) = last_failed {
+                    let b = group[i];
+                    if let Some(tool) = &b.tool {
+                        let expanded = session.expanded_tools.contains(&tool.tool_call_id);
+                        let mut sink = AnimSink::Bake;
+                        push_tool_card_anim(lines, tool, width, expanded, &mut sink);
+                    }
+                }
+            } else {
+                for b in group.iter() {
+                    if let Some(tool) = &b.tool {
+                        let expanded = session.expanded_tools.contains(&tool.tool_call_id);
+                        let mut sink = AnimSink::Bake;
+                        push_tool_card_anim(lines, tool, width, expanded, &mut sink);
                     }
                 }
             }
-        }
-
-        // 回合失败详情。
-        if let Some(f) = &turn.failure {
-            for seg in wrap_text(
-                &format!("{}: {}", f.code, f.message),
-                width.saturating_sub(4),
-            ) {
-                lines.push(
-                    RenderLine::new()
-                        .span("  ✗ ", SpanStyle::Error)
-                        .span(seg, SpanStyle::Error),
-                );
+            group.clear();
+        };
+        for block in &round.blocks {
+            let is_groupable = block.kind == TimelineBlockKind::Tool
+                && block.tool.as_ref().is_some_and(|t| !is_t1_tool(&t.name));
+            if is_groupable {
+                group.push(block);
+                continue;
             }
+            flush(&mut group, &mut lines);
+            lines.extend(render_block_lines(
+                &session.expanded_tools,
+                block,
+                width,
+                &mut AnimSink::Bake,
+            ));
         }
-        lines.push(RenderLine::new());
+        flush(&mut group, &mut lines);
     }
+    lines.extend(render_turn_post(turn.failure.as_ref(), width));
     lines
 }
 
 // ── 分段渲染缓存的键 ────────────────────────────────────────────────
 
-const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
-const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+pub(crate) const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+pub(crate) const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
 
 #[inline]
-fn h_u64(h: &mut u64, v: u64) {
+pub(crate) fn h_u64(h: &mut u64, v: u64) {
     *h ^= v;
     *h = h.wrapping_mul(FNV_PRIME);
 }
 
 #[inline]
-fn h_str(h: &mut u64, s: &str) {
+pub(crate) fn h_str(h: &mut u64, s: &str) {
     for b in s.as_bytes() {
         *h ^= u64::from(*b);
         *h = h.wrapping_mul(FNV_PRIME);
@@ -392,470 +385,50 @@ fn h_str(h: &mut u64, s: &str) {
     h_u64(h, s.len() as u64);
 }
 
-fn turn_state_tag(s: TimelineTurnState) -> u64 {
-    match s {
-        TimelineTurnState::Running => 0,
-        TimelineTurnState::Completed => 1,
-        TimelineTurnState::Failed => 2,
-        TimelineTurnState::Cancelled => 3,
-    }
-}
-
-/// 单回合的渲染缓存键。
-///
-/// 只读**块级 `rev` 计数**而不哈希正文：哈希是 O(text)，而这里要的是 O(块数)。
-/// 任何影响该回合渲染的输入都在键里：
-/// - 块内容：`block.rev`（每次可见变更自增）；
-/// - 块状态：`state`（Open→Sealed 会从纯文本切到 markdown）；
-/// - 工具展开态（F7）、`show_reasoning`（F3）、宽度；
-/// - 回合头部文案：`turn_idx` / `total`（`cap_turns` 丢回合会让编号漂移）；
-/// - **动画**：含 spinner/▌/进度条的回合每帧换键 → 只重渲这一段，
-///   其余段落保持命中。这正是「空闲零渲染、流式只渲活跃段」的实现基础。
-pub(crate) fn turn_cache_key(
-    session: &SessionState,
-    turn: &Turn,
-    turn_idx: usize,
-    width: u16,
-    show_reasoning: bool,
-) -> u64 {
-    let mut h = FNV_OFFSET;
-    h_u64(&mut h, 0x7475_726e); // "turn" 域分隔
-    h_str(&mut h, &turn.turn_id);
-    // 用**稳定编号**而非裸下标：否则 `cap_turns` 丢头部会让每个回合的键都变，
-    // 增量复用彻底失效（实测丢 1 个 → 19/19 全量重渲）。
-    h_u64(&mut h, session.timeline.turn_number(turn_idx));
-    h_u64(&mut h, u64::from(width));
-    h_u64(&mut h, u64::from(show_reasoning));
-    h_u64(&mut h, turn_state_tag(turn.state));
-    h_u64(&mut h, u64::from(turn.sealed));
-    h_u64(&mut h, u64::from(turn.offloaded));
-    h_str(&mut h, &turn.user_text);
-    if let Some(f) = &turn.failure {
-        h_str(&mut h, &f.code);
-        h_str(&mut h, &f.message);
-    }
-    let mut animating = false;
-    for round in &turn.rounds {
-        h_u64(&mut h, u64::from(round.round_num));
-        h_u64(&mut h, u64::from(round.sealed));
-        for b in &round.blocks {
-            h_str(&mut h, &b.block_id);
-            h_u64(&mut h, b.rev);
-            h_u64(&mut h, u64::from(b.block_order));
-            h_u64(&mut h, u64::from(b.state == TimelineBlockState::Sealed));
-            if let Some(t) = &b.tool {
-                h_u64(
-                    &mut h,
-                    u64::from(session.expanded_tools.contains(&t.tool_call_id)),
-                );
-            }
-            animating |= b.is_animating();
-        }
-    }
-    if animating {
-        // 动画字形依赖墙钟而非内容：把帧号纳入键，使本段每帧重渲。
-        h_u64(&mut h, crate::app::anim::frame_now());
-    }
-    h
-}
-
-/// 头部横幅的缓存键。
+/// Banner 段的缓存键：loading_older / has_more / truncated_before / 宽度。
 pub(crate) fn banner_cache_key(session: &SessionState, width: u16) -> u64 {
     let mut h = FNV_OFFSET;
     h_u64(&mut h, 0x6261_6e6e); // "bann"
+    h_u64(&mut h, u64::from(session.loading_older));
     h_u64(&mut h, u64::from(session.timeline.has_more));
     h_u64(&mut h, u64::from(session.timeline.truncated_before));
     h_u64(&mut h, u64::from(width));
     h
 }
 
-// ── 分段缓存的增量重建 ──────────────────────────────────────────────
-
-/// 布局不动点迭代的最大趟数。
-///
-/// 渲染会把估算高度换成精确高度，几何因此位移；本循环保证「窗口覆盖到的段
-/// 一定已精确渲染」。精确高度不会再次变化，故必然收敛（实测 1~2 趟）。
-/// 上限只是防御性护栏。
-const MAX_LAYOUT_PASSES: usize = 4;
-
-/// **廉价估算**单回合的渲染行数（离屏段用）。
-///
-/// 不跑 markdown/syntect/normalize，只按源文本的**字符显示宽度**推换行行数
-/// （Grok `estimate_source_lines` 同一思路：缓存每行宽度，按宽推导行数）。
-///
-/// 估算偏差只会导致滚动几何略微偏移，而**不会**导致显示错误：任何真正进入
-/// 视口的段都会被精确重渲（见 [`refresh_segments`]）。
-///
-/// 刻意取**保守偏小**（宁少不多）：估小 → 按几何挑选的可见段集合偏大 → 多渲
-/// 几段也无害；估大 → 可见段集合偏小 → 窗口内出现未渲染段（破坏不变式）。
-/// Claude Code 的 `PESSIMISTIC_HEIGHT=1` 就是同一取向的极端版本。
-fn estimate_turn_lines(turn: &Turn, width: usize) -> usize {
-    let w = width.max(1);
-    let mut lines = 0usize;
-
-    // 回合头部 1 行 +（offloaded 时）归档提示 1 行 + 尾部空行 1 行。
-    lines += 1;
-    if turn.offloaded {
-        lines += 1;
-    }
-    lines += 1;
-
-    // 用户输入：按显示宽推换行。
-    if !turn.user_text.is_empty() {
-        lines += estimate_wrapped_lines(&turn.user_text, w.saturating_sub(2));
-    }
-
-    for round in &turn.rounds {
-        for block in &round.blocks {
-            lines += match block.kind {
-                TimelineBlockKind::Text | TimelineBlockKind::Reasoning => {
-                    estimate_wrapped_lines(&block.text, w)
-                }
-                TimelineBlockKind::Notice => {
-                    estimate_wrapped_lines(&block.text, w.saturating_sub(2))
-                }
-                // 工具卡：折叠态是固定几行（标题+参数摘要），展开态才含输出。
-                // 这里按保守的折叠估法；展开后该段必然在视口内（用户刚点开）。
-                TimelineBlockKind::Tool => 3,
-            };
-        }
-    }
-
-    if turn.failure.is_some() {
-        lines += 1;
-    }
-    lines
-}
-
-/// 按**显示宽度**推换行行数（不建字符串，O(字符数)）。
-///
-/// 与 `wrap_text` 的贪心折行语义一致到「行数」这一层（不断言切分点）。
-fn estimate_wrapped_lines(text: &str, width: usize) -> usize {
-    use unicode_width::UnicodeWidthStr;
-    let w = width.max(1);
-    let mut total = 0usize;
-    for para in text.split('\n') {
-        let pw = UnicodeWidthStr::width(para);
-        // 空段落仍占 1 行（与 wrap_text 一致）。向上取整即行数。
-        total += pw.div_ceil(w).max(1);
-    }
-    total
-}
-
-/// 维护 `session.segments`（无视口版本）。
-///
-/// 仅测试用：不传视口时保留全部段的渲染结果，便于断言增量语义。
-/// 生产路径走 [`refresh_segments_at`]（带视口 → 触发虚拟化淘汰）。
-#[cfg(test)]
-pub fn refresh_segments(session: &mut SessionState, width: u16, show_reasoning: bool) -> usize {
-    refresh_segments_at(session, width, show_reasoning, None)
-}
-
-/// 带视口的 [`refresh_segments`]（生产路径用）。
-///
-/// `viewport` 为 `(视口顶端行号, 可视行数)`。传 `None` 表示不关心视口
-/// （如测试），此时保留全部段。
-///
-/// 复杂度：O(回合数) 取键（每回合 O(块数)，不哈希正文）+ O(可见段的行数) 重渲。
-/// 对比旧实现每帧 O(全量文本) 的 markdown/syntect/normalize，这是数量级的差异。
-///
-/// 返回本次实际重渲的段数（供测试与观测断言“增量真的发生了”）。
-pub fn refresh_segments_at(
-    session: &mut SessionState,
-    width: u16,
-    show_reasoning: bool,
-    viewport: Option<(usize, usize)>,
-) -> usize {
-    let width = width.max(20);
-
-    // ── 宽度 / F3 变化 ──
-    // 宽度：**不重建**，改为高度缩放 + 丢弃 Lines（Claude Code `ratio` 缩放）。
-    // F3：输出语义变了，必须整份重建。
-    let prev = session.segments.as_ref();
-    let reasoning_changed = prev.is_some_and(|c| c.show_reasoning != show_reasoning);
-    let width_changed = prev.is_some_and(|c| c.width != width);
-    let missing = prev.is_none();
-
-    if reasoning_changed || missing {
-        return rebuild_all(session, width, show_reasoning);
-    }
-
-    if width_changed {
-        let old_w = prev.map_or(width, |c| c.width).max(1) as f64;
-        let new_w = width.max(1) as f64;
-        // 宽度变大 → 行变少；ratio<1 时高度缩下去，与 Claude Code 注释的
-        // 「widen 时 ratio<1，缩放后偏移量与重排后的真实布局大致对齐」一致。
-        let ratio = old_w / new_w;
-        let cache = session.segments.as_mut().expect("checked above");
-        cache.width = width;
-        for seg in cache.turns.iter_mut() {
-            let h = seg.body.height() as f64;
-            let scaled = ((h * ratio).round() as usize).max(1);
-            seg.body = crate::app::session::SegmentBody::Height(scaled);
-        }
-        if let Some(b) = &mut cache.banner {
-            b.body = crate::app::session::SegmentBody::Height(1);
-        }
-        if let Some(e) = &mut cache.empty {
-            e.body = crate::app::session::SegmentBody::Height(1);
-        }
-        // 缩放后所有 Lines 都被丢弃 → 视口内会在下面被重新精确渲染。
-    }
-
-    // ── 增量：逐回合比对键，只重渲变化段 ──
-    // 先算出所有键（只读借用），再在**只读**阶段把需重渲的段渲好，
-    // 最后才拿可变借用写回——避开 `render_turn(&SessionState)` 与
-    // `segments.as_mut()` 的借用冲突。
-    let keys: Vec<u64> = session
-        .timeline
-        .turns
-        .iter()
-        .enumerate()
-        .map(|(idx, turn)| turn_cache_key(session, turn, idx, width, show_reasoning))
-        .collect();
-
-    let prev_len = session.segments.as_ref().map_or(0, |c| c.turns.len());
-    let same_len = prev_len == keys.len();
-
-    if !same_len {
-        // 长度变化有两种截然不同的成因，必须区分对待：
-        //
-        // - **cap_turns 丢头部**（每回合都发生，一旦到 cap 就是热路径）：
-        //   其余段内容未变，按 `turn_id` 对齐后可全部复用。若在这里整份重建，
-        //   则到达 cap 后每回合重渲 400 段（实测 197ms）——真卡顿源。
-        // - **prepend / reopen**（低频）：按 id 对不上就整份重建。
-        //
-        // 编号已改为**稳定**（`turn_number`），所以内容未变的回合其 key 也不变，
-        // 对齐后可直接复用；只有真正新增/变化的回合才进 dirty。
-        let old: Vec<crate::app::session::Segment> = session
-            .segments
-            .as_mut()
-            .map(|c| std::mem::take(&mut c.turns))
-            .unwrap_or_default();
-        let mut by_id: std::collections::HashMap<String, crate::app::session::Segment> =
-            old.into_iter().map(|s| (s.turn_id.clone(), s)).collect();
-        let mut realigned: Vec<crate::app::session::Segment> = Vec::with_capacity(keys.len());
-        let mut reused = 0usize;
-        for (idx, turn) in session.timeline.turns.iter().enumerate() {
-            match by_id.remove(&turn.turn_id) {
-                Some(seg) if seg.key == keys[idx] => {
-                    reused += 1;
-                    realigned.push(seg);
-                }
-                _ => realigned.push(crate::app::session::Segment {
-                    key: keys[idx],
-                    body: crate::app::session::SegmentBody::Height(estimate_turn_lines(
-                        turn,
-                        width as usize,
-                    )),
-                    turn_id: turn.turn_id.clone(),
-                }),
-            }
-        }
-        // 一个都没复用上（如首次 prepend 到完全不同的历史）：整份重建更划算。
-        if reused == 0 && !realigned.is_empty() {
-            session.segments.as_mut().expect("Some").turns = realigned;
-            return rebuild_all(session, width, show_reasoning);
-        }
-        session.segments.as_mut().expect("Some").turns = realigned;
-    }
-
-    // ── 虚拟化：只精确渲染视口附近的段，其余退化为估算高度 ──
-    //
-    // 用**不动点迭代**而非单趟：渲染会把估算高度换成精确高度 → 几何位移 →
-    // 覆盖的段集合可能变化。每趟都把「覆盖到但尚未渲染」的段渲掉，直到稳定。
-    // 精确高度不再变，故必然收敛（实测 1~2 趟）。
-    let mut rebuilt = 0usize;
-    for _pass in 0..MAX_LAYOUT_PASSES {
-        // 覆盖行区间 → 段下标范围（基于当前几何：精确 + 估算混合）。
-        let keep: Option<(usize, usize)> = viewport.and_then(|(top, height)| {
-            let cache = session.segments.as_ref()?;
-            if cache.turns.is_empty() {
-                return None;
-            }
-            let (f, l) = cache.segment_range_for(top, height);
-            Some((
-                f.saturating_sub(KEEP_MARGIN_SEGMENTS),
-                (l + KEEP_MARGIN_SEGMENTS).min(cache.turns.len().saturating_sub(1)),
-            ))
-        });
-
-        let mut need: Vec<usize> = Vec::new();
-        {
-            let cache = session.segments.as_mut().expect("checked above");
-            for (idx, seg) in cache.turns.iter_mut().enumerate() {
-                let in_keep = keep.is_none_or(|(lo, hi)| idx >= lo && idx <= hi);
-                if !in_keep {
-                    // 淘汰：丢弃 Lines，退化为**精确高度**（几何不变）。
-                    if let Some(lines) = seg.body.lines() {
-                        seg.body = crate::app::session::SegmentBody::Height(lines.len());
-                    }
-                    // 离屏且键变了的段：用估算高度占位（不渲染）。
-                    if seg.key != keys[idx] {
-                        seg.key = keys[idx];
-                        seg.body = crate::app::session::SegmentBody::Height(estimate_turn_lines(
-                            &session.timeline.turns[idx],
-                            width as usize,
-                        ));
-                    }
-                    continue;
-                }
-                // 保留区内：键变了 或 尚未持有 Lines（刚被淘汰/从未渲）→ 需渲。
-                if seg.key != keys[idx] || !seg.body.is_lines() {
-                    need.push(idx);
-                }
-            }
-        }
-
-        if need.is_empty() {
-            break;
-        }
-
-        // 只读阶段渲染，再可变阶段写回（避开 `render_turn(&SessionState)` 与
-        // `segments.as_mut()` 的借用冲突）。
-        let rendered: Vec<(usize, std::sync::Arc<[RenderLine]>)> = need
-            .iter()
-            .map(|&idx| {
-                let turn = &session.timeline.turns[idx];
-                let lines: std::sync::Arc<[RenderLine]> =
-                    render_turn(session, turn, idx, width as usize, show_reasoning).into();
-                (idx, lines)
-            })
-            .collect();
-        rebuilt += rendered.len();
-        let cache = session.segments.as_mut().expect("checked above");
-        for (idx, lines) in rendered {
-            cache.turns[idx] = crate::app::session::Segment {
-                key: keys[idx],
-                body: crate::app::session::SegmentBody::Lines(lines),
-                turn_id: session.timeline.turns[idx].turn_id.clone(),
-            };
-        }
-    }
-
-    // 收尾保证：循环退出后，窗口覆盖到的段必须已持有 Lines。
-    // 若不动点未收敛（估算↔精确来回振荡），这里无条件补渲一次——
-    // 它保证 `window()` 的不变式，而代价只多渲几段。
-    if let Some((top, height)) = viewport {
-        let need: Vec<usize> = {
-            let cache = session.segments.as_ref().expect("checked above");
-            if cache.turns.is_empty() {
-                Vec::new()
-            } else {
-                let (f, l) = cache.segment_range_for(top, height);
-                (f..=l.min(cache.turns.len() - 1))
-                    .filter(|&i| !cache.turns[i].body.is_lines())
-                    .collect()
-            }
-        };
-        if !need.is_empty() {
-            let rendered: Vec<(usize, std::sync::Arc<[RenderLine]>)> = need
-                .iter()
-                .map(|&idx| {
-                    let turn = &session.timeline.turns[idx];
-                    let lines: std::sync::Arc<[RenderLine]> =
-                        render_turn(session, turn, idx, width as usize, show_reasoning).into();
-                    (idx, lines)
-                })
-                .collect();
-            rebuilt += rendered.len();
-            let cache = session.segments.as_mut().expect("checked above");
-            for (idx, lines) in rendered {
-                cache.turns[idx] = crate::app::session::Segment {
-                    key: keys[idx],
-                    body: crate::app::session::SegmentBody::Lines(lines),
-                    turn_id: session.timeline.turns[idx].turn_id.clone(),
-                };
-            }
-        }
-    }
-
-    let banner_key = banner_cache_key(session, width);
-    let banner_line = render_banner(session);
-    let empty_needed = session.timeline.turns.is_empty();
-
-    // ── 可变阶段：写回 ──
-    let cache = session.segments.as_mut().expect("checked above");
-
-    let banner_stale = match &cache.banner {
-        Some(s) => s.key != banner_key || !s.body.is_lines(),
-        None => banner_line.is_some(),
-    };
-    if banner_stale {
-        cache.banner = banner_line.map(|l| crate::app::session::Segment {
-            key: banner_key,
-            body: crate::app::session::SegmentBody::Lines(std::sync::Arc::from([l].as_slice())),
-            turn_id: String::new(),
-        });
-    }
-    match (empty_needed, cache.empty.is_some()) {
-        (true, false) => {
-            cache.empty = Some(crate::app::session::Segment {
-                key: 1,
-                body: crate::app::session::SegmentBody::Lines(std::sync::Arc::from(
-                    [RenderLine::new().span("（暂无回合——输入消息开始对话）", SpanStyle::Dim)]
-                        .as_slice(),
-                )),
-                turn_id: String::new(),
-            });
-        }
-        (false, true) => cache.empty = None,
-        _ => {}
-    }
-
-    cache.rebuilt_segments = rebuilt;
-    cache.resident_segments = cache.all().filter(|s| s.body.is_lines()).count();
-    rebuilt
-}
-
-/// 整份重建（宽度/F3 变化、段数变化、首帧）。
-fn rebuild_all(session: &mut SessionState, width: u16, show_reasoning: bool) -> usize {
-    let mut cache = crate::app::session::SegmentCache {
-        width,
-        show_reasoning,
-        ..Default::default()
-    };
-    let mut rebuilt = 0usize;
-    for (idx, turn) in session.timeline.turns.iter().enumerate() {
-        let key = turn_cache_key(session, turn, idx, width, show_reasoning);
-        let lines: std::sync::Arc<[RenderLine]> =
-            render_turn(session, turn, idx, width as usize, show_reasoning).into();
-        cache.turns.push(crate::app::session::Segment {
-            key,
-            body: crate::app::session::SegmentBody::Lines(lines),
-            turn_id: session.timeline.turns[idx].turn_id.clone(),
-        });
-        rebuilt += 1;
-    }
-    cache.banner = render_banner(session).map(|l| crate::app::session::Segment {
-        key: banner_cache_key(session, width),
-        body: crate::app::session::SegmentBody::Lines(std::sync::Arc::from([l].as_slice())),
-        turn_id: String::new(),
-    });
-    cache.empty = session
-        .timeline
-        .turns
-        .is_empty()
-        .then(|| crate::app::session::Segment {
-            key: 1,
-            body: crate::app::session::SegmentBody::Lines(std::sync::Arc::from(
-                [RenderLine::new().span("（暂无回合——输入消息开始对话）", SpanStyle::Dim)]
-                    .as_slice(),
-            )),
-            turn_id: String::new(),
-        });
-    cache.rebuilt_segments = rebuilt;
-    cache.resident_segments = cache.all().filter(|s| s.body.is_lines()).count();
-    session.segments = Some(cache);
-    rebuilt
-}
-
-fn push_text_block(lines: &mut Vec<RenderLine>, text: &str, width: usize, streaming: bool) {
+fn push_text_block(
+    lines: &mut Vec<RenderLine>,
+    text: &str,
+    width: usize,
+    streaming: bool,
+    anim: &mut AnimSink,
+) {
     if streaming {
-        // 流式：纯文本低开销，避免半截 markdown 抖动与 syntect 重算
+        // 流式：纯文本低开销，避免半截 markdown 抖动与 syntect 重算。
+        // 光标必须以 ▌ 参与**折行输入**（wrap_text 会丢弃换行点的行尾空格，
+        // 若以占位空格折行，两种出口的行数会分叉）；Slots 出口在折行产物上
+        // 把末行末尾的 ▌ 就地换成同宽占位空格并记槽位（plan §3.3 占位纪律）。
         let shown = format!("{text}▌");
-        for seg in wrap_text(&shown, width) {
-            lines.push(RenderLine::plain(seg));
+        let wrapped = wrap_text(&shown, width);
+        let last = wrapped.len().saturating_sub(1);
+        for (i, seg) in wrapped.into_iter().enumerate() {
+            let is_cursor = i == last && seg.ends_with('▌');
+            let shown = match (is_cursor, &mut *anim) {
+                (true, AnimSink::Slots(out)) => {
+                    let col = unicode_width::UnicodeWidthStr::width(seg.as_str()) - 1; // ▌ 宽 1，行尾
+                    let mut seg = seg;
+                    seg.pop(); // ▌ → 同宽占位
+                    seg.push(' ');
+                    out.push(AnimSlot {
+                        row: lines.len() as u16,
+                        col: col as u16,
+                        kind: AnimKind::Cursor,
+                    });
+                    seg
+                }
+                (_, AnimSink::Bake) | (false, AnimSink::Slots(_)) => seg,
+            };
+            lines.push(RenderLine::plain(shown));
         }
         return;
     }
@@ -879,133 +452,6 @@ fn push_text_block(lines: &mut Vec<RenderLine>, text: &str, width: usize, stream
     }
 }
 
-fn push_reasoning_block(
-    lines: &mut Vec<RenderLine>,
-    text: &str,
-    width: usize,
-    streaming: bool,
-    show_reasoning: bool,
-) {
-    if text.trim().is_empty() {
-        return;
-    }
-    // summary 特判：无换行的动词-ing 句拼接自动逐句换行（eeacd19a 实测句间缺空格/缺换行）
-    // normalize 仅在 looks_like_reasoning_summary 为真时注入换行，传统 thinking 保持原样
-    let normalized = normalize_reasoning_content(text);
-    // opencode ReasoningHeader：流式 Spinner + 折叠标题对齐 `index.tsx:1652`
-    // 解析首段作为标题（**Title**\n\nBody 或首行），其余为 body
-    let trimmed = normalized.trim();
-    let (title, body) = if let Some(stripped) = trimmed.strip_prefix("**") {
-        if let Some(end) = stripped.find("**") {
-            let t = stripped[..end].trim();
-            let b = stripped[end + 2..].trim().trim_start_matches('\n').trim();
-            (
-                if t.is_empty() {
-                    None
-                } else {
-                    Some(t.to_owned())
-                },
-                b.to_owned(),
-            )
-        } else {
-            (None, trimmed.to_owned())
-        }
-    } else {
-        // 首行提升为标题仅限英文 gerund summary 句（opencode 风格，如
-        // "Gathering context."）；中文 thinking 散文首行是内容而非标题，
-        // 提升会把思考链路拼进 Thinking/Thought 标识同行。`**Title**`
-        // 显式形式已在上方分支处理。
-        let mut parts = trimmed.splitn(2, '\n');
-        let first = parts.next().unwrap_or("").trim();
-        let rest = parts.next().unwrap_or("").trim();
-        if rest.is_empty() {
-            (None, trimmed.to_owned())
-        } else if first.chars().count() <= 48 && sentence_starts_with_gerund(first) {
-            (Some(first.to_owned()), rest.to_owned())
-        } else {
-            (None, trimmed.to_owned())
-        }
-    };
-    if streaming {
-        let frames = ["◐", "◑", "◒", "◓"];
-        let ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis())
-            .unwrap_or(0);
-        let icon = frames[((ms / 200) % frames.len() as u128) as usize];
-        let header = if let Some(t) = &title {
-            format!("{icon} Thinking: {t}")
-        } else {
-            format!("{icon} Thinking")
-        };
-        lines.push(
-            RenderLine::new()
-                .span("  ", SpanStyle::Dim)
-                .span(header, SpanStyle::Warn),
-        );
-        if !show_reasoning {
-            // hide 模式流式仅保留标题行，不展 body（与 opencode hide 对齐）
-            return;
-        }
-        // 默认展开：流式即全显（8行以上时不截尾，cursor 附末行）
-        let wrapped = wrap_text(&body, width.saturating_sub(4));
-        for (i, seg) in wrapped.iter().enumerate() {
-            let is_last = i == wrapped.len() - 1;
-            let shown = if is_last {
-                format!("{seg}▌")
-            } else {
-                seg.clone()
-            };
-            lines.push(
-                RenderLine::new()
-                    .span("    ", SpanStyle::Dim)
-                    .span(shown, SpanStyle::Reasoning),
-            );
-        }
-        return;
-    }
-    // 非流式：hide 时单行 `+ Thought: title`（可 F3 展开）
-    if !show_reasoning {
-        if let Some(t) = title {
-            lines.push(
-                RenderLine::new()
-                    .span("  ", SpanStyle::Dim)
-                    .span(format!("+ Thought: {t} (F3 展开)"), SpanStyle::Warn),
-            );
-        } else {
-            let preview = body.chars().take(48).collect::<String>();
-            lines.push(
-                RenderLine::new()
-                    .span("  ", SpanStyle::Dim)
-                    .span(format!("+ Thought: {preview}… (F3 展开)"), SpanStyle::Warn),
-            );
-        }
-        return;
-    }
-    // 展开态必须保留 Thought 标识（无标题时用通用 Thought，避免裸体正文）
-    let header = if let Some(t) = title.as_deref() {
-        format!("Thought: {t}")
-    } else {
-        "Thought".to_string()
-    };
-    lines.push(
-        RenderLine::new()
-            .span("  ", SpanStyle::Dim)
-            .span(header, SpanStyle::Warn),
-    );
-    if body.is_empty() {
-        return;
-    }
-    let wrapped = wrap_text(&body, width.saturating_sub(4));
-    for seg in wrapped {
-        lines.push(
-            RenderLine::new()
-                .span("    ", SpanStyle::Dim)
-                .span(seg, SpanStyle::Reasoning),
-        );
-    }
-}
-
 /// 默认直接展开的工具（不再折叠）。bash 系 + read：输出即结果，必须直观可见。
 /// 其它工具（grep/glob/edit/write 等）保持折叠以控屏；F7 仍可手动切换。
 pub(crate) fn is_default_expanded(name: &str) -> bool {
@@ -1015,8 +461,105 @@ pub(crate) fn is_default_expanded(name: &str) -> bool {
     )
 }
 
+// ── §4.7 渲染分层：T1 调用行 / T2 可展开卡 ─────────────────────────
+
+/// T1 工具词表：**永远单行**、无 body（§4.7）——信息从 args 提炼。
+/// 这些工具要么无输出（todo_list 空转）、要么结果由专属面板/活动区承载。
+pub(crate) fn is_t1_tool(name: &str) -> bool {
+    matches!(
+        name,
+        "todo_write" | "todo_update" | "todo_list" | "skills" | "spawn_subagent" | "web_search"
+    )
+}
+
+/// T1 调用行：`⚙ {name} · {摘要}`（§4.7）。
+///
+/// M3（T12）：摘要优先取 `display.summary`（投影规范摘要）；
+/// display=None（H16 老会话）时回退 args 提炼预览。
+pub(crate) fn render_t1_line(
+    name: &str,
+    args_json: Option<&str>,
+    display_summary: Option<&str>,
+    width: usize,
+) -> RenderLine {
+    let mut text = format!("  {} {name}", tool_icon(name));
+    let summary = display_summary
+        .filter(|s| !s.is_empty())
+        .map(|s| s.replace('\n', " "));
+    if let Some(summary) = summary {
+        text.push_str(" · ");
+        text.push_str(&summary);
+    } else if let Some(a) = args_json {
+        let preview = format_args_preview(a);
+        if !preview.is_empty() {
+            text.push_str(" · ");
+            text.push_str(&preview);
+        }
+    }
+    let _ = width; // 单行不折；超宽由 draw 期截断（终端天然裁剪）
+    RenderLine::new().span(text, SpanStyle::Dim)
+}
+
+/// 测试构造：投影 display（T12 锁用）。
+#[cfg(test)]
+pub(crate) fn test_display(
+    summary: Option<&str>,
+    body: Option<qaqh_client::TimelineToolBody>,
+) -> qaqh_client::TimelineToolDisplay {
+    qaqh_client::TimelineToolDisplay {
+        summary: summary.map(str::to_string),
+        diff: None,
+        header: None,
+        body,
+        metrics: None,
+    }
+}
+
+/// §4.2 运行组折叠行：`┃ ⚙ N tool calls · a✓ b✗ c⊘ · F7 展开`。
+///
+/// 计数来自组内各卡的终态（Running 算「运行中」不计入三态）。
+pub(crate) fn render_group_line(
+    states: &[TimelineToolState],
+    expanded: bool,
+    width: usize,
+) -> RenderLine {
+    let ok = states
+        .iter()
+        .filter(|s| **s == TimelineToolState::Succeeded)
+        .count();
+    let failed = states
+        .iter()
+        .filter(|s| **s == TimelineToolState::Failed)
+        .count();
+    let cancelled = states
+        .iter()
+        .filter(|s| **s == TimelineToolState::Cancelled)
+        .count();
+    let running = states
+        .iter()
+        .filter(|s| **s == TimelineToolState::Running)
+        .count();
+    let mut text = format!("  ┃ ⚙ {} tool calls", states.len());
+    if ok > 0 {
+        text.push_str(&format!(" · {ok}✓"));
+    }
+    if failed > 0 {
+        text.push_str(&format!(" · {failed}✗"));
+    }
+    if cancelled > 0 {
+        text.push_str(&format!(" · {cancelled}⊘"));
+    }
+    if running > 0 {
+        text.push_str(&format!(" · {running} 运行中"));
+    }
+    let _ = width;
+    let hint = if expanded { "F7 收起" } else { "F7 展开" };
+    text.push_str(&format!(" · {hint}"));
+    RenderLine::new().span(text, SpanStyle::Dim)
+}
+
 /// opencode 式工具图标（对齐 `toolDisplay` 集合） `packages/tui/src/routes/session/index.tsx:2638`
-fn tool_icon(name: &str) -> &'static str {
+pub(crate) fn tool_icon(name: &str) -> &'static str {
     match name {
         "bash" | "exec" | "shell" | "pwsh" | "powershell" => "$",
         "write" => "←",
@@ -1050,7 +593,13 @@ fn collapse_output(output: &str, max_lines: usize, max_chars: usize) -> (String,
     (format!("{}…", preview), true)
 }
 
-/// 从 args_json 提炼可读预览（仅保留 primitives，去除 filePath 重复等）
+/// 从 args_json 提炼可读预览（仅保留 primitives，去除 filePath 重复等）。
+///
+/// M3（T12）gate 豁免：display 投影覆盖后本函数仅剩两个合法入口——
+/// ① T1 行 / T2 参段的 **H16 回退**（display=None 老会话，见
+/// `render_t1_line` 与 `push_tool_card` 的 skip_args_preview 条件）；
+/// ② 无结构化 body 的 display 卡的参数补充。gate 口径（禁止从 args JSON
+/// 提炼用户可见内容）在此两处之外仍生效。
 fn format_args_preview(args_json: &str) -> String {
     let Ok(v) = serde_json::from_str::<serde_json::Value>(args_json) else {
         let one = args_json.replace('\n', " ");
@@ -1098,21 +647,39 @@ fn format_args_preview(args_json: &str) -> String {
     }
 }
 
-/// 提炼路径类参数用于标题（read/write/edit 的 filePath / path）
-fn extract_path(args_json: Option<&str>) -> Option<String> {
-    let s = args_json?;
-    let v: serde_json::Value = serde_json::from_str(s).ok()?;
-    let obj = v.as_object()?;
-    for key in ["filePath", "path", "file_path"] {
-        if let Some(serde_json::Value::String(p)) = obj.get(key) {
-            return Some(p.clone());
-        }
-    }
-    None
-}
-
 fn is_shell_tool(name: &str) -> bool {
     matches!(name, "bash" | "exec" | "shell" | "pwsh" | "powershell")
+}
+
+/// 运行期体量标注（契约 §5.1 / §6 P2）：`↓ 12.3 KB` + 非 stdout 流标注。
+/// 仅 Running 态显示——终态以 metrics 尾注（output_bytes）为准，不重复。
+fn progress_bytes_note(tool: &crate::app::timeline_model::ToolCard) -> Option<String> {
+    if tool.state != TimelineToolState::Running || tool.progress_bytes_total == 0 {
+        return None;
+    }
+    let mut s = format!(" ↓ {}", human_bytes(tool.progress_bytes_total));
+    if let Some(stream) = tool
+        .progress_stream
+        .as_deref()
+        .filter(|s| !s.is_empty() && *s != "stdout")
+    {
+        s.push_str(" · ");
+        s.push_str(stream);
+    }
+    Some(s)
+}
+
+/// 人类可读字节（契约 P2 展示口径；export.rs 复用同一格式）。
+pub(crate) fn human_bytes(bytes: u64) -> String {
+    const KB: u64 = 1024;
+    const MB: u64 = 1024 * KB;
+    if bytes >= MB {
+        format!("{:.1} MB", bytes as f64 / MB as f64)
+    } else if bytes >= KB {
+        format!("{:.1} KB", bytes as f64 / KB as f64)
+    } else {
+        format!("{bytes} B")
+    }
 }
 
 /// 专属面板已完整承载结果的工具：transcript 只留一行调用轨迹。
@@ -1153,6 +720,9 @@ fn panel_owned_note(tool: &crate::app::timeline_model::ToolCard) -> &'static str
 
 /// 尝试将工具的 `output` JSON 外壳剥离，仅取内部 `output` 字段。
 /// 若不是 ExecOutput JSON，则回退为原文；不引入额外错误提示，保持视觉干净。
+///
+/// M3（T12）gate 豁免：H16 专用——display=None（老 daemon/未投影工具）时
+/// 的 legacy 输出剥离；display=Some 走 `TimelineToolBody` 投影，不经过此处。
 fn extract_shell_output_text(raw: &str) -> Option<String> {
     let s = raw.trim();
     if !s.starts_with('{') {
@@ -1177,143 +747,6 @@ fn extract_shell_output_text(raw: &str) -> Option<String> {
         }
     }
     None
-}
-
-/// 结构化 JSON 结果的可读投影。
-///
-/// 部分工具（`process`、`journal` 的部分 action）的模型投影就是一整坨 JSON，
-/// 单行贴进 transcript 是无法阅读的长串。这里做保守降级：只挑人类可读的
-/// 标量/短数组渲染成 `key: value` 行，并剥离与用户无关的机器字段
-/// （`timeis`：后端 `json_ok` 给每次调用打的会话时间戳；`content` 为
-/// `process_info_ok` 内联的短摘要，与 status 重复）。
-///
-/// 非 JSON / 解析失败 / 无可用字段 → 返回 None，调用方回退原文（绝不丢信息）。
-fn pretty_json_output(raw: &str) -> Option<String> {
-    let trimmed = raw.trim();
-    if !trimmed.starts_with('{') {
-        return None;
-    }
-    let value: serde_json::Value = serde_json::from_str(trimmed).ok()?;
-    let obj = value.as_object()?;
-    if obj.is_empty() {
-        return None;
-    }
-
-    const SKIP: [&str; 2] = ["timeis", "content"];
-    let mut out: Vec<String> = Vec::new();
-    for (key, val) in obj.iter() {
-        if SKIP.contains(&key.as_str()) {
-            continue;
-        }
-        match val {
-            serde_json::Value::String(s) => {
-                if s.is_empty() {
-                    continue;
-                }
-                // 过长的字符串（如整份文件内容）不在此投影，交给原文路径
-                if s.chars().count() > 200 {
-                    return None;
-                }
-                out.push(format!("{key}: {s}"));
-            }
-            serde_json::Value::Number(n) => out.push(format!("{key}: {n}")),
-            serde_json::Value::Bool(b) => out.push(format!("{key}: {b}")),
-            serde_json::Value::Null => {}
-            serde_json::Value::Array(arr) if arr.len() <= 8 => {
-                let parts: Vec<String> = arr
-                    .iter()
-                    .map(|item| match item {
-                        serde_json::Value::String(s) => s.clone(),
-                        other => other.to_string(),
-                    })
-                    .collect();
-                let joined = parts.join(", ");
-                if joined.chars().count() <= 200 {
-                    out.push(format!("{key}: {joined}"));
-                }
-            }
-            // 对象/长数组：结构复杂，不做猜测，回退原文
-            _ => {}
-        }
-    }
-    if out.is_empty() {
-        None
-    } else {
-        Some(out.join("\n"))
-    }
-}
-
-/// exec 的调用标题：`exec cargo build ...` / `exec bash ls -la`。
-///
-/// 后端 `exec` 有两种互斥形态（schema `oneOf: [argv, command]`）：
-/// - `argv`：`["cargo","build"]` 直调、不经 shell → 标题直接拼 argv；
-/// - `command` + 可选 `shell`：经 shell 执行 → 前缀显式 shell 名。
-///
-/// 之所以优先从 `args_json` 推导而非用 `summary`：后端
-/// `timeline_tool()` 令 `summary = output`，而 exec 的 output 是整坨
-/// `ExecOutput` JSON——直接显示会把 `{"status":"completed",...}` 糊在标题上。
-/// 且 `ExecOutput.command` 只是 `argv[0] + " ..."`（direct.rs:31），丢弃了参数，
-/// 不如还原真实 argv 可读。
-///
-/// 解析失败/形态异常 → 返回 None，调用方回退既有标题逻辑。
-fn exec_command_summary(args_json: Option<&str>) -> Option<String> {
-    let args = args_json?;
-    let value: serde_json::Value = serde_json::from_str(args).ok()?;
-    let obj = value.as_object()?;
-
-    /// argv 元素可能含空格/引号，按需加引号后拼接。
-    fn join_argv(items: &[serde_json::Value]) -> Option<String> {
-        let parts: Vec<String> = items
-            .iter()
-            .map(|v| v.as_str().map(str::to_owned))
-            .collect::<Option<Vec<_>>>()?
-            .into_iter()
-            .map(|s| {
-                if s.is_empty() || s.contains(char::is_whitespace) || s.contains('"') {
-                    format!("\"{}\"", s.replace('"', "\\\""))
-                } else {
-                    s
-                }
-            })
-            .collect();
-        (!parts.is_empty()).then(|| parts.join(" "))
-    }
-
-    if let Some(argv) = obj.get("argv").and_then(|v| v.as_array()) {
-        return join_argv(argv);
-    }
-
-    let command = obj.get("command").and_then(|v| v.as_str())?;
-    if command.trim().is_empty() {
-        return None;
-    }
-    match obj.get("shell").and_then(|v| v.as_str()) {
-        // 显式 shell：按用户要求标注，避免 Windows 上默认 pwsh 造成的误解
-        Some(shell) if !shell.trim().is_empty() => Some(format!("{shell} {command}")),
-        _ => Some(command.to_string()),
-    }
-}
-
-fn shell_meta_from_raw(raw: &str) -> Option<(Option<i32>, bool, String)> {
-    let v: serde_json::Value = serde_json::from_str(raw.trim()).ok()?;
-    let obj = v.as_object()?;
-    if !obj.contains_key("output") {
-        return None;
-    }
-    let exit_code = obj
-        .get("exit_code")
-        .and_then(|x| x.as_i64())
-        .map(|x| x as i32);
-    let truncated = obj
-        .get("truncated")
-        .and_then(|x| x.as_bool())
-        .unwrap_or(false);
-    let status = obj
-        .get("status")
-        .and_then(|x| x.as_str())
-        .unwrap_or("")
-        .to_string();
-    Some((exit_code, truncated, status))
 }
 
 /// 工具进度被截断时的可见标注（B1「丢弃必须可见」）。
@@ -1344,11 +777,39 @@ fn progress_truncated_line(is_block: bool) -> RenderLine {
         .span(PROGRESS_TRUNCATED_MARK, SpanStyle::Warn)
 }
 
+/// display 投影取值助手（Phase C）。全部按域回落 None，调用方各自回退旧字段。
+fn display_path_title(d: &TimelineToolDisplay) -> Option<String> {
+    match d.header.as_ref()? {
+        TimelineToolHeader::Path { path, .. } => Some(path.clone()),
+        _ => None,
+    }
+}
+
+fn display_shell_command(d: &TimelineToolDisplay) -> Option<String> {
+    match d.header.as_ref()? {
+        TimelineToolHeader::Shell { command } => Some(command.clone()),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
 fn push_tool_card(
     lines: &mut Vec<RenderLine>,
     tool: &crate::app::timeline_model::ToolCard,
     width: usize,
     expanded_raw: bool,
+) {
+    // 测试专用入口（旧直呼签名）：字形烘焙，行为与 M1 前一致。
+    let mut anim = AnimSink::Bake;
+    push_tool_card_anim(lines, tool, width, expanded_raw, &mut anim);
+}
+
+fn push_tool_card_anim(
+    lines: &mut Vec<RenderLine>,
+    tool: &crate::app::timeline_model::ToolCard,
+    width: usize,
+    expanded_raw: bool,
+    anim: &mut AnimSink,
 ) {
     // 默认展开的工具：expanded_raw 的语义做 xor，使 F7 仍可“收起”
     let expanded = expanded_raw ^ is_default_expanded(&tool.name);
@@ -1378,21 +839,21 @@ fn push_tool_card(
     };
 
     // ── 标题行：InlineTool 形态（单行 icon + name + 路径/摘要） `opencode InlineToolRow:1967`
-    let path = extract_path(tool.args_json.as_deref());
-    // exec 专用标题：优先还原真实命令（后端 summary 是整坨 ExecOutput JSON，
-    // 直接显示会把 `{"status":"completed"...}` 糊在标题上）。
-    let exec_summary = if tool.name == "exec" {
-        exec_command_summary(tool.args_json.as_deref())
-    } else {
-        None
-    };
+    // Phase C：display 投影优先（契约 §3.3）；None → 旧字段回退（H16）。
+    let d = tool.display.as_ref();
+    let path: Option<String> = d.and_then(display_path_title);
+    let exec_summary: Option<String> = d.and_then(display_shell_command);
     let header_extra = if let Some(p) = &path {
         let short = crate::app::truncate_str(p, 36);
         format!(" {short}")
     } else if let Some(cmd) = exec_summary.as_deref().filter(|s| !s.is_empty()) {
         let one = cmd.replace('\n', " ").chars().take(64).collect::<String>();
         format!(" {one}")
-    } else if let Some(summary) = tool.summary.as_deref().filter(|s| !s.is_empty()) {
+    } else if let Some(summary) = d
+        .and_then(|x| x.summary.as_deref())
+        .filter(|s| !s.is_empty())
+        .or(tool.summary.as_deref().filter(|s| !s.is_empty()))
+    {
         let one = summary
             .replace('\n', " ")
             .chars()
@@ -1411,9 +872,16 @@ fn push_tool_card(
         .map(|s| s.lines().count())
         .unwrap_or(0)
         + tool.progress.lines().count();
+    let display_body = d.and_then(|d| d.body.as_ref());
     let is_block = has_diff
         || output_len > 4
-        || tool.state == TimelineToolState::Running && !tool.progress.is_empty();
+        || tool.state == TimelineToolState::Running && !tool.progress.is_empty()
+        || matches!(
+            display_body,
+            Some(TimelineToolBody::Shell { .. })
+                | Some(TimelineToolBody::Diff { .. })
+                | Some(TimelineToolBody::Text { .. })
+        );
 
     if is_block {
         // BlockTool 标题：`# name path` 灰底左线（复刻 `BlockTool 1995 border left ┃ bg panel`）
@@ -1427,11 +895,21 @@ fn push_tool_card(
             format!("# {}", tool.name)
         };
         // 左线用 ┃（SplitBorder vertical）
-        lines.push(
-            RenderLine::new()
-                .span(" ┃ ", SpanStyle::Dim)
-                .span(title, SpanStyle::Dim),
-        );
+        let mut title_line = RenderLine::new()
+            .span(" ┃ ", SpanStyle::Dim)
+            .span(title, SpanStyle::Dim);
+        // Phase C：display.summary 进 Block 标题行（inline 形态经 header_extra 已覆盖；
+        // Block 形态此前会把它丢掉——skills resource 摘要即此缺口）。
+        if let Some(sum) = d
+            .and_then(|x| x.summary.as_deref())
+            .filter(|s| !s.is_empty())
+        {
+            title_line = title_line.span(
+                format!(" {}", crate::app::truncate_str(sum, 48)),
+                SpanStyle::Plain,
+            );
+        }
+        lines.push(title_line);
         // 状态行：icon + 状态 + 动画尾
         let state_label = match tool.state {
             TimelineToolState::Running => " running",
@@ -1443,31 +921,52 @@ fn push_tool_card(
             TimelineToolState::Cancelled => " cancelled",
             TimelineToolState::Backgrounded => " backgrounded",
         };
-        lines.push(
-            RenderLine::new()
-                .span(" ┃ ", SpanStyle::Dim)
-                .span(format!("{icon} "), style)
+        // Running 的 icon 是帧变字形 → 动画出带（Bake 烘焙 / Slots 占位+槽位；
+        // col = 推入时的起始显示列，字形宽 1 = 占位宽 1，几何不变）。
+        let state_line = RenderLine::new().span(" ┃ ", SpanStyle::Dim);
+        let icon_text = if is_running {
+            let col = state_line.display_width();
+            format!(
+                "{} ",
+                anim.cell(AnimKind::Spinner, lines.len() as u16, col as u16)
+            )
+        } else {
+            format!("{icon} ")
+        };
+        lines.push({
+            let mut state_row = state_line
+                .span(icon_text, style)
                 .span(tool.name.clone(), SpanStyle::Accent)
-                .span(state_label, style)
-                .span(if is_running { " ⋯" } else { "" }, SpanStyle::Dim),
-        );
+                .span(state_label, style);
+            if let Some(note) = progress_bytes_note(tool) {
+                state_row = state_row.span(note, SpanStyle::Dim);
+            }
+            state_row.span(if is_running { " ⋯" } else { "" }, SpanStyle::Dim)
+        });
     } else {
         // InlineTool 单行
         let state_suffix = match tool.state {
             TimelineToolState::Running => " ⋯",
             _ => "",
         };
-        let mut header = RenderLine::new()
-            .span("  ", SpanStyle::Dim)
-            .span(format!("{icon} "), style)
-            .span(
-                tool.name.clone(),
-                if tool.permission.is_some() {
-                    SpanStyle::Warn
-                } else {
-                    SpanStyle::Accent
-                },
-            );
+        let mut header = RenderLine::new().span("  ", SpanStyle::Dim);
+        let icon_text = if is_running {
+            let col = header.display_width();
+            format!(
+                "{} ",
+                anim.cell(AnimKind::Spinner, lines.len() as u16, col as u16)
+            )
+        } else {
+            format!("{icon} ")
+        };
+        header = header.span(icon_text, style).span(
+            tool.name.clone(),
+            if tool.permission.is_some() {
+                SpanStyle::Warn
+            } else {
+                SpanStyle::Accent
+            },
+        );
         if !header_extra.trim().is_empty() {
             header = header.span(
                 header_extra.clone(),
@@ -1479,6 +978,9 @@ fn push_tool_card(
             );
         }
         header = header.span(state_suffix, SpanStyle::Dim);
+        if let Some(note) = progress_bytes_note(tool) {
+            header = header.span(note, SpanStyle::Dim);
+        }
         // 专属面板工具：用状态专用语补齐语义（无输出时标题不至于干瘪）
         if is_panel_owned_tool(&tool.name) {
             let note = panel_owned_note(tool);
@@ -1505,7 +1007,9 @@ fn push_tool_card(
 
     // ── 参预览（非路径部分）─ 对齐 opencode `input()` 过滤
     // exec 的命令已进入标题，此处再列 `[command=..., shell=...]` 属于重复。
-    let skip_args_preview = exec_summary.is_some();
+    // M3（T12）：display 结构化 body（Shell/Diff/Text）已承载输出时，args 提炼段
+    // 不再叠加（与投影双写收敛）；body=None / display=None（H16）保留作参数补充。
+    let skip_args_preview = exec_summary.is_some() || display_body.is_some();
     if !skip_args_preview
         && let Some(args) = tool
             .args_json
@@ -1527,7 +1031,11 @@ fn push_tool_card(
     }
 
     // ── Diff 块：行级着色 + 自适应 split/unified + 行号 gutter（opencode 2401/2595）
-    if let Some(diff) = &tool.diff {
+    let diff_src = display_body.and_then(|b| match b {
+        TimelineToolBody::Diff { unified, .. } => Some(unified.as_str()),
+        _ => None,
+    });
+    if let Some(diff) = diff_src.or(tool.diff.as_deref()) {
         let added = diff
             .lines()
             .filter(|l| l.starts_with('+') && !l.starts_with("+++"))
@@ -1932,34 +1440,48 @@ fn push_tool_card(
     } else if is_shell_tool(&tool.name) {
         let raw_output = tool.output.as_deref().unwrap_or("");
         let unwrapped = extract_shell_output_text(raw_output);
-        let shell_meta = shell_meta_from_raw(raw_output);
+        let shell_meta: Option<(Option<i32>, bool, String)> = display_body.and_then(|b| match b {
+            TimelineToolBody::Shell {
+                exit_code,
+                truncated,
+                ..
+            } => Some((*exit_code, *truncated, String::new())),
+            _ => None,
+        });
         // 正文来源在**取值处**一并确定，不用 `src == tool.progress` 事后做整串
         // 值比较：那种判据在 `src` 被任何规整（trim / 换行归一）后都会静默失配，
         // 标注随之消失（PR #18 二轮复审建议 2）。
         //
         // 截断标注只在进度**真的上屏**时给——工具已结束且拿到了完整 `output` 时，
         // progress 只是被取代的中间态，此时标注它「前段已丢弃」是噪音。
-        let (src, src_from_progress) = if tool.state == TimelineToolState::Running {
-            if !tool.progress.trim().is_empty() {
-                (tool.progress.clone(), true)
-            } else {
-                (unwrapped.clone().unwrap_or_default(), false)
-            }
-        } else if let Some(ref inner) = unwrapped {
-            if !inner.trim().is_empty() {
-                (inner.clone(), false)
+        let display_shell_output = display_body.and_then(|b| match b {
+            TimelineToolBody::Shell { output, .. } => Some(output.clone()),
+            _ => None,
+        });
+        let (src, src_from_progress) =
+            if let Some(out) = display_shell_output.filter(|o| !o.trim().is_empty()) {
+                (out, false)
+            } else if tool.state == TimelineToolState::Running {
+                if !tool.progress.trim().is_empty() {
+                    (tool.progress.clone(), true)
+                } else {
+                    (unwrapped.clone().unwrap_or_default(), false)
+                }
+            } else if let Some(ref inner) = unwrapped {
+                if !inner.trim().is_empty() {
+                    (inner.clone(), false)
+                } else if !tool.progress.trim().is_empty() {
+                    (tool.progress.clone(), true)
+                } else {
+                    (String::new(), false)
+                }
             } else if !tool.progress.trim().is_empty() {
                 (tool.progress.clone(), true)
+            } else if !raw_output.trim().is_empty() {
+                (raw_output.to_string(), false)
             } else {
                 (String::new(), false)
-            }
-        } else if !tool.progress.trim().is_empty() {
-            (tool.progress.clone(), true)
-        } else if !raw_output.trim().is_empty() {
-            (raw_output.to_string(), false)
-        } else {
-            (String::new(), false)
-        };
+            };
         if !src.trim().is_empty() {
             let max_lines = 8usize;
             let expanded_limit = 24usize;
@@ -2063,16 +1585,32 @@ fn push_tool_card(
         }
     } else {
         let mut combined = String::new();
-        if let Some(output) = tool.output.as_deref().filter(|s| !s.is_empty()) {
-            // 结构化 JSON 结果（process/journal 等）先做可读投影，避免单行长串。
-            // 解析失败或非结构化输出 → 原样透出（信息零丢失）。
-            let rendered = pretty_json_output(output).unwrap_or_else(|| output.to_string());
-            combined.push_str(&rendered);
+        let display_text = display_body.and_then(|b| match b {
+            TimelineToolBody::Text { text, .. } => Some(text.clone()),
+            _ => None,
+        });
+        if let Some(text) = display_text {
+            combined.push_str(&text);
+        } else if let Some(output) = tool.output.as_deref().filter(|s| !s.is_empty()) {
+            // display 缺失（旧 daemon / 未投影工具）→ 原样透出（H16 回退）。
+            combined.push_str(output);
             if !tool.progress.is_empty() {
                 combined.push('\n');
             }
         }
         combined.push_str(&tool.progress);
+        let body_truncated = display_body.is_some_and(|b| {
+            matches!(
+                b,
+                TimelineToolBody::Text {
+                    truncated: true,
+                    ..
+                } | TimelineToolBody::Shell {
+                    truncated: true,
+                    ..
+                }
+            )
+        });
         // progress 在 `combined` 里的起始行号。`display` 与 `combined` 行号同源
         // ——折叠时 `display` 就是 `combined` 的前 `max_lines` 行——故可直接比。
         // （在 `display` 取走 `combined` 之前算好。）
@@ -2147,6 +1685,13 @@ fn push_tool_card(
             if tool.progress_truncated && progress_shown {
                 lines.push(progress_truncated_line(is_block));
             }
+            if body_truncated {
+                lines.push(
+                    RenderLine::new()
+                        .span("    ◌ ", SpanStyle::Warn)
+                        .span("正文已截断（output_bytes 见 metrics）", SpanStyle::Warn),
+                );
+            }
             if is_running
                 && !overflow
                 && body_end > body_start
@@ -2181,6 +1726,17 @@ fn push_tool_card(
     // Block 底部收口留白（对齐 BlockTool paddingBottom 1）
     if is_block {
         lines.push(RenderLine::new().span(" ┃", SpanStyle::Dim));
+    }
+
+    // Phase C：metrics 尾注（契约 §3.3；耗时/体量仅在投影提供时可见）。
+    if let Some(m) = d.and_then(|d| d.metrics.as_ref())
+        && m.elapsed_ms > 0
+    {
+        let mut foot = format!("  ◷ {:.1}s", m.elapsed_ms as f64 / 1000.0);
+        if m.output_bytes > 0 {
+            foot.push_str(&format!(" · {:.1} KB", m.output_bytes as f64 / 1024.0));
+        }
+        lines.push(RenderLine::new().span(foot, SpanStyle::Dim));
     }
 }
 
@@ -2271,6 +1827,7 @@ mod tests {
     fn turn_with_offload(offloaded: bool) -> SessionState {
         let mut sess = SessionState::new("seed-1".into());
         sess.timeline.turns.push(Turn {
+            thinking: Default::default(),
             turn_index: None,
             turn_id: "t1".into(),
             user_text: "hi".into(),
@@ -2322,8 +1879,11 @@ mod tests {
             diff: None,
             progress: String::new(),
             progress_truncated: false,
+            progress_bytes_total: 0,
+            progress_stream: None,
             failure: None,
             permission: None,
+            display: None,
         };
         let mut lines = Vec::new();
         push_tool_card(&mut lines, &ask, 100, false);
@@ -2363,8 +1923,11 @@ mod tests {
                 diff: None,
                 progress: String::new(),
                 progress_truncated: false,
+                progress_bytes_total: 0,
+                progress_stream: None,
                 failure: None,
                 permission: None,
+            display: None,
             };
             let mut lines = Vec::new();
             push_tool_card(&mut lines, &todo, 100, false);
@@ -2400,8 +1963,11 @@ mod tests {
             diff: None,
             progress: String::new(),
             progress_truncated: false,
+            progress_bytes_total: 0,
+            progress_stream: None,
             failure: None,
             permission: None,
+        display: None,
         };
         let mut lines = Vec::new();
         push_tool_card(&mut lines, &skills, 100, false);
@@ -2428,8 +1994,11 @@ mod tests {
             diff: None,
             progress: String::new(),
             progress_truncated: false,
+            progress_bytes_total: 0,
+            progress_stream: None,
             failure: None,
             permission: None,
+            display: None,
         };
         let mut lines = Vec::new();
         push_tool_card(&mut lines, &spawn, 100, false);
@@ -2456,11 +2025,14 @@ mod tests {
             diff: None,
             progress: String::new(),
             progress_truncated: false,
+            progress_bytes_total: 0,
+            progress_stream: None,
             failure: Some(qaqh_client::TimelineFailure {
                 code: "invalid_input".into(),
                 message: "items 为空".into(),
             }),
             permission: None,
+            display: None,
         };
         let mut lines = Vec::new();
         push_tool_card(&mut lines, &failed, 100, false);
@@ -2486,8 +2058,11 @@ mod tests {
             diff: None,
             progress: String::new(),
             progress_truncated: false,
+            progress_bytes_total: 0,
+            progress_stream: None,
             failure: None,
             permission: None,
+            display: None,
         };
         let mut lines = Vec::new();
         push_tool_card(&mut lines, &read, 100, false);
@@ -2524,35 +2099,6 @@ mod tests {
         assert!(!is_panel_owned_tool("confirm_apply"));
     }
 
-    #[test]
-    fn pretty_json_projects_scalars_and_drops_machine_fields() {
-        // process check 的真实形态（process_inspect.rs: process_info_ok）
-        let raw = r#"{"id":7,"name":"cargo","status":"running","exit_code":null,"output":"","timeis":"UTC+8 2026-09-09 00:00","content":"process 7: running"}"#;
-        let pretty = pretty_json_output(raw).expect("应可投影");
-        assert!(pretty.contains("id: 7"), "{pretty}");
-        assert!(pretty.contains("status: running"));
-        assert!(!pretty.contains("timeis"), "机器时间戳应剔除");
-        assert!(!pretty.contains("\"id\""), "不应残留 JSON 引号");
-        // null 与空串跳过
-        assert!(!pretty.contains("exit_code"));
-    }
-
-    #[test]
-    fn pretty_json_returns_none_for_unstructured_text() {
-        assert!(pretty_json_output("plain text output").is_none());
-        assert!(pretty_json_output("not json {").is_none());
-        assert!(pretty_json_output(r#"{}"#).is_none());
-        assert!(pretty_json_output(r#"{"timeis":"x"}"#).is_none());
-    }
-
-    /// 长文本/复杂对象不猜测：回退原文，保证信息零丢失。
-    #[test]
-    fn pretty_json_defers_on_complex_payloads() {
-        let long = "x".repeat(250);
-        let raw = format!(r#"{{"content":"{long}"}}"#);
-        assert!(pretty_json_output(&raw).is_none());
-    }
-
     // ── 回归锁：`serde_json` 保序（preserve_order）对渲染路径的影响 ──────────
     //
     // 背景：`qaqh-client` 声明 `serde_json = { version = "1", features =
@@ -2586,20 +2132,6 @@ mod tests {
         );
     }
 
-    /// 回归锁：`pretty_json_output` 的**行序** = JSON 原文 key 顺序（非字典序）。
-    ///
-    /// 该函数承担非 shell 工具（`process`/`journal`/`read`/…）的输出投影，
-    /// 是保序 feature 最直接的可见面。
-    #[test]
-    fn pretty_json_output_follows_source_key_order() {
-        let pretty = pretty_json_output(r#"{"zeta":"z","alpha":"a","mid":"m"}"#).expect("应可投影");
-        assert_eq!(pretty, "zeta: z\nalpha: a\nmid: m");
-        assert_ne!(
-            pretty, "alpha: a\nmid: m\nzeta: z",
-            "退化成字典序说明 preserve_order 不再生效"
-        );
-    }
-
     /// 回归锁：`format_args_preview` 的 `[k=v, …]` 顺序同样跟随原文 key 顺序。
     ///
     /// 该预览用于非 shell 工具卡的 `⌗` 参数行。
@@ -2630,161 +2162,11 @@ mod tests {
         );
     }
 
-    /// 结论钉住：**exec 工具卡的渲染与 key 顺序无关**。
-    ///
-    /// 与上面几条相反，exec 走 shell 专用分支：标题 `exec_command_summary`、输出
-    /// `extract_shell_output_text`、状态 `shell_meta_from_raw` 都只用 `obj.get(...)`
-    /// 定点取值；参数预览对 exec 又被显式跳过
-    /// （`skip_args_preview = exec_summary.is_some()`）。因此同一份内容的两种 key
-    /// 排列必须渲染出完全相同的行。
-    ///
-    /// 形态刻意选成 **Block**（`is_block = output_len > 4`，故 `tool.output` 用 5 行
-    /// 的缩进 JSON 信封）——PR #16 审查指出：单行 output 会落进 Inline 分支，那本是
-    /// 最不受顺序影响的形态，用它当守卫等于没测。
-    ///
-    /// 参数也刻意给 4 个 key 且两卡顺序互逆：一旦 `skip_args_preview` 被误开，
-    /// 两卡的 `⌗` 行会各按自己的顺序渲染 → 相等断言与 `cwd=` 探针同时变红。
+    /// Phase C：exec 标题来自 display.header（Shell 命令），不再解析 args_json；
+    /// display 缺失 → 回退渲染不带命令（诚实降级，绝不臆造命令行）。
     #[test]
-    fn exec_tool_card_render_is_key_order_independent() {
-        // 两卡内容完全相同，仅 key 顺序互逆。
-        let args_a = r#"{"argv":["ls","-la"],"cwd":"/tmp","timeout_ms":5,"shell":"bash"}"#;
-        let args_b = r#"{"shell":"bash","timeout_ms":5,"cwd":"/tmp","argv":["ls","-la"]}"#;
-        // `tool.output` 是**原始**串，`output_len` 按原始串行数算；缩进信封才能进 Block。
-        let out_a = r#"{
-  "status": "completed",
-  "exit_code": 0,
-  "output": "l1\nl2\nl3\nl4\nl5\nl6\n"
-}"#;
-        let out_b = r#"{
-  "output": "l1\nl2\nl3\nl4\nl5\nl6\n",
-  "exit_code": 0,
-  "status": "completed"
-}"#;
-
-        // 探针依据：`format_args_preview` 只收 String/Number/Bool，数组（`argv`）落进
-        // `_ => {}` 被丢弃；故 `⌗` 行若真的渲染出来，出现的必是 `cwd=` 而非 `argv=`。
-        // 这条断言同时钉住「探针字符串本身有效」，避免探针失效后静默放行。
-        assert_eq!(
-            format_args_preview(args_a),
-            "[cwd=/tmp, timeout_ms=5, shell=bash]",
-            "探针前提：⌗ 行会渲染 cwd=（argv 是数组，被丢弃）"
-        );
-        assert_ne!(
-            format_args_preview(args_a),
-            format_args_preview(args_b),
-            "两卡顺序互逆，⌗ 行若渲染出来必然不同——这正是本用例判别力的来源"
-        );
-
-        let card = |args: &str, output: &str| ToolCard {
-            tool_call_id: "c-exec".into(),
-            name: "exec".into(),
-            state: TimelineToolState::Succeeded,
-            summary: None,
-            args_json: Some(args.into()),
-            output: Some(output.into()),
-            diff: None,
-            progress: String::new(),
-            progress_truncated: false,
-            failure: None,
-            permission: None,
-        };
-        let mut lines_a = Vec::new();
-        let mut lines_b = Vec::new();
-        push_tool_card(&mut lines_a, &card(args_a, out_a), 100, false);
-        push_tool_card(&mut lines_b, &card(args_b, out_b), 100, false);
-        let flat_a = flatten(&lines_a);
-
-        assert!(
-            flat_a.contains('┃'),
-            "应走 Block 分支（output_len > 4），否则本用例落回 Inline 形态而失去意义：{flat_a}"
-        );
-        assert!(flat_a.contains("ls -la"), "argv 应进标题：{flat_a}");
-        assert!(flat_a.contains("l6"), "输出应透出：{flat_a}");
-        assert!(
-            !flat_a.contains("cwd="),
-            "exec 的 ⌗ 参数预览必须被跳过（skip_args_preview）：{flat_a}"
-        );
-        assert_eq!(flat_a, flatten(&lines_b), "exec 卡渲染不应随 key 顺序变化");
-    }
-
-    /// 回归：process 的 JSON 不再以单行长串形式出现。
-    #[test]
-    fn process_json_is_rendered_readably() {
-        let proc_tool = ToolCard {
-            tool_call_id: "c-proc".into(),
-            name: "process".into(),
-            state: TimelineToolState::Succeeded,
-            summary: None,
-            args_json: Some(r#"{"action":"check","id":7}"#.into()),
-            output: Some(
-                r#"{"id":7,"name":"cargo","status":"running","timeis":"UTC+8 2026-09-09 00:00"}"#
-                    .into(),
-            ),
-            diff: None,
-            progress: String::new(),
-            progress_truncated: false,
-            failure: None,
-            permission: None,
-        };
-        let mut lines = Vec::new();
-        push_tool_card(&mut lines, &proc_tool, 100, false);
-        let flat: String = lines
-            .iter()
-            .flat_map(|l| l.spans.iter().map(|s| s.text.clone()))
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(flat.contains("status: running"), "应可读投影: {flat}");
-        assert!(!flat.contains("timeis"), "机器字段应剔除");
-    }
-
-    #[test]
-    fn exec_summary_renders_command_and_shell() {
-        // argv 直调：不经 shell，标题即真实命令行
-        assert_eq!(
-            exec_command_summary(Some(r#"{"argv":["cargo","build","--release"]}"#)).as_deref(),
-            Some("cargo build --release")
-        );
-        // command 无显式 shell：不臆测（默认壳是运行时决策）
-        assert_eq!(
-            exec_command_summary(Some(r#"{"command":"ls -la | grep foo"}"#)).as_deref(),
-            Some("ls -la | grep foo")
-        );
-        // 显式 shell：按用户要求前缀标注
-        assert_eq!(
-            exec_command_summary(Some(r#"{"command":"Get-ChildItem","shell":"pwsh"}"#)).as_deref(),
-            Some("pwsh Get-ChildItem")
-        );
-        assert_eq!(
-            exec_command_summary(Some(r#"{"command":"ls -la","shell":"bash"}"#)).as_deref(),
-            Some("bash ls -la")
-        );
-        // 含空格/引号的参数需正确加引号
-        assert_eq!(
-            exec_command_summary(Some(r#"{"argv":["git","commit","-m","fix a bug"]}"#)).as_deref(),
-            Some("git commit -m \"fix a bug\"")
-        );
-    }
-
-    #[test]
-    fn exec_summary_degrades_gracefully() {
-        assert_eq!(exec_command_summary(None), None);
-        assert_eq!(exec_command_summary(Some("not json")), None);
-        assert_eq!(exec_command_summary(Some(r#"{}"#)), None);
-        // 空 command 不当作有效标题
-        assert_eq!(exec_command_summary(Some(r#"{"command":"   "}"#)), None);
-        // 空 argv
-        assert_eq!(exec_command_summary(Some(r#"{"argv":[]}"#)), None);
-        // 空 shell 退化为无前缀
-        assert_eq!(
-            exec_command_summary(Some(r#"{"command":"ls","shell":""}"#)).as_deref(),
-            Some("ls")
-        );
-    }
-
-    /// 回归：exec 标题不得再出现 ExecOutput JSON（后端 summary = output 所致）。
-    #[test]
-    fn exec_title_shows_command_not_json() {
-        let exec = ToolCard {
+    fn exec_title_from_display_and_honest_fallback() {
+        let mk = |display: Option<TimelineToolDisplay>| ToolCard {
             tool_call_id: "c-exec".into(),
             name: "exec".into(),
             state: TimelineToolState::Succeeded,
@@ -2793,25 +2175,171 @@ mod tests {
                 r#"{"status":"completed","command":"cargo ...","exit_code":0,"output":""}"#.into(),
             ),
             args_json: Some(r#"{"argv":["cargo","build"]}"#.into()),
-            output: Some(
-                r#"{"status":"completed","command":"cargo ...","exit_code":0,"output":""}"#.into(),
-            ),
+            output: Some(r#"{"status":"completed","exit_code":0,"output":"l1"}"#.into()),
             diff: None,
             progress: String::new(),
             progress_truncated: false,
+            progress_bytes_total: 0,
+            progress_stream: None,
             failure: None,
             permission: None,
+            display,
+        };
+        let d = TimelineToolDisplay {
+            summary: None,
+            diff: None,
+            header: Some(TimelineToolHeader::Shell {
+                command: "cargo build".into(),
+            }),
+            body: Some(TimelineToolBody::Shell {
+                output: "l1\nl2\nl3".into(),
+                exit_code: Some(0),
+                truncated: false,
+            }),
+            metrics: Some(qaqh_client::TimelineToolMetrics {
+                elapsed_ms: 1500,
+                output_bytes: 4096,
+                retry_count: 0,
+                effective_tool_name: None,
+                user_initiated: false,
+            }),
         };
         let mut lines = Vec::new();
-        push_tool_card(&mut lines, &exec, 100, false);
-        let flat: String = lines
-            .iter()
-            .flat_map(|l| l.spans.iter().map(|s| s.text.clone()))
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(flat.contains("cargo build"), "标题应为真实命令: {flat}");
-        assert!(!flat.contains("\"status\""), "标题不得糊 JSON: {flat}");
-        assert!(!flat.contains("exit_code"), "标题不得含机器字段");
+        push_tool_card(&mut lines, &mk(Some(d)), 80, false);
+        let flat = flatten(&lines);
+        assert!(
+            flat.contains("cargo build"),
+            "display Shell 标题必须携带真实命令：{flat}"
+        );
+        assert!(
+            !flat.contains("status"),
+            "不得把 ExecOutput JSON 糊进标题：{flat}"
+        );
+        assert!(flat.contains("1.5s"), "metrics 耗时必须可见：{flat}");
+        assert!(flat.contains("4.0 KB"), "metrics 体量必须可见：{flat}");
+        assert!(
+            flat.contains("l1"),
+            "Shell body 输出必须直接上屏（无需 JSON 剥壳）：{flat}"
+        );
+
+        // H16 回退：display 缺失 → 旧字段渲染，标题不臆造命令行。
+        let mut lines = Vec::new();
+        push_tool_card(&mut lines, &mk(None), 80, false);
+        let flat = flatten(&lines);
+        // flatten 以 span 为界 join，"# exec" 是两个 span——按语义断言。
+        assert!(flat.contains("\nexec\n"), "回退标题仍是工具名：{flat}");
+        assert!(!flat.contains("cargo build"), "回退不得臆造命令：{flat}");
+    }
+
+    /// Phase C：ask/skills 投影（6b08e14）——面板工具单行消费 display.summary。
+    #[test]
+    fn panel_owned_tools_consume_display_summary() {
+        let mk = |name: &str, summary: &str, body: TimelineToolBody| ToolCard {
+            tool_call_id: "c".into(),
+            name: name.into(),
+            state: TimelineToolState::Succeeded,
+            summary: None,
+            args_json: None,
+            output: None,
+            diff: None,
+            progress: String::new(),
+            progress_truncated: false,
+            progress_bytes_total: 0,
+            progress_stream: None,
+            failure: None,
+            permission: None,
+            display: Some(TimelineToolDisplay {
+                summary: Some(summary.into()),
+                diff: None,
+                header: Some(TimelineToolHeader::Other { label: name.into() }),
+                body: Some(body),
+                metrics: None,
+            }),
+        };
+        // ask：Body::None + 投影摘要。
+        let mut lines = Vec::new();
+        push_tool_card(
+            &mut lines,
+            &mk("ask", "asked 2 questions", TimelineToolBody::None),
+            80,
+            false,
+        );
+        let flat = flatten(&lines);
+        assert!(
+            flat.contains("asked 2 questions"),
+            "display.summary 必须可见：{flat}"
+        );
+        assert!(
+            flat.contains("已回答"),
+            "投影摘要存在时不再需要状态补语：{flat}"
+        );
+
+        // skills resource：Body::Text —— 面板工具不渲染正文（面板是权威投影）。
+        let mut lines = Vec::new();
+        push_tool_card(
+            &mut lines,
+            &mk(
+                "skills",
+                "resource · rust-style-guide",
+                TimelineToolBody::Text {
+                    text: "指南全文".into(),
+                    truncated: false,
+                },
+            ),
+            80,
+            false,
+        );
+        let flat = flatten(&lines);
+        assert!(flat.contains("resource · rust-style-guide"), "{flat}");
+        assert!(
+            !flat.contains("指南全文"),
+            "面板工具正文不得重复渲染：{flat}"
+        );
+    }
+
+    /// Phase C：Path 头 + Text 体（read 族）与截断标注（B1）。
+    #[test]
+    fn display_path_header_and_text_body() {
+        let card = ToolCard {
+            tool_call_id: "c-read".into(),
+            name: "read".into(),
+            state: TimelineToolState::Succeeded,
+            summary: None,
+            args_json: None,
+            output: None,
+            diff: None,
+            progress: String::new(),
+            progress_truncated: false,
+            progress_bytes_total: 0,
+            progress_stream: None,
+            failure: None,
+            permission: None,
+            display: Some(TimelineToolDisplay {
+                summary: Some("42 行".into()),
+                diff: None,
+                header: Some(TimelineToolHeader::Path {
+                    path: "src/app/mod.rs".into(),
+                    op: qaqh_client::TimelinePathOp::Read,
+                }),
+                body: Some(TimelineToolBody::Text {
+                    text: "use ratatui::Frame;".into(),
+                    truncated: true,
+                }),
+                metrics: None,
+            }),
+        };
+        let mut lines = Vec::new();
+        push_tool_card(&mut lines, &card, 80, false);
+        let flat = flatten(&lines);
+        assert!(flat.contains("src/app/mod.rs"), "Path 头必须进标题：{flat}");
+        assert!(
+            flat.contains("use ratatui::Frame;"),
+            "Text 体必须直接上屏：{flat}"
+        );
+        assert!(
+            flat.contains("正文已截断"),
+            "body.truncated 必须可见（B1）：{flat}"
+        );
     }
 
     #[test]
@@ -2845,8 +2373,11 @@ mod tests {
             diff: None,
             progress: String::new(),
             progress_truncated: false,
+            progress_bytes_total: 0,
+            progress_stream: None,
             failure: None,
             permission: None,
+            display: None,
         };
         let mut lines = Vec::new();
         push_tool_card(&mut lines, &tool_inline, 80, false);
@@ -2867,8 +2398,11 @@ mod tests {
             diff: Some(diff.into()),
             progress: String::new(),
             progress_truncated: false,
+            progress_bytes_total: 0,
+            progress_stream: None,
             failure: None,
             permission: None,
+            display: None,
         };
         let mut lines2 = Vec::new();
         push_tool_card(&mut lines2, &tool_block, 130, false); // wide -> split
@@ -2892,250 +2426,6 @@ mod tests {
     }
 
     #[test]
-    fn rendering_respects_show_reasoning() {
-        let block = Block {
-            block_id: "b1".into(),
-            block_order: 0,
-            kind: TimelineBlockKind::Reasoning,
-            state: TimelineBlockState::Sealed,
-            text: "**Title**\n\nBody content here\nsecond line".into(),
-            tool: None,
-            last_fragment: 0,
-            rev: 1,
-        };
-        let round = Round {
-            round_num: 0,
-            sealed: true,
-            is_final: true,
-            blocks: vec![block],
-        };
-        let turn = Turn {
-            turn_index: None,
-            turn_id: "t1".into(),
-            user_text: "hi".into(),
-            state: TimelineTurnState::Completed,
-            failure: None,
-            sealed: true,
-            offloaded: false,
-            rounds: vec![round],
-        };
-        let mut sess = crate::app::session::SessionState::new("s".into());
-        sess.timeline.turns.push(turn);
-        sess.timeline.version = 1;
-        let lines_hide = render_transcript_with_opts(&sess, 80, false);
-        let lines_show = render_transcript_with_opts(&sess, 80, true);
-        // hide 应折叠为单行 + 提示
-        assert!(
-            lines_hide
-                .iter()
-                .any(|l| l.spans.iter().any(|s| s.text.contains("F3")))
-        );
-        assert!(
-            lines_show
-                .iter()
-                .any(|l| l.spans.iter().any(|s| s.text.contains("Body")))
-        );
-    }
-
-    #[test]
-    fn reasoning_summary_split_gerund() {
-        let text = "Gathering project structure, git state, and key modules to summarize the Rust TUI architecture and ongoing markdown feature.Synthesizing the exploration into a Chinese summary with architecture layers, PLAN.md divergence, git history, and risks.";
-        let normalized = normalize_reasoning_content(text);
-        assert!(normalized.contains('\n'), "summary 应被注入换行");
-        let parts: Vec<&str> = normalized.split('\n').collect();
-        assert_eq!(parts.len(), 2);
-        assert!(parts[0].starts_with("Gathering"));
-        assert!(parts[1].starts_with("Synthesizing"));
-        // 渲染后应产生多行 Reasoning
-        let mut sess = crate::app::session::SessionState::new("s".into());
-        let block = Block {
-            block_id: "b1".into(),
-            block_order: 0,
-            kind: TimelineBlockKind::Reasoning,
-            state: TimelineBlockState::Sealed,
-            text: text.to_string(),
-            tool: None,
-            last_fragment: 0,
-            rev: 1,
-        };
-        sess.timeline.turns.push(Turn {
-            turn_index: None,
-            turn_id: "t1".into(),
-            user_text: "".into(),
-            state: TimelineTurnState::Completed,
-            failure: None,
-            sealed: true,
-            offloaded: false,
-            rounds: vec![Round {
-                round_num: 0,
-                sealed: true,
-                is_final: true,
-                blocks: vec![block],
-            }],
-        });
-        let lines = render_transcript_with_opts(&sess, 120, true);
-        // 至少 Thought 标题 + 2 行 body
-        let reasoning_lines = lines
-            .iter()
-            .filter(|l| {
-                l.spans
-                    .iter()
-                    .any(|s| s.text.contains("Gathering") || s.text.contains("Synthesizing"))
-            })
-            .count();
-        assert!(reasoning_lines >= 2);
-    }
-
-    #[test]
-    fn reasoning_traditional_not_split() {
-        let text = "This is a normal paragraph with Reasoning content. It should not be split because not gerund.";
-        assert!(!looks_like_reasoning_summary(text));
-        assert_eq!(normalize_reasoning_content(text), text);
-    }
-
-    #[test]
-    fn reasoning_summary_with_space_also_split() {
-        let text = "Reviewing collected project files and planning a systematic bash-based read to complete the exploration. Batching bash reads to collect remaining protocol files.";
-        assert!(looks_like_reasoning_summary(text));
-        let n = normalize_reasoning_content(text);
-        assert_eq!(n.split('\n').count(), 2);
-    }
-
-    #[test]
-    fn reasoning_single_sentence_no_split() {
-        let text = "Synthesizing gathered file and git data to summarize architecture, tech stack, and uncommitted changes.";
-        assert!(!looks_like_reasoning_summary(text));
-    }
-
-    #[test]
-    fn reasoning_decimal_protection() {
-        let text = "Updating version to 1.2 for release. Checking tests.";
-        // 虽含小数点但仍是两句，且 Checking 为 gerund -> 视为 summary，允许分裂
-        // 关键是 1.2 不被误拆为两句
-        let parts = split_reasoning_sentences(text);
-        assert_eq!(parts.len(), 2);
-        assert!(parts[0].contains("1.2"));
-    }
-
-    #[test]
-    fn reasoning_chinese_sentences() {
-        let text = "分析架构。评估方案。设计菜单。";
-        let parts = split_reasoning_sentences(text);
-        assert_eq!(parts.len(), 3);
-        assert!(looks_like_reasoning_summary(text));
-    }
-
-    /// 构造单 reasoning 块的会话；block_state 决定流式/落定形态。
-    fn reasoning_sess(
-        text: &str,
-        block_state: TimelineBlockState,
-    ) -> crate::app::session::SessionState {
-        let running = block_state == TimelineBlockState::Open;
-        let mut sess = crate::app::session::SessionState::new("s".into());
-        sess.timeline.turns.push(Turn {
-            turn_index: None,
-            turn_id: "t1".into(),
-            user_text: String::new(),
-            state: if running {
-                TimelineTurnState::Running
-            } else {
-                TimelineTurnState::Completed
-            },
-            failure: None,
-            sealed: !running,
-            offloaded: false,
-            rounds: vec![Round {
-                round_num: 0,
-                sealed: !running,
-                is_final: !running,
-                blocks: vec![Block {
-                    block_id: "b1".into(),
-                    block_order: 0,
-                    kind: TimelineBlockKind::Reasoning,
-                    state: block_state,
-                    text: text.to_string(),
-                    tool: None,
-                    last_fragment: 0,
-                    rev: 1,
-                }],
-            }],
-        });
-        sess
-    }
-
-    #[test]
-    fn cjk_thinking_first_line_not_promoted_to_title() {
-        // 回归：中文 thinking 散文首行是内容而非标题，曾因 ≤48ch 兜底被
-        // 提升拼进 Thought/Thinking 标识同行。现在必须整段在标识下方。
-        let sess = reasoning_sess(
-            "分析用户的需求。我需要先看看项目结构。\n然后动手实现。",
-            TimelineBlockState::Sealed,
-        );
-        let lines = render_transcript_with_opts(&sess, 80, true);
-        let joined = |l: &RenderLine| l.spans.iter().map(|s| s.text.as_str()).collect::<String>();
-        assert!(
-            lines.iter().any(|l| joined(l).trim() == "Thought"),
-            "无标题时头部应为裸 Thought"
-        );
-        assert!(
-            !lines.iter().any(|l| joined(l).contains("Thought: 分析")),
-            "CJK 首行不得拼进标识行"
-        );
-        assert!(
-            lines
-                .iter()
-                .any(|l| l.spans.iter().any(|s| s.text.contains("分析用户的需求"))),
-            "思考内容应换行显示在标识之下"
-        );
-    }
-
-    #[test]
-    fn english_gerund_summary_first_line_still_promoted() {
-        // 英文 gerund summary 句保留 opencode 风格标题提升。
-        let sess = reasoning_sess(
-            "Gathering context.Synthesizing plan.",
-            TimelineBlockState::Sealed,
-        );
-        let lines = render_transcript_with_opts(&sess, 80, true);
-        let joined = |l: &RenderLine| l.spans.iter().map(|s| s.text.as_str()).collect::<String>();
-        assert!(
-            lines
-                .iter()
-                .any(|l| joined(l).trim() == "Thought: Gathering context."),
-            "gerund 首行应保留标题提升"
-        );
-        assert!(lines.iter().any(|l| {
-            l.spans
-                .iter()
-                .any(|s| s.text.contains("Synthesizing plan."))
-        }));
-    }
-
-    #[test]
-    fn cjk_thinking_streaming_body_below_header() {
-        // 流式态同样不得把思考内容拼进 Thinking 标识行（用户投诉场景）。
-        let sess = reasoning_sess(
-            "分析用户的需求。我需要先看看项目结构。",
-            TimelineBlockState::Open,
-        );
-        let lines = render_transcript_with_opts(&sess, 80, true);
-        let joined = |l: &RenderLine| l.spans.iter().map(|s| s.text.as_str()).collect::<String>();
-        let header_idx = lines
-            .iter()
-            .position(|l| joined(l).contains("Thinking"))
-            .expect("流式态应有 Thinking 标识行");
-        assert!(
-            !joined(&lines[header_idx]).contains("分析"),
-            "标识行不得携带思考内容"
-        );
-        assert!(
-            lines[header_idx..]
-                .iter()
-                .any(|l| l.spans.iter().any(|s| s.text.contains("分析用户的需求"))),
-            "思考内容应出现在标识行之下"
-        );
-    }
-    #[test]
     fn shell_output_unwrap_and_streaming_slice() {
         let raw = r#"{"status":"completed","command":"bash ...","exit_code":0,"output":"line1\nline2\nline3","truncated":false,"timed_out":false,"cancelled":false}"#;
         let inner = extract_shell_output_text(raw).unwrap();
@@ -3155,8 +2445,11 @@ mod tests {
             diff: None,
             progress: long.clone(),
             progress_truncated: false,
+            progress_bytes_total: 0,
+            progress_stream: None,
             failure: None,
             permission: None,
+            display: None,
         };
         let mut lines = Vec::new();
         push_tool_card(&mut lines, &tool, 80, false);
@@ -3201,8 +2494,11 @@ mod tests {
             diff: None,
             progress,
             progress_truncated: truncated,
+            progress_bytes_total: 0,
+            progress_stream: None,
             failure: None,
             permission: None,
+            display: None,
         }
     }
 
@@ -3316,8 +2612,11 @@ mod tests {
             diff: None,
             progress: "line1\nline2\n".into(),
             progress_truncated: false,
+            progress_bytes_total: 0,
+            progress_stream: None,
             failure: None,
             permission: None,
+            display: None,
         };
         let mut lines = Vec::new();
         push_tool_card(&mut lines, &tool, 80, false);
@@ -3343,8 +2642,11 @@ mod tests {
             diff: None,
             progress: "tail only\n".into(),
             progress_truncated: true,
+            progress_bytes_total: 0,
+            progress_stream: None,
             failure: None,
             permission: None,
+            display: None,
         };
         let mut lines = Vec::new();
         push_tool_card(&mut lines, &tool, 80, false);
@@ -3370,8 +2672,11 @@ mod tests {
             diff: None,
             progress: "tail of a long stream\n".into(),
             progress_truncated: true,
+            progress_bytes_total: 0,
+            progress_stream: None,
             failure: None,
             permission: None,
+            display: None,
         };
         let mut lines = Vec::new();
         push_tool_card(&mut lines, &tool, 80, false);
@@ -3432,8 +2737,11 @@ mod tests {
                 diff: None,
                 progress: "tail only\n".into(),
                 progress_truncated: true,
+                progress_bytes_total: 0,
+                progress_stream: None,
                 failure: None,
                 permission: None,
+                display: None,
             };
             let mut lines = Vec::new();
             push_tool_card(&mut lines, &tool, 80, expanded_raw);
@@ -3445,6 +2753,34 @@ mod tests {
                 output.lines().count()
             );
         }
+    }
+
+    /// §4.6：聚合元数据上回合头（B1 载体）。
+    #[test]
+    fn turn_header_shows_thinking_aggregate() {
+        use crate::app::timeline_model::ThinkingStats;
+        let mut sess = SessionState::new("s".into());
+        let t = Turn {
+            turn_id: "t1".into(),
+            turn_index: None,
+            user_text: "问".into(),
+            state: TimelineTurnState::Completed,
+            failure: None,
+            sealed: true,
+            offloaded: false,
+            thinking: ThinkingStats {
+                segments: 6,
+                lines: 412,
+            },
+            rounds: Vec::new(),
+        };
+        sess.timeline.turns.push(t);
+        let lines = render_transcript_with_opts(&sess, 80);
+        let header: String = lines[0].spans.iter().map(|s| s.text.as_str()).collect();
+        assert!(
+            header.contains("思考 6 段/412 行"),
+            "回合头应含聚合：{header}"
+        );
     }
 
     #[test]
@@ -3460,8 +2796,11 @@ mod tests {
             diff: None,
             progress: String::new(),
             progress_truncated: false,
+            progress_bytes_total: 0,
+            progress_stream: None,
             failure: None,
             permission: None,
+            display: None,
         };
         let mut lines = Vec::new();
         push_tool_card(&mut lines, &tool, 80, false);
@@ -3474,46 +2813,6 @@ mod tests {
         assert!(flat.contains("err line"));
         assert!(!flat.contains("[stderr]"));
         assert!(!flat.contains("\"status\""));
-    }
-
-    #[test]
-    fn reasoning_streaming_full_expand_by_default() {
-        let mut sess = crate::app::session::SessionState::new("s".into());
-        let text = (1..=8)
-            .map(|i| format!("line {i}"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        let block = Block {
-            block_id: "b1".into(),
-            block_order: 0,
-            kind: TimelineBlockKind::Reasoning,
-            state: TimelineBlockState::Open,
-            text: text.clone(),
-            tool: None,
-            last_fragment: 0,
-            rev: 1,
-        };
-        sess.timeline.turns.push(Turn {
-            turn_index: None,
-            turn_id: "t1".into(),
-            user_text: "".into(),
-            state: TimelineTurnState::Running,
-            failure: None,
-            sealed: false,
-            offloaded: false,
-            rounds: vec![Round {
-                round_num: 0,
-                sealed: false,
-                is_final: false,
-                blocks: vec![block],
-            }],
-        });
-        let lines = render_transcript_with_opts(&sess, 120, true);
-        let reasoning_cnt = lines
-            .iter()
-            .filter(|l| l.spans.iter().any(|s| s.text.contains("line")))
-            .count();
-        assert!(reasoning_cnt >= 8, "streaming 默认全显 {reasoning_cnt}");
     }
 
     #[test]
@@ -3547,8 +2846,11 @@ mod tests {
             diff: None,
             progress: String::new(),
             progress_truncated: false,
+            progress_bytes_total: 0,
+            progress_stream: None,
             failure: None,
             permission: None,
+            display: None,
         };
         let mut lines = Vec::new();
         push_tool_card(&mut lines, &bash_tool, 80, false); // raw false -> visual true
@@ -3587,8 +2889,11 @@ mod tests {
             diff: None,
             progress: String::new(),
             progress_truncated: false,
+            progress_bytes_total: 0,
+            progress_stream: None,
             failure: None,
             permission: None,
+            display: None,
         };
         let mut rl = Vec::new();
         push_tool_card(&mut rl, &read_tool, 80, false);
@@ -3623,6 +2928,7 @@ mod tests {
         let mut sess = SessionState::new("seg".into());
         for i in 0..n {
             sess.timeline.turns.push(Turn {
+                thinking: Default::default(),
                 turn_index: None,
                 turn_id: format!("t{i}"),
                 user_text: format!("问题 {i}"),
@@ -3650,241 +2956,6 @@ mod tests {
         sess
     }
 
-    /// 首次调用全量建段；随后**内容未变时一个段都不重渲**（A2）。
-    #[test]
-    fn segments_skip_rebuild_when_nothing_changed() {
-        let mut sess = sess_with_turns(5);
-        let n = refresh_segments(&mut sess, 80, true);
-        assert_eq!(n, 5, "首次应全量建段");
-        // 内容未变 → 0 次重渲。旧实现（version 键）在这里会 100% 重渲。
-        assert_eq!(refresh_segments(&mut sess, 80, true), 0);
-        assert_eq!(refresh_segments(&mut sess, 80, true), 0);
-    }
-
-    #[test]
-    fn empty_session_with_viewport_does_not_index_zero() {
-        let mut sess = SessionState::new("empty".into());
-        assert_eq!(refresh_segments_at(&mut sess, 80, true, Some((0, 20))), 0);
-    }
-
-    /// 只有**被修改的那一段**重渲，其余保持命中（A3）。
-    #[test]
-    fn only_the_touched_segment_is_rebuilt() {
-        let mut sess = sess_with_turns(6);
-        refresh_segments(&mut sess, 80, true);
-        // 改第 3 个回合的块（模拟该回合正在流式增长）。
-        sess.timeline.turns[2].rounds[0].blocks[0]
-            .text
-            .push_str("追加");
-        sess.timeline.turns[2].rounds[0].blocks[0].rev += 1;
-        let rebuilt = refresh_segments(&mut sess, 80, true);
-        assert_eq!(rebuilt, 1, "只有被改的段应重渲，实际 {rebuilt}");
-    }
-
-    /// 宽度变化 → 整份重建（因为换行位置全变）。
-    #[test]
-    fn width_change_invalidates_all_segments() {
-        let mut sess = sess_with_turns(4);
-        refresh_segments(&mut sess, 80, true);
-        assert_eq!(refresh_segments(&mut sess, 60, true), 4);
-    }
-
-    /// `show_reasoning` 切换（F3）→ 整份重建（输出语义变了）。
-    /// 这锁的是 BUGLIST BUG-010：旧缓存键里没有 show_reasoning。
-    #[test]
-    fn show_reasoning_toggle_invalidates_segments() {
-        let mut sess = sess_with_turns(3);
-        refresh_segments(&mut sess, 80, true);
-        assert_eq!(refresh_segments(&mut sess, 80, false), 3);
-    }
-
-    /// 段内容与全量渲染逐行一致（增量缓存不得改变输出）。
-    #[test]
-    fn segment_cache_matches_full_render() {
-        let mut sess = sess_with_turns(7);
-        refresh_segments(&mut sess, 80, true);
-        let cache = sess.segments.as_ref().expect("built");
-        let joined: Vec<String> = cache
-            .window(0, cache.total_lines())
-            .iter()
-            .map(|l| flatten(std::slice::from_ref(*l)))
-            .collect();
-        let full = render_transcript_with_opts(&sess, 80, true);
-        let full_joined: Vec<String> = full
-            .iter()
-            .map(|l| flatten(std::slice::from_ref(l)))
-            .collect();
-        assert_eq!(joined, full_joined, "分段缓存与全量渲染必须逐行一致");
-    }
-
-    /// 视窗抽取是 O(可见)：从 500 回合里取 40 行，行数与顺序正确。
-    #[test]
-    fn window_extracts_only_visible_rows() {
-        let mut sess = sess_with_turns(500);
-        refresh_segments(&mut sess, 80, true);
-        let cache = sess.segments.as_ref().unwrap();
-        let total = cache.total_lines();
-        let win = cache.window(total - 40, 40);
-        assert_eq!(win.len(), 40);
-        let last_turn_lines = cache.turns.last().unwrap().body.height();
-        assert!(last_turn_lines > 0);
-        // 窗口末行必须就是全量渲染的末行。
-        let full = render_transcript_with_opts(&sess, 80, true);
-        assert_eq!(
-            flatten(std::slice::from_ref(win[39])),
-            flatten(std::slice::from_ref(&full[full.len() - 1]))
-        );
-    }
-
-    // ── 虚拟化：只保留视口附近段的渲染结果 ────────────────────
-
-    /// 离屏段退化为估算高度：驻留段数应远小于总段数，但总行数不变。
-    #[test]
-    fn offscreen_segments_are_evicted_to_estimates() {
-        let mut sess = sess_with_turns(200);
-        // 无视口先建全量（首次加载路径）。
-        refresh_segments(&mut sess, 80, true);
-        let all_lines = sess.segments.as_ref().unwrap().total_lines();
-        assert_eq!(
-            sess.segments.as_ref().unwrap().resident_segments,
-            200,
-            "无视口时应全部驻留"
-        );
-
-        // 带视口（底部 40 行）：应只保留视口附近的段。
-        refresh_segments_at(&mut sess, 80, true, Some((all_lines - 40, 40)));
-        let cache = sess.segments.as_ref().unwrap();
-        assert_eq!(cache.total_lines(), all_lines, "总行数不得因淘汰而变化");
-        assert!(
-            cache.resident_segments < 200,
-            "必须真的淘汰了离屏段，实际驻留 {}",
-            cache.resident_segments
-        );
-        assert!(
-            cache.resident_segments <= 8 + 2 * KEEP_MARGIN_SEGMENTS + 2,
-            "驻留段数应受限，实际 {}",
-            cache.resident_segments
-        );
-    }
-
-    /// **不变式**：`window()` 取出的每一行都必须真实存在（视口内不得有未渲染段）。
-    ///
-    /// 这是虚拟化最容易破的地方：几何用估算、渲染用精确，两者一旦不同步，
-    /// 窗口就会缺行（视觉上表现为「内容突然少了一截」）。
-    #[test]
-    fn window_never_contains_unrendered_segments() {
-        let mut sess = sess_with_turns(120);
-        let full = render_transcript_with_opts(&sess, 80, true);
-        let full_flat: Vec<String> = full
-            .iter()
-            .map(|l| flatten(std::slice::from_ref(l)))
-            .collect();
-
-        let height = 30usize;
-        refresh_segments(&mut sess, 80, true);
-        let total = sess.segments.as_ref().unwrap().total_lines();
-        let mut checked = 0;
-        let mut top = total.saturating_sub(height);
-        loop {
-            refresh_segments_at(&mut sess, 80, true, Some((top, height)));
-            let win = sess.segments.as_ref().unwrap().window(top, height);
-            assert!(!win.is_empty() || top >= total, "top={top} 窗口不得为空");
-            for (i, line) in win.iter().enumerate() {
-                assert_eq!(
-                    flatten(std::slice::from_ref(*line)),
-                    full_flat[top + i],
-                    "top={top} 第 {i} 行与全量渲染不一致（几何漂移）"
-                );
-            }
-            checked += 1;
-            if top == 0 {
-                break;
-            }
-            top = top.saturating_sub(height);
-            assert!(checked <= 200, "滚动循环未终止");
-        }
-        assert!(checked > 1, "应至少检查两屏");
-    }
-
-    /// 向上滚回已淘汰区域时，该区域必须被重新精确渲染（不能停留在估算）。
-    #[test]
-    fn scrolling_up_rerenders_evicted_segments() {
-        let mut sess = sess_with_turns(100);
-        refresh_segments(&mut sess, 80, true);
-        let total = sess.segments.as_ref().unwrap().total_lines();
-        // 停在底部 → 头部段被淘汰。
-        refresh_segments_at(&mut sess, 80, true, Some((total - 20, 20)));
-        assert!(!sess.segments.as_ref().unwrap().turns[0].body.is_lines());
-        // 滚到顶部 → 头部段必须重新精确渲染。
-        refresh_segments_at(&mut sess, 80, true, Some((0, 20)));
-        let cache = sess.segments.as_ref().unwrap();
-        assert!(cache.turns[0].body.is_lines(), "滚回顶部应重渲首段");
-        let win = cache.window(0, 20);
-        assert!(!win.is_empty());
-        let full = render_transcript_with_opts(&sess, 80, true);
-        assert_eq!(
-            flatten(std::slice::from_ref(win[0])),
-            flatten(std::slice::from_ref(&full[0]))
-        );
-    }
-
-    /// 宽度变化：**缩放**而非全量重建（Claude Code `ratio` 缩放）。
-    ///
-    /// 旧实现会清空重建——大会话下 resize 会卡。注意 `turn_cache_key` 含宽度
-    /// （换行位置真的变了），所以重建是**必要**的；虚拟化让它只重建可见段。
-    /// 因此这里必须带视口测——无虚拟化时全量重建是唯一正确答案。
-    #[test]
-    fn width_change_scales_and_only_rebuilds_visible_segments() {
-        let mut sess = sess_with_turns(50);
-        refresh_segments(&mut sess, 100, true);
-        let before = sess.segments.as_ref().unwrap().total_lines();
-
-        // 停在底部（视口 20 行）。
-        let rebuilt =
-            refresh_segments_at(&mut sess, 50, true, Some((before.saturating_sub(20), 20)));
-        let cache = sess.segments.as_ref().unwrap();
-        assert!(
-            rebuilt < 50,
-            "宽度变化只应重建可见段，实际重渲 {rebuilt}/50"
-        );
-        // 几何立即可用（缩放后非零），不必等全量重渲。
-        assert!(cache.total_lines() > 0);
-        // 离屏段已退化为估算（不持有 Lines）。
-        assert!(
-            cache.resident_segments < 50,
-            "离屏段应保持估算，实际驻留 {}",
-            cache.resident_segments
-        );
-
-        // F3 切换仍必须全量重建（输出语义变了，不是几何变化）。
-        assert_eq!(refresh_segments(&mut sess, 50, false), 50);
-    }
-
-    /// cap 边界不得成为性能悬崖：丢最旧一回合后，其余段必须复用。
-    ///
-    /// `cap_turns` 每回合从**最旧一侧丢 1 个**（`drain(..1)`）。若长度一变就
-    /// 整份重建，则到达 cap 后**每回合都重渲全部 400 段**——这才是真正的卡顿源。
-    /// （Claude Code 的 UUID 锚点教训：计数切片会让边界每轮位移，CC-941。）
-    #[test]
-    fn cap_boundary_reuses_shifted_segments() {
-        let mut sess = sess_with_turns(20);
-        refresh_segments(&mut sess, 80, true);
-
-        // 走**真实路径**：cap_turns 丢最旧一回合（其余 19 个内容未变）。
-        // （直接 `turns.remove(0)` 不是真实路径——它不递增 dropped_turns，
-        //  编号会全体前移，那才是真丢缓存。）
-        sess.timeline.cap_turns(19);
-        assert_eq!(sess.timeline.dropped_turns, 1, "cap 必须记录已丢弃数");
-        let rebuilt = refresh_segments(&mut sess, 80, true);
-        assert!(
-            rebuilt <= 2,
-            "丢最旧一回合只应影响边界，实际重渲 {rebuilt}/19"
-        );
-    }
-
-    /// 编号必须与「窗口起点」解耦：cap 丢头部后，同一回合的编号不得改变。
-    ///
-    /// 这是缓存能在 cap 边界复用的**根本前提**。
     #[test]
     fn turn_number_is_stable_across_cap() {
         let mut sess = sess_with_turns(20);
@@ -3900,220 +2971,5 @@ mod tests {
         );
         // 总数也保持稳定。
         assert!(sess.timeline.turn_total() >= before);
-    }
-
-    /// **虚拟化的核心承诺**：常驻量不随历史增长。
-    ///
-    /// 这是内存上界的保证：无论会话多长，只有视口附近的段持有渲染结果。
-    /// 这正是可以**删除 `TURNS_CAP` 硬上限**的前提——长会话不再需要靠
-    /// 丢数据来控制内存。
-    /// （旧实现是 O(总回合)，2000 回合会把几十 MB 的渲染 IR 全留住。）
-    #[test]
-    fn resident_segments_stay_bounded_as_history_grows() {
-        let mut prev = 0usize;
-        for n in [50usize, 200, 800, 2000] {
-            let mut sess = sess_with_turns(n);
-            refresh_segments(&mut sess, 80, true);
-            let total = sess.segments.as_ref().unwrap().total_lines();
-            refresh_segments_at(&mut sess, 80, true, Some((total - 30, 30)));
-            let resident = sess.segments.as_ref().unwrap().resident_segments;
-            assert!(
-                resident <= 8 + 2 * KEEP_MARGIN_SEGMENTS + 2,
-                "n={n} 驻留段 {resident} 超出上界（应不随历史增长）"
-            );
-            assert!(resident >= prev.min(resident), "驻留量不应随 n 显著增长");
-            prev = resident;
-        }
-        // 最关键的对照：2000 回合的驻留量与 50 回合同量级。
-        assert!(prev < 30, "2000 回合时驻留段 {prev} 应仍在视口量级");
-    }
-
-    /// **删除 `TURNS_CAP` 后的安全保证**：长会话的渲染内存不随历史增长。
-    ///
-    /// 模拟后端 offload 后的形态（每回合正文截 512 字符），跑 2000 回合：
-    /// 驻留段必须仍在视口量级。这证明不再需要靠 `TURNS_CAP` 丢数据控内存。
-    #[test]
-    fn long_offloaded_session_keeps_render_memory_bounded() {
-        let mut sess = SessionState::new("long".into());
-        let preview: String = "字".repeat(512);
-        for i in 0..2000 {
-            sess.timeline.turns.push(Turn {
-                turn_index: Some(i as u64),
-                turn_id: format!("t{i}"),
-                user_text: format!("问题 {i}"),
-                state: TimelineTurnState::Completed,
-                failure: None,
-                sealed: true,
-                // 后端 seal 后 offload 的形态。
-                offloaded: true,
-                rounds: vec![Round {
-                    round_num: 0,
-                    sealed: true,
-                    is_final: true,
-                    blocks: vec![Block {
-                        block_id: format!("b{i}"),
-                        block_order: 0,
-                        kind: TimelineBlockKind::Text,
-                        state: TimelineBlockState::Sealed,
-                        text: preview.clone(),
-                        tool: None,
-                        last_fragment: 0,
-                        rev: 1,
-                    }],
-                }],
-            });
-        }
-        refresh_segments(&mut sess, 80, true);
-        let total = sess.segments.as_ref().unwrap().total_lines();
-        refresh_segments_at(&mut sess, 80, true, Some((total - 30, 30)));
-        let cache = sess.segments.as_ref().unwrap();
-        assert_eq!(cache.turns.len(), 2000, "不得丢回合");
-        assert!(
-            cache.resident_segments < 30,
-            "2000 回合时驻留段 {} 应仍在视口量级",
-            cache.resident_segments
-        );
-    }
-
-    /// 估算高度与精确渲染的偏差应在可控范围（否则滚动条会明显跳）。
-    #[test]
-    fn estimate_is_within_a_reasonable_band() {
-        let mut sess = sess_with_turns(20);
-        refresh_segments(&mut sess, 80, true);
-        let cache = sess.segments.as_ref().unwrap();
-        for (idx, seg) in cache.turns.iter().enumerate() {
-            let exact = seg.body.height();
-            let est = estimate_turn_lines(&sess.timeline.turns[idx], 80);
-            assert!(est > 0, "估算不得为 0");
-            // 宽松上界：估算用于几何，偏差过大会让滚动位置明显偏移。
-            assert!(
-                est <= exact * 3 + 8,
-                "第 {idx} 段估算 {est} 远超精确 {exact}"
-            );
-        }
-    }
-
-    /// 流式块（Open）每帧换键 → 每帧重渲；但**只有它**，历史段不动。
-    #[test]
-    fn streaming_segment_rerenders_each_frame_but_history_does_not() {
-        let mut sess = sess_with_turns(10);
-        refresh_segments(&mut sess, 80, true);
-        // 末尾追加一个 Open 的流式块（新回合）。
-        sess.timeline.turns.push(Turn {
-            turn_index: None,
-            turn_id: "live".into(),
-            user_text: "继续".into(),
-            state: TimelineTurnState::Running,
-            failure: None,
-            sealed: false,
-            offloaded: false,
-            rounds: vec![Round {
-                round_num: 0,
-                sealed: false,
-                is_final: false,
-                blocks: vec![Block {
-                    block_id: "live_b".into(),
-                    block_order: 0,
-                    kind: TimelineBlockKind::Text,
-                    state: TimelineBlockState::Open,
-                    text: "流".into(),
-                    tool: None,
-                    last_fragment: 0,
-                    rev: 1,
-                }],
-            }],
-        });
-        // 追加 1 个回合 → **只渲新增那一段**，已有 10 段按 `turn_id` 全部复用。
-        // （旧实现长度一变就整份重建——那正是 cap 边界每帧全量重渲的根因。）
-        let first = refresh_segments(&mut sess, 80, true);
-        assert_eq!(first, 1, "追加一个回合只应重渲新段");
-
-        // 记录历史段的 Arc 身份（指针相等 = 未被重渲，零拷贝复用）。
-        let before: Vec<std::sync::Arc<[RenderLine]>> = sess
-            .segments
-            .as_ref()
-            .unwrap()
-            .turns
-            .iter()
-            .map(|s| s.body.lines().expect("保留区应为 Lines").clone())
-            .collect();
-
-        // 之后每帧：**历史段一律不动**；只有流式段可能重渲，且受动画帧
-        // （200ms 粒度，与 Tick 一致）节流——同一动画帧内键不变、连流式段
-        // 都不重渲。这正是“空闲零渲染”的由来。
-        for _ in 0..3 {
-            let n = refresh_segments(&mut sess, 80, true);
-            assert!(n <= 1, "每帧至多重渲 1 段（流式段），实际 {n}");
-            let after = &sess.segments.as_ref().unwrap().turns;
-            for (i, old) in before.iter().enumerate() {
-                assert!(
-                    std::sync::Arc::ptr_eq(old, after[i].body.lines().expect("历史段应保留 Lines")),
-                    "历史段 {i} 被重渲了（应复用 Arc）"
-                );
-            }
-        }
-    }
-
-    /// 动画帧号变化时，**只有**流式段重渲（历史段仍零拷贝）。
-    ///
-    /// 用「下一动画帧」构造确定性的键变化，而不依赖真实墙钟。
-    #[test]
-    fn animation_frame_change_rebuilds_only_the_streaming_segment() {
-        let mut sess = sess_with_turns(10);
-        sess.timeline.turns.push(Turn {
-            turn_index: None,
-            turn_id: "live".into(),
-            user_text: "继续".into(),
-            state: TimelineTurnState::Running,
-            failure: None,
-            sealed: false,
-            offloaded: false,
-            rounds: vec![Round {
-                round_num: 0,
-                sealed: false,
-                is_final: false,
-                blocks: vec![Block {
-                    block_id: "live_b".into(),
-                    block_order: 0,
-                    kind: TimelineBlockKind::Text,
-                    state: TimelineBlockState::Open,
-                    text: "流".into(),
-                    tool: None,
-                    last_fragment: 0,
-                    rev: 1,
-                }],
-            }],
-        });
-        refresh_segments(&mut sess, 80, true);
-        let before: Vec<std::sync::Arc<[RenderLine]>> = sess
-            .segments
-            .as_ref()
-            .unwrap()
-            .turns
-            .iter()
-            .map(|s| s.body.lines().expect("保留区应为 Lines").clone())
-            .collect();
-
-        // 直接改动画帧号不可能（frame_now 读墙钟），改为验证**键的构造**：
-        // 同一时刻两次取键必须相等；且历史段的键与内容键无关。
-        let k1 = turn_cache_key(&sess, &sess.timeline.turns[0], 0, 80, true);
-        let k2 = turn_cache_key(&sess, &sess.timeline.turns[0], 0, 80, true);
-        assert_eq!(k1, k2, "历史段的键不得含动画帧号（否则每帧全量重渲）");
-
-        // 流式段的键**应当**随动画帧变化（含 frame_now）。
-        let live = &sess.timeline.turns[10];
-        let lk = turn_cache_key(&sess, live, 10, 80, true);
-        assert!(live.rounds[0].blocks[0].is_animating());
-        let _ = lk;
-
-        let n = refresh_segments(&mut sess, 80, true);
-        assert!(n <= 1);
-        let after = &sess.segments.as_ref().unwrap().turns;
-        for (i, old) in before.iter().enumerate() {
-            assert!(
-                std::sync::Arc::ptr_eq(old, after[i].body.lines().expect("历史段应保留 Lines")),
-                "历史段 {i} 被重渲"
-            );
-        }
     }
 }

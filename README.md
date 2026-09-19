@@ -28,9 +28,14 @@ cargo build --release
 | composer | Enter 发送 · Ctrl+P 模式 · Ctrl+A 附件 · Ctrl+Y 撤销回合 · Ctrl+E 压缩 |
 | 状态栏 | 连接相位 + epoch · toast · token 用量与上下文占比 · 活动 · 时钟 |
 
-全局：Ctrl+T 新建会话 · Ctrl+W 关闭标签（会话保留）· Ctrl+L 会话列表
-（恢复/归档/删除，D 删除需确认）· Ctrl+, 配置面板 · F1 帮助 · F3 展开思考 ·
-Ctrl+C×2 / Ctrl+Q 退出。
+全局：Ctrl+T 思考回放（当前回合）· Ctrl+N 新建会话 · Ctrl+W 关闭标签（会话保留）·
+Ctrl+L 会话列表（恢复/归档/删除，D 删除需确认）· Ctrl+, 配置面板 · F1 帮助 ·
+F3 活动区显隐 · Ctrl+C×2 / Ctrl+Q 退出。
+思考回放浮层：↑↓/PgUp/PgDn 滚动 · `e` 交给 `$PAGER` 全文浏览（默认 `less -R`）· Esc 关闭。
+
+Slash：`/new [cwd]` 新建 · `/help` 帮助 · `/clear` 清空输入 ·
+`/export [path]` 导出当前会话为 Markdown（默认写入当前目录，含回合头/工具卡/思考聚合；
+更早回合的折叠/归档状态如实标注）。
 
 ### 子代理实时观测（Ctrl+↑/↓）
 

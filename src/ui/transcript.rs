@@ -26,26 +26,26 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) {
     //
     // 滚动几何与缓存共用 `ui::viewport_top`，避免两处各算一份而错位。
     let fresh: Vec<crate::app::render_line::RenderLine>;
-    let (total, visible_lines): (usize, Vec<&crate::app::render_line::RenderLine>) =
-        match &sess.segments {
-            Some(cache) if cache.width == width => {
-                let total = cache.total_lines();
-                let top =
-                    crate::ui::viewport_top(total, height, sess.scroll.follow, sess.scroll.offset);
-                (total, cache.window(top, height))
-            }
-            _ => {
-                fresh = crate::app::render_transcript::render_transcript_with_opts(
-                    sess,
-                    width,
-                    app.show_reasoning,
-                );
-                let total = fresh.len();
-                let top =
-                    crate::ui::viewport_top(total, height, sess.scroll.follow, sess.scroll.offset);
-                (total, fresh.iter().skip(top).take(height).collect())
-            }
-        };
+    let (total, visible_lines, anim_slots): (
+        usize,
+        Vec<&crate::app::render_line::RenderLine>,
+        Vec<crate::app::render::ViewportSlot>,
+    ) = if let Some(bc) = sess.block_cache.as_ref().filter(|c| c.width == width) {
+        // M1 块级缓存（T8 接线后为唯一来源）：行窗口与动画槽位同源。
+        let total = bc.total_lines();
+        let top = crate::ui::viewport_top(total, height, sess.scroll.follow, sess.scroll.offset);
+        (total, bc.window(top, height), bc.visible_slots(top, height))
+    } else {
+        // 兑底：缓存未就绪（首帧 / 宽度突变同一帧）→ 现场全量渲一次。
+        fresh = crate::app::render_transcript::render_transcript_with_opts(sess, width);
+        let total = fresh.len();
+        let top = crate::ui::viewport_top(total, height, sess.scroll.follow, sess.scroll.offset);
+        (
+            total,
+            fresh.iter().skip(top).take(height).collect(),
+            Vec::new(),
+        )
+    };
 
     let visible: Vec<Line> = visible_lines
         .into_iter()
@@ -68,6 +68,12 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) {
     let top = crate::ui::viewport_top(total, height, sess.scroll.follow, sess.scroll.offset);
 
     f.render_widget(Paragraph::new(visible), area);
+
+    // 动画出带（plan §3.3 / 锁 8）：块级缓存行内只有占位空格，这里按当前帧
+    // 覆盖字形。旧 SegmentCache 路径字形已烘焙（无槽位）→ 零开销直通。
+    if !anim_slots.is_empty() {
+        crate::app::render::apply_anim_slots(f.buffer_mut(), area, &anim_slots);
+    }
 
     if total > height {
         let mut sb = ScrollbarState::new(total.saturating_sub(height))

@@ -24,7 +24,48 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) {
         Overlay::AttachPath { input, cursor, .. } => draw_attach(f, input, *cursor, area),
         Overlay::CwdInput { input, cursor } => draw_cwd(f, input, *cursor, area),
         Overlay::Confirm { action } => draw_confirm(f, action, area),
+        Overlay::Thinking { scroll, body, .. } => draw_thinking(f, area, *scroll, body),
     }
+}
+
+/// §4.5 思考回放浮层：只读 + 滚动。内容在推入时已快照（`Overlay::Thinking.body`）。
+fn draw_thinking(f: &mut Frame, area: Rect, scroll: usize, body: &str) {
+    let inner = box_frame(
+        f,
+        area,
+        86,
+        area.height.saturating_sub(6),
+        "思考回放 · 当前回合",
+    );
+    let width = inner.width.saturating_sub(2).max(20) as usize;
+    // 滚动语义 = **原始行号**（与 overlay_key 的总行数口径一致）：长行 wrap
+    // 拆出的续行跟随其原始行，不占滚动游标。
+    let raw_lines: Vec<&str> = body.lines().collect();
+    let total = raw_lines.len();
+    let start = scroll.min(total.saturating_sub(1));
+    let visible = inner.height as usize;
+
+    let mut lines: Vec<Line> = Vec::new();
+    'outer: for raw in &raw_lines[start..] {
+        for seg in crate::app::render_line::wrap_text(raw, width) {
+            if lines.len() >= visible {
+                break 'outer;
+            }
+            lines.push(Line::from(Span::styled(seg, theme::dim())));
+        }
+    }
+    if total > visible {
+        lines.push(Line::from(Span::styled(
+            format!(" ↓ {start}/{total} 行 · ↑↓/PgUp/PgDn 滚动 · e $PAGER 全文 · Esc 关闭"),
+            theme::dim(),
+        )));
+    } else {
+        lines.push(Line::from(Span::styled(
+            " e $PAGER 全文 · Esc 关闭",
+            theme::dim(),
+        )));
+    }
+    f.render_widget(ratatui::widgets::Paragraph::new(lines), inner);
 }
 
 fn box_frame(f: &mut Frame, area: Rect, width: u16, height: u16, title: &str) -> Rect {

@@ -1183,6 +1183,7 @@ mod tests {
             let turn = Turn {
                 turn_index: None,
                 turn_id: format!("t{i}"),
+                thinking: Default::default(),
                 user_text: format!("user {i}"),
                 state: TimelineTurnState::Completed,
                 failure: None,

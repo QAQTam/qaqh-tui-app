@@ -14,8 +14,10 @@ pub(crate) enum GlobalKey {
     QuitArmed,
     /// Ctrl+Q：直接退出。
     QuitNow,
-    /// Ctrl+T：新建会话。
+    /// Ctrl+N：新建会话（D5 方案 A：原 Ctrl+T 让位给思考回放）。
     NewSession,
+    /// Ctrl+T：思考回放浮层（§4.5，当前回合 body 在内存，零抓取）。
+    ThinkingOverlay,
     /// Alt+W：关闭当前标签（弹 Confirm，实际关闭由 Confirm 分支执行）。
     CloseTab,
     /// Ctrl+L：会话列表。
@@ -24,7 +26,7 @@ pub(crate) enum GlobalKey {
     ToggleSettings,
     /// F1：帮助。
     Help,
-    /// F3：思考链显隐。
+    /// F3：ActivityBar 活动区显隐（M2 §4.4 重定义；旧「思考链展开」废止）。
     ToggleReasoning,
     /// F4：workspace 侧栏。
     ToggleWorkspace,
@@ -46,7 +48,8 @@ pub(crate) fn map_global_key(key: &KeyEvent) -> Option<GlobalKey> {
     match key.code {
         KeyCode::Char('c') if ctrl => Some(GlobalKey::QuitArmed),
         KeyCode::Char('q') if ctrl => Some(GlobalKey::QuitNow),
-        KeyCode::Char('t') if ctrl => Some(GlobalKey::NewSession),
+        KeyCode::Char('t') if ctrl => Some(GlobalKey::ThinkingOverlay),
+        KeyCode::Char('n') if ctrl => Some(GlobalKey::NewSession),
         KeyCode::Char('l') if ctrl => Some(GlobalKey::SessionList),
         KeyCode::Char('r') if ctrl => Some(GlobalKey::Reconnect),
         KeyCode::Char(',') if ctrl => Some(GlobalKey::ToggleSettings),
@@ -135,7 +138,13 @@ mod tests {
         );
         assert_eq!(
             map_global_key(&key(KeyCode::Char('t'), ctrl)),
-            Some(GlobalKey::NewSession)
+            Some(GlobalKey::ThinkingOverlay),
+            "D5 方案 A：Ctrl+T → 思考回放"
+        );
+        assert_eq!(
+            map_global_key(&key(KeyCode::Char('n'), ctrl)),
+            Some(GlobalKey::NewSession),
+            "D5 方案 A：新建会话改绑 Ctrl+N"
         );
         assert_eq!(
             map_global_key(&key(KeyCode::Char('l'), ctrl)),

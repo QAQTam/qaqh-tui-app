@@ -175,8 +175,15 @@ pub struct ToolCard {
     pub diff: Option<String>,
     pub progress: String,
     pub progress_truncated: bool,
+    /// 契约 §5.1（P2）：本次调用累计观测字节（含被丢弃/裁剪前）——运行卡
+    /// 显示 `↓ 12.3 KB`（终态以 metrics.output_bytes 为准，不重复）。
+    pub progress_bytes_total: u64,
+    /// 契约 §5.1（P2）：进度流标识（"stdout"|"stderr"|"mixed"；未知按 None）。
+    pub progress_stream: Option<String>,
     pub failure: Option<TimelineFailure>,
     pub permission: Option<qaqh_client::TimelineToolPermission>,
+    /// 类型化展示投影（09-18 跨仓契约 §3.3）；None → H16 完整回退旧字段。
+    pub display: Option<qaqh_client::TimelineToolDisplay>,
 }
 
 impl From<TimelineTool> for ToolCard {
@@ -207,8 +214,11 @@ impl From<TimelineTool> for ToolCard {
             diff: t.diff,
             progress,
             progress_truncated,
+            progress_bytes_total: t.progress_bytes_total,
+            progress_stream: t.progress_stream,
             failure: t.failure,
             permission: t.permission,
+            display: t.display,
         }
     }
 }
@@ -256,7 +266,9 @@ impl Block {
 
     /// 该块是否含“随时间变化的字形”（spinner / ▌ 光标 / 进度条）。
     ///
-    /// 这类块**不得进缓存**：其输出依赖墙钟而非内容，缓存会把动画冻住。
+    /// T8 后动画已出带（AnimSlot），缓存不再依赖它；保留供 §3.5 帧调度
+    /// （dirty 判定）在 M2 接线。
+    #[allow(dead_code)]
     pub fn is_animating(&self) -> bool {
         if self.state == TimelineBlockState::Open {
             return true;
@@ -275,6 +287,42 @@ pub struct Round {
     pub blocks: Vec<Block>,
 }
 
+/// 思考聚合元数据（§4.6）：回合头显示 `思考 N 段/M 行`，B1 闭环的计数侧。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ThinkingStats {
+    /// reasoning 块数（「段」）。
+    pub segments: u32,
+    /// 各 reasoning 块正文的行数合计。
+    pub lines: u64,
+}
+
+/// D1（Codex 式思考链路）：sealed 回合的 reasoning body 不驻留——统计进
+/// [`Turn::thinking`] 后就地清空。唯一保留 body 的地方是**活动回合**（Running）
+/// （Ctrl+T 浮层回放当前回合的思考）。
+///
+/// 幂等：`TurnSealed`、分页重放（`Turn::from_wire`）、re-baseline
+/// （`replace_from_page`）三条路都会走到；对已清空的块重复调用是 no-op
+/// （text 已空 → 不再计段不计行）。
+pub(crate) fn discard_sealed_reasoning(turn: &mut Turn) {
+    if !turn.sealed {
+        return;
+    }
+    for round in &mut turn.rounds {
+        for block in &mut round.blocks {
+            // 只计非空 body：空段无内容可数，也保证重复调用幂等。
+            if block.kind == TimelineBlockKind::Reasoning && !block.text.is_empty() {
+                turn.thinking.segments = turn.thinking.segments.saturating_add(1);
+                turn.thinking.lines = turn
+                    .thinking
+                    .lines
+                    .saturating_add(block.text.lines().count() as u64);
+                block.text.clear();
+            }
+        }
+    }
+}
+
+/// 单个回合：一次用户输入的全部模型输出。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Turn {
     pub turn_id: String,
@@ -299,12 +347,15 @@ pub struct Turn {
     /// 的 offload 路径）。**必须让用户看得见**，否则残缺内容会被当成完整回合
     /// ——与 B1「丢弃必须可见」同一设计原则。
     pub offloaded: bool,
+    /// 思考聚合（§4.6，B1 载体）：seal 时统计并**丢弃 reasoning body**
+    /// （D1 Codex 式：活动区 + Ctrl+T 回放替代 transcript 常驻）。
+    pub thinking: ThinkingStats,
     pub rounds: Vec<Round>,
 }
 
 impl Turn {
     fn from_wire(t: TimelineTurn) -> Self {
-        Self {
+        let mut turn = Self {
             turn_id: t.turn_id,
             turn_index: t.turn_index,
             user_text: t.user_text,
@@ -312,6 +363,7 @@ impl Turn {
             failure: t.failure,
             sealed: t.sealed,
             offloaded: t.offloaded,
+            thinking: ThinkingStats::default(),
             rounds: t
                 .rounds
                 .into_iter()
@@ -322,7 +374,11 @@ impl Turn {
                     blocks: r.blocks.into_iter().map(Block::from_wire).collect(),
                 })
                 .collect(),
-        }
+        };
+        // D1：分页/re-baseline 重放到达的 sealed reasoning 同样丢 body 只计数
+        // （有损客户端纪律，幂等——重复调用对已清空块是 no-op）。
+        discard_sealed_reasoning(&mut turn);
+        turn
     }
 
     pub fn is_streaming(&self) -> bool {
@@ -424,6 +480,7 @@ impl TimelineModel {
                         state: TimelineTurnState::Running,
                         failure: None,
                         sealed: false,
+                        thinking: ThinkingStats::default(),
                         // 实时新建的回合不可能已 offload（offload 只作用于已封口的
                         // 回合的重载路径）。
                         offloaded: false,
@@ -446,6 +503,7 @@ impl TimelineModel {
                     turn.state = TimelineTurnState::Running;
                     turn.failure = None;
                     turn.sealed = false;
+                    turn.thinking = ThinkingStats::default();
                     // 清 rounds 同时丢弃 per-block `last_fragment`——等价于后端
                     // 重置 `next_fragment`，使续流复用块 id 时 seq=0 不被拒。
                     turn.rounds.clear();
@@ -563,10 +621,13 @@ impl TimelineModel {
                     changed = false;
                 }
             }
+            // TODO(M3): stream/bytes_total 是跨仓契约 §5 的进度元数据，消费在 M3 接入。
             E::ToolProgress {
                 block_id,
                 chunk,
                 truncated,
+                stream: _,
+                bytes_total: _,
             } => {
                 let round_num = entry.round_num.unwrap_or(0);
                 let round = Self::find_round_mut(turn, round_num);
@@ -614,6 +675,8 @@ impl TimelineModel {
                 turn.state = *state;
                 turn.failure = failure.clone();
                 turn.sealed = true;
+                // D1：封口即丢 reasoning body，聚合计数入回合头（§4.6）。
+                discard_sealed_reasoning(turn);
                 terminal = Some(TurnTerminal {
                     turn_id: turn_id.to_owned(),
                     state: *state,
@@ -1158,6 +1221,9 @@ mod tests {
                     state: TimelineBlockState::Open,
                     text: String::new(),
                     tool: Some(TimelineTool {
+                        display: None,
+                        progress_bytes_total: 0,
+                        progress_stream: None,
                         tool_call_id: "c1".into(),
                         name: "exec".into(),
                         state: TimelineToolState::Prepared,
@@ -1180,6 +1246,8 @@ mod tests {
                 block_id: "b2".into(),
                 chunk: "out1\n".into(),
                 truncated: false,
+                stream: None,
+                bytes_total: 0,
             },
         ));
         m.apply(&entry(
@@ -1189,6 +1257,8 @@ mod tests {
                 block_id: "b2".into(),
                 chunk: "out2\n".into(),
                 truncated: false,
+                stream: None,
+                bytes_total: 0,
             },
         ));
         m.apply(&entry(
@@ -1502,6 +1572,9 @@ mod tests {
                     state: TimelineBlockState::Open,
                     text: String::new(),
                     tool: Some(TimelineTool {
+                        display: None,
+                        progress_bytes_total: 0,
+                        progress_stream: None,
                         tool_call_id: "c1".into(),
                         name: "read".into(),
                         state: TimelineToolState::Running,
@@ -1524,6 +1597,8 @@ mod tests {
                 block_id: "b1".into(),
                 chunk: format!("{}{}", "x".repeat(9000), "tail"),
                 truncated: false,
+                stream: None,
+                bytes_total: 0,
             },
         ));
 
@@ -1554,6 +1629,9 @@ mod tests {
                     state: TimelineBlockState::Open,
                     text: String::new(),
                     tool: Some(TimelineTool {
+                        display: None,
+                        progress_bytes_total: 0,
+                        progress_stream: None,
                         tool_call_id: "c1".into(),
                         name: "exec".into(),
                         state: TimelineToolState::Running,
@@ -1576,6 +1654,8 @@ mod tests {
                 block_id: "b1".into(),
                 chunk: "tail".into(),
                 truncated: true,
+                stream: None,
+                bytes_total: 0,
             },
         ));
 
@@ -1644,6 +1724,9 @@ mod tests {
                         state: TimelineBlockState::Open,
                         text: String::new(),
                         tool: Some(TimelineTool {
+                            display: None,
+                            progress_bytes_total: 0,
+                            progress_stream: None,
                             tool_call_id: format!("c_{name}"),
                             name: name.into(),
                             state: TimelineToolState::Running,
@@ -1667,6 +1750,8 @@ mod tests {
                 block_id: "b_bash".into(),
                 chunk: "a\rb\n".into(),
                 truncated: false,
+                stream: None,
+                bytes_total: 0,
             },
         ));
         m.apply(&entry(
@@ -1676,6 +1761,8 @@ mod tests {
                 block_id: "b_read".into(),
                 chunk: "a\rb\n".into(),
                 truncated: false,
+                stream: None,
+                bytes_total: 0,
             },
         ));
         let bash_progress = m.turns[0].rounds[0]
@@ -1734,6 +1821,9 @@ mod tests {
                             state: TimelineBlockState::Sealed,
                             text: String::new(),
                             tool: Some(TimelineTool {
+                                display: None,
+                                progress_bytes_total: 0,
+                                progress_stream: None,
                                 tool_call_id: "c1".into(),
                                 name: "bash".into(),
                                 state: TimelineToolState::Succeeded,
@@ -2043,5 +2133,335 @@ mod tests {
         ));
         assert!(terminal.is_none());
         assert_eq!(m.dropped_missing_turn, 1);
+    }
+
+    // ── D1（M2）：seal 丢 reasoning body，聚合计数入回合头 ────
+
+    fn reasoning_turn_model() -> TimelineModel {
+        use qaqh_client::TimelineEvent as E;
+        let mut m = TimelineModel::default();
+        m.apply(&entry(
+            1,
+            "t1",
+            E::TurnOpened {
+                user_text: "问".into(),
+            },
+        ));
+        m.apply(&entry(
+            2,
+            "t1",
+            E::BlockOpened {
+                block: TimelineBlock {
+                    block_id: "b1".into(),
+                    block_order: 0,
+                    kind: TimelineBlockKind::Reasoning,
+                    state: TimelineBlockState::Open,
+                    text: String::new(),
+                    tool: None,
+                },
+            },
+        ));
+        m.apply(&entry(
+            3,
+            "t1",
+            E::TextDelta {
+                block_id: "b1".into(),
+                fragment_seq: 1,
+                delta: "第一段\n第二行".into(),
+            },
+        ));
+        m
+    }
+
+    #[test]
+    fn turn_seal_discards_reasoning_body_and_counts() {
+        use qaqh_client::{TimelineEvent as E, TimelineTurnState};
+        let mut m = reasoning_turn_model();
+        m.apply(&entry(
+            4,
+            "t1",
+            E::BlockSealed {
+                block_id: "b1".into(),
+            },
+        ));
+        m.apply(&entry(
+            5,
+            "t1",
+            E::TurnSealed {
+                state: TimelineTurnState::Completed,
+                failure: None,
+            },
+        ));
+        let t = &m.turns[0];
+        assert_eq!(t.thinking.segments, 1);
+        assert_eq!(t.thinking.lines, 2);
+        assert_eq!(t.rounds[0].blocks[0].text, "", "body 必须已丢弃");
+    }
+
+    #[test]
+    fn rebaseline_replay_discards_idempotently() {
+        use qaqh_client::TimelineTurnState;
+        // 分页/re-baseline 重放：sealed reasoning 经 from_wire 同样丢 body 只计数。
+        let wire_turn = TimelineTurn {
+            turn_index: Some(1),
+            turn_id: "t1".into(),
+            created_seq: 1,
+            user_text: "问".into(),
+            sealed: true,
+            offloaded: false,
+            state: TimelineTurnState::Completed,
+            failure: None,
+            rounds: vec![qaqh_client::TimelineRound {
+                round_num: 0,
+                sealed: true,
+                is_final: true,
+                blocks: vec![TimelineBlock {
+                    block_id: "b1".into(),
+                    block_order: 0,
+                    kind: TimelineBlockKind::Reasoning,
+                    state: TimelineBlockState::Sealed,
+                    text: "重放的思考\n两行".into(),
+                    tool: None,
+                }],
+            }],
+        };
+        let mut m = TimelineModel::default();
+        m.replace_from_page(&TimelinePage {
+            schema: "qaqh.Ringing".into(),
+            version: 1,
+            server_epoch: "ep".into(),
+            seed: "s".into(),
+            has_more: false,
+            total_turns: 1,
+            truncated_before: false,
+            snapshot: qaqh_client::TimelineSnapshot {
+                watermark: 1,
+                turns: vec![wire_turn],
+            },
+        });
+        let t = &m.turns[0];
+        assert_eq!(t.thinking.segments, 1);
+        assert_eq!(t.thinking.lines, 2);
+        assert_eq!(t.rounds[0].blocks[0].text, "");
+        // 幂等：对已丢弃的块重复 discard 是 no-op。
+        super::discard_sealed_reasoning(&mut m.turns[0]);
+        assert_eq!(m.turns[0].thinking.segments, 1);
+        assert_eq!(m.turns[0].thinking.lines, 2);
+    }
+
+    #[test]
+    fn reopen_resets_thinking_stats() {
+        use qaqh_client::{TimelineEvent as E, TimelineTurnState};
+        let mut m = reasoning_turn_model();
+        m.apply(&entry(
+            4,
+            "t1",
+            E::BlockSealed {
+                block_id: "b1".into(),
+            },
+        ));
+        m.apply(&entry(
+            5,
+            "t1",
+            E::TurnSealed {
+                state: TimelineTurnState::Completed,
+                failure: None,
+            },
+        ));
+        assert_eq!(m.turns[0].thinking.segments, 1);
+        // 原地 reopen：rounds 清空 + stats 归零。
+        m.apply(&entry(
+            6,
+            "t1",
+            E::TurnOpened {
+                user_text: "新问题".into(),
+            },
+        ));
+        assert_eq!(m.turns[0].thinking, Default::default());
+        assert!(m.turns[0].rounds.is_empty());
+    }
+
+    // ── 跨仓 wire fixture（契约 §8.3：后端 wire JSON → 前端模型/渲染） ──
+    // 每工具族最小集：成功 / 失败 / 截断 / path / MCP fallback / H16 旧 JSON /
+    // 未知变体容忍。JSON 形状以契约 §3.3 为准（后端 qaqh-domain 同源类型）。
+
+    fn wire_tool(raw: &str) -> ToolCard {
+        let tool: qaqh_client::TimelineTool =
+            serde_json::from_str(raw).expect("wire fixture 必须可解析");
+        ToolCard::from(tool)
+    }
+
+    #[test]
+    fn wire_fixture_exec_success_with_progress() {
+        let raw = r#"{
+            "tool_call_id": "call-1",
+            "name": "exec",
+            "state": "succeeded",
+            "summary": "cargo test \u00b7 2.3s",
+            "args_json": "{\"command\":\"cargo test\"}",
+            "progress_bytes_total": 12600,
+            "progress_stream": "stdout",
+            "display": {
+                "summary": "cargo test \u00b7 2.3s",
+                "header": {"kind": "shell", "command": "cargo test"},
+                "body": {"kind": "shell", "output": "test result: ok", "exit_code": 0, "truncated": false},
+                "metrics": {"elapsed_ms": 2300, "output_bytes": 4096, "retry_count": 0, "user_initiated": true}
+            }
+        }"#;
+        let card = wire_tool(raw);
+        assert_eq!(card.progress_bytes_total, 12600);
+        assert_eq!(card.progress_stream.as_deref(), Some("stdout"));
+        let d = card.display.as_ref().expect("display");
+        assert!(matches!(
+            d.header,
+            Some(qaqh_client::TimelineToolHeader::Shell { ref command }) if command == "cargo test"
+        ));
+        assert!(matches!(
+            d.body,
+            Some(qaqh_client::TimelineToolBody::Shell {
+                exit_code: Some(0),
+                ..
+            })
+        ));
+        // 渲染断言：标题含完整命令 + metrics 尾注（既有锁的 fixture 形状对齐）。
+        let block = Block {
+            block_id: "b1".into(),
+            block_order: 0,
+            kind: TimelineBlockKind::Tool,
+            state: TimelineBlockState::Sealed,
+            text: String::new(),
+            tool: Some(card),
+            last_fragment: 0,
+            rev: 1,
+        };
+        let mut sink = crate::app::render_transcript::AnimSink::Bake;
+        let lines = crate::app::render_transcript::render_block_lines(
+            &std::collections::HashSet::new(),
+            &block,
+            80,
+            &mut sink,
+        );
+        let flat: String = lines
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.text.as_str()))
+            .collect::<Vec<_>>()
+            .join("|");
+        assert!(flat.contains("cargo test"), "exec 标题：{flat}");
+        assert!(flat.contains("2.3s"), "metrics 尾注：{flat}");
+    }
+
+    #[test]
+    fn wire_fixture_exec_failure_and_truncated() {
+        let failed = r#"{
+            "tool_call_id": "call-2",
+            "name": "exec",
+            "state": "failed",
+            "failure": {"code": "E_TIMEOUT", "message": "超时"},
+            "display": {
+                "header": {"kind": "shell", "command": "sleep 99"},
+                "body": {"kind": "shell", "output": "", "exit_code": 1, "truncated": true}
+            }
+        }"#;
+        let card = wire_tool(failed);
+        assert!(matches!(
+            card.failure.as_ref().map(|f| f.code.as_str()),
+            Some("E_TIMEOUT")
+        ));
+        assert!(matches!(
+            card.display.as_ref().and_then(|d| d.body.as_ref()),
+            Some(qaqh_client::TimelineToolBody::Shell {
+                truncated: true,
+                exit_code: Some(1),
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn wire_fixture_read_path_header() {
+        let raw = r#"{
+            "tool_call_id": "call-3",
+            "name": "read",
+            "state": "succeeded",
+            "display": {
+                "summary": "120 lines",
+                "header": {"kind": "path", "path": "src/main.rs", "op": "read"},
+                "body": {"kind": "text", "text": "fn main() {}", "truncated": false}
+            }
+        }"#;
+        let card = wire_tool(raw);
+        assert!(matches!(
+            card.display.as_ref().and_then(|d| d.header.as_ref()),
+            Some(qaqh_client::TimelineToolHeader::Path { path, op }) if path == "src/main.rs" && *op == qaqh_client::TimelinePathOp::Read
+        ));
+    }
+
+    #[test]
+    fn wire_fixture_mcp_fallback() {
+        let raw = r#"{
+            "tool_call_id": "call-4",
+            "name": "mcp__github__list_issues",
+            "state": "succeeded",
+            "display": {
+                "summary": "args [repo=owner/name, state=open]",
+                "header": {"kind": "other", "label": "mcp__github__list_issues"},
+                "body": {"kind": "none"},
+                "metrics": {"elapsed_ms": 500, "output_bytes": 0, "retry_count": 0, "effective_tool_name": "list_issues", "user_initiated": false}
+            }
+        }"#;
+        let card = wire_tool(raw);
+        let d = card.display.as_ref().expect("display");
+        assert!(matches!(
+            d.header.as_ref(),
+            Some(qaqh_client::TimelineToolHeader::Other { label }) if label == "mcp__github__list_issues"
+        ));
+        assert!(matches!(d.body, Some(qaqh_client::TimelineToolBody::None)));
+        assert_eq!(
+            d.metrics
+                .as_ref()
+                .and_then(|m| m.effective_tool_name.as_deref()),
+            Some("list_issues")
+        );
+    }
+
+    #[test]
+    fn wire_fixture_legacy_without_display() {
+        // H16：旧 server 快照（无 display / 新字段）必须完整可解析并回退。
+        let raw = r#"{
+            "tool_call_id": "call-5",
+            "name": "bash",
+            "state": "succeeded",
+            "summary": "ls -la",
+            "output": "total 0"
+        }"#;
+        let card = wire_tool(raw);
+        assert!(card.display.is_none());
+        assert_eq!(card.progress_bytes_total, 0);
+        assert_eq!(card.progress_stream, None);
+        assert_eq!(card.output.as_deref(), Some("total 0"));
+    }
+
+    #[test]
+    fn wire_fixture_unknown_variants_tolerated() {
+        // 前向兼容：新 header/body 变体 → Unknown，不丢整块（H7）。
+        let raw = r#"{
+            "tool_call_id": "call-6",
+            "name": "future_tool",
+            "state": "succeeded",
+            "display": {
+                "header": {"kind": "hologram", "beam": 3},
+                "body": {"kind": "future_thing", "payload": [1, 2]}
+            }
+        }"#;
+        let card = wire_tool(raw);
+        let d = card.display.as_ref().expect("display 不丢");
+        assert!(matches!(
+            d.header,
+            Some(qaqh_client::TimelineToolHeader::Unknown)
+        ));
+        assert!(matches!(
+            d.body,
+            Some(qaqh_client::TimelineToolBody::Unknown)
+        ));
     }
 }

@@ -123,6 +123,14 @@ impl App {
                 self.slash_selected = 0;
                 true
             }
+            SlashCmd::Export { path } => {
+                if let Some(sess) = self.active_session_mut() {
+                    sess.composer.clear();
+                }
+                self.slash_selected = 0;
+                self.export_active_session(path);
+                true
+            }
             SlashCmd::Unknown(s) => {
                 if s.is_empty() {
                     false
@@ -134,6 +142,28 @@ impl App {
                     true
                 }
             }
+        }
+    }
+
+    /// `/export`：当前会话 → Markdown 文件 + toast 反馈（M4）。
+    ///
+    /// 无活动会话 / 写文件失败 → Error toast，不静默。
+    fn export_active_session(&mut self, path: Option<String>) {
+        let Some(sess) = self.active_session() else {
+            self.toast(NoticeLevel::Error, "无活动会话，无法导出");
+            return;
+        };
+        let md = crate::app::export::export_markdown(sess);
+        let target = match path.as_deref().map(str::trim).filter(|p| !p.is_empty()) {
+            Some(p) => {
+                let expanded = crate::app::slash::expand_tilde(p);
+                std::path::PathBuf::from(expanded)
+            }
+            None => crate::app::export::default_export_path(&sess.seed),
+        };
+        match std::fs::write(&target, md) {
+            Ok(()) => self.toast(NoticeLevel::Info, format!("已导出：{}", target.display())),
+            Err(e) => self.toast(NoticeLevel::Error, format!("导出失败：{e}")),
         }
     }
 

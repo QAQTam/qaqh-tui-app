@@ -102,6 +102,21 @@ pub fn conn_spans(
     }
 }
 
+/// M0 观测：渲染缓存统计的展示单元（纯函数，便于测试）。
+/// `⟂n`=上次 refresh 重渲块数；`res n`=驻留块数；`nµs`=上次重建耗时。
+fn render_stats_span(rebuilt: usize, resident: usize, render_us: u64) -> Span<'static> {
+    Span::styled(
+        format!(" · ⟂{rebuilt} res{resident} {render_us}µs"),
+        theme::dim(),
+    )
+}
+
+/// `QAQH_TUI_DEBUG=1` 时启用观测展示。OnceLock 缓存，避免每帧读环境变量。
+fn debug_stats_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("QAQH_TUI_DEBUG").as_deref() == Ok("1"))
+}
+
 pub fn draw(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
     let width = area.width as usize;
 
@@ -134,6 +149,16 @@ pub fn draw(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
         // B1 可观测：仅契约异常丢弃非零时展示（正常会话零噪声）。
         if let Some(dropped) = sess.timeline.dropped_summary() {
             right.push(Span::styled(format!(" · {dropped}"), theme::warn()));
+        }
+        // M0 观测：QAQH_TUI_DEBUG=1 时展示渲染缓存统计（默认完全不可见，零噪声纪律）。
+        if debug_stats_enabled()
+            && let Some(cache) = sess.block_cache.as_ref()
+        {
+            right.push(render_stats_span(
+                cache.stats.rebuilt_blocks,
+                cache.stats.resident_blocks,
+                cache.stats.render_us,
+            ));
         }
     }
     let now = chrono::Local::now().format("%H:%M");
@@ -201,6 +226,13 @@ mod tests {
 
     fn text(spans: &[Span<'_>]) -> String {
         spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    /// M0 观测：debug 段的格式必须稳定（解析/截图工具都依赖它）。
+    #[test]
+    fn render_stats_span_formats_debug_counters() {
+        let s = render_stats_span(3, 12, 4210);
+        assert_eq!(s.content.as_ref(), " · ⟂3 res12 4210µs");
     }
 
     /// 回归：`Ready` 相位下的流告警必须可见，且恢复后必须消失。

@@ -14,7 +14,7 @@ use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use super::*;
 use crate::app::timeline_model::Turn;
-use qaqh_client::{TimelineTool, TimelineTurnState};
+use qaqh_client::{TimelineTool, TimelineToolBody, TimelineTurnState};
 
 /// spawn_subagent 工具名（与后端 `qaqh-subagent` 注册的 key 一致）。
 pub const SPAWN_TOOL: &str = "spawn_subagent";
@@ -90,8 +90,32 @@ pub fn upsert_from_tool(sess: &mut SessionState, tool: &TimelineTool) -> Option<
     if tool.name != SPAWN_TOOL {
         return None;
     }
-    let output_seed = tool.output.as_deref().and_then(parse_spawn_output);
-    let args_name = parse_agent_name(tool.args_json.as_deref());
+    // Phase C：display.body = Subagent { name, seed }（跨仓展示契约 §3.3）。
+    // 投影期 name 取自 args（Prepared 即有），seed 仅在产出后非空。
+    // display 缺失（旧 daemon）→ 无法发现子代理（观测特性要求新 daemon）。
+    let display_pair = tool
+        .display
+        .as_ref()
+        .and_then(|d| d.body.as_ref())
+        .and_then(|b| match b {
+            TimelineToolBody::Subagent { name, seed } => Some((seed.as_str(), name.as_str())),
+            _ => None,
+        });
+    let output_seed = display_pair
+        .filter(|(seed, _)| !seed.is_empty())
+        .map(|(seed, name)| {
+            (
+                seed.to_string(),
+                if name.trim().is_empty() {
+                    "subagent".to_string()
+                } else {
+                    name.to_string()
+                },
+            )
+        });
+    let args_name = display_pair.and_then(|(seed, name)| {
+        (seed.is_empty() && !name.trim().is_empty()).then(|| name.trim().to_string())
+    });
 
     // 身份锚点：tool_call_id 优先；输出阶段可按 seed 并轨（正常不会分叉，
     // 但 rebaseline 重建后 tool_call_id 可能变化，seed 是稳定身份）。
@@ -163,6 +187,9 @@ pub fn rescan(sess: &mut SessionState) -> Vec<String> {
         .collect();
     for (tool_call_id, args_json, output) in cards {
         let card = TimelineTool {
+            display: None,
+            progress_bytes_total: 0,
+            progress_stream: None,
             tool_call_id,
             name: SPAWN_TOOL.to_string(),
             state: qaqh_client::TimelineToolState::Succeeded,
@@ -242,34 +269,6 @@ pub fn derive_terminal(sub: &SessionState) -> Option<SubagentState> {
     } else {
         SubagentState::Completed
     })
-}
-
-/// 从工具输出 JSON（`json_ok` 形态：`{status:"ok", seed, name, ...}`）解析
-/// (seed, name)。输出可能被截断或为纯文本 → 解析失败返回 None（不阻断）。
-fn parse_spawn_output(output: &str) -> Option<(String, String)> {
-    let trimmed = output.trim();
-    // output 可能是嵌套 JSON 或带前缀文本；取首个 '{' 起尝试解析。
-    let json_start = trimmed.find('{')?;
-    let value: serde_json::Value = serde_json::from_str(&trimmed[json_start..]).ok()?;
-    let seed = value.get("seed")?.as_str()?.to_owned();
-    if seed.is_empty() {
-        return None;
-    }
-    let name = value
-        .get("name")
-        .and_then(|v| v.as_str())
-        .filter(|s| !s.trim().is_empty())
-        .unwrap_or("subagent")
-        .to_owned();
-    Some((seed, name))
-}
-
-/// 从工具参数 JSON 解析 `agent_name`（Prepared/Running 阶段尚无输出）。
-fn parse_agent_name(args_json: Option<&str>) -> Option<String> {
-    let args = args_json?;
-    let value: serde_json::Value = serde_json::from_str(args).ok()?;
-    let name = value.get("agent_name")?.as_str()?.trim().to_owned();
-    (!name.is_empty()).then_some(name)
 }
 
 // ───────────────────────── App 集成 ─────────────────────────
@@ -531,6 +530,9 @@ mod tests {
         output: Option<&str>,
     ) -> TimelineTool {
         TimelineTool {
+            display: None,
+            progress_bytes_total: 0,
+            progress_stream: None,
             tool_call_id: "c1".into(),
             name: name.into(),
             state,
@@ -545,25 +547,42 @@ mod tests {
         }
     }
 
+    /// Phase C fixture：spawn 工具卡挂上 Subagent 投影（name 常显、seed 产出后非空）。
+    fn with_subagent_display(t: TimelineTool, name: &str, seed: &str) -> TimelineTool {
+        TimelineTool {
+            display: Some(qaqh_client::TimelineToolDisplay {
+                summary: None,
+                diff: None,
+                header: Some(qaqh_client::TimelineToolHeader::Other {
+                    label: "subagent".into(),
+                }),
+                body: Some(qaqh_client::TimelineToolBody::Subagent {
+                    name: name.into(),
+                    seed: seed.into(),
+                }),
+                metrics: None,
+            }),
+            ..t
+        }
+    }
+
     #[test]
     fn prepared_then_output_discovers_seed_once() {
         let mut sess = SessionState::new("parent".into());
-        let prepared = tool(
-            SPAWN_TOOL,
-            TimelineToolState::Prepared,
-            Some(r#"{"agent_name":"explore"}"#),
-            None,
+        let prepared = with_subagent_display(
+            tool(SPAWN_TOOL, TimelineToolState::Prepared, None, None),
+            "explore",
+            "",
         );
         assert_eq!(upsert_from_tool(&mut sess, &prepared), None);
         assert_eq!(sess.subagents.len(), 1);
         assert_eq!(sess.subagents[0].name, "explore");
         assert_eq!(sess.subagents[0].state, SubagentState::Starting);
 
-        let done = tool(
-            SPAWN_TOOL,
-            TimelineToolState::Succeeded,
-            Some(r#"{"agent_name":"explore"}"#),
-            Some(r#"{"status":"ok","process_id":7,"seed":"abc123","name":"explore"}"#),
+        let done = with_subagent_display(
+            tool(SPAWN_TOOL, TimelineToolState::Succeeded, None, None),
+            "explore",
+            "abc123",
         );
         assert_eq!(
             upsert_from_tool(&mut sess, &done).as_deref(),
@@ -591,11 +610,10 @@ mod tests {
     #[test]
     fn failed_spawn_keeps_starting_without_seed() {
         let mut sess = SessionState::new("parent".into());
-        let t = tool(
-            SPAWN_TOOL,
-            TimelineToolState::Failed,
-            Some(r#"{"agent_name":"x"}"#),
-            Some(r#"{"status":"error","code":"SPAWN_ERROR"}"#),
+        let t = with_subagent_display(
+            tool(SPAWN_TOOL, TimelineToolState::Failed, None, None),
+            "x",
+            "",
         );
         assert_eq!(upsert_from_tool(&mut sess, &t), None);
         assert_eq!(sess.subagents[0].state, SubagentState::Starting);
@@ -638,6 +656,7 @@ mod tests {
 
         fn turn(state: TimelineTurnState, sealed: bool) -> Turn {
             Turn {
+                thinking: Default::default(),
                 turn_id: "t1".into(),
                 turn_index: Some(1),
                 user_text: String::new(),
@@ -693,6 +712,7 @@ mod tests {
         // 子代理自身 timeline：唯一回合已封口且非 Running → derive_terminal = Completed。
         let mut st = SessionState::new(sub.into());
         st.timeline.turns.push(Turn {
+            thinking: Default::default(),
             turn_id: "t1".into(),
             turn_index: Some(1),
             user_text: String::new(),

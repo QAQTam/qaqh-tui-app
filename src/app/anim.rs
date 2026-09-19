@@ -10,8 +10,38 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use unicode_width::UnicodeWidthChar;
 
+/// 测试专用帧覆盖：锁定 `frame_now()`，让动画相关测试确定性
+/// （M1 回归锁 `anim_frame_triggers_zero_rebuild` / `block_cache_matches_full_render`）。
+/// **thread-local**：并行测试各自独立，互不踩踏（全局 Atomic 会被并行测试清掉）。
+#[cfg(test)]
+pub(crate) mod frame_override {
+    use std::cell::Cell;
+
+    thread_local! {
+        static FRAME: Cell<Option<u64>> = const { Cell::new(None) };
+    }
+
+    pub(crate) fn set(frame: u64) {
+        FRAME.with(|f| f.set(Some(frame)));
+    }
+
+    pub(crate) fn clear() {
+        FRAME.with(|f| f.set(None));
+    }
+
+    pub(crate) fn current() -> Option<u64> {
+        FRAME.with(Cell::get)
+    }
+}
+
 /// 当前动画帧号（200ms/帧，与 Tick 周期一致）。
 pub(crate) fn frame_now() -> u64 {
+    #[cfg(test)]
+    {
+        if let Some(f) = frame_override::current() {
+            return f;
+        }
+    }
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64 / 200)
@@ -21,6 +51,13 @@ pub(crate) fn frame_now() -> u64 {
 /// 八帧 braille 转轮。
 pub(crate) fn spinner_glyph(frame: u64) -> &'static str {
     const FRAMES: [&str; 8] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧"];
+    FRAMES[(frame % FRAMES.len() as u64) as usize]
+}
+
+/// 四帧圆环（思考流式头标）。原 render_transcript 内联手搭的墙钟帧序收编：
+/// `(ms/200) % 4` ≡ `thinking_glyph(frame_now())`，语义不变且可被帧覆盖锁定。
+pub(crate) fn thinking_glyph(frame: u64) -> &'static str {
+    const FRAMES: [&str; 4] = ["◐", "◑", "◒", "◓"];
     FRAMES[(frame % FRAMES.len() as u64) as usize]
 }
 
@@ -127,6 +164,17 @@ mod tests {
         let unique: std::collections::HashSet<_> = glyphs.iter().collect();
         assert_eq!(unique.len(), 8);
         assert_eq!(spinner_glyph(8), spinner_glyph(0));
+    }
+
+    #[test]
+    fn thinking_glyph_cycles_four_frames() {
+        let glyphs: Vec<&str> = (0..4).map(thinking_glyph).collect();
+        let unique: std::collections::HashSet<_> = glyphs.iter().collect();
+        assert_eq!(unique.len(), 4);
+        assert_eq!(thinking_glyph(4), thinking_glyph(0));
+        // 与旧内联实现的帧序逐帧一致（收编不改行为）。
+        assert_eq!(thinking_glyph(0), "◐");
+        assert_eq!(thinking_glyph(3), "◓");
     }
 
     #[test]

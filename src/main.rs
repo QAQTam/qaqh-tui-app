@@ -137,6 +137,11 @@ async fn run_tui(no_spawn: bool) -> Result<()> {
             app.ensure_render_caches(area);
             terminal.draw(|f| ui::draw(f, &app))?;
 
+            // M4（T15）：Ctrl+T 浮层按 `e` 置位 → 帧间挂起终端交给 $PAGER。
+            if let Some(text) = app.pending_pager.take() {
+                run_pager(&mut terminal, &text);
+            }
+
             let Some(msg) = app_rx.recv().await else {
                 break;
             };
@@ -156,6 +161,36 @@ async fn run_tui(no_spawn: bool) -> Result<()> {
     runtime.shutdown().await;
     ratatui::restore();
     loop_result
+}
+
+// ───────────────────────── $PAGER（M4 / T15）─────────────────────────
+
+/// 挂起终端 → 外部分页器全文浏览 → 恢复（重建 + 全量重绘）。
+///
+/// `$PAGER` 未设置 → `less -R`；`less` 不存在（exit 127）→ 退化为 `cat`。
+/// 写临时文件失败则静默放弃（浮层本身仍可滚动，不是功能阻塞）。
+fn run_pager(terminal: &mut ratatui::DefaultTerminal, text: &str) {
+    let tmp = std::env::temp_dir().join(format!("qaqh-pager-{}.md", std::process::id()));
+    if std::fs::write(&tmp, text).is_err() {
+        return;
+    }
+    ratatui::restore();
+    let cmd = format!(
+        "{} {}",
+        app::pager::pager_cmd(std::env::var("PAGER").ok().as_deref()),
+        app::pager::shell_quote(&tmp.to_string_lossy()),
+    );
+    let status = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(&cmd)
+        .status();
+    if matches!(status.map(|s| s.code()), Ok(Some(127))) {
+        let _ = std::process::Command::new("cat").arg(&tmp).status();
+    }
+    *terminal = ratatui::init();
+    let _ = execute!(std::io::stdout(), EnableMouseCapture, EnableBracketedPaste);
+    let _ = terminal.clear();
+    let _ = std::fs::remove_file(&tmp);
 }
 
 // ───────────────────────── doctor 自检 ─────────────────────────

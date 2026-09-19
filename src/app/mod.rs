@@ -5,11 +5,14 @@
 
 pub(crate) mod anim;
 mod composer_ops;
+mod export;
 mod interaction;
 pub(crate) mod keymap;
 pub mod markdown;
 mod overlay_ops;
+pub(crate) mod pager;
 mod paste_guard;
+pub(crate) mod render;
 pub mod render_line;
 pub mod render_transcript;
 pub mod session;
@@ -375,6 +378,13 @@ pub enum Overlay {
         input: Vec<char>,
         cursor: usize,
     },
+    /// 思考回放浮层（§4.5）：当前活动回合的 reasoning body（内存零抓取）。
+    /// 只读 + 滚动；Esc 关闭。body 在推入时快照（后续 delta 不刷新——回放语义）。
+    Thinking {
+        seed: String,
+        scroll: usize,
+        body: String,
+    },
 }
 
 impl ConfirmAction {
@@ -408,6 +418,7 @@ impl Overlay {
         match self {
             Overlay::Confirm { action } => Some(action.seed()),
             Overlay::AttachPath { seed, .. } => Some(seed),
+            Overlay::Thinking { seed, .. } => Some(seed),
             Overlay::SessionList { .. }
             | Overlay::Settings(_)
             | Overlay::Help
@@ -494,7 +505,8 @@ pub struct App {
     pub config: Option<ConfigDto>,
     /// settings 保存请求在途标记（防 config.save 双发——事故 R4）。
     pub settings_saving: bool,
-    pub show_reasoning: bool,
+    /// F3（M2 重定义）：ActivityBar 显隐（§4.4）。旧「思考链全局展开」语义废止。
+    pub show_activity: bool,
     /// 右侧 workspace 面板开关（F4；窄终端自动隐藏）。
     pub show_workspace: bool,
     pub tracked_seeds: HashSet<String>,
@@ -519,6 +531,9 @@ pub struct App {
     pub inspect: Option<String>,
     /// 正在跟踪 timeline 流的子代理 seed 集（attach 后建立，终态后移除）。
     pub(crate) subagent_seeds: HashSet<String>,
+    /// M4（T15）：待交给 `$PAGER` 的文本——Ctrl+T 浮层按 `e` 置位；
+    /// main.rs 主循环在帧间消费（挂起终端 → 分页器 → 恢复）。
+    pub pending_pager: Option<String>,
 }
 
 /// `TimelineLost` 的处置结论。
@@ -595,7 +610,7 @@ impl App {
             dashboard_fetching: HashSet::new(),
             config: None,
             settings_saving: false,
-            show_reasoning: true,
+            show_activity: true,
             show_workspace: true,
             tracked_seeds: HashSet::new(),
             focus_order: Vec::new(),
@@ -610,6 +625,7 @@ impl App {
             initial_cwd,
             inspect: None,
             subagent_seeds: HashSet::new(),
+            pending_pager: None,
         }
     }
 
@@ -625,7 +641,7 @@ impl App {
             AppMsg::Resize => {
                 // 宽度变化 → 渲染缓存全部失效。
                 for s in self.sessions.values_mut() {
-                    s.segments = None;
+                    s.block_cache = None;
                 }
             }
             AppMsg::Tick => self.handle_tick(),
@@ -774,7 +790,7 @@ impl App {
                     sess.scroll.follow = true;
                     sess.scroll.offset = 0;
                 }
-                sess.segments = None;
+                sess.block_cache = None;
                 // 子代理：重扫工具卡 + 终态兑底推导。
                 self.handle_subagent_rebaseline(&seed);
             }
@@ -1115,12 +1131,12 @@ impl App {
                 };
                 if let Some(sess) = self.sessions.get_mut(&target) {
                     sess.dashboard = Some(snapshot);
-                    sess.segments = None;
+                    sess.block_cache = None;
                 } else if self.sessions.contains_key(&snapshot.seed)
                     && let Some(sess) = self.sessions.get_mut(&snapshot.seed)
                 {
                     sess.dashboard = Some(snapshot);
-                    sess.segments = None;
+                    sess.block_cache = None;
                 }
                 // replaceable 空快照（tasks=[]）时：老 daemon/丢帧后仍为空，主动回退 service 拉取。
                 let needs_fallback = self
@@ -1411,7 +1427,7 @@ impl App {
                                     && dash.documents.is_empty()
                                     && dash.recent_edits.is_empty();
                                 sess.dashboard = Some(dash);
-                                sess.segments = None;
+                                sess.block_cache = None;
                                 needs_fetch = is_empty;
                             }
                             None => {
@@ -1439,7 +1455,7 @@ impl App {
                         if let Some(m) = model {
                             let _ = m;
                         }
-                        sess.segments = None;
+                        sess.block_cache = None;
                     }
                     if needs_fetch {
                         self.fetch_dashboard(bootstrap_seed);
@@ -1566,7 +1582,7 @@ impl App {
                     sess.timeline.replace_from_page(&page);
                     sess.scroll.follow = true;
                     sess.scroll.offset = 0;
-                    sess.segments = None;
+                    sess.block_cache = None;
                 }
             }
             ActionResult::LoadOlder { seed, result } => {
@@ -1575,7 +1591,7 @@ impl App {
                     // prepend 而非 replace：已加载的窗口内容保留；
                     // offset（距底行数）不变，视口内容相对稳定。
                     sess.timeline.prepend_older(&page);
-                    sess.segments = None;
+                    sess.block_cache = None;
                 } else if let Some(sess) = self.sessions.get_mut(&seed) {
                     sess.loading_older = false;
                 }
@@ -1607,7 +1623,7 @@ impl App {
                                 || !dash.documents.is_empty())
                         {
                             sess.dashboard = Some(dash);
-                            sess.segments = None;
+                            sess.block_cache = None;
                         }
                     }
                     Err(_e) => {}
@@ -1685,6 +1701,10 @@ impl App {
                 self.new_session();
                 return;
             }
+            Some(GlobalKey::ThinkingOverlay) => {
+                self.open_thinking_overlay();
+                return;
+            }
             Some(GlobalKey::CloseTab) => {
                 if let Some(seed) = self.active_seed() {
                     self.overlays.push(Overlay::Confirm {
@@ -1706,9 +1726,9 @@ impl App {
                 return;
             }
             Some(GlobalKey::ToggleReasoning) => {
-                self.show_reasoning = !self.show_reasoning;
+                self.show_activity = !self.show_activity;
                 for s in self.sessions.values_mut() {
-                    s.segments = None;
+                    s.block_cache = None;
                 }
                 return;
             }
@@ -1811,18 +1831,26 @@ impl App {
             self.touch_focus(&active);
             self.last_focused = Some(active.clone());
         }
-        let show_reasoning = self.show_reasoning;
         let show_workspace = self.show_workspace;
         let composer_height = crate::ui::composer::height(self);
-        let (width, height) = crate::ui::transcript_viewport(area, composer_height, show_workspace);
+        let activity_height = crate::ui::activity_bar::height(self);
+        let (width, height) =
+            crate::ui::transcript_viewport(area, composer_height, activity_height, show_workspace);
         let Some(sess) = self.sessions.get_mut(&active) else {
             return;
         };
         // 视口顶端行号需先知道总行数，而总行数来自缓存本身（估算高度也算）。
-        // 首帧缓存为空时用 0——`rebuild_all` 会渲染全量，下一帧即收敛。
-        let total = sess.segments.as_ref().map_or(0, |c| c.total_lines());
+        // 首帧缓存为空时用 0——refresh 会渲染视口覆盖块，下一帧即收敛。
+        let total = sess.block_cache.as_ref().map_or(0, |c| c.total_lines());
         let top = crate::ui::viewport_top(total, height, sess.scroll.follow, sess.scroll.offset);
-        render_transcript::refresh_segments_at(sess, width, show_reasoning, Some((top, height)));
+        // 缓存内嵌于 SessionState：take 出来以满足 refresh 的 &SessionState 借用
+        // （结构体 move 是指针搬运，O(1)）。
+        let mut cache = sess
+            .block_cache
+            .take()
+            .unwrap_or_else(|| render::TranscriptCache::new(width));
+        render::refresh(sess, width, Some((top, height)), &mut cache);
+        sess.block_cache = Some(cache);
     }
 }
 
@@ -2083,6 +2111,24 @@ mod tests {
     }
 
     // ───────── App 层接线（端到端：经 App::handle 投递真实事件） ─────────
+
+    /// M4（T15）：Ctrl+T 浮层按 `e` → 置位 pending_pager（main.rs 帧间消费）；
+    /// 浮层保持打开（$PAGER 是附加浏览，不消耗浮层）。
+    #[test]
+    fn thinking_overlay_e_requests_pager() {
+        let (mut app, _rx) = App::new_for_test();
+        app.overlays.push(Overlay::Thinking {
+            seed: "s".into(),
+            scroll: 0,
+            body: "第一段\n第二段".into(),
+        });
+        assert!(app.overlay_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE)));
+        assert_eq!(app.pending_pager.as_deref(), Some("第一段\n第二段"));
+        assert!(matches!(
+            app.overlays.last(),
+            Some(Overlay::Thinking { .. })
+        ));
+    }
 
     use ratatui::crossterm::event::{KeyCode, KeyModifiers};
 

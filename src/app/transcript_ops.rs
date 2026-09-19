@@ -77,7 +77,7 @@ impl App {
         };
         if let Some(sess) = self.sessions.get_mut(&seed) {
             sess.mode = next; // 乐观更新
-            sess.segments = None;
+            sess.block_cache = None;
         }
         self.spawn_api(move |api, tx| async move {
             let result = api
@@ -313,7 +313,11 @@ impl App {
             let Some(sess) = self.view_session() else {
                 return;
             };
-            let total = sess.segments.as_ref().map(|c| c.total_lines()).unwrap_or(0);
+            let total = sess
+                .block_cache
+                .as_ref()
+                .map(|c| c.total_lines())
+                .unwrap_or(0);
             (
                 total,
                 sess.scroll.offset >= total.saturating_sub(1),
@@ -329,60 +333,33 @@ impl App {
     }
 
     pub(super) fn toggle_tool_expand(&mut self) {
+        // §4.7（M2）：F7 作用于**最近一个 T2 运行组**（逆序首个含 T2 工具的
+        // round），切换其 expanded_groups 位。组展开 = 卡片列表；收起 = 一行
+        // 组行（组内最后 Failed 卡例外内联，错误不许藏）。
         let Some(seed) = self.view_seed() else {
             return;
         };
         let Some(sess) = self.sessions.get_mut(&seed) else {
             return;
         };
-        // 收集所有可折叠工具（有输出或 diff），按时间逆序；携带 name 以计算视觉展开态
-        let mut candidates: Vec<(String, String)> = Vec::new();
         for turn in sess.timeline.turns.iter().rev() {
             for round in turn.rounds.iter().rev() {
-                for block in round.blocks.iter().rev() {
-                    if let Some(tool) = &block.tool {
-                        // 专属面板工具不渲染输出体，F7 对它无意义，排除以免空切。
-                        if crate::app::render_transcript::is_panel_owned_tool(&tool.name) {
-                            continue;
-                        }
-                        let has_content =
-                            tool.output.as_deref().is_some_and(|s| !s.trim().is_empty())
-                                || !tool.progress.trim().is_empty()
-                                || tool.diff.as_deref().is_some_and(|d| !d.trim().is_empty());
-                        if has_content {
-                            candidates.push((tool.tool_call_id.clone(), tool.name.clone()));
-                        }
-                    }
+                let has_t2 = round.blocks.iter().any(|b| {
+                    b.kind == qaqh_client::TimelineBlockKind::Tool
+                        && b.tool
+                            .as_ref()
+                            .is_some_and(|t| !render_transcript::is_t1_tool(&t.name))
+                });
+                if !has_t2 {
+                    continue;
                 }
+                let key = (turn.turn_id.clone(), round.round_num);
+                if !sess.expanded_groups.remove(&key) {
+                    sess.expanded_groups.insert(key);
+                }
+                sess.block_cache = None;
+                return;
             }
-        }
-        if candidates.is_empty() {
-            return;
-        }
-        // 视觉展开态 = expanded_raw ^ is_default_expanded(name)，F7 在此视觉上切换
-        let is_visual_expanded = |id: &str, name: &str| {
-            let raw = sess.expanded_tools.contains(id);
-            raw ^ crate::app::render_transcript::is_default_expanded(name)
-        };
-        // 策略：优先展开最近的“视觉收起”；若全部已展开，则收起最近的展开态（循环）
-        let mut target: Option<String> = None;
-        for (id, name) in &candidates {
-            if !is_visual_expanded(id, name) {
-                target = Some(id.clone());
-                break;
-            }
-        }
-        if target.is_none() {
-            // 全部已视觉展开 → 收起最近一个
-            target = candidates.first().map(|(id, _)| id.clone());
-        }
-        if let Some(id) = target {
-            if sess.expanded_tools.contains(&id) {
-                sess.expanded_tools.remove(&id);
-            } else {
-                sess.expanded_tools.insert(id);
-            }
-            sess.segments = None;
         }
     }
 }

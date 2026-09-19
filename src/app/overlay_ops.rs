@@ -1,6 +1,7 @@
 //! 覆盖层/首页按键路由（自 app/mod.rs 拆分，行为不变）。
 
 use super::*;
+use qaqh_client::TimelineBlockKind;
 
 impl App {
     /// 标签/观测切换后调用：清掉不属于当前标签 seed 的 overlay。
@@ -32,6 +33,39 @@ impl App {
         self.overlays.push(Overlay::SessionList {
             selected: 0,
             show_archived: false,
+        });
+    }
+
+    /// §4.5：Ctrl+T 思考回放——**当前活动回合**的 reasoning body 在内存
+    /// （D1 唯一保留点），零抓取。无活动回合/无思考内容 → toast，不推空浮层。
+    /// 历史回合不在此列：offloaded 的远端只有预览壳，全文回放 v2 立项。
+    pub(crate) fn open_thinking_overlay(&mut self) {
+        let Some(seed) = self.view_seed() else {
+            return;
+        };
+        let Some(sess) = self.sessions.get(&seed) else {
+            return;
+        };
+        let mut parts: Vec<String> = Vec::new();
+        if let Some(tid) = sess.timeline.running_turn_id()
+            && let Some(t) = sess.timeline.turns.iter().find(|t| t.turn_id == tid)
+        {
+            for r in &t.rounds {
+                for b in &r.blocks {
+                    if b.kind == TimelineBlockKind::Reasoning && !b.text.is_empty() {
+                        parts.push(b.text.clone());
+                    }
+                }
+            }
+        }
+        if parts.is_empty() {
+            self.toast(NoticeLevel::Info, "当前回合没有进行中的思考");
+            return;
+        }
+        self.overlays.push(Overlay::Thinking {
+            seed,
+            scroll: 0,
+            body: parts.join("\n\n"),
         });
     }
 
@@ -139,6 +173,42 @@ impl App {
         };
 
         match top {
+            Overlay::Thinking { body, .. } => {
+                // 只读回放：滚动 + Esc 关闭。总行数按折行后算（与 draw 同一 wrap）。
+                let total = body.lines().count().max(1);
+                match key.code {
+                    KeyCode::Esc => {
+                        self.overlays.pop();
+                    }
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        if let Some(Overlay::Thinking { scroll, .. }) = self.overlays.last_mut() {
+                            *scroll = scroll.saturating_sub(1);
+                        }
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        if let Some(Overlay::Thinking { scroll, .. }) = self.overlays.last_mut() {
+                            *scroll = (*scroll + 1).min(total.saturating_sub(1));
+                        }
+                    }
+                    KeyCode::PageUp => {
+                        if let Some(Overlay::Thinking { scroll, .. }) = self.overlays.last_mut() {
+                            *scroll = scroll.saturating_sub(20);
+                        }
+                    }
+                    KeyCode::PageDown => {
+                        if let Some(Overlay::Thinking { scroll, .. }) = self.overlays.last_mut() {
+                            *scroll = (*scroll + 20).min(total.saturating_sub(1));
+                        }
+                    }
+                    KeyCode::Char('e') => {
+                        // M4（T15）：交给 `$PAGER` 全文浏览——置位后由 main.rs
+                        // 在帧间挂起终端执行（本层拿不到 terminal）。
+                        self.pending_pager = Some(body.clone());
+                    }
+                    _ => {}
+                }
+                true
+            }
             Overlay::Help => {
                 self.overlays.pop();
                 true
