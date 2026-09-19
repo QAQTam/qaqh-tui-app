@@ -181,73 +181,57 @@ def local_time(iso: str) -> str:
 
 # ───────────────────────────── 数据面 ─────────────────────────────
 
-def fetch_issues(repo: str) -> list[dict]:
+def _paged(argv: list[str]) -> list[dict] | None:
+    """翻页拉全（`totalPages`）。**任一夜读失败即返回 None**——调用方据此不得推进游标。
+
+    返回 `[]` 与返回 `None` 是两件不同的事：前者是「真的没有」，后者是「本轮没读到」。
+    把两者压成同一个值，正是「瞬时失败 → 游标照推 → 静默漏事件」的入口。
+    """
+    out: list[dict] = []
+    page = 1
+    while True:
+        payload = cnb_json([*argv, "--page", str(page), "--page-size", str(PAGE_SIZE)])
+        if payload is None:
+            return None
+        batch = payload.get("data") or []
+        out.extend(batch)
+        if page >= int(payload.get("totalPages") or 1) or not batch:
+            return out
+        page += 1
+        time.sleep(FETCH_PAUSE)
+
+
+def fetch_issues(repo: str) -> list[dict] | None:
     """issues 接口不接受 `--state all`（实测 400），只能 open/closed 各拉一次再合并。"""
     merged: dict[str, dict] = {}
     for state in ("open", "closed"):
-        payload = cnb_json([
-            "issues", "list-issues", "--repo", repo,
-            "--state", state, "--page-size", str(PAGE_SIZE), "--order-by", "-updated_at",
-        ])
-        for item in (payload or {}).get("data") or []:
+        batch = _paged(["issues", "list-issues", "--repo", repo,
+                        "--state", state, "--order-by", "-updated_at"])
+        if batch is None:
+            return None
+        for item in batch:
             merged[str(item.get("number"))] = item
         time.sleep(FETCH_PAUSE)
     return list(merged.values())
 
 
-def fetch_issue_comments(repo: str, number: str) -> list[dict]:
-    out: list[dict] = []
-    page = 1
-    while True:
-        payload = cnb_json([
-            "issues", "list-issue-comments", "--repo", repo, "--number", str(number),
-            "--sort", "created", "--page", str(page), "--page-size", str(PAGE_SIZE),
-        ])
-        if payload is None:
-            break
-        batch = payload.get("data") or []
-        out.extend(batch)
-        if page >= int(payload.get("totalPages") or 1) or not batch:
-            break
-        page += 1
-        time.sleep(FETCH_PAUSE)
-    return out
+def fetch_issue_comments(repo: str, number: str) -> list[dict] | None:
+    return _paged(["issues", "list-issue-comments", "--repo", repo,
+                   "--number", str(number), "--sort", "created"])
 
 
-def fetch_pulls(repo: str) -> list[dict]:
-    payload = cnb_json([
-        "pulls", "list-pulls", "--repo", repo,
-        "--state", "all", "--page-size", str(PAGE_SIZE), "--order-by", "-updated_at",
-    ])
-    return (payload or {}).get("data") or []
+def fetch_pulls(repo: str) -> list[dict] | None:
+    return _paged(["pulls", "list-pulls", "--repo", repo,
+                   "--state", "all", "--order-by", "-updated_at"])
 
 
-def fetch_pull_comments(repo: str, number: str) -> list[dict]:
-    out: list[dict] = []
-    page = 1
-    while True:
-        payload = cnb_json([
-            "pulls", "list-pull-comments", "--repo", repo, "--number", str(number),
-            "--page", str(page), "--page-size", str(PAGE_SIZE),
-        ])
-        if payload is None:
-            break
-        batch = payload.get("data") or []
-        out.extend(batch)
-        if page >= int(payload.get("totalPages") or 1) or not batch:
-            break
-        page += 1
-        time.sleep(FETCH_PAUSE)
-    return out
+def fetch_pull_comments(repo: str, number: str) -> list[dict] | None:
+    return _paged(["pulls", "list-pull-comments", "--repo", repo, "--number", str(number)])
 
 
-def fetch_pull_reviews(repo: str, number: str) -> list[dict]:
-    """评审（review）与普通评论是两个面；失败不致命（老仓库可能没有评审）。"""
-    payload = cnb_json([
-        "pulls", "list-pull-reviews", "--repo", repo, "--number", str(number),
-        "--page-size", str(PAGE_SIZE),
-    ])
-    return (payload or {}).get("data") or []
+def fetch_pull_reviews(repo: str, number: str) -> list[dict] | None:
+    """评审（review）与普通评论是两个面；失败返回 None（调用方不得据此推进游标）。"""
+    return _paged(["pulls", "list-pull-reviews", "--repo", repo, "--number", str(number)])
 
 
 # ───────────────────────────── 事件抽取 ─────────────────────────────
@@ -263,19 +247,13 @@ def _comment_id(node: dict) -> str:
 
 
 def _new_comments(comments: list[dict], last_id: str) -> list[dict]:
-    """按雪花 id 数值比较取增量；id 不可解析的退回「全部视为新」。"""
-    try:
-        floor = int(last_id or "0")
-    except ValueError:
-        floor = 0
-    fresh = []
-    for c in comments:
-        try:
-            if int(_comment_id(c)) > floor:
-                fresh.append(c)
-        except ValueError:
-            fresh.append(c)
-    return fresh
+    """按 `_id_key` 全序取增量——**与游标推进同一个键**。
+
+    口径不一致（这里 `int()` 严格解析、游标那边 `_id_key()` 容错）会让非数字 id
+    每轮都被判为新、却永远进不了游标 → 每轮重复投递。
+    """
+    floor = _id_key(last_id)
+    return [c for c in comments if _id_key(_comment_id(c)) > floor]
 
 
 def _make_event(cur: dict, kind: str, thread: str, *, author: str, body: str = "",
@@ -299,7 +277,9 @@ def poll_once(cur: dict, repo: str, *, baseline: bool = False) -> list[dict]:
     events: list[dict] = []
     base = f"https://cnb.cool/{repo}/-/"
 
-    for iss in fetch_issues(repo):
+    # 读失败（None）＝本轮这一面不投递、**不写任何游标**，下一轮自动重试；
+    # 与「真的为空」严格区分（否则瞬时失败会静默吞掉事件）。
+    for iss in fetch_issues(repo) or []:
         number = str(iss.get("number"))
         prev = cur["issues"].get(number)
         first_seen = prev is None
@@ -313,31 +293,41 @@ def poll_once(cur: dict, repo: str, *, baseline: bool = False) -> list[dict]:
 
         comment_count = iss.get("comment_count")
         updated_at = iss.get("updated_at") or ""
+        state = iss.get("state")
+        state_changed = bool(not first_seen and prev.get("state") and prev["state"] != state)
         dirty = first_seen or prev.get("comments") != comment_count or prev.get("updated_at") != updated_at
         if dirty:
             comments = fetch_issue_comments(repo, number)
-            fresh = _new_comments(comments, prev.get("last_comment_id", ""))
-            if fresh:
-                if not baseline:
-                    for c in fresh:
-                        events.append(_make_event(
-                            cur, "issue_comment", f"#{number}",
-                            author=_author(c.get("author")), body=c.get("body") or "",
-                            url=f"{base}issues/{number}", ts=c.get("created_at") or "",
-                            cid=_comment_id(c),
-                        ))
-                prev["last_comment_id"] = max((_comment_id(c) for c in comments), key=_id_key, default="")
-            elif not first_seen and not baseline and prev.get("updated_at") != updated_at:
-                events.append(_make_event(
-                    cur, "issue_comment_edited", f"#{number}", author="(未知)",
-                    body="线程有改动但没有新评论（编辑或删除）", url=f"{base}issues/{number}",
-                    ts=updated_at,
-                ))
-            prev["comments"] = comment_count
-            prev["updated_at"] = updated_at
+            if comments is None:
+                # 读失败：不写 comments / last_comment_id / updated_at
+                # ⇒ 下一轮 `dirty` 仍为真，自动重拉。
+                pass
+            else:
+                fresh = _new_comments(comments, prev.get("last_comment_id", ""))
+                if fresh:
+                    if not baseline:
+                        for c in fresh:
+                            events.append(_make_event(
+                                cur, "issue_comment", f"#{number}",
+                                author=_author(c.get("author")), body=c.get("body") or "",
+                                url=f"{base}issues/{number}", ts=c.get("created_at") or "",
+                                cid=_comment_id(c),
+                            ))
+                    prev["last_comment_id"] = max((_comment_id(c) for c in comments), key=_id_key, default="")
+                elif not first_seen and not baseline and prev.get("updated_at") != updated_at \
+                        and not state_changed:
+                    # 没有新评论但 updated_at 跳了：可能是编辑/删除，也可能是标签/处理人/标题
+                    # 等元数据变更——本接口分不开，所以文案放宽；并与同轮的 issue_state 互斥，
+                    # 否则「关一个 issue」会产出两条，其中一条是误导。
+                    events.append(_make_event(
+                        cur, "issue_comment_edited", f"#{number}", author="(未知)",
+                        body="线程有改动但没有新评论（编辑/删除，或标签/处理人等元数据变更）",
+                        url=f"{base}issues/{number}", ts=updated_at,
+                    ))
+                prev["comments"] = comment_count
+                prev["updated_at"] = updated_at
 
-        state = iss.get("state")
-        if not first_seen and prev.get("state") and prev["state"] != state and not baseline:
+        if state_changed and not baseline:
             events.append(_make_event(
                 cur, "issue_state", f"#{number}", author="(平台)",
                 body=f"{prev['state']} → {state}", url=f"{base}issues/{number}", ts=updated_at,
@@ -345,7 +335,7 @@ def poll_once(cur: dict, repo: str, *, baseline: bool = False) -> list[dict]:
         prev["state"] = state
         cur["issues"][number] = prev
 
-    for pr in fetch_pulls(repo):
+    for pr in fetch_pulls(repo) or []:
         number = str(pr.get("number"))
         prev = cur["pulls"].get(number)
         first_seen = prev is None
@@ -361,37 +351,47 @@ def poll_once(cur: dict, repo: str, *, baseline: bool = False) -> list[dict]:
         review_count = pr.get("review_count")
         updated_at = pr.get("updated_at") or ""
 
+        comments_ok = True
         if first_seen or prev.get("comments") != comment_count or prev.get("updated_at") != updated_at:
             comments = fetch_pull_comments(repo, number)
-            fresh = _new_comments(comments, prev.get("last_comment_id", ""))
-            if fresh:
-                if not baseline:
-                    for c in fresh:
-                        events.append(_make_event(
-                            cur, "pr_comment", f"PR#{number}",
-                            author=_author(c.get("author")), body=c.get("body") or "",
-                            url=f"{base}pulls/{number}", ts=c.get("created_at") or "",
-                            cid=_comment_id(c),
-                        ))
-                prev["last_comment_id"] = max((_comment_id(c) for c in comments), key=_id_key, default="")
-            prev["comments"] = comment_count
+            if comments is None:
+                # 读失败：不写 comments/last_comment_id，也不推进 updated_at（见下方 comments_ok）。
+                comments_ok = False
+            else:
+                fresh = _new_comments(comments, prev.get("last_comment_id", ""))
+                if fresh:
+                    if not baseline:
+                        for c in fresh:
+                            events.append(_make_event(
+                                cur, "pr_comment", f"PR#{number}",
+                                author=_author(c.get("author")), body=c.get("body") or "",
+                                url=f"{base}pulls/{number}", ts=c.get("created_at") or "",
+                                cid=_comment_id(c),
+                            ))
+                    prev["last_comment_id"] = max((_comment_id(c) for c in comments), key=_id_key, default="")
+                prev["comments"] = comment_count
 
         if first_seen or prev.get("reviews") != review_count:
             reviews = fetch_pull_reviews(repo, number)
-            floor = _id_key(prev.get("last_review_id") or "")
-            if reviews and not baseline:
-                for r in reviews:
-                    if _id_key(_comment_id(r)) <= floor:
-                        continue
-                    events.append(_make_event(
-                        cur, "pr_review", f"PR#{number}", author=_author(r.get("author")),
-                        body=json.dumps({k: v for k, v in r.items()
-                                         if k in ("state", "body", "verdict")}, ensure_ascii=False),
-                        url=f"{base}pulls/{number}", ts=r.get("created_at") or "",
-                        cid=_comment_id(r),
-                    ))
-            prev["reviews"] = review_count
-            prev["last_review_id"] = max((_comment_id(r) for r in reviews), key=_id_key, default="")
+            if reviews is None:
+                # 读失败：**绝不**写 reviews / last_review_id——旧实现会把 last_review_id
+                # 重置成 "" 并关上闸门，历史评审再也不会重放（评审 #23 阻断项 1）。
+                pass
+            else:
+                floor = _id_key(prev.get("last_review_id") or "")
+                if reviews and not baseline:
+                    for r in reviews:
+                        if _id_key(_comment_id(r)) <= floor:
+                            continue
+                        events.append(_make_event(
+                            cur, "pr_review", f"PR#{number}", author=_author(r.get("author")),
+                            body=json.dumps({k: v for k, v in r.items()
+                                             if k in ("state", "body", "verdict")}, ensure_ascii=False),
+                            url=f"{base}pulls/{number}", ts=r.get("created_at") or "",
+                            cid=_comment_id(r),
+                        ))
+                prev["reviews"] = review_count
+                prev["last_review_id"] = max((_comment_id(r) for r in reviews), key=_id_key, default="")
 
         state = pr.get("state")
         mergeable = pr.get("mergeable_state") or ""
@@ -405,17 +405,25 @@ def poll_once(cur: dict, repo: str, *, baseline: bool = False) -> list[dict]:
                 ))
         prev["state"] = state
         prev["mergeable_state"] = mergeable
-        prev["updated_at"] = updated_at
+        if comments_ok:
+            prev["updated_at"] = updated_at
         cur["pulls"][number] = prev
 
     return events
 
 
 def _id_key(value: str):
+    """id 的全序键：数字 id 按数值排；非数字 id 退到字典序且**恒小于任何数字 id**。
+
+    增量判定 / 游标推进 / 评审 floor 三处必须同用这一个键（见 `_new_comments`）。
+    已知边界：游标一旦是数字 id，非数字 id 就不再算「新」——真实 CNB id 是雪花数字，
+    该分支只在合成数据里出现；两条行为都由 selftest 钉住。
+    """
+    text = str(value or "")
     try:
-        return (1, int(value))
+        return (1, int(text), "")
     except (TypeError, ValueError):
-        return (0, 0)
+        return (0, 0, text)
 
 
 # ───────────────────────────── 渲染 ─────────────────────────────
@@ -491,7 +499,14 @@ def filter_events(events: list[dict], threads: str | None, since: str | None) ->
 # ───────────────────────────── 子命令 ─────────────────────────────
 
 def cmd_poll(args) -> int:
-    if args.interval:
+    if args.interval < 0:
+        warn("--interval 不得为负")
+        return 2
+    if args.cmd == "watch" and args.interval < 1:
+        # 旧行为：watch --interval 0 会静默退化成「只跑一轮」，与子命令名不符。
+        warn("watch 的 --interval 必须 ≥ 1（0 会静默退化成只跑一轮）")
+        return 2
+    if args.interval and not getattr(args, "once", False):
         return watch_loop(args)
     with state_lock():
         cur = load_state(args.repo)
@@ -579,6 +594,10 @@ def cmd_send(args) -> int:
 
 
 def cmd_inbox(args) -> int:
+    if args.tail < 0:
+        # `lines[-(-3):]` = `lines[3:]`：负值会静默变成「去掉前 3 条」的反义行为。
+        warn("--tail 不得为负（0=全部）")
+        return 2
     if not INBOX_PATH.exists():
         warn("收件箱为空（还没跑过 poll）")
         return 0
@@ -621,7 +640,19 @@ def cmd_selftest(args) -> int:
     check("增量：位数不同不得按字典序（9 不得混入）",
           [c["id"] for c in _new_comments(comments, "100")] == [])
     check("增量：空游标取全部", len(_new_comments(comments, "")) == 3)
-    check("增量：非数字 id 视为新", len(_new_comments([{"id": "x"}], "300")) == 1)
+    # 非数字 id：**增量判定与游标推进必须用同一个键**。旧实现里 `_new_comments` 用
+    # `int()` 严格解析（解不开就「视为新」）、游标推进用 `_id_key()` 容错（非数字恒最小），
+    # 于是非数字 id「每轮判新、却永远进不了游标」→ 每轮重复投递。原 selftest 把这个
+    # 错误当期望锁住了（`== 1`），所以变异测试也不会变红——本条已改正。
+    check("增量：非数字 id 在空游标下必须投递（不得静默漏）",
+          len(_new_comments([{"id": "x"}], "")) == 1)
+    check("增量：游标为数字时非数字 id 不得每轮重投",
+          _new_comments([{"id": "x"}], "300") == [])
+    mixed = [{"id": "zzz"}, {"id": "100"}]
+    check("增量：游标为数字时混合集不得重投", _new_comments(mixed, "100") == [])
+    check("id 比较：数字 id 恒大于非数字 id（同一全序键）", _id_key("1") > _id_key("zzz"))
+    check("游标推进：取的就是增量判定那个键",
+          max((_comment_id(c) for c in mixed), key=_id_key, default="") == "100")
     check("id 比较：数值而非字典序", _id_key("99") < _id_key("100"))
     check("id 比较：空值退化为最小", _id_key("") < _id_key("1"))
 
@@ -671,6 +702,90 @@ def cmd_selftest(args) -> int:
     finally:
         STATE_DIR, CURSOR_PATH, INBOX_PATH = saved
 
+    # 6) 读失败不得推进游标（把**最底层的 `cnb_json`** 打桩成瞬时失败，让真实的
+    #    `fetch_*` → `_paged` → `poll_once` 全链路被覆盖——可证伪）
+    saved_json = cnb_json
+
+    def _iss(comment_count=5, updated_at="2026-09-19T18:00:00Z"):
+        return {"number": "22", "comment_count": comment_count, "updated_at": updated_at,
+                "state": "open", "title": "t", "author": {"username": "QAQTam"},
+                "created_at": "2026-09-19T10:00:00Z"}
+
+    def _pull(comment_count=2, review_count=2, updated_at="2026-09-19T10:00:00Z"):
+        return {"number": "23", "comment_count": comment_count, "review_count": review_count,
+                "updated_at": updated_at, "state": "open", "mergeable_state": "mergeable",
+                "title": "t", "author": {"username": "AnyBuddy"},
+                "created_at": "2026-09-19T10:00:00Z"}
+
+    def _c(cid, body="x", ts="2026-09-19T18:00:00Z"):
+        return {"id": cid, "author": {"username": "AnyBuddy"}, "body": body, "created_at": ts}
+
+    down = {"issue_comments": True, "pull_comments": True, "reviews": True}  # 模拟「本轮没读到」
+    # 两个面分开测：同时活着会让 `issue_new`/`pr_new`/`pr_comment` 混进断言。
+    live = {"issues": True, "pulls": False}
+
+    def _stub(argv: list[str]) -> dict | None:
+        if "list-issues" in argv:
+            return {"data": [_iss(comment_count=5)] if live["issues"] else [], "totalPages": 1}
+        if "list-pulls" in argv:
+            return {"data": [_pull()] if live["pulls"] else [], "totalPages": 1}
+        if "list-issue-comments" in argv:
+            if down["issue_comments"]:
+                return None                              # 瞬时失败
+            return {"data": [_c("100"), _c("200", "补投")], "totalPages": 1}
+        if "list-pull-comments" in argv:
+            if down["pull_comments"]:
+                return None
+            return {"data": [_c("500")], "totalPages": 1}
+        if "list-pull-reviews" in argv:
+            if down["reviews"]:
+                return None
+            return {"data": [{"id": "1000", "state": "approved", "body": "ok",
+                              "author": {"username": "AnyBuddy"},
+                              "created_at": "2026-09-19T18:00:00Z"}], "totalPages": 1}
+        return None
+
+    try:
+        globals()["cnb_json"] = _stub
+
+        # 6a) issue 评论面读失败：游标逐字段不变，且不得产出误导性的 issue_comment_edited
+        cur = {"self": "QAQTam", "repo": "o/r", "seq": 0,
+               "issues": {"22": {"comments": 4, "updated_at": "2026-09-19T10:00:00Z",
+                                 "state": "open", "last_comment_id": "100"}},
+               "pulls": {}}
+        ev = poll_once(cur, "o/r")
+        check("读失败：issue 游标不得推进",
+              cur["issues"]["22"]["comments"] == 4
+              and cur["issues"]["22"]["updated_at"] == "2026-09-19T10:00:00Z"
+              and cur["issues"]["22"]["last_comment_id"] == "100")
+        check("读失败：不得产出误导性的 issue_comment_edited", [e["kind"] for e in ev] == [])
+
+        down["issue_comments"] = False                   # 下一轮恢复
+        ev = poll_once(cur, "o/r")
+        check("读失败恢复后：漏掉的那条必须补投",
+              [e["kind"] for e in ev] == ["issue_comment"] and ev[0]["cid"] == "200")
+        check("读失败恢复后：游标推进到最新", cur["issues"]["22"]["last_comment_id"] == "200")
+
+        # 6b) 评审面读失败：`last_review_id` 绝不能被重置（否则历史评审永不重放）
+        live["issues"] = False
+        live["pulls"] = True
+        cur2 = {"self": "QAQTam", "repo": "o/r", "seq": 0, "issues": {},
+                "pulls": {"23": {"comments": 2, "reviews": 1, "last_comment_id": "500",
+                                 "last_review_id": "999", "state": "open",
+                                 "mergeable_state": "mergeable",
+                                 "updated_at": "2026-09-19T10:00:00Z"}}}
+        ev = poll_once(cur2, "o/r")
+        check("读失败：last_review_id 不得被重置", cur2["pulls"]["23"]["last_review_id"] == "999")
+        check("读失败：reviews 计数不得推进", cur2["pulls"]["23"]["reviews"] == 1)
+        check("读失败：评审面不得产出事件", [e["kind"] for e in ev] == [])
+
+        down["reviews"] = False
+        ev = poll_once(cur2, "o/r")
+        check("读失败恢复后：漏掉的评审必须补投",
+              [e["kind"] for e in ev] == ["pr_review"] and ev[0]["cid"] == "1000")
+    finally:
+        globals()["cnb_json"] = saved_json
+
     print(f"\n{len(failures)} 项失败" if failures else "\n全部通过")
     return 1 if failures else 0
 
@@ -710,13 +825,16 @@ MCP_TOOLS = [
 
 def mcp_call(name: str, arguments: dict) -> dict:
     if name == "chat_poll":
-        cur = load_cursor()
-        repo = cur.get("repo") or repo_slug()
-        cur["repo"] = repo
-        if not cur.get("self"):
-            cur["self"] = whoami()
-        events = poll_once(cur, repo)
-        save_cursor(cur)
+        # 与 cmd_poll/watch_loop 同样持锁：MCP 客户端与常驻 watch 并存时，
+        # 无锁路径正是 state_lock docstring 点名的「重复投递 / seq 冲突」。
+        with state_lock():
+            cur = load_cursor()
+            repo = cur.get("repo") or repo_slug()
+            cur["repo"] = repo
+            if not cur.get("self"):
+                cur["self"] = whoami()
+            events = poll_once(cur, repo)
+            save_cursor(cur)
         text = "\n\n".join(render(e, color=False) for e in events) or "(无新消息)"
     elif name == "chat_send":
         ns = argparse.Namespace(
