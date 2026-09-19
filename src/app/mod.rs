@@ -478,6 +478,20 @@ pub fn prune_seed_bound_overlays(overlays: &mut Vec<Overlay>, seed: Option<&str>
 
 use self::settings::{FieldKind, SettingsState};
 
+/// 主循环帧统计（`QAQH_TUI_DEBUG=1` 展示）。
+///
+/// 由 `main.rs` 主循环每秒结算一次：把「wire 事件率」与「终端实际刷新率」
+/// 两个数字分开——前者来自 SSE，后者才是用户看到的观感上限。
+#[derive(Debug, Clone, Copy, Default)]
+pub struct FrameStats {
+    /// 最近一秒完成的帧数（每帧 = 一次 `terminal.draw`）。
+    pub fps: u32,
+    /// 最近一秒消费的运行时消息数（`AppMsg::Runtime`；≈ timeline 事件率）。
+    pub events_per_s: u32,
+    /// 最近一秒的平均整帧耗时（`ensure_render_caches` + `terminal.draw`）。
+    pub draw_us: u64,
+}
+
 pub struct App {
     pub quit: bool,
     pub runtime: Arc<Runtime>,
@@ -534,6 +548,8 @@ pub struct App {
     /// M4（T15）：待交给 `$PAGER` 的文本——Ctrl+T 浮层按 `e` 置位；
     /// main.rs 主循环在帧间消费（挂起终端 → 分页器 → 恢复）。
     pub pending_pager: Option<String>,
+    /// 主循环帧统计（`QAQH_TUI_DEBUG=1` 时在状态栏展示）。
+    pub frame_stats: FrameStats,
 }
 
 /// `TimelineLost` 的处置结论。
@@ -626,6 +642,7 @@ impl App {
             inspect: None,
             subagent_seeds: HashSet::new(),
             pending_pager: None,
+            frame_stats: FrameStats::default(),
         }
     }
 

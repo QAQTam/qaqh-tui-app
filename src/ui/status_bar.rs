@@ -111,6 +111,18 @@ fn render_stats_span(rebuilt: usize, resident: usize, render_us: u64) -> Span<'s
     )
 }
 
+/// M1 观测：主循环帧统计的展示单元（纯函数，便于测试）。
+/// `n fps`=最近一秒帧数；`evn/s`=运行时消息率；`drawnµs`=整帧平均耗时。
+fn frame_stats_span(stats: &crate::app::FrameStats) -> Span<'static> {
+    Span::styled(
+        format!(
+            " · {}fps ev{}/s draw{}µs",
+            stats.fps, stats.events_per_s, stats.draw_us
+        ),
+        theme::dim(),
+    )
+}
+
 /// `QAQH_TUI_DEBUG=1` 时启用观测展示。OnceLock 缓存，避免每帧读环境变量。
 fn debug_stats_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -150,15 +162,17 @@ pub fn draw(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
         if let Some(dropped) = sess.timeline.dropped_summary() {
             right.push(Span::styled(format!(" · {dropped}"), theme::warn()));
         }
-        // M0 观测：QAQH_TUI_DEBUG=1 时展示渲染缓存统计（默认完全不可见，零噪声纪律）。
-        if debug_stats_enabled()
-            && let Some(cache) = sess.block_cache.as_ref()
-        {
-            right.push(render_stats_span(
-                cache.stats.rebuilt_blocks,
-                cache.stats.resident_blocks,
-                cache.stats.render_us,
-            ));
+        // M0/M1 观测：QAQH_TUI_DEBUG=1 时展示渲染缓存统计与主循环帧统计
+        // （默认完全不可见，零噪声纪律）。
+        if debug_stats_enabled() {
+            if let Some(cache) = sess.block_cache.as_ref() {
+                right.push(render_stats_span(
+                    cache.stats.rebuilt_blocks,
+                    cache.stats.resident_blocks,
+                    cache.stats.render_us,
+                ));
+            }
+            right.push(frame_stats_span(&app.frame_stats));
         }
     }
     let now = chrono::Local::now().format("%H:%M");
@@ -233,6 +247,17 @@ mod tests {
     fn render_stats_span_formats_debug_counters() {
         let s = render_stats_span(3, 12, 4210);
         assert_eq!(s.content.as_ref(), " · ⟂3 res12 4210µs");
+    }
+
+    /// M1 观测：帧统计格式稳定（fps / 事件率 / 整帧耗时三个数字）。
+    #[test]
+    fn frame_stats_span_formats_debug_counters() {
+        let s = frame_stats_span(&crate::app::FrameStats {
+            fps: 187,
+            events_per_s: 203,
+            draw_us: 412,
+        });
+        assert_eq!(s.content.as_ref(), " · 187fps ev203/s draw412µs");
     }
 
     /// 回归：`Ready` 相位下的流告警必须可见，且恢复后必须消失。

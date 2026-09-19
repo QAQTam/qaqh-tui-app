@@ -13,7 +13,7 @@ use ratatui::crossterm::event::{
 use ratatui::crossterm::execute;
 use tokio::sync::mpsc;
 
-use app::{App, AppMsg};
+use app::{App, AppMsg, FrameStats};
 use runtime::{Runtime, RuntimeMsg};
 
 fn main() -> Result<()> {
@@ -125,6 +125,14 @@ async fn run_tui(no_spawn: bool) -> Result<()> {
     app.fetch_session_list();
 
     // 主循环：事件驱动，批量消费后单帧重绘。
+    //
+    // 帧统计（QAQH_TUI_DEBUG=1 展示）：帧数 / 消费的运行时消息数 / 整帧耗时，
+    // 每秒结算一次写回 `app.frame_stats`——把「wire 事件率」与「终端实际刷新率」
+    // 分开测量（前者来自 SSE，后者才是观感上限）。
+    let mut frames: u32 = 0;
+    let mut events: u32 = 0;
+    let mut draw_us: u64 = 0;
+    let mut stats_at = std::time::Instant::now();
     let loop_result: Result<()> = async {
         loop {
             if app.quit {
@@ -134,8 +142,11 @@ async fn run_tui(no_spawn: bool) -> Result<()> {
             // （ui::mod 的 transcript_content_width 是唯一事实源）。
             let area =
                 ratatui::layout::Rect::new(0, 0, terminal.size()?.width, terminal.size()?.height);
+            let frame_t0 = std::time::Instant::now();
             app.ensure_render_caches(area);
             terminal.draw(|f| ui::draw(f, &app))?;
+            draw_us += frame_t0.elapsed().as_micros() as u64;
+            frames += 1;
 
             // M4（T15）：Ctrl+T 浮层按 `e` 置位 → 帧间挂起终端交给 $PAGER。
             if let Some(text) = app.pending_pager.take() {
@@ -145,13 +156,30 @@ async fn run_tui(no_spawn: bool) -> Result<()> {
             let Some(msg) = app_rx.recv().await else {
                 break;
             };
+            if matches!(&msg, AppMsg::Runtime(_)) {
+                events += 1;
+            }
             app.handle(msg);
             // 排空积压（一帧内合并多个事件）。
             while let Ok(msg) = app_rx.try_recv() {
+                if matches!(&msg, AppMsg::Runtime(_)) {
+                    events += 1;
+                }
                 app.handle(msg);
                 if app.quit {
                     break;
                 }
+            }
+            if stats_at.elapsed() >= std::time::Duration::from_secs(1) {
+                app.frame_stats = FrameStats {
+                    fps: frames,
+                    events_per_s: events,
+                    draw_us: draw_us / u64::from(frames.max(1)),
+                };
+                frames = 0;
+                events = 0;
+                draw_us = 0;
+                stats_at = std::time::Instant::now();
             }
         }
         Ok(())
