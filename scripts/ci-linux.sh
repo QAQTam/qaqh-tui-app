@@ -18,10 +18,14 @@
 #
 # 这自 2026-09-15（T-01 迁移引入 path 依赖）起就让 `main` 的 CI 一直是红的。
 #
-# ── 版本策略（待定，见 docs/todo U-30）────────────────────────────────
-# 两个 rev **钉死**在下面，保证 CI 可复现。代价是 CI 与本地可能跑在不同版本上
-# （本地跟随各自仓的 main）。改动这里必须同步 `Cargo.toml` 里 [patch.crates-io]
-# 的注释。ratatui 用的是**上游未发版的 main**（ratatui#2743 修复尚未发版）。
+# ── 版本策略（2026-09-20 · W-05 / U-30 已决）──────────────────────────
+# 两个 rev **继续钉死**：跨仓 gate 必须可归因 —— 红了要能立刻分清「是本仓改动，
+# 还是后端/上游漂移」。代价是钉住的 rev 会落后，所以本脚本额外**报告落后多少**
+# （`report_drift`：只报告、不阻塞 —— 后端改造期间让 CI 因漂移变红只会烧掉
+# 稀缺额度，且那条红不指向本仓的任何改动）。
+# 刷新时机：**后端阶段性收口后由人确认**再改 rev；不要改成跟随 main。
+# 改动这里必须同步 `Cargo.toml` 里 [patch.crates-io] 的注释。
+# ratatui 用的是**上游未发版的 main**（ratatui#2743 修复尚未发版）。
 #
 # ── 严格模式 ─────────────────────────────────────────────────────────
 # `STRICT_DEPS=1`（CI 里由 .cnb.yml 设置）：兄弟仓库目录已存在时**也要校验 rev**，
@@ -104,6 +108,37 @@ prepare() {
     echo "  [$name] ✓ $got"
 }
 
+# $dir 的 HEAD 落后 $ref 多少个提交；不可用时返回非零且**不打印任何东西**。
+# 纯函数（只读本地 git 对象，不发网络请求），可被测试直接断言。
+count_behind() {
+    local dir="$1" ref="$2" got n
+    got=$(git -C "$dir" rev-parse HEAD 2>/dev/null) || return 1
+    n=$(git -C "$dir" rev-list --count "$got..$ref" 2>/dev/null) || return 1
+    printf '%s\n' "$n"
+}
+
+# U-30：报告钉住的 rev 落后远端默认分支多少（**只报告，不阻塞**）。
+#
+# 只在 STRICT_DEPS=1（CI）下调用：本机开发时兄弟仓库是开发者自己的工作树，
+# 不该在这里发网络请求 —— 与 prepare() 的「非严格模式不动你的工作树」同一条纪律。
+report_drift() {
+    local dir="$1" name="$2" behind
+    [ -d "$dir/.git" ] || return 0
+    if ! git -C "$dir" fetch --quiet origin main 2>/dev/null; then
+        echo "  [$name] 漂移检查跳过（fetch origin main 失败，可能离线）"
+        return 0
+    fi
+    if behind=$(count_behind "$dir" FETCH_HEAD); then
+        if [ "$behind" = "0" ]; then
+            echo "  [$name] 与 origin/main 一致"
+        else
+            echo "  [$name] ⚠ 钉住的 rev 落后 origin/main **$behind** 个提交（U-30：只报告，不阻塞）"
+        fi
+    else
+        echo "  [$name] 漂移检查跳过（无法计算落后提交数）"
+    fi
+}
+
 main() {
     local root parent tc_file tc
     root=$(git rev-parse --show-toplevel)
@@ -117,6 +152,14 @@ main() {
     prepare "$parent/qaqh-backend" "$QAQH_BACKEND_REPO" "$QAQH_BACKEND_REV" "qaqh-backend"
     prepare "$parent/ratatui" "$RATATUI_REPO" "$RATATUI_REV" "ratatui"
 
+    # U-30：钉死的 rev 落后多少（只报告，不阻塞）。仅 CI —— 本机不动开发者工作树。
+    if [ "${STRICT_DEPS:-0}" = "1" ]; then
+        echo
+        echo "== 依赖漂移（U-30：只报告，不阻塞）=="
+        report_drift "$parent/qaqh-backend" "qaqh-backend"
+        report_drift "$parent/ratatui" "ratatui"
+    fi
+
     # libssl-dev / pkg-config：为可能仍需要系统 TLS 头文件的构建准备（幂等）。
     if command -v apt-get >/dev/null 2>&1; then
         apt-get update -qq
@@ -125,11 +168,10 @@ main() {
 
     echo
     echo "== 工具链与组件 =="
-    # ⚠ 容易误诊的坑：CI 镜像是 `rust:1.98.1`，而本仓 `rust-toolchain.toml` 钉的是
-    # 1.98.0。两套 toolchain 在 rustup home 里并存、组件各自独立。cargo 在仓库目录
-    # 里运行时会按 rust-toolchain.toml 切到 1.98.0（此时才下载那套），而
-    # `rustup component add` 不带 `--toolchain` 时装的是**当前活动**那套。
-    # 所以「镜像里缺 fmt」是错的归因——真正会缺组件的是**仓库钉的那套**。
+    # U-28（2026-09-20）后镜像 tag 已对齐 `rust-toolchain.toml` 的 1.98.0，
+    # 「两套 toolchain 并存、组件装错那套」的旧坑不复存在。下面仍显式
+    # `--toolchain "$tc"`：组件必须装到**仓库钉的那套**上，而不是「当前活动」那套
+    # —— 这条纪律与镜像版本无关，留着是为了不把正确性押在「镜像恰好装齐组件」上。
     if command -v rustup >/dev/null 2>&1; then
         # 用绝对路径：`[ -f rust-toolchain.toml ]` 依赖 cwd，而 $root 已在手。
         tc_file="$root/rust-toolchain.toml"
