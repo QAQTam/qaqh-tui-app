@@ -54,6 +54,11 @@ PAGE_SIZE = 100
 BODY_LINE_CAP = 40          # stdout 里正文最多打多少行
 BODY_CHAR_CAP = 6000
 FETCH_PAUSE = 0.15          # 连续请求之间的礼貌间隔（秒）
+# 每 N 轮无条件重拉一次评论/评审面。兜底用：游标（`last_comment_id` / `last_review_id`）
+# 用 `max(...)` 单调推进、**从不回退**，而 `dirty` 只看计数与 `updated_at` —— 若对面
+# 「删一条 + 加一条」使计数恰好不变、且平台没有推进 `updated_at`，这两面根本不会重拉，
+# 新评论/评审会被静默漏掉（2026-09-20 打桩复现）。代价：每线程每 N 轮多一次请求。
+REFETCH_ROUNDS = 10
 CNB_TIMEOUT = 60
 
 
@@ -295,11 +300,14 @@ def poll_once(cur: dict, repo: str, *, baseline: bool = False) -> list[dict]:
         updated_at = iss.get("updated_at") or ""
         state = iss.get("state")
         state_changed = bool(not first_seen and prev.get("state") and prev["state"] != state)
-        dirty = first_seen or prev.get("comments") != comment_count or prev.get("updated_at") != updated_at
+        # `idle` = 连续未成功拉取评论面的轮数（本轮先记上）；到 REFETCH_ROUNDS 就无条件重拉。
+        idle = int(prev.get("idle", 0)) + 1
+        dirty = (first_seen or prev.get("comments") != comment_count
+                 or prev.get("updated_at") != updated_at or idle >= REFETCH_ROUNDS)
         if dirty:
             comments = fetch_issue_comments(repo, number)
             if comments is None:
-                # 读失败：不写 comments / last_comment_id / updated_at
+                # 读失败：不写 comments / last_comment_id / updated_at，也不重置 idle
                 # ⇒ 下一轮 `dirty` 仍为真，自动重拉。
                 pass
             else:
@@ -326,6 +334,10 @@ def poll_once(cur: dict, repo: str, *, baseline: bool = False) -> list[dict]:
                     ))
                 prev["comments"] = comment_count
                 prev["updated_at"] = updated_at
+                prev["idle"] = 0
+        else:
+            # 无变更：记下累计静默轮数；到 REFETCH_ROUNDS 就无条件重拉一次（兜底）。
+            prev["idle"] = idle
 
         if state_changed and not baseline:
             events.append(_make_event(
@@ -352,7 +364,9 @@ def poll_once(cur: dict, repo: str, *, baseline: bool = False) -> list[dict]:
         updated_at = pr.get("updated_at") or ""
 
         comments_ok = True
-        if first_seen or prev.get("comments") != comment_count or prev.get("updated_at") != updated_at:
+        idle_c = int(prev.get("idle_comments", 0)) + 1
+        if (first_seen or prev.get("comments") != comment_count
+                or prev.get("updated_at") != updated_at or idle_c >= REFETCH_ROUNDS):
             comments = fetch_pull_comments(repo, number)
             if comments is None:
                 # 读失败：不写 comments/last_comment_id，也不推进 updated_at（见下方 comments_ok）。
@@ -370,8 +384,12 @@ def poll_once(cur: dict, repo: str, *, baseline: bool = False) -> list[dict]:
                             ))
                     prev["last_comment_id"] = max((_comment_id(c) for c in comments), key=_id_key, default="")
                 prev["comments"] = comment_count
+                prev["idle_comments"] = 0
+        else:
+            prev["idle_comments"] = idle_c
 
-        if first_seen or prev.get("reviews") != review_count:
+        idle_r = int(prev.get("idle_reviews", 0)) + 1
+        if first_seen or prev.get("reviews") != review_count or idle_r >= REFETCH_ROUNDS:
             reviews = fetch_pull_reviews(repo, number)
             if reviews is None:
                 # 读失败：**绝不**写 reviews / last_review_id——旧实现会把 last_review_id
@@ -392,6 +410,9 @@ def poll_once(cur: dict, repo: str, *, baseline: bool = False) -> list[dict]:
                         ))
                 prev["reviews"] = review_count
                 prev["last_review_id"] = max((_comment_id(r) for r in reviews), key=_id_key, default="")
+                prev["idle_reviews"] = 0
+        else:
+            prev["idle_reviews"] = idle_r
 
         state = pr.get("state")
         mergeable = pr.get("mergeable_state") or ""
@@ -723,16 +744,21 @@ def cmd_selftest(args) -> int:
     down = {"issue_comments": True, "pull_comments": True, "reviews": True}  # 模拟「本轮没读到」
     # 两个面分开测：同时活着会让 `issue_new`/`pr_new`/`pr_comment` 混进断言。
     live = {"issues": True, "pulls": False}
+    # issue 评论面的可控返回（6c 要构造「删一条 + 加一条、计数与 updated_at 都不变」）。
+    fixed = {"count": 5, "comments": [_c("100"), _c("200", "补投")]}
+    calls = {"issue_comments": 0}          # 计数：钉住「兜底是每 N 轮一次，不是每轮都拉」
 
     def _stub(argv: list[str]) -> dict | None:
         if "list-issues" in argv:
-            return {"data": [_iss(comment_count=5)] if live["issues"] else [], "totalPages": 1}
+            return {"data": [_iss(comment_count=fixed["count"])] if live["issues"] else [],
+                    "totalPages": 1}
         if "list-pulls" in argv:
             return {"data": [_pull()] if live["pulls"] else [], "totalPages": 1}
         if "list-issue-comments" in argv:
+            calls["issue_comments"] += 1
             if down["issue_comments"]:
                 return None                              # 瞬时失败
-            return {"data": [_c("100"), _c("200", "补投")], "totalPages": 1}
+            return {"data": fixed["comments"], "totalPages": 1}
         if "list-pull-comments" in argv:
             if down["pull_comments"]:
                 return None
@@ -783,6 +809,31 @@ def cmd_selftest(args) -> int:
         ev = poll_once(cur2, "o/r")
         check("读失败恢复后：漏掉的评审必须补投",
               [e["kind"] for e in ev] == ["pr_review"] and ev[0]["cid"] == "1000")
+
+        # 6c) 兜底重拉：对面「删一条 + 加一条」使计数与 updated_at 都不变时，
+        #     游标（单调不回退）会悬空、`dirty` 又不为真 → 本来永远看不到新评论。
+        #     REFETCH_ROUNDS 轮后无条件重拉一次，必须补投。
+        live["issues"] = True
+        live["pulls"] = False
+        down["issue_comments"] = False
+        fixed["count"] = 3                              # 与游标里的计数相同
+        fixed["comments"] = [_c("100"), _c("200"), _c("400")]   # 300 被删、400 新增
+        cur3 = {"self": "QAQTam", "repo": "o/r", "seq": 0,
+                "issues": {"22": {"comments": 3, "updated_at": "2026-09-19T18:00:00Z",
+                                   "state": "open", "last_comment_id": "300"}},
+                "pulls": {}}
+        hits: list[tuple[int, str]] = []
+        calls["issue_comments"] = 0
+        for r in range(1, REFETCH_ROUNDS + 3):
+            ev = poll_once(cur3, "o/r")
+            hits += [(r, e["cid"]) for e in ev if e["kind"] == "issue_comment"]
+        check("兜底重拉：删+加且计数不变时，最迟 REFETCH_ROUNDS 轮内必须补投",
+              bool(hits) and hits[0][0] <= REFETCH_ROUNDS and hits[0][1] == "400",
+              f"实测 {hits}")
+        check("兜底重拉：只补投一次（不得重复投）", [c for _, c in hits] == ["400"], f"实测 {hits}")
+        check("兜底重拉：补投后游标到最新", cur3["issues"]["22"]["last_comment_id"] == "400")
+        check("兜底重拉：成功后重置计数 ⇒ 每 N 轮才拉一次（不得变成每轮都拉）",
+              calls["issue_comments"] == 1, f"实测拉了 {calls['issue_comments']} 次")
     finally:
         globals()["cnb_json"] = saved_json
 
