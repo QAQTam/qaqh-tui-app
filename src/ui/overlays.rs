@@ -194,7 +194,7 @@ fn draw_help(f: &mut Frame, area: Rect) {
         ("Ctrl+A", "添加附件（上传 → ContentRef）"),
         ("PgUp/PgDn", "滚动 transcript（PgUp 加载更早回合）"),
         ("Ctrl+Home/End", "顶部 / 底部"),
-        ("F3", "展开/折叠思考块"),
+        ("F3", "活动区（ActivityBar）显隐"),
         ("F4", "workspace 侧栏（todo 列表）开/关"),
         ("F6", "todo 详情展开/折叠"),
         ("F7", "工具输出展开/折叠（长输出/diff）"),
