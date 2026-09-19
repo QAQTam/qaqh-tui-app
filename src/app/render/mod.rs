@@ -215,6 +215,9 @@ pub(crate) fn refresh(
     stats.render_us = t0.elapsed().as_micros() as u64;
     stats.resident_blocks = count_resident(cache);
     cache.stats = stats;
+    // 把本次实际用的视口记进缓存，供 `ui::transcript::draw` 复用**同一份**几何
+    // （issue #33：draw 自己重算会用 refresh **之后**的 total，与这里用的 top 不一致）。
+    cache.viewport = viewport;
     stats
 }
 
@@ -422,7 +425,18 @@ fn flush_tool_group(
                 BlockBody::Height(0) // 组中间块：折叠态零行
             };
             let seg = match old_by_id.remove(b.block_id.as_str()) {
-                Some(s) if s.key == key => s,
+                Some(mut s) if s.key == key => {
+                    // 组行是 O(1) 的便宜物化：**复用时不得沿用淘汰后的 `Height` 占位**。
+                    //
+                    // 否则：淘汰把 `Lines(组行, 1 行)` 转成 `Height(1)`（保高度、丢内容）
+                    // → 下次对齐按键复用 → 物化循环发现「未渲染且高度>0」，用
+                    // `render_block_into` 按**单块**重渲——而它不认识「组」，会把组首块
+                    // 渲成整张卡（1 行 → 2 行），总行数随滚动漂移（锁 2 / W-09）。
+                    if !s.body.is_rendered() {
+                        s.body = body;
+                    }
+                    s
+                }
                 _ => BlockSeg {
                     key,
                     body,
@@ -955,6 +969,200 @@ mod tests {
             flatten(&old_empty.iter().collect::<Vec<_>>()),
         );
         anim::frame_override::clear();
+    }
+
+    // ── 锁 2：**任意滚动位置**的窗口逐行与全量渲染一致（几何不漂移）──
+
+    /// 锁 2 的夹具：回合数够深（能扫出多屏），四种形态轮转——纯文本 / 文本+工具卡 /
+    /// 工具卡 / 超长行，并混入归档回合。目的是让「估算高度」与「精确高度」
+    /// 有机会不一致（漂移只在这种情况下暴露）。
+    fn sweep_fixture(n: usize) -> SessionState {
+        let mut s = SessionState::new("seed".to_string());
+        for i in 0..n {
+            let blocks = match i % 4 {
+                0 => vec![blk(
+                    &format!("b{i}"),
+                    0,
+                    TimelineBlockKind::Text,
+                    TimelineBlockState::Sealed,
+                    "第一行\n第二行\n第三行",
+                )],
+                1 => vec![
+                    blk(
+                        &format!("b{i}"),
+                        0,
+                        TimelineBlockKind::Text,
+                        TimelineBlockState::Sealed,
+                        "```rust\nfn main() {}\n```",
+                    ),
+                    tool_blk(&format!("b{i}t"), 1, TimelineToolState::Succeeded),
+                ],
+                2 => vec![tool_blk(&format!("b{i}t"), 0, TimelineToolState::Failed)],
+                _ => vec![blk(
+                    &format!("b{i}"),
+                    0,
+                    TimelineBlockKind::Text,
+                    TimelineBlockState::Sealed,
+                    "这一行特别长用来测 CJK 宽字符在窄视口下的折行行为是否与全量渲染一致存在差异",
+                )],
+            };
+            let offloaded = i % 7 == 6;
+            s.timeline.turns.push(turn_of(
+                &format!("t{i}"),
+                &format!("问题 {i}"),
+                TimelineTurnState::Completed,
+                None,
+                offloaded,
+                blocks,
+            ));
+        }
+        s
+    }
+
+    /// **P0 回归锁（issue #33）**：按 app 的真实两步流程——
+    /// ① `ensure_render_caches` 用 refresh **之前**的 total 算 top（首帧缓存为空 ⇒ 0）；
+    /// ② `draw` 用 refresh **之后**的 total 重算 top。
+    /// 修复前两者不一致（`0` vs `670`）→ 窗口落在未渲染块 → `window()` 的 debug_assert 炸
+    /// （release 下静默取到 0 行）。修复后：app 侧迭代到不动点 + `draw` 复用
+    /// `cache.viewport` ⇒ 两处共用同一份几何。
+    #[test]
+    fn first_frame_viewport_is_fully_rendered() {
+        let sess = sweep_fixture(120);
+        let h = 30usize;
+        let mut cache = TranscriptCache::new(80);
+        // ① 首帧：缓存为空 → total=0 → top=0（调用方只能这么算）
+        // 走**生产路径**：`App::ensure_render_caches` 调的就是这个函数，
+        // 锁不去复刻那套循环（否则测的是锁自己，不是实现）。
+        crate::app::refresh_at_viewport(&sess, 80, h, &mut cache);
+        // ② draw 侧：用刷新后的 total 重算（现在应与 refresh 用的同一份）
+        let top_window = crate::ui::viewport_top(cache.total_lines(), h, true, 0);
+        assert_eq!(
+            cache.viewport,
+            Some((top_window, h)),
+            "refresh 与 draw 必须共用同一份视口几何（修复前：0 vs {top_window}）"
+        );
+        assert_eq!(
+            cache.unrendered_lines(top_window, h),
+            0,
+            "窗口内不得有未渲染块"
+        );
+        assert_eq!(
+            cache.window(top_window, h).len(),
+            h.min(cache.total_lines()),
+            "窗口应取满（修复前 release 下取到 0 行）"
+        );
+    }
+
+    /// B1「丢弃必须可见」：未渲染块占的行数必须能被报出来——`draw` 据此显式提示，
+    /// 而不是 release 下静默少行。
+    #[test]
+    fn unrendered_lines_reports_shortfall() {
+        let sess = sweep_fixture(20);
+        let mut cache = TranscriptCache::new(80);
+        refresh(&sess, 80, None, &mut cache); // 无视口 → 全驻留
+        assert_eq!(
+            cache.unrendered_lines(0, cache.total_lines()),
+            0,
+            "全驻留时不应有未渲染行"
+        );
+        // 人为淘汰第一回合：body 由 Lines 变成精确高度占位（未渲染）
+        let h0 = {
+            let t = &mut cache.turns[0];
+            evict_turn(t);
+            t.height()
+        };
+        assert!(h0 > 0);
+        assert_eq!(
+            cache.unrendered_lines(0, h0),
+            h0,
+            "淘汰后的行数必须被报为未渲染（否则 release 下就是静默少行）"
+        );
+    }
+
+    /// **不变式**：`window()` 取出的每一行都必须真实存在，且**在任意滚动位置上**
+    /// 都与一次性全量渲染逐行一致（视口内不得有未渲染块、几何不得漂移）。
+    ///
+    /// 这是虚拟化最容易破的地方：几何用估算、渲染用精确，两者一旦不同步，
+    /// 窗口就会缺行或错位（视觉上表现为「内容突然少了一截」）。
+    ///
+    /// **2026-09-20 补回**：本锁在 M1 迁移（`4372e11`）中随旧 `SegmentCache` 路径
+    /// 一起被删（旧位置 `render_transcript.rs:3775`），此后只剩
+    /// `offscreen_eviction_counts_blocks` 的**两个位置**（底/顶）作弱化替代，
+    /// 中间滚动位置的漂移无人覆盖。plan §3.7 的锁 2 即此。
+    ///
+    /// ⚠ **本锁一写出来就是红的**，它抓到的是：折叠组的**首块被淘汰后**，`evict_turn`
+    /// 把 `Lines(组行, 1 行)` 转成 `Height(1)`（保高度、丢内容）；下次对齐按键复用这个
+    /// 占位，物化循环发现「未渲染且高度>0」后用 `render_block_into` 按**单块**重渲——
+    /// 而它不认识「组」，把组首块渲成整张卡（1 行 → 2 行）→ 总行数随滚动漂移。
+    /// `sweep_fixture(120)` 实测 **21 个滚动位置全部漂移**（`total` 647 → 649/650/652…）。
+    ///
+    /// 修法见 `flush_tool_group`：组行是 O(1) 的便宜物化，复用时不得沿用淘汰占位。
+    #[test]
+    fn window_never_contains_unrendered_segments() {
+        let sess = sweep_fixture(120);
+        let full = render_transcript_with_opts(&sess, 80);
+        let full_flat: Vec<String> = full.iter().map(|l| flatten(&[l])).collect();
+
+        let mut cache = TranscriptCache::new(80);
+        refresh(&sess, 80, None, &mut cache);
+        let total = cache.total_lines();
+        assert_eq!(total, full_flat.len(), "无视口总行数必须与全量渲染一致");
+
+        let height = 30usize;
+        let mut top = total.saturating_sub(height);
+        let mut checked = 0usize;
+        loop {
+            refresh(&sess, 80, Some((top, height)), &mut cache);
+            assert_eq!(cache.total_lines(), total, "淘汰不得改变总行数");
+            let win = cache.window(top, height);
+            assert!(!win.is_empty() || top >= total, "top={top} 窗口不得为空");
+            for (i, line) in win.iter().enumerate() {
+                assert_eq!(
+                    flatten(&[*line]),
+                    full_flat[top + i],
+                    "top={top} 第 {i} 行与全量渲染不一致（几何漂移）"
+                );
+            }
+            checked += 1;
+            if top == 0 {
+                break;
+            }
+            top = top.saturating_sub(height);
+            assert!(checked <= 200, "滚动循环未终止");
+        }
+        assert!(checked > 1, "应至少检查两屏，实际 {checked}");
+    }
+
+    /// **首帧几何（W-11）**：生产首帧是「空缓存 + 视口」——此时视口外的块只有估算
+    /// 高度，总行数因此不得偏离全量渲染，否则滚动条与滚动位置随物化漂移。
+    ///
+    /// ⚠ **当前 `#[ignore]`：实测偏离 +53 行（700 vs 647）**，`sweep_fixture(120)` 按形态拆分：
+    ///
+    /// | 形态 | 偏差 | 成因 |
+    /// |---|---|---|
+    /// | 纯文本 3 行 | 0 | 估 = 实 |
+    /// | markdown 代码块 + 工具卡 | +26 / 30 回合 | 文本块按**原始行**折行估 3，markdown 实渲 2 |
+    /// | 单张 Failed 工具卡 | +27 / 30 回合 | 工具卡估 3，实渲 2（卡片头 + 体） |
+    /// | 超长单行 | 0 | 估 = 实 |
+    ///
+    /// 即估算与实渲在 **markdown / 工具卡**两条渲染器上系统性不一致。修法不是改常数，
+    /// 而是让估算复用渲染器的高度口径（单一事实源），或改布局语义（首次见到即冻结高度）
+    /// ——两者都是设计取舍，另立 W-11 决策，不在补锁的范围内。
+    #[ignore = "W-11：首帧估算偏离 +53 行（markdown / 工具卡两条渲染器）——估算精确化后摘除"]
+    #[test]
+    fn first_frame_estimate_matches_full_render() {
+        let sess = sweep_fixture(120);
+        let mut exact = TranscriptCache::new(80);
+        refresh(&sess, 80, None, &mut exact);
+        let total = exact.total_lines();
+
+        let mut fresh = TranscriptCache::new(80);
+        refresh(&sess, 80, Some((0, 30)), &mut fresh);
+        assert_eq!(
+            fresh.total_lines(),
+            total,
+            "首帧估算不得偏离全量渲染的总行数"
+        );
     }
 
     // ── 锁 3：流式 delta 只重渲一个块（且不惊动邻居的 Arc 身份） ────

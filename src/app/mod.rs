@@ -51,6 +51,15 @@ use session::{
     sync_streaming_from_timeline,
 };
 
+/// `ensure_render_caches` 里「refresh → 用刷新后的总行数重算视口顶端」的迭代上限。
+///
+/// 为什么要迭代：`refresh` 会把估算高度换成精确高度 ⇒ **总行数会在 refresh 中改变**，
+/// 用刷新前的 total 算出的 `top` 与 `draw` 用刷新后的 total 算出的 `top` 不一致，
+/// 窗口就会落到未渲染块上（issue #33）。实测首帧 2~3 趟收敛；上限只是防呆，
+/// 即使超出，`TranscriptCache::viewport` 仍保证 `draw` 取到**同一份**几何——
+/// 不变量不会破，最多滚动位置晚一帧收敛。
+const VIEWPORT_FIXPOINT_PASSES: usize = 4;
+
 /// 保留 timeline 模型的最近焦点标签数（LRU；超出者仅存轻状态，
 /// 重新聚焦时 re-baseline 重建 transcript）。对照 opencode sync 的
 /// "进入会话全量重取 + 滑动窗口" 策略。
@@ -1866,18 +1875,51 @@ impl App {
         let Some(sess) = self.sessions.get_mut(&active) else {
             return;
         };
-        // 视口顶端行号需先知道总行数，而总行数来自缓存本身（估算高度也算）。
-        // 首帧缓存为空时用 0——refresh 会渲染视口覆盖块，下一帧即收敛。
-        let total = sess.block_cache.as_ref().map_or(0, |c| c.total_lines());
-        let top = crate::ui::viewport_top(total, height, sess.scroll.follow, sess.scroll.offset);
         // 缓存内嵌于 SessionState：take 出来以满足 refresh 的 &SessionState 借用
         // （结构体 move 是指针搬运，O(1)）。
         let mut cache = sess
             .block_cache
             .take()
             .unwrap_or_else(|| render::TranscriptCache::new(width));
-        render::refresh(sess, width, Some((top, height)), &mut cache);
+        refresh_at_viewport(sess, width, height, &mut cache);
         sess.block_cache = Some(cache);
+    }
+}
+
+/// 视口不动点：在 `cache` 上把视口覆盖到的块渲染齐，供本帧 `draw` 取窗口。
+///
+/// 为什么要迭代：`refresh` 会把估算高度换成精确高度 ⇒ **总行数会在 refresh 中改变**，
+/// 用刷新前的 total 算出的 `top` 与 `draw` 用刷新后的 total 算出的 `top` 不一致，
+/// 窗口就会落到未渲染块上（issue #33：debug 直接 panic，release 静默空屏）。
+/// 所以迭代到「用刷新后的 total 算出的 top 与上一趟相同」为止；实测首帧 2~3 趟收敛，
+/// 第 2 趟起几乎全是复用（O(keep)）。上限只是防呆——即使超出，
+/// `TranscriptCache::viewport` 仍保证 `draw` 取到**同一份**几何，不变量不会破。
+///
+/// 抽成自由函数是为了**可测**：`app::render` 的回归锁直接调它，不必复刻这套循环。
+pub(crate) fn refresh_at_viewport(
+    sess: &SessionState,
+    width: u16,
+    height: usize,
+    cache: &mut render::TranscriptCache,
+) {
+    let mut top = crate::ui::viewport_top(
+        cache.total_lines(),
+        height,
+        sess.scroll.follow,
+        sess.scroll.offset,
+    );
+    for _ in 0..VIEWPORT_FIXPOINT_PASSES {
+        render::refresh(sess, width, Some((top, height)), cache);
+        let next = crate::ui::viewport_top(
+            cache.total_lines(),
+            height,
+            sess.scroll.follow,
+            sess.scroll.offset,
+        );
+        if next == top {
+            break;
+        }
+        top = next;
     }
 }
 
