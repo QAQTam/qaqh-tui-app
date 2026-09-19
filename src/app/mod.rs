@@ -1155,14 +1155,16 @@ impl App {
                 } else {
                     seed.clone()
                 };
+                // 不得清 `block_cache`：dashboard 只被 workspace 侧栏消费
+                // （`ui/sidebar.rs` 直接读 `sess.dashboard`），与 transcript 渲染
+                // 缓存无关；而 dashboard 在工具调用期高频更新（todo/最近改动），
+                // 清缓存会让每次工具调用触发整缓存重建（实测 ⟂ 峰值 466 ≈ 全量）。
                 if let Some(sess) = self.sessions.get_mut(&target) {
                     sess.dashboard = Some(snapshot);
-                    sess.block_cache = None;
                 } else if self.sessions.contains_key(&snapshot.seed)
                     && let Some(sess) = self.sessions.get_mut(&snapshot.seed)
                 {
                     sess.dashboard = Some(snapshot);
-                    sess.block_cache = None;
                 }
                 // replaceable 空快照（tasks=[]）时：老 daemon/丢帧后仍为空，主动回退 service 拉取。
                 let needs_fallback = self
@@ -1453,7 +1455,6 @@ impl App {
                                     && dash.documents.is_empty()
                                     && dash.recent_edits.is_empty();
                                 sess.dashboard = Some(dash);
-                                sess.block_cache = None;
                                 needs_fetch = is_empty;
                             }
                             None => {
@@ -1648,8 +1649,8 @@ impl App {
                                 || !dash.recent_edits.is_empty()
                                 || !dash.documents.is_empty())
                         {
+                            // 同上：dashboard 更新不触碰 transcript 渲染缓存。
                             sess.dashboard = Some(dash);
-                            sess.block_cache = None;
                         }
                     }
                     Err(_e) => {}
@@ -2439,6 +2440,59 @@ mod tests {
             app.sessions["root"].subagents[0].state,
             SubagentState::Closed,
             "会话已消失 → 挂在 root 名下的父条目收口为 Closed"
+        );
+    }
+
+    /// **渲染缓存纪律回归**（机主实测 ⟂ 峰值 466 的根因）：
+    /// dashboard（todo / 最近改动）只被 workspace 侧栏消费
+    /// （`ui/sidebar.rs` 直读 `sess.dashboard`），与 transcript 渲染缓存无关；
+    /// 而它在工具调用期高频更新——清缓存 = 每次工具调用整缓存重建
+    /// （实测 ⟂ 峰值 466 ≈ 全量重渲）。
+    ///
+    /// 证伪方式：把任一处 `sess.block_cache = None` 加回 dashboard 路径 → 本测试红。
+    #[test]
+    fn dashboard_updates_must_not_clear_transcript_cache() {
+        let (mut app, _rx) = app_with_tabs(&["seed"], 0);
+        app.sessions.get_mut("seed").unwrap().block_cache =
+            Some(crate::app::render::TranscriptCache::new(80));
+
+        let snapshot = || qaqh_client::DomainDashboardSnapshot {
+            seed: "seed".into(),
+            documents: Vec::new(),
+            recent_edits: vec!["src/lib.rs".into()],
+            tasks: Vec::new(),
+            current_todo_id: None,
+        };
+
+        // ① control 频道推送（daemon 主动推，工具调用期高频）。
+        let env = qaqh_client::RingingEventEnvelope::new(
+            "seed",
+            1,
+            1,
+            1,
+            "ev-dash-1",
+            qaqh_client::RingingEvent::Control(ControlEvent::DashboardSnapshot {
+                snapshot: snapshot(),
+            }),
+        );
+        app.handle(AppMsg::Runtime(RuntimeMsg::Ringing { env: Box::new(env) }));
+        assert!(
+            app.sessions["seed"].dashboard.is_some(),
+            "dashboard 必须被应用"
+        );
+        assert!(
+            app.sessions["seed"].block_cache.is_some(),
+            "DashboardSnapshot 不得清空 transcript 渲染缓存"
+        );
+
+        // ② service 拉取兜底路径（DashboardUpdated → fetch_dashboard 的结果）。
+        app.handle(AppMsg::Action(ActionResult::Dashboard {
+            seed: "seed".into(),
+            result: Ok(snapshot()),
+        }));
+        assert!(
+            app.sessions["seed"].block_cache.is_some(),
+            "Dashboard 结果不得清空 transcript 渲染缓存"
         );
     }
 }
