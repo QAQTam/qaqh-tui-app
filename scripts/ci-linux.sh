@@ -40,7 +40,7 @@ set -euo pipefail
 
 # 与 Cargo.toml 的 path 依赖对应。改动请同步 Cargo.toml 的注释。
 QAQH_BACKEND_REPO="${QAQH_BACKEND_REPO:-https://cnb.cool/QAQ-Harness/qaqh-backend.git}"
-QAQH_BACKEND_REV="${QAQH_BACKEND_REV:-8c1c1544fd9f9754275970d8aa338287ef20a440}"
+QAQH_BACKEND_REV="${QAQH_BACKEND_REV:-66539a0301cf193119e56b6397946a847d7f02df}"
 RATATUI_REPO="${RATATUI_REPO:-https://github.com/ratatui/ratatui.git}"
 RATATUI_REV="${RATATUI_REV:-e02e2a622eda6e4cae105df48a48f641cdba0303}"
 
