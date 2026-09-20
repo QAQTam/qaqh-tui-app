@@ -6,10 +6,14 @@
 
 #![allow(dead_code)] // M3.2 inline 接线前先冻结 API。
 
+use std::collections::VecDeque;
+
 use crate::terminal::commit::{CommitDecision, CommitId, CommitLedger, content_hash};
 use crate::ui::v2::transcript::{BlockState, TranscriptBlock};
 
-#[derive(Debug, Default)]
+const DEFAULT_PENDING_CAP: usize = 4096;
+
+#[derive(Debug, Clone, Default)]
 pub struct TranscriptCommitLedger {
     ledger: CommitLedger,
 }
@@ -58,14 +62,107 @@ impl TranscriptCommitLedger {
     }
 }
 
+/// 等待写入 terminal scrollback 的已决策提交。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingCommit {
+    pub seed: String,
+    pub block: TranscriptBlock,
+}
+
+/// projector 与 terminal 之间的提交泵。
+///
+/// - 只接收 `Sealed` block；
+/// - 队列有界，避免异常事件率把内存拉爆；
+/// - `drain_emittable` 通过 ledger 做最终幂等裁决；
+/// - 返回的条目已经被标记为 `Committed`，调用方只负责渲染和 `insert_before`。
+#[derive(Debug, Clone)]
+pub struct TranscriptCommitPump {
+    ledger: TranscriptCommitLedger,
+    pending: VecDeque<PendingCommit>,
+    cap: usize,
+    dropped: u64,
+}
+
+impl Default for TranscriptCommitPump {
+    fn default() -> Self {
+        Self::new(DEFAULT_PENDING_CAP)
+    }
+}
+
+impl TranscriptCommitPump {
+    pub fn new(cap: usize) -> Self {
+        Self {
+            ledger: TranscriptCommitLedger::new(),
+            pending: VecDeque::new(),
+            cap: cap.max(1),
+            dropped: 0,
+        }
+    }
+
+    pub fn enqueue(
+        &mut self,
+        seed: &str,
+        blocks: impl IntoIterator<Item = TranscriptBlock>,
+    ) -> usize {
+        let mut enqueued = 0;
+        for block in blocks {
+            if block.state != BlockState::Sealed {
+                continue;
+            }
+            if self.pending.len() == self.cap {
+                self.pending.pop_front();
+                self.dropped = self.dropped.saturating_add(1);
+            }
+            self.pending.push_back(PendingCommit {
+                seed: seed.to_string(),
+                block,
+            });
+            enqueued += 1;
+        }
+        enqueued
+    }
+
+    pub fn drain_emittable(&mut self) -> Vec<PendingCommit> {
+        let mut emitted = Vec::new();
+        while let Some(mut pending) = self.pending.pop_front() {
+            if self.ledger.commit_block(&pending.seed, &mut pending.block)
+                == Some(CommitDecision::Emit)
+            {
+                emitted.push(pending);
+            }
+        }
+        emitted
+    }
+
+    pub fn len(&self) -> usize {
+        self.pending.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.pending.is_empty()
+    }
+
+    pub fn dropped(&self) -> u64 {
+        self.dropped
+    }
+
+    pub fn ledger(&self) -> &TranscriptCommitLedger {
+        &self.ledger
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::ui::v2::transcript::{BlockKind, TranscriptBlock};
 
     fn sealed(text: &str) -> TranscriptBlock {
+        sealed_with_id("block-1", text)
+    }
+
+    fn sealed_with_id(id: &str, text: &str) -> TranscriptBlock {
         let mut block = TranscriptBlock::new(
-            "block-1",
+            id,
             BlockKind::Assistant {
                 text: text.to_string(),
             },
@@ -132,5 +229,49 @@ mod tests {
         .with_turn_id("turn-1");
         assert_eq!(ledger.commit_block("seed", &mut block), None);
         assert!(ledger.is_empty());
+    }
+
+    #[test]
+    fn pump_emits_in_order_and_deduplicates_replay() {
+        let mut pump = TranscriptCommitPump::new(8);
+        assert_eq!(
+            pump.enqueue("seed", [sealed_with_id("a", "a"), sealed_with_id("b", "b")]),
+            2
+        );
+        let emitted = pump.drain_emittable();
+        assert_eq!(emitted.len(), 2);
+        assert!(matches!(
+            emitted[0].block.kind,
+            BlockKind::Assistant { ref text } if text == "a"
+        ));
+        assert!(matches!(
+            emitted[1].block.kind,
+            BlockKind::Assistant { ref text } if text == "b"
+        ));
+
+        assert_eq!(pump.enqueue("seed", [sealed_with_id("a", "a")]), 1);
+        assert!(pump.drain_emittable().is_empty());
+    }
+
+    #[test]
+    fn pump_ignores_live_blocks_and_bounds_queue() {
+        let mut pump = TranscriptCommitPump::new(1);
+        let live = TranscriptBlock::new(
+            "live",
+            BlockKind::Assistant {
+                text: "live".to_string(),
+            },
+        )
+        .with_turn_id("turn-1");
+        assert_eq!(pump.enqueue("seed", [live]), 0);
+        assert!(pump.is_empty());
+
+        assert_eq!(pump.enqueue("seed", [sealed_with_id("first", "first")]), 1);
+        assert_eq!(
+            pump.enqueue("seed", [sealed_with_id("second", "second")]),
+            1
+        );
+        assert_eq!(pump.len(), 1);
+        assert_eq!(pump.dropped(), 1);
     }
 }

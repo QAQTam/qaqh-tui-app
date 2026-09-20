@@ -47,7 +47,7 @@ struct CommitRecord {
 }
 
 /// 进程内提交账本。
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct CommitLedger {
     records: HashMap<CommitId, CommitRecord>,
     order: Vec<CommitId>,
