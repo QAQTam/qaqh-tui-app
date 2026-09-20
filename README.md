@@ -14,8 +14,9 @@ cargo build --release
 ```
 
 环境变量：`QAQH_DATA_DIR`（数据目录覆盖，默认 `%USERPROFILE%\.qaqh`）、
-`QAQH_BACKEND_ROOT`（daemon 拉起候选根）。Bearer token 只从 `daemon.json`
-读入内存，永不落日志/URL。
+`QAQH_BACKEND_ROOT`（daemon 拉起候选根）、`QAQH_THEME`（`night` / `day` /
+`terminal` / `auto`）。`NO_COLOR` 存在时不输出颜色，只保留 glyph 与修饰符。
+Bearer token 只从 `daemon.json` 读入内存，永不落日志/URL。
 
 ### V2 inline 原型（实验）
 

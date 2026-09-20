@@ -1,6 +1,6 @@
 # QAQH TUI v2 Inline 原型报告（V2-M1）
 
-> 状态：**M1 原型完成；待 V2-M2 主题底座**
+> 状态：**M1 原型完成；M2 主题底座已接续**
 > 日期：2026-09-20
 > 上游计划：[`2026-09-20-v2视觉与交互重构-plan.md`](../plan/2026-09-20-v2视觉与交互重构-plan.md)
 > 关联规范：
@@ -174,10 +174,9 @@ cargo test --all-targets                     # 234 passed / 0 failed / 6 ignored
 
 ## 7. 下一步
 
-V2-M2：主题底座。
+V2-M3：Transcript v2。
 
-- 建立 `src/theme/`；
-- 实现 QAQH Night / Day / Terminal / Auto；
-- 实现 truecolor / 256 / 16 / NO_COLOR 降级；
-- 把 inline 原型改为消费 token；
-- 增加主题快照测试。
+- User / Assistant / Thinking / Tool 块；
+- 消费 `Theme::current()`；
+- 覆盖 CJK、宽字符、折叠、diff、工具状态；
+- 继续复用 commit ledger 与 inline viewport。

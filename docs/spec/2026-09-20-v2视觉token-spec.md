@@ -1,6 +1,6 @@
 # QAQH TUI v2 视觉 Token 规范
 
-> 状态：**V2-M0 冻结候选**
+> 状态：**V2-M2 主题底座已实现（2026-09-20）**
 > 日期：2026-09-20
 > 上游计划：[`2026-09-20-v2视觉与交互重构-plan.md`](../plan/2026-09-20-v2视觉与交互重构-plan.md)
 > 适用范围：v2 Agent View、Workspace View、Modal View、markdown、工具块、composer、status。

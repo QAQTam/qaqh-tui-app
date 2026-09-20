@@ -4,6 +4,7 @@ mod app;
 mod protocol;
 mod runtime;
 mod terminal;
+mod theme;
 mod ui;
 
 use anyhow::{Context, Result, bail};
@@ -34,7 +35,7 @@ fn main() -> Result<()> {
             println!("  qaqh-tui doctor     自检：发现/pid 判活/open 握手");
             println!();
             println!(
-                "环境: QAQH_DATA_DIR（数据目录覆盖）、QAQH_BACKEND_ROOT（daemon 拉起候选）、QAQH_DEFAULT_CWD（新建会话默认目录，支持 ~/ 展开）"
+                "环境: QAQH_DATA_DIR（数据目录覆盖）、QAQH_BACKEND_ROOT（daemon 拉起候选）、QAQH_DEFAULT_CWD（新建会话默认目录，支持 ~/ 展开）、QAQH_THEME=night|day|terminal|auto"
             );
             return Ok(());
         }

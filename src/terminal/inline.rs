@@ -11,14 +11,17 @@
 
 use anyhow::Result;
 use ratatui::crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers, read};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Widget};
 use ratatui::{DefaultTerminal, Frame, TerminalOptions, Viewport};
 
 use crate::terminal::commit::{CommitDecision, CommitId, CommitLedger, content_hash};
+use crate::theme::Theme;
 
 const VIEWPORT_HEIGHT: u16 = 7;
+/// 原型阶段先给 live buffer 一个明确上限，避免异常输入把 TUI 内存拖垮。
+const MAX_LIVE_BYTES: usize = 64 * 1024;
 
 /// 启动隔离的 inline 原型。
 pub fn run_prototype() -> Result<()> {
@@ -52,8 +55,9 @@ impl Default for PrototypeState {
 
 fn run_loop(terminal: &mut DefaultTerminal) -> Result<()> {
     let mut state = PrototypeState::default();
+    let theme = Theme::current();
     loop {
-        terminal.draw(|f| draw(f, &state))?;
+        terminal.draw(|f| draw(f, &state, theme))?;
         let key = match read()? {
             Event::Key(key) if key.kind == KeyEventKind::Press => key,
             Event::Resize(_, _) => {
@@ -65,19 +69,31 @@ fn run_loop(terminal: &mut DefaultTerminal) -> Result<()> {
         match key.code {
             KeyCode::Char('q') | KeyCode::Esc => break,
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => break,
-            KeyCode::Enter => commit_live(terminal, &mut state)?,
+            KeyCode::Enter => commit_live(terminal, &mut state, theme)?,
             KeyCode::Char('r') => replay_last(&mut state),
             KeyCode::Backspace => {
                 state.live.pop();
             }
-            KeyCode::Char(c) => state.live.push(c),
+            KeyCode::Char(c) => push_live(&mut state, c),
             _ => {}
         }
     }
     Ok(())
 }
 
-fn commit_live(terminal: &mut DefaultTerminal, state: &mut PrototypeState) -> Result<()> {
+fn push_live(state: &mut PrototypeState, c: char) {
+    if state.live.len().saturating_add(c.len_utf8()) > MAX_LIVE_BYTES {
+        state.status = format!("input limit {MAX_LIVE_BYTES} bytes reached");
+        return;
+    }
+    state.live.push(c);
+}
+
+fn commit_live(
+    terminal: &mut DefaultTerminal,
+    state: &mut PrototypeState,
+    theme: &Theme,
+) -> Result<()> {
     let text = state.live.trim().to_string();
     if text.is_empty() {
         state.status = "empty input · nothing committed".to_string();
@@ -89,7 +105,7 @@ fn commit_live(terminal: &mut DefaultTerminal, state: &mut PrototypeState) -> Re
     let hash = content_hash(&text);
     match state.ledger.commit(id.clone(), hash) {
         CommitDecision::Emit => {
-            let line = committed_line(seq, &text);
+            let line = committed_line(seq, &text, theme);
             terminal.insert_before(1, |buf| {
                 line.render(buf.area, buf);
             })?;
@@ -120,34 +136,39 @@ fn replay_last(state: &mut PrototypeState) {
     };
 }
 
-fn committed_line(seq: u64, text: &str) -> Line<'static> {
+fn committed_line<'a>(seq: u64, text: &'a str, theme: &Theme) -> Line<'a> {
     Line::from(vec![
-        Span::styled("  ❯ ", Style::new().fg(Color::Cyan)),
-        Span::styled(format!("#{seq} "), Style::new().fg(Color::DarkGray)),
-        Span::raw(text.to_string()),
+        Span::styled(
+            format!("  {} ", theme.glyph.user),
+            Style::new().fg(theme.accent.user),
+        ),
+        Span::styled(format!("#{seq} "), Style::new().fg(theme.text.dim)),
+        Span::styled(text, Style::new().fg(theme.text.primary)),
     ])
 }
 
-fn draw(f: &mut Frame, state: &PrototypeState) {
-    let dim = Style::new().fg(Color::DarkGray);
+fn draw(f: &mut Frame, state: &PrototypeState, theme: &Theme) {
+    let dim = Style::new().fg(theme.text.dim);
     let lines = vec![
         Line::from(vec![
             Span::styled(
                 "QAQH v2 inline prototype",
-                Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                Style::new()
+                    .fg(theme.accent.system)
+                    .add_modifier(Modifier::BOLD),
             ),
-            Span::styled("  · M1", dim),
+            Span::styled(format!("  {} M1", theme.glyph.system), dim),
         ]),
         Line::from(vec![
-            Span::styled("live ❯ ", Style::new().fg(Color::Magenta)),
-            Span::raw(state.live.clone()),
-            Span::styled("▌", Style::new().fg(Color::Magenta)),
+            Span::styled(
+                format!("live {} ", theme.glyph.user),
+                Style::new().fg(theme.accent.user),
+            ),
+            Span::styled(state.live.as_str(), Style::new().fg(theme.text.primary)),
+            Span::styled(theme.glyph.cursor, Style::new().fg(theme.accent.user)),
         ]),
-        Line::from(Span::styled(state.status.clone(), dim)),
-        Line::from(Span::styled(
-            "Enter commit · r replay last · q quit",
-            Style::new().fg(Color::DarkGray),
-        )),
+        Line::from(Span::styled(state.status.as_str(), dim)),
+        Line::from(Span::styled("Enter commit · r replay last · q quit", dim)),
     ];
     let block = Block::new()
         .borders(Borders::TOP | Borders::BOTTOM)
@@ -158,13 +179,19 @@ fn draw(f: &mut Frame, state: &PrototypeState) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::theme::{ColorSupport, ThemeKind};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use ratatui::layout::Rect;
 
+    fn test_theme() -> Theme {
+        Theme::resolve(ThemeKind::QaqhNight, ColorSupport::TrueColor)
+    }
+
     #[test]
     fn committed_line_contains_sequence_and_text() {
-        let line = committed_line(3, "hello");
+        let theme = test_theme();
+        let line = committed_line(3, "hello", &theme);
         let text: String = line
             .spans
             .iter()
@@ -172,6 +199,15 @@ mod tests {
             .collect();
         assert!(text.contains("#3"), "{text}");
         assert!(text.contains("hello"), "{text}");
+    }
+
+    #[test]
+    fn committed_line_uses_theme_tokens() {
+        let theme = test_theme();
+        let line = committed_line(3, "hello", &theme);
+        assert_eq!(line.spans[0].style.fg, Some(theme.accent.user));
+        assert_eq!(line.spans[1].style.fg, Some(theme.text.dim));
+        assert_eq!(line.spans[2].style.fg, Some(theme.text.primary));
     }
 
     #[test]
@@ -191,7 +227,18 @@ mod tests {
     }
 
     #[test]
-    fn inline_viewport_survives_resize() {
+    fn live_input_is_bounded() {
+        let mut state = PrototypeState {
+            live: "a".repeat(MAX_LIVE_BYTES),
+            ..Default::default()
+        };
+        push_live(&mut state, 'b');
+        assert_eq!(state.live.len(), MAX_LIVE_BYTES);
+        assert!(state.status.contains("input limit"), "{}", state.status);
+    }
+
+    #[test]
+    fn inline_viewport_survives_repeated_resize() {
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::with_options(
             backend,
@@ -200,13 +247,15 @@ mod tests {
             },
         )
         .expect("inline terminal");
+        let theme = test_theme();
 
-        terminal
-            .draw(|f| draw(f, &PrototypeState::default()))
-            .expect("first draw");
-        terminal.resize(Rect::new(0, 0, 100, 30)).expect("resize");
-        terminal
-            .draw(|f| draw(f, &PrototypeState::default()))
-            .expect("draw after resize");
+        for (width, height) in [(80, 24), (100, 30), (60, 18), (120, 40)] {
+            terminal
+                .resize(Rect::new(0, 0, width, height))
+                .expect("resize");
+            terminal
+                .draw(|f| draw(f, &PrototypeState::default(), &theme))
+                .expect("draw after resize");
+        }
     }
 }
