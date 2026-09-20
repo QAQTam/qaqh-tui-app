@@ -15,7 +15,7 @@ M4 把 V2 transcript runtime 接到真实 `Runtime` / `App` 事件循环，并�
 Agent View 的输入、状态与流式交互底座：
 
 - 新增实验入口 `--v2-agent` / `QAQH_V2_AGENT`；
-- 使用 `Viewport::Inline(10)`，不进入 alternate screen；
+- 使用固定 `Viewport::Inline(10)`，不进入 alternate screen（M6.1 已改为动态高度）；
 - 复用 v1 的 `Runtime`、`AppMsg`、`App` 状态机与全部协议处理；
 - 已封口 transcript 经 `V2TranscriptRuntime` 与 commit ledger 幂等写入 scrollback；
 - live block、composer、status、shortcuts 只占底部 inline viewport；
@@ -158,7 +158,8 @@ scripts/tests/ci-linux-parse-test.sh         # 15 passed / 0 failed
 ## 7. 已知边界
 
 - Workspace / Modal / 会话选择器 / 设置 / 权限 / ask / plan 的完整绘制由 M5 接入；
-- inline viewport 当前固定 10 行，内部布局自适应；真正动态 viewport 高度留到 M6；
+- M4 阶段 inline viewport 固定 10 行，内部布局自适应；动态高度已在
+  [`2026-09-20-v2-dynamic-inline-viewport-m6-1-report.md`](2026-09-20-v2-dynamic-inline-viewport-m6-1-report.md) 完成；
 - 分页加载更早回合的 scrollback 插入顺序尚未定义，M6 处理；
 - 仅实验入口启用，v1 仍是默认路径。
 

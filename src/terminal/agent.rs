@@ -38,11 +38,14 @@ use crate::ui::v2::transcript::{BlockState, render_transcript};
 use crate::ui::v2::workspace;
 use qaqh_client::ConversationMode;
 
-const VIEWPORT_HEIGHT: u16 = 10;
 const TICK_INTERVAL: Duration = Duration::from_millis(200);
 const COMMIT_CHUNK_BLOCKS: usize = 32;
-const MAX_COMPOSER_ROWS: usize = 4;
 const MAX_SLASH_ROWS: usize = 4;
+const MAX_VIEWPORT_HEIGHT: u16 = 16;
+const LIVE_VIEWPORT_ROWS: usize = 4;
+const NARROW_LIVE_VIEWPORT_ROWS: usize = 2;
+const NARROW_VIEWPORT_WIDTH: u16 = 40;
+const VIEWPORT_HEIGHT_PERCENT: u16 = 60;
 
 /// 启动真实 V2 Agent View。
 pub async fn run(no_spawn: bool) -> Result<()> {
@@ -63,7 +66,13 @@ pub async fn run(no_spawn: bool) -> Result<()> {
         .await
         .context("连接 daemon 失败")?;
 
-    let mut terminal = TerminalHost::init();
+    let mut app = App::new(runtime.clone(), app_tx.clone());
+    // V2 的 F4/Workspace 是 alternate-screen 工作区，不再复用 v1 常驻 sidebar。
+    app.show_workspace = false;
+    app.fetch_session_list();
+    let theme = Theme::current();
+    let initial_height = initial_inline_height(&app, theme);
+    let mut terminal = TerminalHost::init(initial_height);
     if let Err(error) = execute!(stdout(), EnableBracketedPaste) {
         ratatui::restore();
         runtime.shutdown().await;
@@ -73,12 +82,7 @@ pub async fn run(no_spawn: bool) -> Result<()> {
     spawn_input(app_tx.clone());
     spawn_tick(app_tx.clone());
 
-    let mut app = App::new(runtime.clone(), app_tx);
-    // V2 的 F4/Workspace 是 alternate-screen 工作区，不再复用 v1 常驻 sidebar。
-    app.show_workspace = false;
-    app.fetch_session_list();
     let mut agent = AgentState::default();
-    let theme = Theme::current();
 
     let result = run_loop(&mut terminal, &mut app_rx, &mut app, &mut agent, theme).await;
 
@@ -130,7 +134,13 @@ async fn run_loop(
             break;
         }
         let route = route::resolve(app);
+        let size = terminal.terminal.size()?;
+        let desired_height = inline_viewport_height(app, size.width, size.height, theme);
+        terminal.set_inline_height(desired_height);
         reconcile_screen(terminal, &route, app, agent, theme)?;
+        if route == ScreenRoute::Agent {
+            terminal.ensure_inline_height()?;
+        }
         terminal
             .terminal
             .draw(|frame| draw(frame, app, theme, &route))?;
@@ -191,16 +201,54 @@ fn screen_transition(mode: ScreenMode, route: &ScreenRoute) -> ScreenTransition 
 struct TerminalHost {
     terminal: DefaultTerminal,
     mode: ScreenMode,
+    inline_height: u16,
+    desired_inline_height: u16,
 }
 
 impl TerminalHost {
-    fn init() -> Self {
+    fn init(inline_height: u16) -> Self {
+        let inline_height = inline_height.max(1);
         Self {
             terminal: ratatui::init_with_options(TerminalOptions {
-                viewport: Viewport::Inline(VIEWPORT_HEIGHT),
+                viewport: Viewport::Inline(inline_height),
             }),
             mode: ScreenMode::Inline,
+            inline_height,
+            desired_inline_height: inline_height,
         }
+    }
+
+    fn set_inline_height(&mut self, height: u16) {
+        self.desired_inline_height = height.max(1);
+    }
+
+    /// 在当前 inline viewport 高度与布局需求不一致时重建 viewport。
+    ///
+    /// 只清理旧 viewport 区域，并把它锚定在原来的顶部；不会触碰已提交到
+    /// scrollback 的内容，也不会重放 transcript。
+    fn ensure_inline_height(&mut self) -> Result<()> {
+        if self.mode != ScreenMode::Inline || self.inline_height == self.desired_inline_height {
+            return Ok(());
+        }
+        self.rebuild_inline(self.desired_inline_height)
+    }
+
+    fn rebuild_inline(&mut self, height: u16) -> Result<()> {
+        let height = height.max(1);
+        let old_area = self.terminal.get_frame().area();
+        self.terminal.clear()?;
+        self.terminal
+            .set_cursor_position(Position::new(0, old_area.y))?;
+        self.terminal = Terminal::with_options(
+            CrosstermBackend::new(stdout()),
+            TerminalOptions {
+                viewport: Viewport::Inline(height),
+            },
+        )?;
+        self.inline_height = height;
+        self.desired_inline_height = height;
+        self.mode = ScreenMode::Inline;
+        Ok(())
     }
 
     fn enter_alternate(&mut self) -> Result<()> {
@@ -211,13 +259,15 @@ impl TerminalHost {
     }
 
     fn leave_alternate(&mut self) -> Result<()> {
+        let inline_height = self.desired_inline_height.max(1);
         execute!(stdout(), LeaveAlternateScreen)?;
         self.terminal = Terminal::with_options(
             CrosstermBackend::new(stdout()),
             TerminalOptions {
-                viewport: Viewport::Inline(VIEWPORT_HEIGHT),
+                viewport: Viewport::Inline(inline_height),
             },
         )?;
+        self.inline_height = inline_height;
         self.mode = ScreenMode::Inline;
         Ok(())
     }
@@ -244,9 +294,11 @@ impl TerminalHost {
             let _ = std::process::Command::new("cat").arg(&path).status();
         }
 
+        let inline_height = self.desired_inline_height.max(1);
         self.terminal = ratatui::init_with_options(TerminalOptions {
-            viewport: Viewport::Inline(VIEWPORT_HEIGHT),
+            viewport: Viewport::Inline(inline_height),
         });
+        self.inline_height = inline_height;
         self.mode = ScreenMode::Inline;
         execute!(stdout(), EnableBracketedPaste)?;
         if was_alternate {
@@ -385,6 +437,127 @@ struct AgentRender {
     cursor: Option<Position>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AgentLayout {
+    live_rows: usize,
+    slash_rows: usize,
+    composer_rows: usize,
+    status_rows: usize,
+    shortcuts_rows: usize,
+}
+
+impl AgentLayout {
+    fn height(self) -> usize {
+        self.live_rows
+            .saturating_add(self.slash_rows)
+            .saturating_add(self.composer_rows)
+            .saturating_add(self.status_rows)
+            .saturating_add(self.shortcuts_rows)
+    }
+}
+
+fn initial_inline_height(app: &App, theme: &Theme) -> u16 {
+    let (width, height) = ratatui::crossterm::terminal::size().unwrap_or((80, 24));
+    inline_viewport_height(app, width, height, theme)
+}
+
+/// 计算 inline viewport 的目标高度。
+///
+/// 高度由实际布局需求推导，并受终端高度的 60% 与绝对上限约束。终端过矮时，
+/// 先压缩 live/slash，再隐藏 shortcuts，最后才压缩 composer 与 status。
+fn inline_viewport_height(app: &App, width: u16, terminal_height: u16, theme: &Theme) -> u16 {
+    let terminal_height = terminal_height.max(1);
+    let ratio_height = terminal_height
+        .saturating_mul(VIEWPORT_HEIGHT_PERCENT)
+        .checked_div(100)
+        .unwrap_or(0)
+        .clamp(1, MAX_VIEWPORT_HEIGHT);
+    let max_height = ratio_height.min(terminal_height).max(1);
+
+    if app.active_session().is_none() {
+        return max_height.clamp(1, 3);
+    }
+
+    u16::try_from(agent_layout(app, width, max_height, theme).height())
+        .unwrap_or(u16::MAX)
+        .min(max_height)
+        .max(1)
+}
+
+fn agent_layout(app: &App, width: u16, available: u16, theme: &Theme) -> AgentLayout {
+    let available = usize::from(available.max(1));
+    let Some(session) = app.active_session() else {
+        return AgentLayout {
+            live_rows: 0,
+            slash_rows: 0,
+            composer_rows: 0,
+            status_rows: 0,
+            shortcuts_rows: 0,
+        };
+    };
+
+    let narrow = width < NARROW_VIEWPORT_WIDTH;
+    let min_composer = if narrow {
+        1
+    } else {
+        usize::from(theme.spacing.composer_min_height.max(1))
+    };
+    let max_composer = usize::from(theme.spacing.composer_max_height.max(1)).max(min_composer);
+    let preferred_composer = composer_visual_rows(session, width, theme)
+        .clamp(min_composer.min(available), max_composer.min(available));
+    let preferred_slash = slash_menu_rows(app);
+    let preferred_live = if narrow {
+        NARROW_LIVE_VIEWPORT_ROWS
+    } else {
+        LIVE_VIEWPORT_ROWS
+    };
+    let preferred_status = usize::from(theme.spacing.status_height.max(1));
+    let preferred_shortcuts = if narrow {
+        0
+    } else {
+        usize::from(theme.spacing.shortcuts_height.max(1))
+    };
+
+    let mut layout = AgentLayout {
+        live_rows: preferred_live,
+        slash_rows: preferred_slash,
+        composer_rows: preferred_composer,
+        status_rows: if available >= 2 { preferred_status } else { 0 },
+        shortcuts_rows: preferred_shortcuts,
+    };
+
+    // 高度不足时按“正文优先、chrome 降级”的顺序收缩。composer 至少保留
+    // 一行；只有终端高度连 composer + status 都放不下时才牺牲 status。
+    while layout.height() > available {
+        if layout.live_rows > 0 {
+            layout.live_rows -= 1;
+        } else if layout.slash_rows > 0 {
+            layout.slash_rows -= 1;
+        } else if layout.shortcuts_rows > 0 {
+            layout.shortcuts_rows = 0;
+        } else if layout.composer_rows > 1 {
+            layout.composer_rows -= 1;
+        } else if layout.status_rows > 0 {
+            layout.status_rows = 0;
+        } else {
+            break;
+        }
+    }
+    layout
+}
+
+fn composer_visual_rows(
+    session: &crate::app::session::SessionState,
+    width: u16,
+    theme: &Theme,
+) -> usize {
+    let prefix = format!("{} ", theme.glyph.user);
+    let text_width = usize::from(width).saturating_sub(prefix.width()).max(1);
+    build_composer_rows(&session.composer.input, session.composer.cursor, text_width)
+        .0
+        .len()
+}
+
 fn render_agent(app: &App, width: u16, height: u16, theme: &Theme) -> AgentRender {
     let height = usize::from(height.max(1));
     let Some(session) = app.active_session() else {
@@ -406,25 +579,16 @@ fn render_agent(app: &App, width: u16, height: u16, theme: &Theme) -> AgentRende
         };
     };
 
-    // 底部固定 status + shortcuts；其余空间优先给 composer，再给 slash 菜单，
-    // 最后才给 live transcript。窄屏不会把输入区挤出 viewport。
-    let footer = 2usize;
-    let body_capacity = height.saturating_sub(footer);
-    let slash_capacity = slash_menu_capacity(app, body_capacity);
-    let composer_capacity =
-        composer_capacity(session, body_capacity.saturating_sub(slash_capacity));
-    let live_capacity = body_capacity
-        .saturating_sub(slash_capacity)
-        .saturating_sub(composer_capacity);
+    let layout = agent_layout(app, width, u16::try_from(height).unwrap_or(u16::MAX), theme);
 
     let blocks: Vec<_> = adapter::from_turns(&session.timeline.turns)
         .into_iter()
         .filter(|block| block.state == BlockState::Live)
         .collect();
     let live = render_transcript(&blocks, width, theme);
-    let live_start = live.len().saturating_sub(live_capacity);
+    let live_start = live.len().saturating_sub(layout.live_rows);
     let mut lines: Vec<Line<'static>> = live[live_start..].to_vec();
-    while lines.len() < live_capacity {
+    while lines.len() < layout.live_rows {
         lines.push(Line::default());
     }
 
@@ -434,18 +598,25 @@ fn render_agent(app: &App, width: u16, height: u16, theme: &Theme) -> AgentRende
         *last = overlay_hint(overlay, theme);
     }
 
-    lines.extend(slash_menu_lines(app, width, theme, slash_capacity));
+    lines.extend(slash_menu_lines(app, width, theme, layout.slash_rows));
     let composer_start = lines.len();
     let composer = composer_lines(
         &session.composer.input,
         session.composer.cursor,
         width,
         theme,
-        composer_capacity,
+        layout.composer_rows,
     );
     lines.extend(composer.lines);
-    lines.push(status_line(app, width, theme));
-    lines.push(shortcuts_line(app, width, theme));
+    while lines.len() < composer_start.saturating_add(layout.composer_rows) {
+        lines.push(Line::default());
+    }
+    if layout.status_rows > 0 {
+        lines.push(status_line(app, width, theme));
+    }
+    if layout.shortcuts_rows > 0 {
+        lines.push(shortcuts_line(app, width, theme));
+    }
     lines.truncate(height);
 
     let cursor_y = composer_start
@@ -461,17 +632,6 @@ struct ComposerRender {
     lines: Vec<Line<'static>>,
     cursor_row: usize,
     cursor_x: u16,
-}
-
-fn composer_capacity(session: &crate::app::session::SessionState, available: usize) -> usize {
-    let input_rows = session
-        .composer
-        .input
-        .iter()
-        .filter(|ch| **ch == '\n')
-        .count()
-        .saturating_add(1);
-    input_rows.clamp(1, MAX_COMPOSER_ROWS).min(available.max(1))
 }
 
 fn composer_lines(
@@ -582,14 +742,11 @@ fn overlay_hint(overlay: &Overlay, theme: &Theme) -> Line<'static> {
     Line::from(Span::styled(text, Style::new().fg(theme.semantic.warning)))
 }
 
-fn slash_menu_capacity(app: &App, available: usize) -> usize {
+fn slash_menu_rows(app: &App) -> usize {
     if !app.overlays.is_empty() || app.inspecting() {
         return 0;
     }
-    app.slash_candidates()
-        .len()
-        .min(MAX_SLASH_ROWS)
-        .min(available.saturating_sub(1))
+    app.slash_candidates().len().min(MAX_SLASH_ROWS)
 }
 
 fn slash_menu_lines(app: &App, width: u16, theme: &Theme, capacity: usize) -> Vec<Line<'static>> {
@@ -941,6 +1098,75 @@ mod tests {
     }
 
     #[test]
+    fn dynamic_viewport_grows_for_composer_and_slash_menu() {
+        let mut app = app_with_model(TimelineModel::default());
+        let theme = test_theme();
+        let base = inline_viewport_height(&app, 80, 40, &theme);
+
+        let session = app.sessions.get_mut("seed-1").expect("session");
+        session.composer.input = "line\n".repeat(8).chars().collect();
+        session.composer.cursor = session.composer.input.len();
+        let grown = inline_viewport_height(&app, 80, 40, &theme);
+        assert!(grown > base, "base={base}, grown={grown}");
+        assert!(grown <= MAX_VIEWPORT_HEIGHT, "grown={grown}");
+
+        let session = app.sessions.get_mut("seed-1").expect("session");
+        session.composer.input = vec!['/'];
+        session.composer.cursor = 1;
+        let slash = inline_viewport_height(&app, 80, 40, &theme);
+        assert!(slash > base, "base={base}, slash={slash}");
+        assert!(slash <= MAX_VIEWPORT_HEIGHT, "slash={slash}");
+    }
+
+    #[test]
+    fn narrow_viewport_hides_shortcuts_and_preserves_composer_tail() {
+        let mut app = app_with_model(TimelineModel::default());
+        let input = "这是一个很长的中文输入，用来验证窄屏横向窗口";
+        let session = app.sessions.get_mut("seed-1").expect("session");
+        session.composer.input = input.chars().collect();
+        session.composer.cursor = session.composer.input.len();
+        let theme = test_theme();
+
+        let height = inline_viewport_height(&app, 20, 8, &theme);
+        assert!(height <= 4, "height={height}");
+        let layout = agent_layout(&app, 20, height, &theme);
+        assert_eq!(layout.shortcuts_rows, 0);
+        assert!(layout.composer_rows >= 1);
+        assert_eq!(layout.status_rows, 1);
+
+        let rendered = render_agent(&app, 20, height, &theme);
+        let text: String = rendered
+            .lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert!(text.contains("横向窗口"), "{text}");
+        assert!(rendered.lines.len() <= usize::from(height));
+    }
+
+    #[test]
+    fn viewport_height_respects_screen_ratio_and_cap() {
+        let app = app_with_model(TimelineModel::default());
+        let theme = test_theme();
+        for terminal_height in [1, 2, 4, 8, 24, 40, 80] {
+            let height = inline_viewport_height(&app, 80, terminal_height, &theme);
+            let expected_cap = terminal_height
+                .saturating_mul(VIEWPORT_HEIGHT_PERCENT)
+                .checked_div(100)
+                .unwrap_or(0)
+                .clamp(1, MAX_VIEWPORT_HEIGHT)
+                .min(terminal_height)
+                .max(1);
+            assert!(
+                height <= expected_cap,
+                "screen={terminal_height}, height={height}"
+            );
+            assert!(height >= 1);
+        }
+    }
+
+    #[test]
     fn slash_menu_tracks_selection_and_stays_in_viewport() {
         let mut app = app_with_model(TimelineModel::default());
         let session = app.sessions.get_mut("seed-1").expect("session");
@@ -1011,7 +1237,7 @@ mod tests {
         let mut terminal = Terminal::with_options(
             backend,
             TerminalOptions {
-                viewport: Viewport::Inline(VIEWPORT_HEIGHT),
+                viewport: Viewport::Inline(10),
             },
         )
         .expect("inline terminal");
@@ -1041,7 +1267,7 @@ mod tests {
         let mut terminal = Terminal::with_options(
             backend,
             TerminalOptions {
-                viewport: Viewport::Inline(VIEWPORT_HEIGHT),
+                viewport: Viewport::Inline(10),
             },
         )
         .expect("inline terminal");
