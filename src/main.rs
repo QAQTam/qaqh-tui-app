@@ -32,6 +32,7 @@ fn main() -> Result<()> {
             println!("  qaqh-tui            连接本地 daemon 并进入 TUI");
             println!("  qaqh-tui --no-spawn 不自动拉起 daemon（仅连接已有实例）");
             println!("  qaqh-tui --v2-inline 启动 V2 inline 原型（实验，不连接 daemon）");
+            println!("  qaqh-tui --v2-agent 启动 V2 Agent View（实验，连接 daemon）");
             println!("  qaqh-tui doctor     自检：发现/pid 判活/open 握手");
             println!();
             println!(
@@ -51,6 +52,11 @@ fn main() -> Result<()> {
         .enable_all()
         .build()
         .context("构建 tokio runtime")?;
+    if args.iter().any(|arg| arg == "--v2-agent") || std::env::var_os("QAQH_V2_AGENT").is_some() {
+        return runtime.block_on(terminal::agent::run(
+            !args.iter().any(|arg| arg == "--no-spawn"),
+        ));
+    }
     runtime.block_on(run_tui(args.iter().any(|a| a == "--no-spawn")))
 }
 
