@@ -23,7 +23,7 @@ mod estimates;
 mod seg;
 mod stream;
 
-pub(crate) use seg::{AnimKind, AnimSlot, TranscriptCache, ViewportSlot};
+pub(crate) use seg::{AnimKind, AnimSlot, BlockBody, TranscriptCache, ViewportSlot};
 
 use std::collections::HashMap;
 
@@ -36,9 +36,12 @@ use crate::app::session::SessionState;
 use crate::app::timeline_model::{Block, Turn};
 use qaqh_client::{TimelineBlockKind, TimelineBlockState, TimelineToolState};
 
-use seg::{BlockBody, BlockSeg, RenderStats, TurnSeg};
+use seg::{BlockSeg, RenderStats, TurnSeg};
 
-/// 布局不动点迭代上限（与旧 `MAX_LAYOUT_PASSES` 同值，防御性护栏）。
+/// 布局不动点迭代上限（防御性护栏）。
+///
+/// ⚠ 与 `app::VIEWPORT_FIXPOINT_PASSES` **数值相同但语义不同**（那个是「视口不动点」）：
+/// 两者分居两文件，**改一个不必改另一个**。
 const MAX_LAYOUT_PASSES: usize = 4;
 
 /// 块级刷新：与 `refresh_segments_at` 同语义，粒度为块。
@@ -1149,6 +1152,26 @@ mod tests {
             fresh.total_lines(),
             total,
             "首帧估算不得偏离全量渲染的总行数"
+        );
+    }
+
+    /// **不动点稳定性**（NPC 建议 ①）：连跑两帧 `refresh_at_viewport`（同 width/height），
+    /// 第二帧必须**零重炳**且 total 不变——否则「每帧都在重算几何」，不动点没收敛。
+    #[test]
+    fn second_frame_refreshes_nothing() {
+        let sess = sweep_fixture(120);
+        let mut cache = TranscriptCache::new(80);
+        crate::app::refresh_at_viewport(&sess, 80, 30, &mut cache);
+        let total = cache.total_lines();
+        crate::app::refresh_at_viewport(&sess, 80, 30, &mut cache);
+        assert_eq!(
+            cache.total_lines(),
+            total,
+            "第二帧 total 不得变（几何已不动点）"
+        );
+        assert_eq!(
+            cache.stats.rebuilt_blocks, 0,
+            "第二帧不应重炳任何块（否则每帧都在重算）"
         );
     }
 

@@ -350,6 +350,111 @@ mod tests {
         );
     }
 
+    /// **B1 提示必须可见（评审阻断 1）**：`unrendered > 0` 时原实现把提示 `push` 到第
+    /// `height` 行**之后**，而 `Paragraph` 只画 `height` 行 → 提示被裁掉，仍然是静默少行。
+    /// 「未渲染必须可见」只在**原始空屏**（`window()` 取不满）那种场景碰巧成立。
+    ///
+    /// 这里**强制制造坏缓存**（`ensure` 之后、`draw` 之前：视口钉到顶部 + 淘汰首回合），
+    /// 复刻评审给出的实测形态：`unrendered_lines(0,30) > 0` 且 `window(0,30).len() == 30`
+    /// —— 即“窗口取满、提示仍会被裁”。断言提示**真的出现在渲染缓冲里**，而不是只数计数。
+    ///
+    /// 证伪：撤掉 `transcript.rs` 的 `truncate(height - 1)` → 本锁红（提示落在第 31 行被裁）。
+    ///
+    /// ⚠ **只在 release 下存在**（`cfg(not(debug_assertions))`）：坏缓存态在 debug 下会先
+    /// 撞上 `window()` 里的 `debug_assert!`（`seg.rs:251`），根本走不到 `draw` —— 这正是
+    /// issue #33 的 debug/release 差异。所以：
+    ///
+    /// ```text
+    /// cargo test --release --bin qaqh-tui unrendered_hint_is_actually_drawn
+    /// ```
+    ///
+    /// debug 下由 `unrendered_hint_replaces_last_line`（直测拼装函数）把关。
+    #[cfg(not(debug_assertions))]
+    #[test]
+    fn unrendered_hint_is_actually_drawn() {
+        let turns = (0..12u32)
+            .map(|i| {
+                turn(
+                    &format!("t{i}"),
+                    TimelineTurnState::Completed,
+                    vec![text_block(&format!("b{i}"), 0, "第一行\n第二行\n第三行")],
+                )
+            })
+            .collect();
+        let mut app = app_with(turns);
+        let area = Rect::new(0, 0, 80, 30);
+        app.ensure_render_caches(area);
+        {
+            let cache = app
+                .sessions
+                .get_mut("seed")
+                .and_then(|s| s.block_cache.as_mut())
+                .expect("缓存应已建立");
+            // 视口钉到顶部（评审实测形态），再淘汰首回合：它在视口内、不再是 Lines
+            // ⇒ unrendered > 0，但后面的回合会把窗口补满。
+            //
+            // ⚠ 高度必须取缓存**自己的**视口高度：`draw` 里的 transcript 高度 = 传入的
+            // 30 减去 tab bar / composer / 活动条，硬编码 30 会让 `draw` 的
+            // `h == height` 守卫失配 → 退回兜底全量渲染，锁就测不到目标路径。
+            let h = cache.viewport.expect("ensure 之后应有视口").1;
+            cache.viewport = Some((0, h));
+            let t = &mut cache.turns[0];
+            t.pre.body = crate::app::render::BlockBody::Height(t.pre.body.height());
+            for b in t.content.iter_mut() {
+                b.body = crate::app::render::BlockBody::Height(b.body.height());
+            }
+            t.post.body = crate::app::render::BlockBody::Height(t.post.body.height());
+            assert!(
+                cache.unrendered_lines(0, h) > 0,
+                "坏缓存构造失败：视口内应有未渲染行"
+            );
+            assert_eq!(
+                cache.window(0, h).len(),
+                h,
+                "本锁要复刻的是「窗口取满、提示仍被裁」那种形态"
+            );
+        }
+        let text = draw_only(&mut app, 80, 30);
+        assert!(
+            text.contains("未渲染"),
+            "提示必须真的画出来（否则仍是静默少行）\n{text}"
+        );
+    }
+
+    /// **提示拼装（评审阻断 1，debug 可跑的那一半）**：窗口取满 `height` 行时，提示必须
+    /// **挤掉最后一行**而不是被 `Paragraph` 裁掉；`height == 0` / `unrendered == 0` 时不动。
+    #[test]
+    fn unrendered_hint_replaces_last_line() {
+        let mut visible: Vec<ratatui::text::Line> = (0..30)
+            .map(|i| ratatui::text::Line::from(format!("行{i}")))
+            .collect();
+        super::transcript::attach_unrendered_hint(&mut visible, 3, 30);
+        assert_eq!(
+            visible.len(),
+            30,
+            "提示不得让总行数超过 height（否则 Paragraph 会裁掉它）"
+        );
+        let last: String = visible
+            .last()
+            .expect("应有最后一行")
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert!(
+            last.contains("未渲染"),
+            "提示必须落在最后一行，实得「{last}」"
+        );
+
+        // 空视口 / 零行：不得越界，也不得凭空插行
+        let mut empty: Vec<ratatui::text::Line> = Vec::new();
+        super::transcript::attach_unrendered_hint(&mut empty, 3, 0);
+        assert!(empty.is_empty(), "height == 0 时不应插行");
+        let mut clean: Vec<ratatui::text::Line> = vec![ratatui::text::Line::from("行0")];
+        super::transcript::attach_unrendered_hint(&mut clean, 0, 30);
+        assert_eq!(clean.len(), 1, "unrendered == 0 时不应动窗口");
+    }
+
     fn turn(id: &str, state: TimelineTurnState, blocks: Vec<Block>) -> Turn {
         Turn {
             turn_id: id.into(),
@@ -381,8 +486,12 @@ mod tests {
 
     /// 渲染一帧并提取纯文本（每行 trim 尾；宽字符后继占位 cell 不重复拼入）。
     fn draw_text(app: &mut App, w: u16, h: u16) -> String {
-        let area = Rect::new(0, 0, w, h);
-        app.ensure_render_caches(area);
+        app.ensure_render_caches(Rect::new(0, 0, w, h));
+        draw_only(app, w, h)
+    }
+
+    /// 只画一帧、**不**维护缓存——给「强制坏缓存」的锁用（`ensure` 会把坏状态修好）。
+    fn draw_only(app: &mut App, w: u16, h: u16) -> String {
         let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
         terminal.draw(|f| crate::ui::draw(f, app)).unwrap();
         let buf = terminal.backend().buffer();
