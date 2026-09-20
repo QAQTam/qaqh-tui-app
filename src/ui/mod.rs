@@ -20,6 +20,7 @@ pub mod status_bar;
 pub mod tab_bar;
 pub mod theme;
 pub mod transcript;
+pub mod v2;
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
