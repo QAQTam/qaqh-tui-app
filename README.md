@@ -28,7 +28,7 @@ cargo run -- --v2-inline
 commit ledger。`Enter` 提交一行，`r` 重放最近一次提交（应被幂等拒绝），`q` 退出。
 正式 v1 默认路径不受影响。
 
-### V2 Agent View（实验，M4.1）
+### V2 Agent View（实验，M4）
 
 ```bash
 cargo run -- --v2-agent
@@ -36,10 +36,12 @@ cargo run -- --v2-agent
 
 连接 daemon，复用现有 Runtime/App 状态；已封口 transcript 通过 V2 projector 与
 commit ledger 写入终端 scrollback，live block、composer、status 与 shortcuts 留在
-底部 inline viewport。该模式不启用鼠标捕获，保留终端原生选择/复制；`Ctrl+Q` 退出。
+底部 inline viewport。composer 支持多行与宽字符折行，slash 菜单、model/mode/cwd、
+usage、附件与连接告警均已接入。该模式不启用鼠标捕获，保留终端原生选择/复制；
+`Ctrl+Q` 退出。
 
-M4.1 只冻结 Agent 外壳与提交接线：Workspace/Modal、完整快捷键和会话选择器仍由
-v1 路径承担，后续 M4/M5 切片继续迁移。`--no-spawn` 与 v1 语义一致。
+Workspace/Modal、会话选择器、设置、权限/ask/plan 仍由 M5 迁移；M4 只覆盖默认
+Agent View 的输入、状态、shortcuts 与 live transcript。`--no-spawn` 与 v1 语义一致。
 
 ## 界面与按键
 
