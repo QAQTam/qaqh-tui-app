@@ -44,7 +44,7 @@ pub fn from_turn(turn: &Turn) -> Vec<TranscriptBlock> {
     }
     for round in &turn.rounds {
         for block in &round.blocks {
-            if let Some(block) = from_block(&turn.turn_id, block) {
+            if let Some(block) = from_block(&turn.turn_id, turn.sealed, block) {
                 blocks.push(block);
             }
         }
@@ -52,10 +52,14 @@ pub fn from_turn(turn: &Turn) -> Vec<TranscriptBlock> {
     blocks
 }
 
-fn from_block(turn_id: &str, block: &Block) -> Option<TranscriptBlock> {
-    let state = match block.state {
-        TimelineBlockState::Open => BlockState::Live,
-        TimelineBlockState::Sealed => BlockState::Sealed,
+fn from_block(turn_id: &str, turn_sealed: bool, block: &Block) -> Option<TranscriptBlock> {
+    let state = if turn_sealed {
+        BlockState::Sealed
+    } else {
+        match block.state {
+            TimelineBlockState::Open => BlockState::Live,
+            TimelineBlockState::Sealed => BlockState::Sealed,
+        }
     };
     let kind = match block.kind {
         TimelineBlockKind::Reasoning => {

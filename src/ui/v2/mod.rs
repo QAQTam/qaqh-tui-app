@@ -4,4 +4,5 @@
 //! status、workspace 与 modal 继续放在此目录下。
 
 pub mod adapter;
+pub mod projector;
 pub mod transcript;
