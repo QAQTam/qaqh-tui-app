@@ -1,6 +1,6 @@
 # QAQH TUI v2 v1/v2 Parity Matrix
 
-> 状态：**V2-M0 冻结候选**
+> 状态：**V2-M5 已完成；permission/ask/plan 完整 PTY 故障注入待 M6**
 > 日期：2026-09-20
 > 上游计划：[`2026-09-20-v2视觉与交互重构-plan.md`](../plan/2026-09-20-v2视觉与交互重构-plan.md)
 > 关联规范：
@@ -44,11 +44,11 @@ v2 可以在视觉与终端模型上重构，但不能静默降低 QAQH 的核�
 | P-05 | 流式回复 | 全屏重绘 | inline live viewport | Intentionally changed | 不写 scrollback，seal 后提交 |
 | P-06 | 工具调用 | 工具卡 | ToolBlock / ToolGroup | Intentionally changed | 最终态提交，失败内联 |
 | P-07 | 思考 | ActivityBar + Ctrl+T | ThinkingLine + Ctrl+T | Intentionally changed | 实时可见，seal 后聚合 |
-| P-08 | 权限确认 | modal | alternate-screen modal | Intentionally changed | 批准/拒绝结果正确 |
-| P-09 | ask_user | modal | 阻塞式单题分页 Modal | Intentionally changed | 全题可读、快捷键/自定义输入正确 |
-| P-10 | plan review | modal | alternate-screen modal | Intentionally changed | 批准/拒绝正确 |
-| P-11 | 子代理观测 | Ctrl+↑/↓ 视图栈 | Workspace 子代理视图 | Intentionally changed | 只读观测，返回父会话 |
-| P-12 | workspace/todo | 右侧栏 | Workspace View | Intentionally changed | 数据不丢失 |
+| P-08 | 权限确认 | modal | alternate-screen modal | Intentionally changed | 渲染/批准拒绝逻辑单测通过；PTY 待 M6 |
+| P-09 | ask_user | modal | 阻塞式单题分页 Modal | Intentionally changed | 全题可读、1-based 快捷键/自定义输入单测通过；PTY 待 M6 |
+| P-10 | plan review | modal | alternate-screen modal | Intentionally changed | 渲染与批准/拒绝路径单测通过；PTY 待 M6 |
+| P-11 | 子代理观测 | Ctrl+↑/↓ 视图栈 | Workspace 子代理视图 | Intentionally changed | 只读观测、返回父会话路由通过 |
+| P-12 | workspace/todo | 右侧栏 | Workspace View | Intentionally changed | F4/`/workspace` 路由与 CJK 渲染通过 |
 | P-13 | 导出 | `/export` | `/export` | Must parity | Markdown 内容完整 |
 | P-14 | 加载更早 | PgUp + banner | Workspace / 命令入口 | Intentionally changed | 不破坏 scrollback |
 | P-15 | 手动重连 | Ctrl+R | Ctrl+R | Must parity | 不重复提交历史 |

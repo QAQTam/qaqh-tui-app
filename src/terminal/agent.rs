@@ -13,15 +13,17 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use futures::StreamExt;
+use ratatui::backend::CrosstermBackend;
 use ratatui::crossterm::event::{
     DisableBracketedPaste, EnableBracketedPaste, Event, EventStream, KeyEventKind,
 };
-use ratatui::crossterm::execute;
+use ratatui::crossterm::terminal::{EnterAlternateScreen, LeaveAlternateScreen};
+use ratatui::crossterm::{event::KeyCode, execute};
 use ratatui::layout::Position;
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Widget};
-use ratatui::{DefaultTerminal, Frame, TerminalOptions, Viewport};
+use ratatui::{DefaultTerminal, Frame, Terminal, TerminalOptions, Viewport};
 use tokio::sync::mpsc;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
@@ -30,8 +32,10 @@ use crate::runtime::{Runtime, RuntimeMsg};
 use crate::terminal::transcript::PendingCommit;
 use crate::theme::Theme;
 use crate::ui::v2::adapter;
+use crate::ui::v2::route::{self, ScreenRoute};
 use crate::ui::v2::runtime::V2TranscriptRuntime;
 use crate::ui::v2::transcript::{BlockState, render_transcript};
+use crate::ui::v2::workspace;
 use qaqh_client::ConversationMode;
 
 const VIEWPORT_HEIGHT: u16 = 10;
@@ -59,9 +63,7 @@ pub async fn run(no_spawn: bool) -> Result<()> {
         .await
         .context("连接 daemon 失败")?;
 
-    let mut terminal = ratatui::init_with_options(TerminalOptions {
-        viewport: Viewport::Inline(VIEWPORT_HEIGHT),
-    });
+    let mut terminal = TerminalHost::init();
     if let Err(error) = execute!(stdout(), EnableBracketedPaste) {
         ratatui::restore();
         runtime.shutdown().await;
@@ -72,6 +74,8 @@ pub async fn run(no_spawn: bool) -> Result<()> {
     spawn_tick(app_tx.clone());
 
     let mut app = App::new(runtime.clone(), app_tx);
+    // V2 的 F4/Workspace 是 alternate-screen 工作区，不再复用 v1 常驻 sidebar。
+    app.show_workspace = false;
     app.fetch_session_list();
     let mut agent = AgentState::default();
     let theme = Theme::current();
@@ -115,7 +119,7 @@ fn spawn_tick(tx: mpsc::UnboundedSender<AppMsg>) {
 }
 
 async fn run_loop(
-    terminal: &mut DefaultTerminal,
+    terminal: &mut TerminalHost,
     app_rx: &mut mpsc::UnboundedReceiver<AppMsg>,
     app: &mut App,
     agent: &mut AgentState,
@@ -125,19 +129,156 @@ async fn run_loop(
         if app.quit {
             break;
         }
-        terminal.draw(|frame| draw(frame, app, theme))?;
+        let route = route::resolve(app);
+        reconcile_screen(terminal, &route, app, agent, theme)?;
+        terminal
+            .terminal
+            .draw(|frame| draw(frame, app, theme, &route))?;
 
         let Some(msg) = app_rx.recv().await else {
             break;
         };
-        app.handle(msg);
+        handle_message(app, msg);
         while let Ok(msg) = app_rx.try_recv() {
-            app.handle(msg);
+            handle_message(app, msg);
             if app.quit {
                 break;
             }
         }
-        commit_pending(terminal, app, agent, theme)?;
+        if let Some(text) = app.pending_pager.take() {
+            terminal.run_pager(&text)?;
+        }
+    }
+    Ok(())
+}
+
+fn handle_message(app: &mut App, msg: AppMsg) {
+    if let AppMsg::Key(key) = &msg
+        && key.code == KeyCode::Esc
+        && route::resolve(app) == ScreenRoute::Workspace(route::WorkspaceRoute::Todo)
+    {
+        app.show_workspace = false;
+        return;
+    }
+    app.handle(msg);
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScreenMode {
+    Inline,
+    Alternate,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScreenTransition {
+    Stay,
+    EnterAlternate,
+    LeaveAlternate,
+}
+
+fn screen_transition(mode: ScreenMode, route: &ScreenRoute) -> ScreenTransition {
+    match (mode, route) {
+        (ScreenMode::Inline, ScreenRoute::Agent)
+        | (ScreenMode::Alternate, ScreenRoute::Workspace(_))
+        | (ScreenMode::Alternate, ScreenRoute::Modal(_)) => ScreenTransition::Stay,
+        (ScreenMode::Inline, ScreenRoute::Workspace(_) | ScreenRoute::Modal(_)) => {
+            ScreenTransition::EnterAlternate
+        }
+        (ScreenMode::Alternate, ScreenRoute::Agent) => ScreenTransition::LeaveAlternate,
+    }
+}
+
+struct TerminalHost {
+    terminal: DefaultTerminal,
+    mode: ScreenMode,
+}
+
+impl TerminalHost {
+    fn init() -> Self {
+        Self {
+            terminal: ratatui::init_with_options(TerminalOptions {
+                viewport: Viewport::Inline(VIEWPORT_HEIGHT),
+            }),
+            mode: ScreenMode::Inline,
+        }
+    }
+
+    fn enter_alternate(&mut self) -> Result<()> {
+        execute!(stdout(), EnterAlternateScreen)?;
+        self.terminal = Terminal::new(CrosstermBackend::new(stdout()))?;
+        self.mode = ScreenMode::Alternate;
+        Ok(())
+    }
+
+    fn leave_alternate(&mut self) -> Result<()> {
+        execute!(stdout(), LeaveAlternateScreen)?;
+        self.terminal = Terminal::with_options(
+            CrosstermBackend::new(stdout()),
+            TerminalOptions {
+                viewport: Viewport::Inline(VIEWPORT_HEIGHT),
+            },
+        )?;
+        self.mode = ScreenMode::Inline;
+        Ok(())
+    }
+
+    /// 挂起 TUI → 外部分页器 → 按原屏幕模式恢复。
+    fn run_pager(&mut self, text: &str) -> Result<()> {
+        let path = std::env::temp_dir().join(format!("qaqh-pager-{}.md", std::process::id()));
+        if std::fs::write(&path, text).is_err() {
+            return Ok(());
+        }
+
+        let was_alternate = self.mode == ScreenMode::Alternate;
+        ratatui::restore();
+        let command = format!(
+            "{} {}",
+            crate::app::pager::pager_cmd(std::env::var("PAGER").ok().as_deref()),
+            crate::app::pager::shell_quote(&path.to_string_lossy()),
+        );
+        let status = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(command)
+            .status();
+        if matches!(status.map(|status| status.code()), Ok(Some(127))) {
+            let _ = std::process::Command::new("cat").arg(&path).status();
+        }
+
+        self.terminal = ratatui::init_with_options(TerminalOptions {
+            viewport: Viewport::Inline(VIEWPORT_HEIGHT),
+        });
+        self.mode = ScreenMode::Inline;
+        execute!(stdout(), EnableBracketedPaste)?;
+        if was_alternate {
+            self.enter_alternate()?;
+        }
+        let _ = self.terminal.clear();
+        let _ = std::fs::remove_file(&path);
+        Ok(())
+    }
+}
+
+fn reconcile_screen(
+    terminal: &mut TerminalHost,
+    route: &ScreenRoute,
+    app: &App,
+    agent: &mut AgentState,
+    theme: &Theme,
+) -> Result<()> {
+    match screen_transition(terminal.mode, route) {
+        ScreenTransition::Stay => {
+            if *route == ScreenRoute::Agent {
+                commit_pending(&mut terminal.terminal, app, agent, theme)?;
+            }
+        }
+        ScreenTransition::EnterAlternate => {
+            commit_pending(&mut terminal.terminal, app, agent, theme)?;
+            terminal.enter_alternate()?;
+        }
+        ScreenTransition::LeaveAlternate => {
+            terminal.leave_alternate()?;
+            commit_pending(&mut terminal.terminal, app, agent, theme)?;
+        }
     }
     Ok(())
 }
@@ -203,12 +344,35 @@ fn commit_pending(
     Ok(())
 }
 
-fn draw(frame: &mut Frame, app: &App, theme: &Theme) {
+fn draw(frame: &mut Frame, app: &App, theme: &Theme, route: &ScreenRoute) {
+    match route {
+        ScreenRoute::Agent => draw_agent(frame, app, theme),
+        ScreenRoute::Modal(modal) => {
+            clear_screen(frame, theme);
+            crate::ui::v2::modal::draw(frame, app, frame.area(), theme, *modal);
+        }
+        ScreenRoute::Workspace(workspace_route) => {
+            clear_screen(frame, theme);
+            workspace::draw(frame, app, workspace_route, theme);
+        }
+    }
+}
+
+fn clear_screen(frame: &mut Frame, theme: &Theme) {
+    let area = frame.area();
+    frame.render_widget(ratatui::widgets::Clear, area);
+    frame.render_widget(
+        ratatui::widgets::Block::default()
+            .style(Style::new().bg(theme.surface.base).fg(theme.text.primary)),
+        area,
+    );
+}
+
+fn draw_agent(frame: &mut Frame, app: &App, theme: &Theme) {
     let area = frame.area();
     let rendered = render_agent(app, area.width, area.height, theme);
     frame.render_widget(Paragraph::new(rendered.lines), area);
-    let modal = crate::ui::v2::modal::draw(frame, app, area, theme);
-    if !modal && let Some(cursor) = rendered.cursor {
+    if let Some(cursor) = rendered.cursor {
         frame.set_cursor_position((
             area.x.saturating_add(cursor.x),
             area.y.saturating_add(cursor.y),
@@ -792,7 +956,8 @@ mod tests {
             .map(|span| span.content.as_ref())
             .collect();
         assert!(text.contains("/new"), "{text}");
-        assert!(text.contains("▸ /clear"), "{text}");
+        assert!(text.contains("▸ /sessions"), "{text}");
+        assert!(text.contains("/settings"), "{text}");
         assert!(rendered.lines.len() <= 10);
     }
 
@@ -850,8 +1015,9 @@ mod tests {
             },
         )
         .expect("inline terminal");
+        let route = route::resolve(&app);
         terminal
-            .draw(|frame| draw(frame, &app, &theme))
+            .draw(|frame| draw(frame, &app, &theme, &route))
             .expect("draw ask modal");
         let text: String = terminal
             .backend()
@@ -879,14 +1045,42 @@ mod tests {
             },
         )
         .expect("inline terminal");
+        let route = route::resolve(&app);
 
         for (width, height) in [(80, 24), (40, 20), (20, 8), (120, 40)] {
             terminal
                 .resize(Rect::new(0, 0, width, height))
                 .expect("resize");
             terminal
-                .draw(|frame| draw(frame, &app, &theme))
+                .draw(|frame| draw(frame, &app, &theme, &route))
                 .expect("draw after resize");
         }
+    }
+
+    #[test]
+    fn screen_transition_enters_and_leaves_alternate_once() {
+        let workspace = ScreenRoute::Workspace(route::WorkspaceRoute::Help);
+        let modal = ScreenRoute::Modal(route::ModalRoute::Ask);
+        assert_eq!(
+            screen_transition(ScreenMode::Inline, &ScreenRoute::Agent),
+            ScreenTransition::Stay
+        );
+        assert_eq!(
+            screen_transition(ScreenMode::Inline, &workspace),
+            ScreenTransition::EnterAlternate
+        );
+        assert_eq!(
+            screen_transition(ScreenMode::Alternate, &workspace),
+            ScreenTransition::Stay
+        );
+        assert_eq!(
+            screen_transition(ScreenMode::Alternate, &modal),
+            ScreenTransition::Stay,
+            "Workspace → Modal 不应重复进出 alternate"
+        );
+        assert_eq!(
+            screen_transition(ScreenMode::Alternate, &ScreenRoute::Agent),
+            ScreenTransition::LeaveAlternate
+        );
     }
 }

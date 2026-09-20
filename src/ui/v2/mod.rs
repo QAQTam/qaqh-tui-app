@@ -6,5 +6,7 @@
 pub mod adapter;
 pub mod modal;
 pub mod projector;
+pub mod route;
 pub mod runtime;
 pub mod transcript;
+pub mod workspace;

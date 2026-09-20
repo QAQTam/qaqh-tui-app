@@ -116,6 +116,30 @@ impl App {
                 self.toggle_overlay(Overlay::Help);
                 true
             }
+            SlashCmd::Sessions => {
+                if let Some(sess) = self.active_session_mut() {
+                    sess.composer.clear();
+                }
+                self.slash_selected = 0;
+                self.open_session_list();
+                true
+            }
+            SlashCmd::Settings => {
+                if let Some(sess) = self.active_session_mut() {
+                    sess.composer.clear();
+                }
+                self.slash_selected = 0;
+                self.toggle_settings();
+                true
+            }
+            SlashCmd::Workspace => {
+                if let Some(sess) = self.active_session_mut() {
+                    sess.composer.clear();
+                }
+                self.slash_selected = 0;
+                self.show_workspace = true;
+                true
+            }
             SlashCmd::Clear => {
                 if let Some(sess) = self.active_session_mut() {
                     sess.composer.clear();

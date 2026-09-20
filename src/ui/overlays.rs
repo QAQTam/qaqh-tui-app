@@ -177,7 +177,7 @@ fn draw_help(f: &mut Frame, area: Rect) {
         ),
         (
             "/ + Tab/↑↓/Enter",
-            "斜杠命令（/new [cwd] · /help · /clear）",
+            "斜杠命令（/new · /sessions · /settings · /workspace · /help · /clear）",
         ),
         (
             "/new [cwd]",

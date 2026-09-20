@@ -672,6 +672,19 @@ mod tests {
         assert_eq!(ask.editing_custom, Some(0));
     }
 
+    #[test]
+    fn blocking_modal_consumes_global_workspace_keys() {
+        let mut app = app_with_ask();
+        app.handle(AppMsg::Key(KeyEvent::new(
+            KeyCode::Char('l'),
+            KeyModifiers::CONTROL,
+        )));
+        assert!(
+            app.overlays.is_empty(),
+            "阻塞式 ask 不应被 Ctrl+L 压到 SessionList 下面"
+        );
+    }
+
     #[tokio::test]
     async fn incomplete_submit_returns_to_first_missing_question() {
         let mut app = app_with_ask();

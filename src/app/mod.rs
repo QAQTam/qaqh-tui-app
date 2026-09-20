@@ -1709,8 +1709,23 @@ impl App {
         // 粘贴护栏：记录按键节拍（洪流判定与抑制在 composer_key 的 Enter 路径）。
         self.paste_guard.observe(Instant::now());
 
+        let global = keymap::map_global_key(&key);
+        let blocking_modal = self.active_session().is_some_and(|session| {
+            session.active_permission().is_some()
+                || session.pending_ask.is_some()
+                || session.pending_plan.is_some()
+        });
+        // 阻塞式交互期间只放行退出键，避免 Ctrl+L/Ctrl+,/F1 等全局键把
+        // overlay 压在 Modal 下方，随后 Esc 误落到 permission/ask/plan。
+        if blocking_modal
+            && !matches!(global, Some(GlobalKey::QuitArmed | GlobalKey::QuitNow))
+            && self.modal_key(key)
+        {
+            return;
+        }
+
         // 退出与全局键：先经 keymap 纯映射（可单测），再做状态副作用。
-        match keymap::map_global_key(&key) {
+        match global {
             Some(GlobalKey::QuitArmed) => {
                 if self.quit_armed.is_some() {
                     self.quit = true;
