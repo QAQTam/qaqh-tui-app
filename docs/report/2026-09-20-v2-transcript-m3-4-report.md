@@ -1,6 +1,6 @@
 # QAQH TUI v2 Transcript Runtime 报告（V2-M3.4）
 
-> 状态：**M3.4 commit pump/runtime 已完成；V2 Agent mode 接线待 M4**
+> 状态：**M3 已完成；commit pump/runtime 已由 M4 Agent mode 消费**
 > 日期：2026-09-20
 > 上游报告：[`2026-09-20-v2-transcript-m3-3-report.md`](2026-09-20-v2-transcript-m3-3-report.md)
 > 关联规范：
@@ -20,6 +20,10 @@ M3.4 完成 transcript projector 与 terminal scrollback 之间的提交运行�
 - `drain_emittable` 通过 `TranscriptCommitLedger` 做最终幂等裁决；
 - `sync_turn` / `replay_all` 返回已经过 ledger 的 `PendingCommit`；
 - V1 默认路径不受影响。
+
+M3 的最终收口由后续 M4.1/M4 完成：`--v2-agent` 已消费本层
+`V2TranscriptRuntime`，真实 timeline 的 sealed block 会经 ledger 幂等提交到
+scrollback，live block 继续留在 inline viewport。
 
 真实 `--v2-agent` 模式没有在 M3.4 强行打开：当前 inline Agent 外壳尚未由 M4 完成，
 提前把该队列接到 V1 全屏路径会污染默认 scrollback。M4 增加 V2 viewport 后直接消费

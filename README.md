@@ -43,6 +43,10 @@ usage、附件与连接告警均已接入。该模式不启用鼠标捕获，保
 Workspace/Modal、会话选择器、设置、权限/ask/plan 仍由 M5 迁移；M4 只覆盖默认
 Agent View 的输入、状态、shortcuts 与 live transcript。`--no-spawn` 与 v1 语义一致。
 
+ask_user 在 v2 中采用阻塞式单题分页：`←/→` 切题，`↑/↓` 移动选项，`Enter`
+选择并前进，`Space` 只选择，`1-9/a-f` 直接选择，`e`/`z` 输入自定义答案，
+`Esc` 跳过。快捷键与屏幕编号统一为 1-based。
+
 ## 界面与按键
 
 | 区域 | 说明 |

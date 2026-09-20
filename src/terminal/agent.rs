@@ -207,7 +207,8 @@ fn draw(frame: &mut Frame, app: &App, theme: &Theme) {
     let area = frame.area();
     let rendered = render_agent(app, area.width, area.height, theme);
     frame.render_widget(Paragraph::new(rendered.lines), area);
-    if let Some(cursor) = rendered.cursor {
+    let modal = crate::ui::v2::modal::draw(frame, app, area, theme);
+    if !modal && let Some(cursor) = rendered.cursor {
         frame.set_cursor_position((
             area.x.saturating_add(cursor.x),
             area.y.saturating_add(cursor.y),
@@ -585,12 +586,12 @@ fn shortcuts_line(app: &App, width: u16, theme: &Theme) -> Line<'static> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::session::SessionState;
+    use crate::app::session::{AskPanel, SessionState};
     use crate::app::timeline_model::TimelineModel;
     use crate::theme::{ColorSupport, ThemeKind};
     use qaqh_client::{
-        TimelineBlock, TimelineBlockKind, TimelineBlockState, TimelineEntry, TimelineEvent,
-        TimelineTool, TimelineToolState,
+        AskMode, DomainAskQuestion as AskQuestion, TimelineBlock, TimelineBlockKind,
+        TimelineBlockState, TimelineEntry, TimelineEvent, TimelineTool, TimelineToolState,
     };
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
@@ -824,6 +825,46 @@ mod tests {
 
         let session = app.sessions.get("seed-1").expect("session");
         assert!(session.composer.is_empty());
+    }
+
+    #[test]
+    fn agent_draw_routes_pending_ask_to_v2_modal() {
+        let mut app = app_with_model(TimelineModel::default());
+        app.sessions.get_mut("seed-1").expect("session").pending_ask = Some(AskPanel::new(
+            "interaction-1".into(),
+            "turn-1".into(),
+            AskMode::Single,
+            vec![AskQuestion {
+                id: "q1".into(),
+                question: "选择完整方案".into(),
+                options: vec!["方案一".into(), "方案二".into()],
+                allow_custom: true,
+            }],
+        ));
+        let theme = test_theme();
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::with_options(
+            backend,
+            TerminalOptions {
+                viewport: Viewport::Inline(VIEWPORT_HEIGHT),
+            },
+        )
+        .expect("inline terminal");
+        terminal
+            .draw(|frame| draw(frame, &app, &theme))
+            .expect("draw ask modal");
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>()
+            .chars()
+            .filter(|ch| !ch.is_whitespace())
+            .collect();
+        assert!(text.contains("问题1/1"), "{text}");
+        assert!(text.contains("选择完整方案"), "{text}");
     }
 
     #[test]

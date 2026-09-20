@@ -45,7 +45,7 @@ v2 可以在视觉与终端模型上重构，但不能静默降低 QAQH 的核�
 | P-06 | 工具调用 | 工具卡 | ToolBlock / ToolGroup | Intentionally changed | 最终态提交，失败内联 |
 | P-07 | 思考 | ActivityBar + Ctrl+T | ThinkingLine + Ctrl+T | Intentionally changed | 实时可见，seal 后聚合 |
 | P-08 | 权限确认 | modal | alternate-screen modal | Intentionally changed | 批准/拒绝结果正确 |
-| P-09 | ask_user | modal | alternate-screen modal | Intentionally changed | 选项/自定义输入正确 |
+| P-09 | ask_user | modal | 阻塞式单题分页 Modal | Intentionally changed | 全题可读、快捷键/自定义输入正确 |
 | P-10 | plan review | modal | alternate-screen modal | Intentionally changed | 批准/拒绝正确 |
 | P-11 | 子代理观测 | Ctrl+↑/↓ 视图栈 | Workspace 子代理视图 | Intentionally changed | 只读观测，返回父会话 |
 | P-12 | workspace/todo | 右侧栏 | Workspace View | Intentionally changed | 数据不丢失 |

@@ -59,7 +59,12 @@ pub struct AskPanel {
     /// 正在编辑自定义输入的问题下标。
     pub editing_custom: Option<usize>,
     pub input: String,
+    /// 当前问题页。左右键切题；与 `option_cursor[focus]` 分离。
     pub focus: usize,
+    /// 每个问题的选项光标。自定义输入行位于 `options.len()`。
+    pub option_cursor: Vec<usize>,
+    /// 当前问题页的滚动行，供长问题文本使用。
+    pub scroll: u16,
     pub error: Option<String>,
 }
 
@@ -81,8 +86,84 @@ impl AskPanel {
             editing_custom: None,
             input: String::new(),
             focus: 0,
+            option_cursor: vec![0; n],
+            scroll: 0,
             error: None,
         }
+    }
+
+    pub fn option_count(&self, question_idx: usize) -> usize {
+        self.questions
+            .get(question_idx)
+            .map(|q| q.options.len() + usize::from(q.allow_custom))
+            .unwrap_or(0)
+    }
+
+    pub fn option_cursor(&self, question_idx: usize) -> usize {
+        self.option_cursor
+            .get(question_idx)
+            .copied()
+            .unwrap_or(0)
+            .min(self.option_count(question_idx).saturating_sub(1))
+    }
+
+    pub fn move_option_cursor(&mut self, question_idx: usize, delta: i32) {
+        let count = self.option_count(question_idx);
+        if count == 0 {
+            return;
+        }
+        let current = self.option_cursor(question_idx) as i32;
+        let next = (current + delta).clamp(0, count.saturating_sub(1) as i32) as usize;
+        if let Some(cursor) = self.option_cursor.get_mut(question_idx) {
+            *cursor = next;
+        }
+    }
+
+    pub fn select_option(&mut self, question_idx: usize, option_idx: usize) {
+        let Some(question) = self.questions.get(question_idx) else {
+            return;
+        };
+        if option_idx >= question.options.len() {
+            return;
+        }
+        if let Some(selection) = self.selections.get_mut(question_idx) {
+            *selection = Some(option_idx);
+        }
+        if let Some(custom) = self.customs.get_mut(question_idx) {
+            custom.clear();
+        }
+        if let Some(cursor) = self.option_cursor.get_mut(question_idx) {
+            *cursor = option_idx;
+        }
+        self.error = None;
+    }
+
+    pub fn toggle_option(&mut self, question_idx: usize, option_idx: usize) {
+        let selected = self
+            .selections
+            .get(question_idx)
+            .is_some_and(|value| *value == Some(option_idx));
+        if selected {
+            if let Some(selection) = self.selections.get_mut(question_idx) {
+                *selection = None;
+            }
+        } else {
+            self.select_option(question_idx, option_idx);
+        }
+    }
+
+    pub fn is_on_custom_row(&self) -> bool {
+        let Some(question) = self.questions.get(self.focus) else {
+            return false;
+        };
+        question.allow_custom && self.option_cursor(self.focus) == question.options.len()
+    }
+
+    pub fn first_unanswered(&self) -> Option<usize> {
+        (0..self.questions.len()).find(|&idx| {
+            let custom = self.customs.get(idx).is_some_and(|v| !v.trim().is_empty());
+            !custom && self.selections.get(idx).and_then(|value| *value).is_none()
+        })
     }
 
     /// 提交前检查：每个问题都必须有答案（自定义输入优先）。
@@ -107,6 +188,24 @@ impl AskPanel {
             return Err(format!("问题 {} 尚未作答", idx + 1));
         }
         Ok(out)
+    }
+}
+
+/// 选项快捷键：1..9 对应前 9 项，a..f 对应第 10..15 项。
+pub fn option_shortcut_label(index: usize) -> Option<char> {
+    match index {
+        0..=8 => Some((b'1' + index as u8) as char),
+        9..=14 => Some((b'a' + (index - 9) as u8) as char),
+        _ => None,
+    }
+}
+
+/// 把用户按下的字符映射为 0-based 选项下标。
+pub fn option_index_for_key(ch: char) -> Option<usize> {
+    match ch {
+        '1'..='9' => Some(ch as usize - '1' as usize),
+        'a'..='f' => Some(9 + ch as usize - 'a' as usize),
+        _ => None,
     }
 }
 
