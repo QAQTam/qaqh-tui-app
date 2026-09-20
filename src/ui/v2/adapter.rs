@@ -34,6 +34,7 @@ pub fn from_turn(turn: &Turn) -> Vec<TranscriptBlock> {
     if !turn.user_text.is_empty() {
         blocks.push(TranscriptBlock {
             id: BlockId::new(format!("{}:user", turn.turn_id)),
+            turn_id: turn.turn_id.clone(),
             revision: 1,
             state: BlockState::Sealed,
             kind: BlockKind::User {
@@ -43,7 +44,7 @@ pub fn from_turn(turn: &Turn) -> Vec<TranscriptBlock> {
     }
     for round in &turn.rounds {
         for block in &round.blocks {
-            if let Some(block) = from_block(block) {
+            if let Some(block) = from_block(&turn.turn_id, block) {
                 blocks.push(block);
             }
         }
@@ -51,7 +52,7 @@ pub fn from_turn(turn: &Turn) -> Vec<TranscriptBlock> {
     blocks
 }
 
-fn from_block(block: &Block) -> Option<TranscriptBlock> {
+fn from_block(turn_id: &str, block: &Block) -> Option<TranscriptBlock> {
     let state = match block.state {
         TimelineBlockState::Open => BlockState::Live,
         TimelineBlockState::Sealed => BlockState::Sealed,
@@ -80,6 +81,7 @@ fn from_block(block: &Block) -> Option<TranscriptBlock> {
     };
     Some(TranscriptBlock {
         id: BlockId::new(block.block_id.clone()),
+        turn_id: turn_id.to_string(),
         revision: block.rev,
         state,
         kind,

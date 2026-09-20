@@ -16,8 +16,10 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Widget};
 use ratatui::{DefaultTerminal, Frame, TerminalOptions, Viewport};
 
-use crate::terminal::commit::{CommitDecision, CommitId, CommitLedger, content_hash};
+use crate::terminal::commit::CommitDecision;
+use crate::terminal::transcript::TranscriptCommitLedger;
 use crate::theme::Theme;
+use crate::ui::v2::transcript::{BlockKind, BlockState, TranscriptBlock, render_block};
 
 const VIEWPORT_HEIGHT: u16 = 7;
 /// 原型阶段先给 live buffer 一个明确上限，避免异常输入把 TUI 内存拖垮。
@@ -36,8 +38,8 @@ pub fn run_prototype() -> Result<()> {
 struct PrototypeState {
     live: String,
     next_seq: u64,
-    last_commit: Option<(CommitId, String)>,
-    ledger: CommitLedger,
+    last_commit: Option<TranscriptBlock>,
+    ledger: TranscriptCommitLedger,
     status: String,
 }
 
@@ -47,7 +49,7 @@ impl Default for PrototypeState {
             live: String::new(),
             next_seq: 0,
             last_commit: None,
-            ledger: CommitLedger::new(),
+            ledger: TranscriptCommitLedger::new(),
             status: "ready · Enter commit · r replay · q quit".to_string(),
         }
     }
@@ -101,50 +103,48 @@ fn commit_live(
     }
 
     let seq = state.next_seq;
-    let id = CommitId::new("prototype", "turn-0", format!("block-{seq}"), 1);
-    let hash = content_hash(&text);
-    match state.ledger.commit(id.clone(), hash) {
-        CommitDecision::Emit => {
-            let line = committed_line(seq, &text, theme);
-            terminal.insert_before(1, |buf| {
-                line.render(buf.area, buf);
+    let mut block = TranscriptBlock::new(
+        format!("block-{seq}"),
+        BlockKind::User { text: text.clone() },
+    )
+    .with_turn_id("turn-0");
+    block.seal();
+    match state.ledger.commit_block("prototype", &mut block) {
+        Some(CommitDecision::Emit) => {
+            let width = terminal.get_frame().area().width;
+            let lines = render_block(&block, usize::from(width), theme);
+            let height = u16::try_from(lines.len().max(1)).unwrap_or(u16::MAX);
+            terminal.insert_before(height, |buf| {
+                Paragraph::new(lines).render(buf.area, buf);
             })?;
-            state.last_commit = Some((id, text));
+            state.last_commit = Some(block);
             state.next_seq += 1;
             state.status = format!("committed block-{seq}");
         }
-        CommitDecision::Duplicate => {
+        Some(CommitDecision::Duplicate) => {
             state.status = format!("skipped duplicate block-{seq}");
         }
-        CommitDecision::Conflict => {
+        Some(CommitDecision::Conflict) => {
             state.status = format!("conflict on block-{seq}; kept original");
         }
+        None => state.status = "block was not sealed".to_string(),
     }
     state.live.clear();
     Ok(())
 }
 
 fn replay_last(state: &mut PrototypeState) {
-    let Some((id, text)) = state.last_commit.clone() else {
+    let Some(mut block) = state.last_commit.clone() else {
         state.status = "no commit to replay".to_string();
         return;
     };
-    state.status = match state.ledger.commit(id, content_hash(&text)) {
-        CommitDecision::Duplicate => "replay skipped · duplicate commit id".to_string(),
-        CommitDecision::Conflict => "replay rejected · content changed".to_string(),
-        CommitDecision::Emit => "replay unexpectedly emitted".to_string(),
+    block.state = BlockState::Sealed;
+    state.status = match state.ledger.commit_block("prototype", &mut block) {
+        Some(CommitDecision::Duplicate) => "replay skipped · duplicate commit id".to_string(),
+        Some(CommitDecision::Conflict) => "replay rejected · content changed".to_string(),
+        Some(CommitDecision::Emit) => "replay unexpectedly emitted".to_string(),
+        None => "replay rejected · block was not sealed".to_string(),
     };
-}
-
-fn committed_line<'a>(seq: u64, text: &'a str, theme: &Theme) -> Line<'a> {
-    Line::from(vec![
-        Span::styled(
-            format!("  {} ", theme.glyph.user),
-            Style::new().fg(theme.accent.user),
-        ),
-        Span::styled(format!("#{seq} "), Style::new().fg(theme.text.dim)),
-        Span::styled(text, Style::new().fg(theme.text.primary)),
-    ])
 }
 
 fn draw(f: &mut Frame, state: &PrototypeState, theme: &Theme) {
@@ -189,25 +189,36 @@ mod tests {
     }
 
     #[test]
-    fn committed_line_contains_sequence_and_text() {
+    fn committed_block_contains_prompt_and_text() {
         let theme = test_theme();
-        let line = committed_line(3, "hello", &theme);
-        let text: String = line
-            .spans
+        let block = TranscriptBlock::new(
+            "block-3",
+            BlockKind::User {
+                text: "hello".to_string(),
+            },
+        );
+        let lines = render_block(&block, 40, &theme);
+        let text: String = lines
             .iter()
+            .flat_map(|line| line.spans.iter())
             .map(|span| span.content.as_ref())
             .collect();
-        assert!(text.contains("#3"), "{text}");
+        assert!(text.contains('❯'), "{text}");
         assert!(text.contains("hello"), "{text}");
     }
 
     #[test]
-    fn committed_line_uses_theme_tokens() {
+    fn committed_block_uses_theme_tokens() {
         let theme = test_theme();
-        let line = committed_line(3, "hello", &theme);
-        assert_eq!(line.spans[0].style.fg, Some(theme.accent.user));
-        assert_eq!(line.spans[1].style.fg, Some(theme.text.dim));
-        assert_eq!(line.spans[2].style.fg, Some(theme.text.primary));
+        let block = TranscriptBlock::new(
+            "block-3",
+            BlockKind::User {
+                text: "hello".to_string(),
+            },
+        );
+        let lines = render_block(&block, 40, &theme);
+        assert_eq!(lines[0].spans[0].style.fg, Some(theme.accent.user));
+        assert_eq!(lines[0].spans[1].style.fg, Some(theme.text.primary));
     }
 
     #[test]
@@ -216,12 +227,19 @@ mod tests {
             live: "hello".to_string(),
             ..Default::default()
         };
-        let id = CommitId::new("prototype", "turn-0", "block-0", 1);
+        let mut block = TranscriptBlock::new(
+            "block-0",
+            BlockKind::User {
+                text: "hello".to_string(),
+            },
+        )
+        .with_turn_id("turn-0");
+        block.seal();
         assert_eq!(
-            state.ledger.commit(id.clone(), content_hash("hello")),
-            CommitDecision::Emit
+            state.ledger.commit_block("prototype", &mut block),
+            Some(CommitDecision::Emit)
         );
-        state.last_commit = Some((id, "hello".to_string()));
+        state.last_commit = Some(block);
         replay_last(&mut state);
         assert!(state.status.contains("duplicate"), "{}", state.status);
     }

@@ -11,6 +11,7 @@
 #![allow(dead_code)] // M3 逐层接线；先冻结模型和渲染口径。
 
 use std::fmt;
+use std::fmt::Write as _;
 use std::time::Duration;
 
 use ratatui::style::{Modifier, Style};
@@ -151,6 +152,7 @@ pub enum BlockKind {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TranscriptBlock {
     pub id: BlockId,
+    pub turn_id: String,
     pub revision: u64,
     pub state: BlockState,
     pub kind: BlockKind,
@@ -160,10 +162,16 @@ impl TranscriptBlock {
     pub fn new(id: impl Into<BlockId>, kind: BlockKind) -> Self {
         Self {
             id: id.into(),
+            turn_id: String::new(),
             revision: 1,
             state: BlockState::Live,
             kind,
         }
+    }
+
+    pub fn with_turn_id(mut self, turn_id: impl Into<String>) -> Self {
+        self.turn_id = turn_id.into();
+        self
     }
 
     pub fn with_state(mut self, state: BlockState) -> Self {
@@ -218,6 +226,54 @@ impl TranscriptBlock {
             BlockKind::Tool(_) => false,
         }
     }
+
+    /// 生成不含 ANSI 的稳定内容指纹，供 commit ledger 冲突检测使用。
+    pub fn content_fingerprint(&self) -> String {
+        let mut out = String::new();
+        push_field(&mut out, self.id.as_str());
+        push_field(&mut out, &self.turn_id);
+        push_field(&mut out, &self.revision.to_string());
+        push_field(&mut out, &format!("{:?}", self.state));
+        match &self.kind {
+            BlockKind::User { text } => {
+                push_field(&mut out, "user");
+                push_field(&mut out, text);
+            }
+            BlockKind::Assistant { text } => {
+                push_field(&mut out, "assistant");
+                push_field(&mut out, text);
+            }
+            BlockKind::Thinking { text, duration } => {
+                push_field(&mut out, "thinking");
+                push_field(&mut out, text);
+                push_field(&mut out, &format!("{duration:?}"));
+            }
+            BlockKind::Tool(tool) => {
+                push_field(&mut out, "tool");
+                push_field(&mut out, &tool.name);
+                push_field(&mut out, tool.summary.as_deref().unwrap_or(""));
+                push_field(&mut out, &format!("{:?}", tool.state));
+                push_field(&mut out, tool.output.as_deref().unwrap_or(""));
+                push_field(&mut out, tool.diff.as_deref().unwrap_or(""));
+                push_field(&mut out, tool.progress.as_deref().unwrap_or(""));
+                push_field(&mut out, tool.failure.as_deref().unwrap_or(""));
+                push_field(&mut out, &format!("{:?}", tool.duration));
+                push_field(&mut out, &format!("{:?}", tool.bytes));
+            }
+            BlockKind::System { text, level } => {
+                push_field(&mut out, "system");
+                push_field(&mut out, text);
+                push_field(&mut out, &format!("{level:?}"));
+            }
+        }
+        out
+    }
+}
+
+fn push_field(out: &mut String, value: &str) {
+    let _ = write!(out, "{}:", value.len());
+    out.push_str(value);
+    out.push('|');
 }
 
 /// 渲染整个 transcript。
