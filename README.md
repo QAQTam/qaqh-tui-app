@@ -17,6 +17,16 @@ cargo build --release
 `QAQH_BACKEND_ROOT`（daemon 拉起候选根）。Bearer token 只从 `daemon.json`
 读入内存，永不落日志/URL。
 
+### V2 inline 原型（实验）
+
+```bash
+cargo run -- --v2-inline
+```
+
+不连接 daemon、不进入 alternate screen；用于验证终端 scrollback + inline viewport +
+commit ledger。`Enter` 提交一行，`r` 重放最近一次提交（应被幂等拒绝），`q` 退出。
+正式 v1 默认路径不受影响。
+
 ## 界面与按键
 
 | 区域 | 说明 |

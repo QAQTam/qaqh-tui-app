@@ -3,6 +3,7 @@
 mod app;
 mod protocol;
 mod runtime;
+mod terminal;
 mod ui;
 
 use anyhow::{Context, Result, bail};
@@ -29,6 +30,7 @@ fn main() -> Result<()> {
             println!("用法:");
             println!("  qaqh-tui            连接本地 daemon 并进入 TUI");
             println!("  qaqh-tui --no-spawn 不自动拉起 daemon（仅连接已有实例）");
+            println!("  qaqh-tui --v2-inline 启动 V2 inline 原型（实验，不连接 daemon）");
             println!("  qaqh-tui doctor     自检：发现/pid 判活/open 握手");
             println!();
             println!(
@@ -37,6 +39,11 @@ fn main() -> Result<()> {
             return Ok(());
         }
         _ => {}
+    }
+
+    // V2-M1 隔离原型：不连接 daemon、不进入 alternate screen。
+    if args.iter().any(|arg| arg == "--v2-inline") || std::env::var_os("QAQH_V2_INLINE").is_some() {
+        return terminal::inline::run_prototype();
     }
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
