@@ -5,6 +5,10 @@
 //! 同一取向（工具块按折叠态 3 行估——刚展开的块必然刚进视口）。
 //!
 //! 不建字符串、不跑 markdown/syntect/normalize：O(字符显示宽度)。
+//!
+//! **例外（W-11，2026-09-20）**：T2 工具卡直接问渲染器要行数——卡片高度是内容相关的
+//! （标题行 + 正文窗口：≤6 行全显，否则 head3+标注+tail3），常数估不准；
+//! 实测 **5.15 µs/卡**，且每块只算一次（结构未变时 seg 复用、淘汰后保精确高度）。
 
 use unicode_width::UnicodeWidthStr;
 
@@ -33,17 +37,14 @@ pub(crate) fn estimate_block_lines(block: &Block, width: usize) -> usize {
         // 无谓物化（每个 delta 白跑一次全文折行估算）。
         TimelineBlockKind::Reasoning => 0,
         TimelineBlockKind::Notice => estimate_wrapped_lines(&block.text, w.saturating_sub(2)),
-        // §4.7：T1 工具恒单行；T2 折叠卡仍按 3 行估（阶段 2 精确化）。
+        // §4.7：T1 工具恒单行——但不再由估算层判 T1，而是**直接问渲染器**（单一事实源）。
+        //
+        // W-11（2026-09-20）：原实现按常数 3 估 T2 卡片，与实渲差 ±1 行（卡高 = 1 + 正文
+        // 窗口），于是首帧总行数漂移（实测 form2 每回合 +1、共 +27）。改为问渲染器要行数：
+        // 零复刻、与实渲**恒等**；代价实测 5.15 µs/卡（见文件头）。
         TimelineBlockKind::Tool => {
-            if block
-                .tool
-                .as_ref()
-                .is_some_and(|t| crate::app::render_transcript::is_t1_tool(&t.name))
-            {
-                1
-            } else {
-                3
-            }
+            let mut sink = crate::app::render_transcript::AnimSink::Slots(Vec::new());
+            crate::app::render_transcript::render_block_lines(block, w, &mut sink).len()
         }
     }
 }

@@ -1003,6 +1003,38 @@ mod tests {
         s
     }
 
+    /// ①a 定价：把**工具卡**实渲一遍取行数（= 用渲染器做单一事实源的代价）。
+    #[ignore = "W-11 量化诊断（非锁）：手动重跑用 `cargo test --bin qaqh-tui -- --ignored --nocapture`"]
+    #[test]
+    fn zz_w11_price_card() {
+        let sess = sweep_fixture(120);
+        let blocks: Vec<_> = sess
+            .timeline
+            .turns
+            .iter()
+            .flat_map(|t| t.rounds.iter())
+            .flat_map(|r| r.blocks.iter())
+            .filter(|b| b.kind == TimelineBlockKind::Tool)
+            .collect();
+        let n = blocks.len();
+        let mut sink = crate::app::render::AnimSink::Slots(Vec::new());
+        for b in blocks.iter().take(4) {
+            let _ = crate::app::render_transcript::render_block_lines(b, 80, &mut sink);
+        }
+        let t0 = std::time::Instant::now();
+        let mut h = 0usize;
+        for b in blocks.iter() {
+            h += crate::app::render_transcript::render_block_lines(b, 80, &mut sink).len();
+        }
+        let us = t0.elapsed().as_micros();
+        println!(
+            "①a: {} 个工具卡实渲共 {} 行，耗时 {us}µs（{:.2}µs/卡）",
+            n,
+            h,
+            us as f64 / n as f64
+        );
+    }
+
     /// ①b 定价：给一个 markdown 文本块跑**真实渲染**要多久（估算若复用渲染器口径，
     /// 每个离屏文本块都要付这个成本）。
     #[ignore = "W-11 量化诊断（非锁）：手动重跑用 `cargo test -- --ignored --nocapture`"]
@@ -1026,7 +1058,8 @@ mod tests {
         let t0 = std::time::Instant::now();
         let mut total_lines = 0usize;
         for b in blocks.iter() {
-            total_lines += crate::app::render_transcript::render_block_lines(b, 80, &mut sink).len();
+            total_lines +=
+                crate::app::render_transcript::render_block_lines(b, 80, &mut sink).len();
         }
         let us = t0.elapsed().as_micros();
         println!(
@@ -1076,7 +1109,10 @@ mod tests {
             acc[f][2] += c.post.body.height() as i64 - e.post.body.height() as i64;
         }
         for (f, row) in acc.iter().enumerate() {
-            println!("  form{f}: pre {:+} / content {:+} / post {:+}", row[0], row[1], row[2]);
+            println!(
+                "  form{f}: pre {:+} / content {:+} / post {:+}",
+                row[0], row[1], row[2]
+            );
         }
         // 抽两个具体回合看 pre 与块
         for i in [1usize, 2] {
@@ -1159,32 +1195,50 @@ mod tests {
     /// **首帧几何（W-11）**：生产首帧是「空缓存 + 视口」——此时视口外的块只有估算
     /// 高度，总行数因此不得偏离全量渲染，否则滚动条与滚动位置随物化漂移。
     ///
-    /// ⚠ **当前 `#[ignore]`：实测偏离 +53 行（700 vs 647）**，`sweep_fixture(120)` 按形态拆分：
+    /// W-11（2026-09-20）已把**工具卡**这一类做成恒等：估算直接问渲染器要行数
+    /// （单一事实源，实测 5.15 µs/卡、每块只算一次），`sweep_fixture(120)` 里
+    /// form2（单张 Failed 卡）由 **+27 → 0**。
     ///
-    /// | 形态 | 偏差 | 成因 |
-    /// |---|---|---|
-    /// | 纯文本 3 行 | 0 | 估 = 实 |
-    /// | markdown 代码块 + 工具卡 | +26 / 30 回合 | 文本块按**原始行**折行估 3，markdown 实渲 2 |
-    /// | 单张 Failed 工具卡 | +27 / 30 回合 | 工具卡估 3，实渲 2（卡片头 + 体） |
-    /// | 超长单行 | 0 | 估 = 实 |
+    /// **仍有已知残余：markdown 文本**（form1，每回合 +1、合计 +26——估算按**原始行**
+    /// 折行，markdown 会把 fence 合并）。**不追它**的理由是实测成本：让估算跑 markdown
+    /// 要 **55 µs/块**（≈估算预算两个数量级，千块会话 55ms/帧），远超它换来的 4% 行数精度。
     ///
-    /// 即估算与实渲在 **markdown / 工具卡**两条渲染器上系统性不一致。修法不是改常数，
-    /// 而是让估算复用渲染器的高度口径（单一事实源），或改布局语义（首次见到即冻结高度）
-    /// ——两者都是设计取舍，另立 W-11 决策，不在补锁的范围内。
-    #[ignore = "W-11：首帧估算偏离 +53 行（markdown / 工具卡两条渲染器）——估算精确化后摘除"]
+    /// 所以本锁**把可控形态钉成精确、把残余钉成有界**（每回合最多 +1）——
+    /// 这样任何**新的**漂移源都会让本锁变红，而不是被一个宽松的总量阈值盖住。
     #[test]
     fn first_frame_estimate_matches_full_render() {
         let sess = sweep_fixture(120);
         let mut exact = TranscriptCache::new(80);
         refresh(&sess, 80, None, &mut exact);
-        let total = exact.total_lines();
+        let exact_total = exact.total_lines();
 
         let mut fresh = TranscriptCache::new(80);
-        refresh(&sess, 80, Some((0, 30)), &mut fresh);
+        let top = crate::ui::viewport_top(0, 30, true, 0);
+        refresh(&sess, 80, Some((top, 30)), &mut fresh);
+
+        // ① 可控形态必须**精确**：逐回合比对（比总量更严——能定位到具体回合）
+        let mut drift = [0i64; 4];
+        for i in 0..120usize {
+            drift[i % 4] += fresh.turns[i].height() as i64 - exact.turns[i].height() as i64;
+        }
+        assert_eq!(drift[0], 0, "form0（纯文本）必须精确");
         assert_eq!(
-            fresh.total_lines(),
-            total,
-            "首帧估算不得偏离全量渲染的总行数"
+            drift[2], 0,
+            "form2（单张 Failed 卡）必须精确——W-11 ①a 已做成恒等"
+        );
+        assert_eq!(drift[3], 0, "form3（超长单行）必须精确");
+        // ② markdown 残余：有界且**不得少算**（估算「宁少不多」的反面也不能有）
+        assert!(
+            (0..=30).contains(&drift[1]),
+            "form1（markdown 文本）残余应在 [0, 30]（每回合 +1 以内），实测 {}",
+            drift[1]
+        );
+        // ③ 总量：落在 [精确, 精确 + markdown 回合数]
+        let total = fresh.total_lines();
+        assert!(
+            total >= exact_total && total <= exact_total + 30,
+            "首帧 total 应落在 [{exact_total}, {}]，实测 {total}",
+            exact_total + 30
         );
     }
 
