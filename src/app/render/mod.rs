@@ -1003,6 +1003,105 @@ mod tests {
         s
     }
 
+    /// ①b 定价：给一个 markdown 文本块跑**真实渲染**要多久（估算若复用渲染器口径，
+    /// 每个离屏文本块都要付这个成本）。
+    #[ignore = "W-11 量化诊断（非锁）：手动重跑用 `cargo test -- --ignored --nocapture`"]
+    #[test]
+    fn zz_w11_price_markdown() {
+        let sess = sweep_fixture(120);
+        let blocks: Vec<_> = sess
+            .timeline
+            .turns
+            .iter()
+            .flat_map(|t| t.rounds.iter())
+            .flat_map(|r| r.blocks.iter())
+            .filter(|b| b.kind == TimelineBlockKind::Text)
+            .collect();
+        let n = blocks.len();
+        // 热身后计时
+        let mut sink = crate::app::render::AnimSink::Slots(Vec::new());
+        for b in blocks.iter().take(4) {
+            let _ = crate::app::render_transcript::render_block_lines(b, 80, &mut sink);
+        }
+        let t0 = std::time::Instant::now();
+        let mut total_lines = 0usize;
+        for b in blocks.iter() {
+            total_lines += crate::app::render_transcript::render_block_lines(b, 80, &mut sink).len();
+        }
+        let us = t0.elapsed().as_micros();
+        println!(
+            "①b: {} 个文本块实渲共 {} 行，耗时 {us}µs（{:.2}µs/块）",
+            n,
+            total_lines,
+            us as f64 / n as f64
+        );
+    }
+
+    /// **W-11 量化诊断**（不是锁，是测量；已 `#[ignore]`，手动重跑）：首帧（空缓存 + 视口）下估算 total 与
+    /// 全量渲染 total 的差，按夹具四种形态拆分，并逐块给出 `est` vs 实渲高度。
+    #[ignore = "W-11 量化诊断（非锁）：手动重跑用 `cargo test -- --ignored --nocapture`"]
+    #[test]
+    fn zz_w11_quantify() {
+        let sess = sweep_fixture(120);
+        let h = 30usize;
+        // 精确基准：无视口 = 全驻留全渲染
+        let mut exact = TranscriptCache::new(80);
+        refresh(&sess, 80, None, &mut exact);
+        let exact_total = exact.total_lines();
+        // 首帧：空缓存 + 视口（betav2 的路径：用刷新前的 total=0 算 top）
+        let mut fresh = TranscriptCache::new(80);
+        let top = crate::ui::viewport_top(0, h, true, 0);
+        refresh(&sess, 80, Some((top, h)), &mut fresh);
+        let first_total = fresh.total_lines();
+        println!(
+            "W-11 首帧 total={first_total} 精确 total={exact_total} 差={}",
+            first_total as i64 - exact_total as i64
+        );
+        // 按形态聚合
+        let mut by_form = [0i64; 4];
+        for i in 0..120usize {
+            by_form[i % 4] += fresh.turns[i].height() as i64 - exact.turns[i].height() as i64;
+        }
+        for (f, d) in by_form.iter().enumerate() {
+            println!("  form{f}: 合计差 {d}（{} 回合）", 120 / 4);
+        }
+        // 拆 pre / content / post 定位那 53 行到底在哪一段
+        let mut acc = [[0i64; 3]; 4];
+        for i in 0..120usize {
+            let f = i % 4;
+            let (e, c) = (&exact.turns[i], &fresh.turns[i]);
+            acc[f][0] += c.pre.body.height() as i64 - e.pre.body.height() as i64;
+            acc[f][1] += c.content.iter().map(|b| b.body.height()).sum::<usize>() as i64
+                - e.content.iter().map(|b| b.body.height()).sum::<usize>() as i64;
+            acc[f][2] += c.post.body.height() as i64 - e.post.body.height() as i64;
+        }
+        for (f, row) in acc.iter().enumerate() {
+            println!("  form{f}: pre {:+} / content {:+} / post {:+}", row[0], row[1], row[2]);
+        }
+        // 抽两个具体回合看 pre 与块
+        for i in [1usize, 2] {
+            let (e, c) = (&exact.turns[i], &fresh.turns[i]);
+            println!(
+                "  turn{i}: pre 精确 {} 首帧 {} | post 精确 {} 首帧 {}",
+                e.pre.body.height(),
+                c.pre.body.height(),
+                e.post.body.height(),
+                c.post.body.height()
+            );
+            let turn = &sess.timeline.turns[i];
+            let blocks: Vec<_> = turn.rounds.iter().flat_map(|r| r.blocks.iter()).collect();
+            for (bi, b) in blocks.iter().enumerate() {
+                println!(
+                    "    block{bi} kind={:?} est={} 精确={} 首帧={}",
+                    b.kind,
+                    estimates::estimate_block_lines(b, 80),
+                    e.content[bi].body.height(),
+                    c.content[bi].body.height()
+                );
+            }
+        }
+    }
+
     /// **不变式**：`window()` 取出的每一行都必须真实存在，且**在任意滚动位置上**
     /// 都与一次性全量渲染逐行一致（视口内不得有未渲染块、几何不得漂移）。
     ///
