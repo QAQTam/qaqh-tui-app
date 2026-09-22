@@ -41,16 +41,14 @@ pub enum CommitDecision {
     Conflict,
 }
 
-#[derive(Debug, Clone)]
-struct CommitRecord {
-    content_hash: u64,
-}
-
 /// 进程内提交账本。
 #[derive(Debug, Clone, Default)]
 pub struct CommitLedger {
-    records: HashMap<CommitId, CommitRecord>,
-    order: Vec<CommitId>,
+    /// seed → (128-bit identity fingerprint → content hash)。
+    ///
+    /// 不保存完整 CommitId，避免每个 block 重复持有 seed/turn/block 字符串。
+    /// 指纹只用于进程内冲突检测，不用于安全用途。
+    seeds: HashMap<String, HashMap<u128, u64>>,
 }
 
 #[allow(dead_code)] // M1 scaffold: accessors are consumed by M2/M3 and unit tests.
@@ -65,34 +63,76 @@ impl CommitLedger {
     /// - 同 id 同 hash：返回 [`CommitDecision::Duplicate`]；
     /// - 同 id 不同 hash：返回 [`CommitDecision::Conflict`]，不覆盖原记录。
     pub fn commit(&mut self, id: CommitId, content_hash: u64) -> CommitDecision {
-        match self.records.get(&id) {
-            Some(record) if record.content_hash == content_hash => CommitDecision::Duplicate,
+        let fingerprint = identity_fingerprint(&id);
+        let records = self.seeds.entry(id.seed).or_default();
+        match records.get(&fingerprint) {
+            Some(existing) if *existing == content_hash => CommitDecision::Duplicate,
             Some(_) => CommitDecision::Conflict,
             None => {
-                self.records
-                    .insert(id.clone(), CommitRecord { content_hash });
-                self.order.push(id);
+                records.insert(fingerprint, content_hash);
                 CommitDecision::Emit
             }
         }
     }
 
     pub fn contains(&self, id: &CommitId) -> bool {
-        self.records.contains_key(id)
+        self.seeds
+            .get(&id.seed)
+            .is_some_and(|records| records.contains_key(&identity_fingerprint(id)))
     }
 
     pub fn len(&self) -> usize {
-        self.records.len()
+        self.seeds.values().map(HashMap::len).sum()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.records.is_empty()
+        self.seeds.is_empty()
     }
 
-    /// 已提交顺序，用于 resize / 会话切换时的重放。
-    pub fn order(&self) -> &[CommitId] {
-        &self.order
+    /// 忘掉某个 seed 的全部提交记录。
+    ///
+    /// 仅用于**已经清空终端 scrollback** 后的会话重放：此时保留旧 ledger 会让
+    /// 重放全部被判为 `Duplicate`，与“清屏后按 ledger 顺序重放”冲突。
+    pub fn forget_seed(&mut self, seed: &str) {
+        self.seeds.remove(seed);
     }
+}
+
+/// 两个独立 FNV-1a 变体组成 128-bit 身份指纹。
+///
+/// 指纹覆盖 seed/turn/block/revision，并使用 `0` 分隔各字段，避免拼接歧义。
+/// 这是进程内去重键，不是安全哈希；碰撞概率按 2^-128 量级处理。
+fn identity_fingerprint(id: &CommitId) -> u128 {
+    const OFFSET_A: u64 = 0xcbf2_9ce4_8422_2325;
+    const OFFSET_B: u64 = 0x8422_2325_cbf2_9ce4;
+    const PRIME_A: u64 = 0x0000_0100_0000_01b3;
+    const PRIME_B: u64 = 0x9e37_79b1_85eb_ca87;
+
+    fn update(mut hash: u64, prime: u64, bytes: &[u8]) -> u64 {
+        for byte in bytes {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(prime);
+        }
+        hash
+    }
+
+    let mut a = OFFSET_A;
+    let mut b = OFFSET_B;
+    for part in [
+        id.seed.as_bytes(),
+        b"\0",
+        id.turn_id.as_bytes(),
+        b"\0",
+        id.block_id.as_bytes(),
+        b"\0",
+    ] {
+        a = update(a, PRIME_A, part);
+        b = update(b, PRIME_B, part);
+    }
+    let revision = id.revision.to_le_bytes();
+    a = update(a, PRIME_A, &revision);
+    b = update(b, PRIME_B, &revision);
+    (u128::from(a) << 64) | u128::from(b)
 }
 
 /// 确定性 FNV-1a：仅用于进程内冲突检测，不用于安全哈希。
@@ -133,7 +173,7 @@ mod tests {
     }
 
     #[test]
-    fn order_is_stable_and_replay_does_not_duplicate() {
+    fn replay_does_not_duplicate() {
         let mut ledger = CommitLedger::new();
         let a = id("a", 1);
         let b = id("b", 1);
@@ -150,8 +190,8 @@ mod tests {
             ledger.commit(a.clone(), content_hash("a")),
             CommitDecision::Duplicate
         );
-
-        assert_eq!(ledger.order(), &[a, b]);
+        assert!(ledger.contains(&a));
+        assert!(ledger.contains(&b));
     }
 
     #[test]
@@ -172,5 +212,25 @@ mod tests {
     fn content_hash_changes_with_content() {
         assert_ne!(content_hash("hello"), content_hash("hello!"));
         assert_eq!(content_hash("hello"), content_hash("hello"));
+    }
+
+    #[test]
+    fn forgetting_a_seed_keeps_other_seed_records() {
+        let mut ledger = CommitLedger::new();
+        let a = CommitId::new("a", "turn", "block", 1);
+        let b = CommitId::new("b", "turn", "block", 1);
+        assert_eq!(
+            ledger.commit(a.clone(), content_hash("a")),
+            CommitDecision::Emit
+        );
+        assert_eq!(
+            ledger.commit(b.clone(), content_hash("b")),
+            CommitDecision::Emit
+        );
+
+        ledger.forget_seed("a");
+
+        assert!(!ledger.contains(&a));
+        assert!(ledger.contains(&b));
     }
 }

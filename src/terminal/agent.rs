@@ -8,16 +8,20 @@
 //! - inline viewport 只绘制 live transcript、composer、status 与 shortcuts；
 //! - 不启用鼠标捕获，保留终端原生选择/复制；v1 默认全屏路径不受影响。
 
+use std::collections::VecDeque;
 use std::io::stdout;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use futures::StreamExt;
 use ratatui::backend::CrosstermBackend;
+use ratatui::crossterm::cursor::MoveTo;
 use ratatui::crossterm::event::{
-    DisableBracketedPaste, EnableBracketedPaste, Event, EventStream, KeyEventKind,
+    DisableBracketedPaste, EnableBracketedPaste, Event, KeyEventKind, poll, read,
 };
-use ratatui::crossterm::terminal::{EnterAlternateScreen, LeaveAlternateScreen};
+use ratatui::crossterm::terminal::{Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen};
 use ratatui::crossterm::{event::KeyCode, execute};
 use ratatui::layout::Position;
 use ratatui::style::Style;
@@ -27,6 +31,7 @@ use ratatui::{DefaultTerminal, Frame, Terminal, TerminalOptions, Viewport};
 use tokio::sync::mpsc;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
+use crate::app::timeline_model::Turn;
 use crate::app::{App, AppMsg, ConnPhase, Overlay};
 use crate::runtime::{Runtime, RuntimeMsg};
 use crate::terminal::transcript::PendingCommit;
@@ -79,35 +84,95 @@ pub async fn run(no_spawn: bool) -> Result<()> {
         return Err(error).context("启用括号粘贴");
     }
 
-    spawn_input(app_tx.clone());
+    let mut input = InputPump::new(app_tx.clone());
     spawn_tick(app_tx.clone());
 
     let mut agent = AgentState::default();
 
-    let result = run_loop(&mut terminal, &mut app_rx, &mut app, &mut agent, theme).await;
+    let result = run_loop(
+        &mut terminal,
+        &mut input,
+        &mut app_rx,
+        &mut app,
+        &mut agent,
+        theme,
+    )
+    .await;
 
+    input.suspend().await;
     let _ = execute!(stdout(), DisableBracketedPaste);
     runtime.shutdown().await;
     ratatui::restore();
     result
 }
 
-fn spawn_input(tx: mpsc::UnboundedSender<AppMsg>) {
-    tokio::spawn(async move {
-        let mut reader = EventStream::new();
-        while let Some(event) = reader.next().await {
-            let msg = match event {
-                Ok(Event::Key(key)) if key.kind == KeyEventKind::Press => AppMsg::Key(key),
-                Ok(Event::Paste(text)) => AppMsg::Paste(text),
-                Ok(Event::Resize(_, _)) => AppMsg::Resize,
-                Ok(_) => continue,
-                Err(_) => break,
-            };
-            if tx.send(msg).is_err() {
-                break;
-            }
+struct InputPump {
+    tx: mpsc::UnboundedSender<AppMsg>,
+    stop: Option<Arc<AtomicBool>>,
+    handle: Option<thread::JoinHandle<()>>,
+}
+
+impl InputPump {
+    fn new(tx: mpsc::UnboundedSender<AppMsg>) -> Self {
+        let mut pump = Self {
+            tx,
+            stop: None,
+            handle: None,
+        };
+        pump.resume();
+        pump
+    }
+
+    fn resume(&mut self) {
+        if self.handle.is_some() {
+            return;
         }
-    });
+        let tx = self.tx.clone();
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread_stop = stop.clone();
+        self.stop = Some(stop);
+        self.handle = Some(thread::spawn(move || {
+            while !thread_stop.load(Ordering::SeqCst) {
+                match poll(Duration::from_millis(10)) {
+                    Ok(true) => match read() {
+                        Ok(event) => {
+                            let msg = match event {
+                                Event::Key(key) if key.kind == KeyEventKind::Press => {
+                                    AppMsg::Key(key)
+                                }
+                                Event::Paste(text) => AppMsg::Paste(text),
+                                Event::Resize(_, _) => AppMsg::Resize,
+                                _ => continue,
+                            };
+                            if tx.send(msg).is_err() {
+                                break;
+                            }
+                        }
+                        Err(_) => break,
+                    },
+                    Ok(false) => {}
+                    Err(_) => break,
+                }
+            }
+        }));
+    }
+
+    /// 暂停 crossterm 输入读取。
+    ///
+    /// 读取线程每次只 poll 10ms 后主动释放 crossterm 内部 event reader 锁；
+    /// `Terminal::with_options(Viewport::Inline)` 重建 viewport 时要读取 cursor
+    /// position，若输入线程正阻塞在 `read/poll` 会等锁到超时（实测 2s 后 Agent
+    /// View 直接退出）。因此所有可能重建终端对象的路径都必须先停止并 join 输入
+    /// 线程，确保锁已经释放。
+    async fn suspend(&mut self) {
+        if let Some(stop) = self.stop.take() {
+            stop.store(true, Ordering::SeqCst);
+        }
+        let Some(handle) = self.handle.take() else {
+            return;
+        };
+        let _ = tokio::task::spawn_blocking(move || handle.join()).await;
+    }
 }
 
 fn spawn_tick(tx: mpsc::UnboundedSender<AppMsg>) {
@@ -124,6 +189,7 @@ fn spawn_tick(tx: mpsc::UnboundedSender<AppMsg>) {
 
 async fn run_loop(
     terminal: &mut TerminalHost,
+    input: &mut InputPump,
     app_rx: &mut mpsc::UnboundedReceiver<AppMsg>,
     app: &mut App,
     agent: &mut AgentState,
@@ -137,9 +203,12 @@ async fn run_loop(
         let size = terminal.terminal.size()?;
         let desired_height = inline_viewport_height(app, size.width, size.height, theme);
         terminal.set_inline_height(desired_height);
-        reconcile_screen(terminal, &route, app, agent, theme)?;
-        if route == ScreenRoute::Agent {
-            terminal.ensure_inline_height()?;
+        reconcile_screen(terminal, input, &route, app, agent, theme).await?;
+        if route == ScreenRoute::Agent && terminal.needs_inline_rebuild() {
+            input.suspend().await;
+            let result = terminal.ensure_inline_height();
+            input.resume();
+            result?;
         }
         terminal
             .terminal
@@ -156,7 +225,10 @@ async fn run_loop(
             }
         }
         if let Some(text) = app.pending_pager.take() {
-            terminal.run_pager(&text)?;
+            input.suspend().await;
+            let result = terminal.run_pager(&text);
+            input.resume();
+            result?;
         }
     }
     Ok(())
@@ -222,12 +294,16 @@ impl TerminalHost {
         self.desired_inline_height = height.max(1);
     }
 
+    fn needs_inline_rebuild(&self) -> bool {
+        self.mode == ScreenMode::Inline && self.inline_height != self.desired_inline_height
+    }
+
     /// 在当前 inline viewport 高度与布局需求不一致时重建 viewport。
     ///
     /// 只清理旧 viewport 区域，并把它锚定在原来的顶部；不会触碰已提交到
     /// scrollback 的内容，也不会重放 transcript。
     fn ensure_inline_height(&mut self) -> Result<()> {
-        if self.mode != ScreenMode::Inline || self.inline_height == self.desired_inline_height {
+        if !self.needs_inline_rebuild() {
             return Ok(());
         }
         self.rebuild_inline(self.desired_inline_height)
@@ -261,6 +337,30 @@ impl TerminalHost {
     fn leave_alternate(&mut self) -> Result<()> {
         let inline_height = self.desired_inline_height.max(1);
         execute!(stdout(), LeaveAlternateScreen)?;
+        self.terminal = Terminal::with_options(
+            CrosstermBackend::new(stdout()),
+            TerminalOptions {
+                viewport: Viewport::Inline(inline_height),
+            },
+        )?;
+        self.inline_height = inline_height;
+        self.mode = ScreenMode::Inline;
+        Ok(())
+    }
+
+    /// 清空屏幕与终端 scrollback，并把 inline viewport 重新锚定到顶部。
+    ///
+    /// 只用于会话切换：旧会话的历史必须从终端历史里移除，否则新会话只能被
+    /// 追加到旧历史后面，无法满足“清屏 + 按 ledger 顺序重放”。调用后由
+    /// `commit_pending` 写入新 seed 的完整已封口快照。
+    fn purge_scrollback_for_replay(&mut self) -> Result<()> {
+        let inline_height = self.desired_inline_height.max(1);
+        execute!(
+            stdout(),
+            Clear(ClearType::All),
+            Clear(ClearType::Purge),
+            MoveTo(0, 0)
+        )?;
         self.terminal = Terminal::with_options(
             CrosstermBackend::new(stdout()),
             TerminalOptions {
@@ -310,8 +410,9 @@ impl TerminalHost {
     }
 }
 
-fn reconcile_screen(
+async fn reconcile_screen(
     terminal: &mut TerminalHost,
+    input: &mut InputPump,
     route: &ScreenRoute,
     app: &App,
     agent: &mut AgentState,
@@ -320,16 +421,22 @@ fn reconcile_screen(
     match screen_transition(terminal.mode, route) {
         ScreenTransition::Stay => {
             if *route == ScreenRoute::Agent {
-                commit_pending(&mut terminal.terminal, app, agent, theme)?;
+                commit_pending(terminal, input, app, agent, theme).await?;
             }
         }
         ScreenTransition::EnterAlternate => {
-            commit_pending(&mut terminal.terminal, app, agent, theme)?;
-            terminal.enter_alternate()?;
+            commit_pending(terminal, input, app, agent, theme).await?;
+            input.suspend().await;
+            let result = terminal.enter_alternate();
+            input.resume();
+            result?;
         }
         ScreenTransition::LeaveAlternate => {
-            terminal.leave_alternate()?;
-            commit_pending(&mut terminal.terminal, app, agent, theme)?;
+            input.suspend().await;
+            let result = terminal.leave_alternate();
+            input.resume();
+            result?;
+            commit_pending(terminal, input, app, agent, theme).await?;
         }
     }
     Ok(())
@@ -339,6 +446,16 @@ fn reconcile_screen(
 struct AgentState {
     transcript: V2TranscriptRuntime,
     seed: Option<String>,
+    pending_commits: VecDeque<PendingCommit>,
+    replay_active: bool,
+    replay_cursor: usize,
+    replay_version: Option<u64>,
+}
+
+#[derive(Debug, Default)]
+struct AgentSync {
+    pending: Vec<PendingCommit>,
+    reset_scrollback: bool,
 }
 
 impl AgentState {
@@ -346,53 +463,131 @@ impl AgentState {
     ///
     /// 首次进入一个 seed 时先以权威快照重建 projector 的“已见”状态，再全量
     /// 重放；ledger 会拒绝已经写进 scrollback 的块。之后只做增量投影。
-    fn sync(&mut self, app: &App) -> Vec<PendingCommit> {
+    fn sync(&mut self, app: &App) -> AgentSync {
         let Some(seed) = app.active_seed() else {
+            let reset_scrollback = self.seed.is_some();
             self.seed = None;
-            return Vec::new();
+            self.transcript.clear();
+            self.pending_commits.clear();
+            self.replay_active = false;
+            self.replay_cursor = 0;
+            self.replay_version = None;
+            return AgentSync {
+                pending: Vec::new(),
+                reset_scrollback,
+            };
         };
         let Some(session) = app.sessions.get(&seed) else {
+            let reset_scrollback = self.seed.is_some();
             self.seed = None;
-            return Vec::new();
+            self.transcript.clear();
+            self.pending_commits.clear();
+            self.replay_active = false;
+            self.replay_cursor = 0;
+            self.replay_version = None;
+            return AgentSync {
+                pending: Vec::new(),
+                reset_scrollback,
+            };
         };
 
         if self.seed.as_deref() != Some(seed.as_str()) {
             self.seed = Some(seed.clone());
-            self.transcript.reset_from_turns(&session.timeline.turns);
-            return self.transcript.replay_all(&seed, &session.timeline.turns);
+            self.pending_commits.clear();
+            self.transcript.begin_replay(&seed);
+            self.replay_active = true;
+            self.replay_cursor = 0;
+            self.replay_version = Some(session.timeline.version);
+            return AgentSync {
+                pending: self.replay_chunk(
+                    &seed,
+                    &session.timeline.turns,
+                    session.timeline.version,
+                ),
+                reset_scrollback: true,
+            };
         }
 
-        let mut pending = Vec::new();
-        for turn in &session.timeline.turns {
-            pending.extend(self.transcript.sync_turn(&seed, turn));
+        if self.replay_active {
+            if self.replay_version != Some(session.timeline.version) {
+                self.transcript.begin_replay(&seed);
+                self.replay_cursor = 0;
+                self.replay_version = Some(session.timeline.version);
+            }
+            return AgentSync {
+                pending: self.replay_chunk(
+                    &seed,
+                    &session.timeline.turns,
+                    session.timeline.version,
+                ),
+                reset_scrollback: false,
+            };
+        }
+
+        AgentSync {
+            pending: self.transcript.sync_timeline_versioned(
+                &seed,
+                &session.timeline.turns,
+                session.timeline.version,
+            ),
+            reset_scrollback: false,
+        }
+    }
+
+    fn replay_chunk(&mut self, seed: &str, turns: &[Turn], version: u64) -> Vec<PendingCommit> {
+        const REPLAY_TURNS_PER_FRAME: usize = 8;
+
+        let end = self
+            .replay_cursor
+            .saturating_add(REPLAY_TURNS_PER_FRAME)
+            .min(turns.len());
+        let pending = self
+            .transcript
+            .replay_slice(seed, &turns[self.replay_cursor..end]);
+        self.replay_cursor = end;
+        if self.replay_cursor >= turns.len() {
+            self.replay_active = false;
+            self.transcript.finish_replay(version);
         }
         pending
     }
+
+    fn take_commit_chunk(&mut self, max: usize) -> Vec<PendingCommit> {
+        let count = max.min(self.pending_commits.len());
+        self.pending_commits.drain(..count).collect()
+    }
 }
 
-fn commit_pending(
-    terminal: &mut DefaultTerminal,
+async fn commit_pending(
+    host: &mut TerminalHost,
+    input: &mut InputPump,
     app: &App,
     agent: &mut AgentState,
     theme: &Theme,
 ) -> Result<()> {
-    let pending = agent.sync(app);
-    if pending.is_empty() {
+    let sync = agent.sync(app);
+    if sync.reset_scrollback {
+        input.suspend().await;
+        let result = host.purge_scrollback_for_replay();
+        input.resume();
+        result?;
+    }
+    agent.pending_commits.extend(sync.pending);
+    let chunk = agent.take_commit_chunk(COMMIT_CHUNK_BLOCKS);
+    if chunk.is_empty() {
         return Ok(());
     }
 
-    let width = terminal.get_frame().area().width;
-    for chunk in pending.chunks(COMMIT_CHUNK_BLOCKS) {
-        let blocks: Vec<_> = chunk.iter().map(|item| item.block.clone()).collect();
-        let mut lines = render_transcript(&blocks, width, theme);
-        if lines.is_empty() {
-            lines.push(Line::default());
-        }
-        let height = u16::try_from(lines.len()).unwrap_or(u16::MAX);
-        terminal.insert_before(height, |buffer| {
-            Paragraph::new(lines).render(buffer.area, buffer);
-        })?;
+    let width = host.terminal.get_frame().area().width;
+    let blocks: Vec<_> = chunk.into_iter().map(|item| item.block).collect();
+    let mut lines = render_transcript(&blocks, width, theme);
+    if lines.is_empty() {
+        lines.push(Line::default());
     }
+    let height = u16::try_from(lines.len()).unwrap_or(u16::MAX);
+    host.terminal.insert_before(height, |buffer| {
+        Paragraph::new(lines).render(buffer.area, buffer);
+    })?;
     Ok(())
 }
 
@@ -968,6 +1163,35 @@ mod tests {
         model
     }
 
+    fn model_with_many_sealed_turns(count: usize) -> TimelineModel {
+        let mut model = TimelineModel::default();
+        for index in 0..count {
+            let turn = format!("turn-{index}");
+            model.apply(&entry(
+                index as u64 * 2 + 1,
+                &turn,
+                TimelineEvent::TurnOpened {
+                    user_text: format!("user-{index}"),
+                },
+            ));
+            model.apply(&entry(
+                index as u64 * 2 + 2,
+                &turn,
+                TimelineEvent::BlockOpened {
+                    block: TimelineBlock {
+                        block_id: format!("block-{index}"),
+                        block_order: 0,
+                        kind: TimelineBlockKind::Text,
+                        state: TimelineBlockState::Sealed,
+                        text: format!("answer-{index}"),
+                        tool: None,
+                    },
+                },
+            ));
+        }
+        model
+    }
+
     fn model_with_live_activity() -> TimelineModel {
         let mut model = TimelineModel::default();
         model.apply(&entry(
@@ -1028,8 +1252,122 @@ mod tests {
         let app = app_with_model(model_with_sealed_answer());
         let mut state = AgentState::default();
 
-        assert_eq!(state.sync(&app).len(), 2);
-        assert!(state.sync(&app).is_empty());
+        let first = state.sync(&app);
+        assert!(first.reset_scrollback);
+        assert_eq!(first.pending.len(), 2);
+
+        let second = state.sync(&app);
+        assert!(!second.reset_scrollback);
+        assert!(second.pending.is_empty());
+    }
+
+    #[test]
+    fn session_switch_resets_scrollback_and_replays_each_seed() {
+        let mut app = app_with_model(model_with_sealed_answer());
+        let mut second = TimelineModel::default();
+        second.apply(&entry(
+            1,
+            "turn-2",
+            TimelineEvent::TurnOpened {
+                user_text: "second session".to_string(),
+            },
+        ));
+        second.apply(&entry(
+            2,
+            "turn-2",
+            TimelineEvent::BlockOpened {
+                block: TimelineBlock {
+                    block_id: "b2".to_string(),
+                    block_order: 0,
+                    kind: TimelineBlockKind::Text,
+                    state: TimelineBlockState::Sealed,
+                    text: "second answer".to_string(),
+                    tool: None,
+                },
+            },
+        ));
+        app.tabs.push("seed-2".to_string());
+        let mut session = SessionState::new("seed-2".to_string());
+        session.timeline = second;
+        app.sessions.insert("seed-2".to_string(), session);
+
+        let mut state = AgentState::default();
+        let first = state.sync(&app);
+        assert!(first.reset_scrollback);
+        assert_eq!(first.pending.len(), 2);
+
+        app.active = 1;
+        let switched = state.sync(&app);
+        assert!(switched.reset_scrollback);
+        assert_eq!(switched.pending.len(), 2);
+        assert!(
+            switched
+                .pending
+                .iter()
+                .all(|pending| pending.seed == "seed-2")
+        );
+
+        app.active = 0;
+        let switched_back = state.sync(&app);
+        assert!(switched_back.reset_scrollback);
+        assert_eq!(
+            switched_back.pending.len(),
+            2,
+            "切回旧会话时必须先清 scrollback，因此允许重新 emit"
+        );
+    }
+
+    #[test]
+    fn replay_commits_are_drained_in_bounded_chunks() {
+        fn pending(index: usize) -> PendingCommit {
+            let mut block = crate::ui::v2::transcript::TranscriptBlock::new(
+                format!("b{index}"),
+                crate::ui::v2::transcript::BlockKind::Assistant {
+                    text: format!("block {index}"),
+                },
+            )
+            .with_turn_id("turn-1");
+            assert!(block.seal());
+            PendingCommit {
+                seed: "seed".into(),
+                block,
+            }
+        }
+
+        let mut state = AgentState::default();
+        state.pending_commits.extend((0..70).map(pending));
+
+        assert_eq!(
+            state.take_commit_chunk(COMMIT_CHUNK_BLOCKS).len(),
+            COMMIT_CHUNK_BLOCKS
+        );
+        assert_eq!(state.pending_commits.len(), 70 - COMMIT_CHUNK_BLOCKS);
+        assert_eq!(
+            state.take_commit_chunk(COMMIT_CHUNK_BLOCKS).len(),
+            COMMIT_CHUNK_BLOCKS
+        );
+        assert_eq!(state.pending_commits.len(), 70 - 2 * COMMIT_CHUNK_BLOCKS);
+    }
+
+    #[test]
+    fn first_replay_is_chunked_across_frames() {
+        let app = app_with_model(model_with_many_sealed_turns(20));
+        let mut state = AgentState::default();
+
+        let first = state.sync(&app);
+        assert!(first.reset_scrollback);
+        assert_eq!(first.pending.len(), 16);
+        assert!(state.replay_active);
+
+        let second = state.sync(&app);
+        assert_eq!(second.pending.len(), 16);
+        assert!(state.replay_active);
+
+        let third = state.sync(&app);
+        assert_eq!(third.pending.len(), 8);
+        assert!(!state.replay_active);
+
+        assert!(state.sync(&app).pending.is_empty());
     }
 
     #[test]

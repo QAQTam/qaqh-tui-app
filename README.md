@@ -11,6 +11,10 @@ cargo build --release
 
 # 自检：发现 → 存活 → /health → open 握手
 ./target/release/qaqh-tui.exe doctor
+
+# v2 实验模式；显式 --v1 可覆盖 QAQH_V2_AGENT 环境变量并强制回退
+./target/release/qaqh-tui.exe --v2-agent
+./target/release/qaqh-tui.exe --v1
 ```
 
 环境变量：`QAQH_DATA_DIR`（数据目录覆盖，默认 `%USERPROFILE%\.qaqh`）、

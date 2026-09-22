@@ -18,7 +18,6 @@ use crate::ui::v2::transcript::{BlockId, BlockState, TranscriptBlock};
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct BlockKey {
     turn_id: String,
-    user_text: String,
     block_id: BlockId,
 }
 
@@ -46,7 +45,6 @@ impl V2TranscriptState {
         for block in adapter::from_turn(turn) {
             let key = BlockKey {
                 turn_id: turn.turn_id.clone(),
-                user_text: turn.user_text.clone(),
                 block_id: block.id.clone(),
             };
             let previous = self.seen.get(&key).copied();
@@ -94,7 +92,6 @@ impl V2TranscriptState {
             for block in adapter::from_turn(turn) {
                 let key = BlockKey {
                     turn_id: turn.turn_id.clone(),
-                    user_text: turn.user_text.clone(),
                     block_id: block.id.clone(),
                 };
                 let state = match block.state {

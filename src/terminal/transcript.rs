@@ -57,8 +57,8 @@ impl TranscriptCommitLedger {
         self.ledger.is_empty()
     }
 
-    pub fn order(&self) -> &[CommitId] {
-        self.ledger.order()
+    pub fn forget_seed(&mut self, seed: &str) {
+        self.ledger.forget_seed(seed);
     }
 }
 
@@ -122,6 +122,29 @@ impl TranscriptCommitPump {
         enqueued
     }
 
+    /// 完整 replay 专用：不做容量裁剪。
+    ///
+    /// 会话切换/resize 必须按 ledger 顺序重放全部已提交内容；若复用有界
+    /// `enqueue`，长会话会从头部静默丢掉超过 cap 的块。
+    pub fn enqueue_replay(
+        &mut self,
+        seed: &str,
+        blocks: impl IntoIterator<Item = TranscriptBlock>,
+    ) -> usize {
+        let mut enqueued = 0;
+        for block in blocks {
+            if block.state != BlockState::Sealed {
+                continue;
+            }
+            self.pending.push_back(PendingCommit {
+                seed: seed.to_string(),
+                block,
+            });
+            enqueued += 1;
+        }
+        enqueued
+    }
+
     pub fn drain_emittable(&mut self) -> Vec<PendingCommit> {
         let mut emitted = Vec::new();
         while let Some(mut pending) = self.pending.pop_front() {
@@ -130,6 +153,11 @@ impl TranscriptCommitPump {
             {
                 emitted.push(pending);
             }
+        }
+        // 完整 replay 会把队列扩到上万条；drain 后空队列仍持有旧容量。
+        // 小增量队列不 shrink，避免每帧重新分配。
+        if self.pending.is_empty() && self.pending.capacity() > 256 {
+            self.pending.shrink_to_fit();
         }
         emitted
     }
@@ -148,6 +176,12 @@ impl TranscriptCommitPump {
 
     pub fn ledger(&self) -> &TranscriptCommitLedger {
         &self.ledger
+    }
+
+    /// 丢弃某 seed 的待提交项与提交记录，准备清屏后的完整重放。
+    pub fn reset_seed(&mut self, seed: &str) {
+        self.pending.retain(|pending| pending.seed != seed);
+        self.ledger.forget_seed(seed);
     }
 }
 
@@ -273,5 +307,44 @@ mod tests {
         );
         assert_eq!(pump.len(), 1);
         assert_eq!(pump.dropped(), 1);
+    }
+
+    #[test]
+    fn reset_seed_allows_replay_after_scrollback_purge() {
+        let mut pump = TranscriptCommitPump::new(8);
+        let blocks = [sealed_with_id("a", "a"), sealed_with_id("b", "b")];
+        pump.enqueue("seed", blocks.clone());
+        assert_eq!(pump.drain_emittable().len(), 2);
+
+        pump.reset_seed("seed");
+        pump.enqueue("seed", blocks);
+        assert_eq!(pump.drain_emittable().len(), 2);
+    }
+
+    #[test]
+    fn reset_seed_keeps_other_seed_ledger() {
+        let mut pump = TranscriptCommitPump::new(8);
+        pump.enqueue("a", [sealed_with_id("a", "a")]);
+        pump.enqueue("b", [sealed_with_id("b", "b")]);
+        assert_eq!(pump.drain_emittable().len(), 2);
+
+        pump.reset_seed("a");
+
+        pump.enqueue("b", [sealed_with_id("b", "b")]);
+        assert!(pump.drain_emittable().is_empty());
+        pump.enqueue("a", [sealed_with_id("a", "a")]);
+        assert_eq!(pump.drain_emittable().len(), 1);
+    }
+
+    #[test]
+    fn replay_enqueue_does_not_drop_past_capacity() {
+        let mut pump = TranscriptCommitPump::new(2);
+        let blocks: Vec<_> = (0..10)
+            .map(|index| sealed_with_id(&format!("b{index}"), &format!("block {index}")))
+            .collect();
+
+        assert_eq!(pump.enqueue_replay("seed", blocks), 10);
+        assert_eq!(pump.drain_emittable().len(), 10);
+        assert_eq!(pump.dropped(), 0);
     }
 }

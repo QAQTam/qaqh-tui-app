@@ -1,6 +1,6 @@
 # QAQH TUI v2 v1/v2 Parity Matrix
 
-> 状态：**V2-M5 已完成；permission/ask/plan 完整 PTY 故障注入待 M6**
+> 状态：**V2-M6.2 已完成；M6.3 进行中：Workspace/resize/高频 resize/会话切换/自动重连已通过，permission/ask/plan 与终端矩阵待补**
 > 日期：2026-09-20
 > 上游计划：[`2026-09-20-v2视觉与交互重构-plan.md`](../plan/2026-09-20-v2视觉与交互重构-plan.md)
 > 关联规范：
@@ -39,20 +39,21 @@ v2 可以在视觉与终端模型上重构，但不能静默降低 QAQH 的核�
 |---|---|---|---|---|---|
 | P-01 | 启动 | alternate screen 全屏 | inline viewport + scrollback | Intentionally changed | 退出后历史保留 |
 | P-02 | 新建会话 | Ctrl+N | Ctrl+N / Workspace | Must parity | 创建成功、可发送 |
-| P-03 | 切换会话 | tab bar / Alt+数字 | Workspace / 命令面板 | Intentionally changed | 切换后历史重放正确 |
+| P-03 | 切换会话 | tab bar / Alt+数字 | Workspace / 命令面板 | Intentionally changed | PTY 切换 + purge/replay 通过 |
 | P-04 | 发送消息 | composer Enter | composer Enter | Must parity | 用户 prompt 提交一次 |
 | P-05 | 流式回复 | 全屏重绘 | inline live viewport | Intentionally changed | 不写 scrollback，seal 后提交 |
 | P-06 | 工具调用 | 工具卡 | ToolBlock / ToolGroup | Intentionally changed | 最终态提交，失败内联 |
 | P-07 | 思考 | ActivityBar + Ctrl+T | ThinkingLine + Ctrl+T | Intentionally changed | 实时可见，seal 后聚合 |
-| P-08 | 权限确认 | modal | alternate-screen modal | Intentionally changed | 渲染/批准拒绝逻辑单测通过；PTY 待 M6 |
-| P-09 | ask_user | modal | 阻塞式单题分页 Modal | Intentionally changed | 全题可读、1-based 快捷键/自定义输入单测通过；PTY 待 M6 |
-| P-10 | plan review | modal | alternate-screen modal | Intentionally changed | 渲染与批准/拒绝路径单测通过；PTY 待 M6 |
+| P-08 | 权限确认 | modal | alternate-screen modal | Intentionally changed | fake provider + 真实 daemon PTY：modal 可见 + 批准通过 |
+| P-09 | ask_user | modal | 阻塞式单题分页 Modal | Intentionally changed | fake provider + 真实 daemon PTY：modal 可见 + 1-based 应答通过 |
+| P-10 | plan review | modal | alternate-screen modal | Intentionally changed | 渲染与批准/拒绝路径单测通过；lap 内挂起路径为空，PTY 入口待补 |
 | P-11 | 子代理观测 | Ctrl+↑/↓ 视图栈 | Workspace 子代理视图 | Intentionally changed | 只读观测、返回父会话路由通过 |
 | P-12 | workspace/todo | 右侧栏 | Workspace View | Intentionally changed | F4/`/workspace` 路由与 CJK 渲染通过 |
 | P-13 | 导出 | `/export` | `/export` | Must parity | Markdown 内容完整 |
-| P-14 | 加载更早 | PgUp + banner | Workspace / 命令入口 | Intentionally changed | 不破坏 scrollback |
-| P-15 | 手动重连 | Ctrl+R | Ctrl+R | Must parity | 不重复提交历史 |
-| P-16 | 退出 | Ctrl+C×2 / Ctrl+Q | 同 v1 | Must parity | 恢复终端，保留 scrollback |
+| P-14 | 加载更早 | PgUp + banner | Workspace / 命令入口 | Intentionally changed | 高水位过滤通过；旧页不倒灌 scrollback |
+| P-15 | 手动重连 | Ctrl+R | Ctrl+R | Must parity | v2 auto + manual Ctrl+R PTY 均通过 |
+| P-16 | 退出 | Ctrl+C×2 / Ctrl+Q | 同 v1 | Must parity | PTY 退出码 0，恢复终端 |
+| P-17 | v1 回退 | 默认入口 | `--v1` 显式覆盖 | Must parity | 单元测试锁定 CLI > env > 默认优先级 |
 
 ---
 
@@ -94,11 +95,12 @@ v2 可以在视觉与终端模型上重构，但不能静默降低 QAQH 的核�
 | T-01 | 滚动 | App 自绘 | 终端 scrollback | 原生 PgUp/PgDn 可用 |
 | T-02 | 滚动条 | App 自绘 | 终端原生 | 不显示自绘滚动条 |
 | T-03 | 选择/复制 | 鼠标捕获影响 | 默认不捕获 | 原生选择可用 |
-| T-04 | resize | 全屏重算 | inline + 重放协议 | 不重复、不错位 |
+| T-04 | resize | 全屏重算 | inline + 重放协议 | 80 次高频高度 resize PTY 通过 |
 | T-05 | 主题切换 | 全屏重绘 | viewport 即时；历史可选重放 | 行为有提示 |
-| T-06 | 重连 | 全量重绘 | ledger 幂等提交 | 不重复历史 |
-| T-07 | 退出 | 离开 alternate screen | 保留 scrollback | 历史仍在终端 |
-| T-08 | tmux/SSH | 可用 | 兼容矩阵覆盖 | 无阻塞 |
+| T-06 | 重连 | 全量重绘 | ledger 幂等提交 | daemon kill/restart 后自动恢复 ready |
+| T-07 | 退出 | 离开 alternate screen | 保留 scrollback | PTY 恢复 terminal；逐字节历史断言待补 |
+| T-08 | tmux/SSH | 可用 | 兼容矩阵覆盖 | tmux/screen/SSH 环境分支通过；真实链路待测 |
+| T-09 | `$PAGER` 挂起/恢复 | 全屏 restore/re-init | inline viewport 恢复 | 真实 daemon + PTY 通过 |
 
 ---
 
@@ -106,12 +108,12 @@ v2 可以在视觉与终端模型上重构，但不能静默降低 QAQH 的核�
 
 | ID | 指标 | v1 基线 | v2 目标 |
 |---|---|---|---|
-| R-01 | 首帧 | 现有基线 | 不劣化 |
-| R-02 | 流式 delta | 只重绘活动块 | 只重绘 live viewport |
-| R-03 | 长会话 UI 驻留 | 虚拟化 + 估算 | 显著下降 |
+| R-01 | 首帧 | 现有基线 | 不劣化 | 达标：v1 31.4ms / v2 lazy 6.6ms |
+| R-02 | 流式 delta | 只重绘活动块 | 只重绘 live viewport | 基准：V2 sync 8µs/帧 |
+| R-03 | 长会话 UI 驻留 | 虚拟化 + 估算 | 显著下降 | 达标：440 回合 v2 runtime steady 545KB，v1 cache 2297KB |
 | R-04 | 历史滚动 | App 窗口 | 终端负责 |
-| R-05 | resize 重放 | 无 | 纳入基准 |
-| R-06 | commit 开销 | 无 | 批量 + 背压 |
+| R-05 | resize 重放 | 无 | 已有 80 次 PTY 压力；定量基准待补 |
+| R-06 | commit 开销 | 无 | 批量 + 背压 | 已有 v2 runtime 基准；无新增同步 1µs |
 
 ---
 

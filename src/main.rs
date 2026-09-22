@@ -18,6 +18,32 @@ use tokio::sync::mpsc;
 use app::{App, AppMsg, FrameStats};
 use runtime::{Runtime, RuntimeMsg};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StartupMode {
+    V1,
+    V2Agent,
+    V2Inline,
+}
+
+/// 启动模式优先级：`--v1` > `--v2-inline`/env > `--v2-agent`/env > 默认 v1。
+///
+/// `--v1` 是显式回退闸，必须压过环境变量；否则一旦 shell 里残留
+/// `QAQH_V2_AGENT=1`，用户无法在单次启动里回到 v1。
+fn select_startup_mode(args: &[String], v2_agent_env: bool, v2_inline_env: bool) -> StartupMode {
+    let force_v1 = args.iter().any(|arg| arg == "--v1");
+    if !force_v1 && (args.iter().any(|arg| arg == "--v2-inline") || v2_inline_env) {
+        return StartupMode::V2Inline;
+    }
+    if force_v1 {
+        return StartupMode::V1;
+    }
+    if args.iter().any(|arg| arg == "--v2-agent") || v2_agent_env {
+        StartupMode::V2Agent
+    } else {
+        StartupMode::V1
+    }
+}
+
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
@@ -33,6 +59,7 @@ fn main() -> Result<()> {
             println!("  qaqh-tui --no-spawn 不自动拉起 daemon（仅连接已有实例）");
             println!("  qaqh-tui --v2-inline 启动 V2 inline 原型（实验，不连接 daemon）");
             println!("  qaqh-tui --v2-agent 启动 V2 Agent View（实验，连接 daemon）");
+            println!("  qaqh-tui --v1       强制 v1 全屏模式（覆盖 QAQH_V2_AGENT）");
             println!("  qaqh-tui doctor     自检：发现/pid 判活/open 握手");
             println!();
             println!(
@@ -43,8 +70,14 @@ fn main() -> Result<()> {
         _ => {}
     }
 
-    // V2-M1 隔离原型：不连接 daemon、不进入 alternate screen。
-    if args.iter().any(|arg| arg == "--v2-inline") || std::env::var_os("QAQH_V2_INLINE").is_some() {
+    let mode = select_startup_mode(
+        &args,
+        std::env::var_os("QAQH_V2_AGENT").is_some(),
+        std::env::var_os("QAQH_V2_INLINE").is_some(),
+    );
+
+    if mode == StartupMode::V2Inline {
+        // V2-M1 隔离原型：不连接 daemon、不进入 alternate screen。
         return terminal::inline::run_prototype();
     }
 
@@ -52,12 +85,13 @@ fn main() -> Result<()> {
         .enable_all()
         .build()
         .context("构建 tokio runtime")?;
-    if args.iter().any(|arg| arg == "--v2-agent") || std::env::var_os("QAQH_V2_AGENT").is_some() {
-        return runtime.block_on(terminal::agent::run(
+    match mode {
+        StartupMode::V2Agent => runtime.block_on(terminal::agent::run(
             !args.iter().any(|arg| arg == "--no-spawn"),
-        ));
+        )),
+        StartupMode::V1 => runtime.block_on(run_tui(args.iter().any(|a| a == "--no-spawn"))),
+        StartupMode::V2Inline => unreachable!("handled before runtime construction"),
     }
-    runtime.block_on(run_tui(args.iter().any(|a| a == "--no-spawn")))
 }
 
 async fn run_tui(no_spawn: bool) -> Result<()> {
@@ -324,5 +358,54 @@ async fn doctor_async() -> Result<()> {
             bail!("[3] open 被拒（协议代差）: {m} —— 请更新客户端或 daemon")
         }
         Err(e) => bail!("[3] open 失败: {e}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{StartupMode, select_startup_mode};
+
+    fn args(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| (*value).to_string()).collect()
+    }
+
+    #[test]
+    fn startup_mode_defaults_to_v1() {
+        assert_eq!(
+            select_startup_mode(&args(&[]), false, false),
+            StartupMode::V1
+        );
+    }
+
+    #[test]
+    fn startup_mode_env_enables_v2_agent() {
+        assert_eq!(
+            select_startup_mode(&args(&[]), true, false),
+            StartupMode::V2Agent
+        );
+    }
+
+    #[test]
+    fn cli_v1_overrides_v2_env_and_flags() {
+        assert_eq!(
+            select_startup_mode(&args(&["--v1", "--v2-agent"]), true, true),
+            StartupMode::V1
+        );
+        assert_eq!(
+            select_startup_mode(&args(&["--v1", "--v2-inline"]), true, true),
+            StartupMode::V1
+        );
+    }
+
+    #[test]
+    fn inline_takes_precedence_over_agent() {
+        assert_eq!(
+            select_startup_mode(&args(&["--v2-agent", "--v2-inline"]), true, false),
+            StartupMode::V2Inline
+        );
+        assert_eq!(
+            select_startup_mode(&args(&[]), false, true),
+            StartupMode::V2Inline
+        );
     }
 }

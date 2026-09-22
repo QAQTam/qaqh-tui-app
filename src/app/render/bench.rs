@@ -22,6 +22,9 @@ use super::*;
 use crate::app::anim;
 use crate::app::session::SessionState;
 use crate::app::timeline_model::{Block, Round, ToolCard};
+use crate::theme::Theme;
+use crate::ui::v2::runtime::V2TranscriptRuntime;
+use crate::ui::v2::transcript::render_transcript;
 use qaqh_client::{TimelineBlockKind, TimelineBlockState, TimelineToolState, TimelineTurnState};
 
 // ── 计数分配器 ──────────────────────────────────────────────────────
@@ -399,4 +402,161 @@ fn bench_long_stream_delta() {
         inc_us / DELTAS as u128,
         full_us / DELTAS as u128,
     );
+}
+
+// ── 基准 4：V2 projector + commit ledger + render ─────────────────
+
+#[test]
+#[ignore = "基准：cargo test render::bench -- --ignored --nocapture"]
+fn bench_v2_commit_runtime() {
+    let _guard = BENCH_LOCK.lock().unwrap();
+    const TURNS: usize = 110;
+    const TOOLS: usize = 20;
+
+    let mut sess = gen_session(TURNS, TOOLS);
+    let turns = &sess.timeline.turns;
+
+    let mut v1_cache = TranscriptCache::new(WIDTH);
+    let v1_start = Instant::now();
+    let _ = refresh(&sess, WIDTH, None, &mut v1_cache);
+    let v1_first_frame = v1_start.elapsed();
+
+    let lazy_start = Instant::now();
+    let mut lazy_runtime = V2TranscriptRuntime::new();
+    lazy_runtime.begin_replay("bench");
+    let lazy_pending = lazy_runtime.replay_slice("bench", &turns[..8.min(turns.len())]);
+    let lazy_blocks: Vec<_> = lazy_pending
+        .iter()
+        .take(COMMIT_CHUNK_BLOCKS_FOR_BENCH)
+        .map(|pending| pending.block.clone())
+        .collect();
+    let _ = render_transcript(&lazy_blocks, WIDTH, Theme::current());
+    let lazy_first_frame = lazy_start.elapsed();
+
+    reset_counters();
+    let replay_start = Instant::now();
+    let mut runtime = V2TranscriptRuntime::new();
+    let emitted = runtime.replay_from_scratch_versioned("bench", turns, sess.timeline.version);
+    let replay_elapsed = replay_start.elapsed();
+    let runtime_live = live();
+    let runtime_peak = peak();
+
+    let incremental_start = Instant::now();
+    let incremental = runtime.sync_timeline_versioned("bench", turns, sess.timeline.version);
+    let incremental_elapsed = incremental_start.elapsed();
+    assert!(incremental.is_empty(), "高水位重放后不得重复 emit");
+
+    const DELTAS: usize = 20;
+    let delta_start = Instant::now();
+    for _ in 0..DELTAS {
+        push_delta(&mut sess);
+        sess.timeline.version = sess.timeline.version.saturating_add(1);
+        let _ =
+            runtime.sync_timeline_versioned("bench", &sess.timeline.turns, sess.timeline.version);
+    }
+    let delta_elapsed = delta_start.elapsed();
+
+    let blocks: Vec<_> = emitted
+        .iter()
+        .map(|pending| pending.block.clone())
+        .collect();
+    let first_chunk_start = Instant::now();
+    let first_chunk: Vec<_> = emitted
+        .iter()
+        .take(COMMIT_CHUNK_BLOCKS_FOR_BENCH)
+        .map(|pending| pending.block.clone())
+        .collect();
+    let _ = render_transcript(&first_chunk, WIDTH, Theme::current());
+    let first_chunk_elapsed = first_chunk_start.elapsed();
+    let render_start = Instant::now();
+    let lines = render_transcript(&blocks, WIDTH, Theme::current());
+    let render_elapsed = render_start.elapsed();
+    let v2_first_frame = replay_elapsed + first_chunk_elapsed;
+
+    println!(
+        "\n=== V2 commit runtime（{TURNS} turns × {TOOLS} tools）===\n\
+         ⑤ replay: {} blocks / {:.2} ms；runtime live {} / peak {}\n\
+           高水位增量: {} blocks / {} µs\n\
+           live delta ×{DELTAS}: avg {} µs/帧\n\
+           render: {} lines / {:.2} ms\n\
+           first frame: v1 cache {:.2} ms | v2 lazy replay+chunk {:.2} ms | \
+           v2 full replay+chunk {:.2} ms",
+        emitted.len(),
+        replay_elapsed.as_secs_f64() * 1000.0,
+        kb(runtime_live),
+        kb(runtime_peak),
+        incremental.len(),
+        incremental_elapsed.as_micros(),
+        delta_elapsed.as_micros() / DELTAS as u128,
+        lines.len(),
+        render_elapsed.as_secs_f64() * 1000.0,
+        v1_first_frame.as_secs_f64() * 1000.0,
+        lazy_first_frame.as_secs_f64() * 1000.0,
+        v2_first_frame.as_secs_f64() * 1000.0,
+    );
+}
+
+const COMMIT_CHUNK_BLOCKS_FOR_BENCH: usize = 32;
+
+#[test]
+#[ignore = "基准：cargo test render::bench -- --ignored --nocapture"]
+fn bench_v2_runtime_scale_curve() {
+    let _guard = BENCH_LOCK.lock().unwrap();
+    const TOOLS: usize = 20;
+    const DELTAS: usize = 20;
+
+    println!("\n=== V2 commit runtime 规模曲线（每回合 {TOOLS} 工具）===");
+    reset_counters();
+    println!(
+        "{:>6} {:>8} {:>12} {:>13} {:>15} {:>12}",
+        "turns", "blocks", "replay ms", "live delta µs", "render ms", "steady live"
+    );
+
+    for &turns_n in &[25usize, 50, 110, 220, 440] {
+        let mut sess = gen_session(turns_n, TOOLS);
+
+        let live_before = live();
+        let replay_start = Instant::now();
+        let mut runtime = V2TranscriptRuntime::new();
+        let emitted = runtime.replay_from_scratch_versioned(
+            "bench",
+            &sess.timeline.turns,
+            sess.timeline.version,
+        );
+        let emitted_len = emitted.len();
+        let replay_elapsed = replay_start.elapsed();
+
+        let delta_start = Instant::now();
+        for _ in 0..DELTAS {
+            push_delta(&mut sess);
+            sess.timeline.version = sess.timeline.version.saturating_add(1);
+            let _ = runtime.sync_timeline_versioned(
+                "bench",
+                &sess.timeline.turns,
+                sess.timeline.version,
+            );
+        }
+        let delta_elapsed = delta_start.elapsed();
+
+        let blocks: Vec<_> = emitted
+            .iter()
+            .map(|pending| pending.block.clone())
+            .collect();
+        let render_start = Instant::now();
+        let lines = render_transcript(&blocks, WIDTH, Theme::current());
+        let render_elapsed = render_start.elapsed();
+        drop(lines);
+        drop(blocks);
+        drop(emitted);
+        let runtime_steady = live().saturating_sub(live_before);
+
+        println!(
+            "{turns_n:>6} {:>8} {:>12.2} {:>13} {:>15.2} {:>12}",
+            emitted_len,
+            replay_elapsed.as_secs_f64() * 1000.0,
+            delta_elapsed.as_micros() / DELTAS as u128,
+            render_elapsed.as_secs_f64() * 1000.0,
+            kb(runtime_steady),
+        );
+    }
 }
