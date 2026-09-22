@@ -161,6 +161,12 @@ impl TurnSeg {
 #[derive(Debug, Clone)]
 pub struct TranscriptCache {
     pub width: u16,
+    /// 上一次 `refresh` **实际使用**的视口 `(top, height)`（`None` = 无视口模式）。
+    ///
+    /// `ui::transcript::draw` 必须用它取窗口，**不得自己重算**：`refresh` 会把估算高度
+    /// 换成精确高度 ⇒ 总行数会变，自己重算就会落到另一个窗口（issue #33：窗口压在
+    /// 未渲染块上 → debug 直接 panic、release 静默空屏）。
+    pub viewport: Option<(usize, usize)>,
     pub banner: Option<BlockSeg>,
     pub empty: Option<BlockSeg>,
     pub turns: Vec<TurnSeg>,
@@ -180,11 +186,44 @@ impl TranscriptCache {
     pub fn new(width: u16) -> Self {
         Self {
             width,
+            viewport: None,
             banner: None,
             empty: None,
             turns: Vec::new(),
             stats: RenderStats::default(),
         }
+    }
+
+    /// 遍历全部段（banner → 各回合 pre/content/post → empty），顺序即行序。
+    fn iter_segs(&self) -> impl Iterator<Item = &BlockSeg> {
+        self.banner
+            .iter()
+            .chain(self.turns.iter().flat_map(|t| {
+                std::iter::once(&t.pre)
+                    .chain(t.content.iter())
+                    .chain(std::iter::once(&t.post))
+            }))
+            .chain(self.empty.iter())
+    }
+
+    /// 视口 `[top, top+height)` 内**未渲染**块所占的行数。
+    ///
+    /// 正常路径恒 0（`refresh` 的收尾保证）。>0 说明几何不一致——调用方必须**显式提示**，
+    /// 不能静默少行：release 下 `window()` 里的 `debug_assert` 会被编译掉，未渲染段既不
+    /// 产出行也不推进 `skip`，实测「请求 30 行取到 0 行」（issue #33，违反 B1「丢弃必须可见」）。
+    pub fn unrendered_lines(&self, top: usize, height: usize) -> usize {
+        let bottom = top.saturating_add(height);
+        let mut missing = 0usize;
+        let mut acc = 0usize;
+        for seg in self.iter_segs() {
+            let h = seg.body.height();
+            let start = acc;
+            acc += h;
+            if !seg.body.is_rendered() {
+                missing += acc.min(bottom).saturating_sub(start.max(top));
+            }
+        }
+        missing
     }
 
     /// 总行数（视窗定位/滚动条需要；估算高度同价计入）。
@@ -199,16 +238,7 @@ impl TranscriptCache {
     pub fn window(&self, top: usize, height: usize) -> Vec<&RenderLine> {
         let mut out: Vec<&RenderLine> = Vec::with_capacity(height);
         let mut skip = top;
-        for seg in self
-            .banner
-            .iter()
-            .chain(self.turns.iter().flat_map(|t| {
-                std::iter::once(&t.pre)
-                    .chain(t.content.iter())
-                    .chain(std::iter::once(&t.post))
-            }))
-            .chain(self.empty.iter())
-        {
+        for seg in self.iter_segs() {
             if out.len() >= height {
                 break;
             }

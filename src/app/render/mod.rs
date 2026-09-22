@@ -215,6 +215,9 @@ pub(crate) fn refresh(
     stats.render_us = t0.elapsed().as_micros() as u64;
     stats.resident_blocks = count_resident(cache);
     cache.stats = stats;
+    // 把本次实际用的视口记进缓存，供 `ui::transcript::draw` 复用**同一份**几何
+    // （issue #33：draw 自己重算会用 refresh **之后**的 total，与这里用的 top 不一致）。
+    cache.viewport = viewport;
     stats
 }
 
@@ -1136,6 +1139,66 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// **P0 回归锁（issue #33）**：按 app 的真实两步流程——
+    /// ① `ensure_render_caches` 用 refresh **之前**的 total 算 top（首帧缓存为空 ⇒ 0）；
+    /// ② `draw` 用 refresh **之后**的 total 重算 top。
+    /// 修复前两者不一致（`0` vs `670`）→ 窗口落在未渲染块 → `window()` 的 debug_assert 炸
+    /// （release 下静默取到 0 行）。修复后：app 侧迭代到不动点 + `draw` 复用
+    /// `cache.viewport` ⇒ 两处共用同一份几何。
+    #[test]
+    fn first_frame_viewport_is_fully_rendered() {
+        let sess = sweep_fixture(120);
+        let h = 30usize;
+        let mut cache = TranscriptCache::new(80);
+        // ① 首帧：缓存为空 → total=0 → top=0（调用方只能这么算）
+        // 走**生产路径**：`App::ensure_render_caches` 调的就是这个函数，
+        // 锁不去复刻那套循环（否则测的是锁自己，不是实现）。
+        crate::app::refresh_at_viewport(&sess, 80, h, &mut cache);
+        // ② draw 侧：用刷新后的 total 重算（现在应与 refresh 用的同一份）
+        let top_window = crate::ui::viewport_top(cache.total_lines(), h, true, 0);
+        assert_eq!(
+            cache.viewport,
+            Some((top_window, h)),
+            "refresh 与 draw 必须共用同一份视口几何（修复前：0 vs {top_window}）"
+        );
+        assert_eq!(
+            cache.unrendered_lines(top_window, h),
+            0,
+            "窗口内不得有未渲染块"
+        );
+        assert_eq!(
+            cache.window(top_window, h).len(),
+            h.min(cache.total_lines()),
+            "窗口应取满（修复前 release 下取到 0 行）"
+        );
+    }
+
+    /// B1「丢弃必须可见」：未渲染块占的行数必须能被报出来——`draw` 据此显式提示，
+    /// 而不是 release 下静默少行。
+    #[test]
+    fn unrendered_lines_reports_shortfall() {
+        let sess = sweep_fixture(20);
+        let mut cache = TranscriptCache::new(80);
+        refresh(&sess, 80, None, &mut cache); // 无视口 → 全驻留
+        assert_eq!(
+            cache.unrendered_lines(0, cache.total_lines()),
+            0,
+            "全驻留时不应有未渲染行"
+        );
+        // 人为淘汰第一回合：body 由 Lines 变成精确高度占位（未渲染）
+        let h0 = {
+            let t = &mut cache.turns[0];
+            evict_turn(t);
+            t.height()
+        };
+        assert!(h0 > 0);
+        assert_eq!(
+            cache.unrendered_lines(0, h0),
+            h0,
+            "淘汰后的行数必须被报为未渲染（否则 release 下就是静默少行）"
+        );
     }
 
     /// **不变式**：`window()` 取出的每一行都必须真实存在，且**在任意滚动位置上**

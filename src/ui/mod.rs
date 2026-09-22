@@ -301,6 +301,56 @@ mod tests {
         }
     }
 
+    /// **P0 整链路锁（issue #33）**：`ensure_render_caches` → `draw` 走完整一帧。
+    ///
+    /// 修复前：首帧 `top` 被算**两遍**（refresh 前用 total=0 算出 0；draw 用 refresh 后的
+    /// total=700 算出 670），窗口落到未渲染块上 → debug 直接 panic、release 整个视口静默变空
+    /// （实测请求 30 行取到 0 行）。夹具刻意混入**估算≠实渲**的形态（markdown 代码块、
+    /// 工具卡），否则总行数不会在 refresh 中漂移、这条锁就抓不到。
+    ///
+    /// 证伪（实测）：把**两处**修复都撤掉 → 本锁在 `seg.rs` 的 `debug_assert` 上 panic；
+    /// 只撤其中任一处则仍绿——两处是**冗余防御**：
+    ///
+    ///   - `draw` 复用 `cache.viewport`（单靠它就不会 panic，但滚动位置会晚一帧收敛）；
+    ///   - `App::refresh_at_viewport` 迭代到不动点（单靠它则两遍算出的 top 一致）。
+    ///
+    /// 两条各有一条锁盯着（本锁 + `render::tests::first_frame_viewport_is_fully_rendered`）。
+    #[test]
+    fn first_frame_draw_covers_viewport() {
+        let mut turns = Vec::new();
+        for i in 0..120u32 {
+            let blocks = match i % 4 {
+                0 => vec![text_block(&format!("b{i}"), 0, "第一行\n第二行\n第三行")],
+                1 => vec![
+                    text_block(&format!("b{i}"), 0, "```rust\nfn main() {}\n```"),
+                    tool_block(
+                        &format!("b{i}t"),
+                        1,
+                        tool_card(&format!("c{i}"), "bash", TimelineToolState::Succeeded),
+                    ),
+                ],
+                2 => vec![tool_block(
+                    &format!("b{i}t"),
+                    0,
+                    tool_card(&format!("c{i}"), "bash", TimelineToolState::Failed),
+                )],
+                _ => vec![text_block(&format!("b{i}"), 0, &"一".repeat(200))],
+            };
+            turns.push(turn(&format!("t{i}"), TimelineTurnState::Completed, blocks));
+        }
+        let mut app = app_with(turns);
+        let text = draw_text(&mut app, 80, 30);
+        assert!(
+            !text.contains("未渲染"),
+            "视口不得落在未渲染块上（B1：出现该提示即为几何不一致）\n{text}"
+        );
+        let non_empty = text.lines().filter(|l| !l.trim().is_empty()).count();
+        assert!(
+            non_empty >= 20,
+            "视口不得为空（修复前 release 下实测取到 0 行），实得 {non_empty} 行非空"
+        );
+    }
+
     fn turn(id: &str, state: TimelineTurnState, blocks: Vec<Block>) -> Turn {
         Turn {
             turn_id: id.into(),
