@@ -10,6 +10,28 @@ use crate::app::App;
 use crate::app::render_line::{RenderStyle, SpanStyle};
 use crate::ui::theme;
 
+/// 把「未渲染」提示拼到窗口行上（`draw` 的唯一实现；抽成函数是为了能在 debug 下直接测——
+/// 坏缓存态在 debug 下会先撞上 `window()` 里的 `debug_assert`，走不到 `draw`）。
+///
+/// ⚠ 提示必须占住**最后一行**：`window()` 可能仍取满 `height` 行（未渲染段被跳过、
+/// 后面的已渲染段把窗口补齐），此时直接 `push` 会把提示放到第 `height + 1` 行，而
+/// `Paragraph` 只画 `height` 行 → 提示被裁掉，等于没提示（评审阻断 1 实测复现）。
+/// 代价是**视口少一行真实内容**——刻意取舍：几何不一致本来就是异常态，
+/// 宁可少一行也要让人看见。
+pub(super) fn attach_unrendered_hint(
+    visible: &mut Vec<Line<'static>>,
+    unrendered: usize,
+    height: usize,
+) {
+    if unrendered == 0 || height == 0 {
+        return;
+    }
+    visible.truncate(height - 1);
+    visible.push(Line::from(format!(
+        "⛔ 视口内有 {unrendered} 行未渲染（内部几何不一致；复现条件见 issue #33）"
+    )));
+}
+
 pub fn draw(f: &mut Frame, app: &App, area: Rect) {
     let Some(seed) = app.view_seed() else {
         return;
@@ -89,11 +111,7 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) {
     // B1「丢弃必须可见」：release 下 `window()` 里的 `debug_assert` 会被编译掉，未渲染段
     // 既不产出行也不推进 `skip` → 实测「请求 30 行取到 0 行」的**静默空屏**（issue #33）。
     // 正常路径 `unrendered == 0`；>0 时显式提示，绝不无声少行。
-    if unrendered > 0 {
-        visible.push(Line::from(format!(
-            "⛔ 视口内有 {unrendered} 行未渲染（内部几何不一致；复现条件见 issue #33）"
-        )));
-    }
+    attach_unrendered_hint(&mut visible, unrendered, height);
 
     f.render_widget(Paragraph::new(visible), area);
 
