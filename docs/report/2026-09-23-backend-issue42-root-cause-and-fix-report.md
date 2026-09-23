@@ -146,7 +146,7 @@ MODE=plan-reject   PASS（9 条后端证据）
 两条**行为**断言都通过，红的是「某个诊断文案是否出现在屏幕上」——属于 **TUI 侧**
 harness 断言与 v2 实际渲染文案的匹配问题（v1/v2 文案或渲染通道不同），不是后端缺陷。
 
-### 4.2 `gap`：注入 gap 后回复不可见 —— **真正的剩余问题**
+### 4.2 `gap`：注入 gap 后回复不可见 —— **已定位并修复（第二处）**
 
 ```text
 [✓] gap 后用户消息仍在（re-baseline 生效）
@@ -154,9 +154,65 @@ harness 断言与 v2 实际渲染文案的匹配问题（v1/v2 文案或渲染�
 ```
 
 `QAQH_TEST_TIMELINE_GAP=1` 丢弃第一条可投递 entry 后，客户端 re-baseline 生效
-（用户消息在），但**该回合的回复仍不渲染**。这与 #42 的「gap 恢复拿到的快照是回合
-中途的、封口事件又收不到」是同一族问题，需要单独定位（建议作为 #42 的后续，
-或新开 issue）。
+（用户消息在），但**该回合的回复仍不渲染**。
+
+**daemon 侧 SSE 探针（修复前）**：
+
+```text
+[PROBE-sse] subscribe after=0 gap=true replay_seqs=[]
+[PROBE-sse] gap-drop(live) seq=1        ← 钩子丢掉 TurnOpened
+[PROBE-sse] send(live) seq=2            ← 客户端收到 2（期望 1）→ 判 gap
+[PROBE-sse] send(live) seq=3
+[PROBE-sse] send(live) seq=4
+[PROBE-sse] subscribe after=3 gap=false replay_seqs=[]   ← 重连后**一帧都没发**
+```
+
+**根因**：客户端 gap 恢复时取的快照是**回合中途**的（watermark=3），此后它要靠
+`seq > 3` 的条目把这个回合补完；但这些条目在 **turn seal 时被即时裁剪**删掉了，
+而重连又晚于它们的 live 投递 —— 客户端**永远收不到 `TurnSealed`**，回合停在未
+封口态，回复不渲染。
+
+`persistence_policy.rs` 的文档把 seal 裁剪写成有意设计，代价是「重连走
+`recover_gap` 快照重基线」。这条在**回合中途重基线**时并不成立：快照本身就没
+覆盖完整回合，裁剪又拿走了补齐所需的那段。
+
+**修复（第二处，`crates/qaqh-runtime/src/timeline.rs`）**：去掉
+`seal_turn_with_state` 里的无条件 `prune_turn_journal`（连同死代码一起删除）。
+
+内存上界本来就有两条硬约束，每次 `next_entry` 都会执行：
+
+- `MAX_TIMELINE_JOURNAL_ENTRIES = 8192`（条数）
+- `journal_byte_limit()`（字节，实测最坏 256 MB 上限）
+
+seal 裁剪是**冗余的第二道**，却以「最近一个回合不可重放」为代价 —— 去掉它，
+内存仍由预算钉死。
+
+**修复后**：
+
+```text
+[PROBE-sse] subscribe after=3 gap=false replay_seqs={4,5,6,7}   ← HashSet 打印序
+[PROBE-sse] send(replay) seq=4
+[PROBE-sse] send(replay) seq=5
+[PROBE-sse] send(replay) seq=6
+[PROBE-sse] send(replay) seq=7
+```
+
+```text
+[✓] gap 后用户消息仍在（re-baseline 生效）
+[✓] gap 后回复可见
+RESULT: PASS
+```
+
+### 4.3 修复后故障钩子总览
+
+| MODE | 修复前 | 修复后 |
+|---|---|---|
+| `none` | ✗ | **✓** |
+| `gap` | ✗ | **✓**（第二处修复） |
+| `ack-delay` | ✗ | **✓** |
+| `ack-hang` | ✗ | **✓** |
+| `lagged` | ✗ | ✗（仅 UI 文案断言，行为已通过） |
+| `session-404` | ✗ | ✗（仅 UI 文案断言，行为已通过） |
 
 ## 5. 修复代码的位置与交接
 
@@ -164,8 +220,11 @@ harness 断言与 v2 实际渲染文案的匹配问题（v1/v2 文案或渲染�
 
 ```text
 /home/qaqtamsy/项目/qaqh-backend-fix42        # detached @ 9e63c79（betav2 HEAD）
-  crates/qaqh-runtime/src/ringing/timeline_hub.rs   ← 唯一改动
+  crates/qaqh-runtime/src/ringing/timeline_hub.rs   ← 修复①（seq 空间）
+  crates/qaqh-runtime/src/timeline.rs               ← 修复②（seal 裁剪）
 ```
+
+两处改动合计约 45 行（含注释），互不依赖，可分开合入。
 
 - 该 worktree 是**新开的**，没有碰后端开发工作树（那里有 5 个未提交的沙箱文件），
   也没碰只读锚点 worktree `qaqh-backend-anchor`（TUI 门禁依赖它保持纯净）；
