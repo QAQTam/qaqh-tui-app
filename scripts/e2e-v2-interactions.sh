@@ -8,6 +8,9 @@
 #       `PlanReviewRequested` 并挂起（后端契约测试钩子 spec §1.1）。
 # *-hang：daemon 侧 `QAQH_TEST_INTERACTION_FAULT=<mode>`，应答命令**永不返回 ack**
 #       （spec §1.2），用于验证 TUI 的应答超时终态与 daemon 消失后的干净退出。
+# permission-deny / ask-dismiss / plan-reject：同上的**否定路径**（`d` 拒绝 / `Esc` 跳过 /
+#       `r`+理由+Enter 驳回）。判据不是「模态消失」，而是后端物化 timeline 落到否定终态
+#       （tool_denied / cancelled / `Plan rejected: <理由>`）。
 #
 # 用法：
 #   MODE=permission scripts/e2e-v2-interactions.sh
@@ -16,6 +19,9 @@
 #   MODE=pager scripts/e2e-v2-interactions.sh
 #   MODE=permission-hang scripts/e2e-v2-interactions.sh
 #   MODE=ask-hang scripts/e2e-v2-interactions.sh
+#   MODE=permission-deny scripts/e2e-v2-interactions.sh
+#   MODE=ask-dismiss scripts/e2e-v2-interactions.sh
+#   MODE=plan-reject scripts/e2e-v2-interactions.sh
 # 前置：qaqh-daemon 与 qaqh-tui 已构建。
 
 set -u
@@ -52,6 +58,7 @@ mkdir -p "$D/qaqh"
 
 DAEMON="$DAEMON" TUI="$TUI" D="$D" MODE="$MODE" python3 - <<'PY'
 import fcntl
+import hashlib
 import json
 import os
 import pathlib
@@ -74,18 +81,30 @@ RAW = D / "tui.raw"
 mode = os.environ.get("MODE", "permission")
 # `*-hang` 是「同一个交互 + 注入 ack 永不返回」的组合模式，先拆成 base + is_hang。
 HANG_BASE = {"permission-hang": "permission", "ask-hang": "ask"}
-if mode not in {"permission", "ask", "plan", "pager", *HANG_BASE}:
+# 否定路径：同一个交互，按键换成「拒绝 / 跳过 / 拒绝并填理由」。
+# 判据不是「模态消失」（那只是 TUI 侧下架），而是**后端 timeline 落到否定终态**。
+NEGATIVE = {"permission-deny": "permission", "ask-dismiss": "ask", "plan-reject": "plan"}
+if mode not in {"permission", "ask", "plan", "pager", *HANG_BASE, *NEGATIVE}:
     raise SystemExit(
-        "MODE must be permission|ask|plan|pager|permission-hang|ask-hang, "
+        "MODE must be permission|ask|plan|pager|permission-hang|ask-hang|"
+        "permission-deny|ask-dismiss|plan-reject, "
         f"got {mode!r}"
     )
-base = HANG_BASE.get(mode, mode)
+base = HANG_BASE.get(mode) or NEGATIVE.get(mode) or mode
 is_hang = mode in HANG_BASE
+is_negative = mode in NEGATIVE
 
 def post_json(url, payload, headers=None):
     body = json.dumps(payload).encode()
     request = Request(url, data=body, method="POST")
     request.add_header("Content-Type", "application/json")
+    for key, value in (headers or {}).items():
+        request.add_header(key, value)
+    with urlopen(request, timeout=10) as response:
+        return json.loads(response.read())
+
+def get_json(url, headers=None):
+    request = Request(url, method="GET")
     for key, value in (headers or {}).items():
         request.add_header(key, value)
     with urlopen(request, timeout=10) as response:
@@ -105,6 +124,9 @@ class FakeProvider(BaseHTTPRequestHandler):
             payload = json.loads(body or b"{}")
         except json.JSONDecodeError:
             payload = {}
+        # 留住**每一次**请求体：否定路径要用「模型上下文里到底有没有
+        # 拒绝理由 / 拒绝结果」作后端权威证据（见 `negative_evidence`）。
+        self.server.requests.append(payload)
         self.server.request_count += 1
         first_request = self.server.request_count == 1
 
@@ -223,6 +245,7 @@ class FakeProvider(BaseHTTPRequestHandler):
 
 server = ThreadingHTTPServer(("127.0.0.1", 0), FakeProvider)
 server.request_count = 0
+server.requests = []
 port = server.server_address[1]
 threading.Thread(target=server.serve_forever, daemon=True).start()
 print(f"fake provider: http://127.0.0.1:{port}/v1")
@@ -363,11 +386,21 @@ sent_thinking = False
 sent_pager = False
 quit_sent = False
 daemon_killed = False
+# plan-reject 是两段式：`r` 进理由输入态，再 `Enter` 提交。
+sent_reject_reason = False
+reject_entered_at = None
 # TUI 侧交互应答的 ack 上限（`INTERACTION_ACK_TIMEOUT`，10s）触发后的 toast 文案。
 # 断言用「子串」而不是整句：文案里带秒数，改上限不该让本脚本变红。
 TIMEOUT_TEXT = "应答超时".encode()
 # plan modal 的标题（`ui/v2/modal.rs` 的 `📋 计划评审 · {review_type}`）。
 PLAN_TITLE = "计划评审".encode()
+# 否定路径的后端权威证据：判据全部取自 `GET /sessions/{seed}/timeline` 的物化快照，
+# 不看 TUI 字节流（「模态消失」只证明面板下架，不证明裁决送达后端）。
+# 出处（后端锚点 `8dbe22e`）：
+#   permission-deny → 工具终态 failed + 输出 `[DENIED] '…' (user denied permission)`
+#   ask-dismiss     → `engine_turn.rs::handle_ask_dismiss`：回合落 `TimelineTurnState::Cancelled`
+#   plan-reject     → `engine_turn.rs::handle_plan_response`：工具结果 `Plan rejected: <理由>`
+REJECT_REASON = "e2e-plan-reject-marker"
 deadline = start + 45
 
 while time.monotonic() < deadline:
@@ -383,22 +416,49 @@ while time.monotonic() < deadline:
         sent_message = True
     if base == "permission":
         if b"\xe6\x89\xb9\xe5\x87\x86" in capture and not resolved:
-            os.write(master, b"a")
+            key = b"d" if mode == "permission-deny" else b"a"
+            os.write(master, key)
             resolved = True
             resolved_at = time.monotonic()
-            print("permission modal detected; approved with a")
+            print(
+                "permission modal detected; denied with d"
+                if key == b"d"
+                else "permission modal detected; approved with a"
+            )
     elif base == "ask":
         if b"Continue with the test?" in capture and not resolved:
-            os.write(master, b"1")
+            key = b"\x1b" if mode == "ask-dismiss" else b"1"
+            os.write(master, key)
             resolved = True
             resolved_at = time.monotonic()
-            print("ask modal detected; answered with 1")
+            print(
+                "ask modal detected; dismissed with Esc"
+                if key == b"\x1b"
+                else "ask modal detected; answered with 1"
+            )
     elif base == "plan":
         if PLAN_TITLE in capture and not resolved:
-            os.write(master, b"a")
-            resolved = True
+            if mode == "plan-reject":
+                # 两段式：`r` 只进理由输入态，`Enter` 才真正提交裁决。
+                os.write(master, b"r")
+                resolved = True
+                reject_entered_at = time.monotonic()
+                print("plan modal detected; entered reject-reason mode with r")
+            else:
+                os.write(master, b"a")
+                resolved = True
+                resolved_at = time.monotonic()
+                print("plan modal detected; approved with a")
+        if (
+            mode == "plan-reject"
+            and reject_entered_at is not None
+            and not sent_reject_reason
+            and time.monotonic() - reject_entered_at >= 1.0
+        ):
+            os.write(master, REJECT_REASON.encode() + b"\r")
+            sent_reject_reason = True
             resolved_at = time.monotonic()
-            print("plan modal detected; approved with a")
+            print("reject reason submitted with Enter")
     elif base == "pager":
         if not sent_thinking and elapsed >= 12.0:
             os.write(master, b"\x14")
@@ -454,6 +514,106 @@ if tui.poll() is None:
     except subprocess.TimeoutExpired:
         os.killpg(tui.pid, signal.SIGKILL)
 
+# ── 否定路径的后端权威证据 ──────────────────────────────────────────────
+# TUI 侧「模态消失」只说明它把面板下架了；拒绝/跳过/驳回是否**真的落到后端**，
+# 必须查后端物化 timeline。必须在杀 daemon 之前查。
+def timeline_tools(page):
+    """展平快照里的 tool block → [(turn, tool)]。"""
+    out = []
+    for turn in page.get("snapshot", {}).get("turns", []):
+        for rnd in turn.get("rounds", []):
+            for block in rnd.get("blocks", []):
+                tool = block.get("tool")
+                if isinstance(tool, dict):
+                    out.append((turn, tool))
+    return out
+
+def tool_text(tool):
+    return f"{tool.get('summary', '')} {tool.get('output', '')}"
+
+def decision_ref(decision):
+    """后端 `record_interaction_resolution` 写进账本的 decision_ref 算法。
+
+    后端：`serde_json::to_vec(&json!({"decision": decision}))` 再 sha256
+    （`qaqh-runtime/src/agent/engine_turn.rs`）。这里复刻成**可校验的指纹**，
+    断言时比子串匹配硬：账本里必须有一条 decision_ref 正好等于它。
+    """
+    body = json.dumps({"decision": decision}, separators=(",", ":")).encode()
+    return "sha256:" + hashlib.sha256(body).hexdigest()
+
+def ledger_decisions():
+    """读后端会话事实账本（`sessions/*/events.jsonl`）里的 interaction_resolved。
+
+    这是 daemon 自己 fsync 的持久化事实，不是 TUI 侧的自述；用它做否定路径的
+    权威证据。返回 decision_ref 列表。
+    """
+    refs = []
+    for path in (DATA / "sessions").glob("*/events.jsonl"):
+        for line in path.read_text(errors="replace").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                fact = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            payload = fact.get("payload") or {}
+            if payload.get("kind") != "interaction_resolved":
+                continue
+            refs.append((payload.get("data") or {}).get("decision_ref"))
+    return refs
+
+def negative_evidence(page, decisions):
+    """返回 (是否满足, 人读描述)。判据全部来自后端侧，不看 TUI 字节流。"""
+    turns = page.get("snapshot", {}).get("turns", [])
+    states = [t.get("state") for t in turns]
+    tools = timeline_tools(page)
+    if mode == "permission-deny":
+        hit = [
+            t
+            for _, t in tools
+            if t.get("state") == "failed" and "[DENIED]" in tool_text(t)
+        ]
+        return bool(hit), f"timeline：tool 终态 failed + [DENIED]（turns={states}）"
+    if mode == "ask-dismiss":
+        ok = "cancelled" in states and decision_ref("dismissed") in decisions
+        return ok, (
+            f"timeline 回合 cancelled + 账本 decision=dismissed（turns={states}）"
+        )
+    # plan-reject：`QAQH_TEST_PLAN_REVIEW` 钩子只发控制面 `PlanReviewRequested`，
+    # **既不物化 timeline 块、也不把拒绝结果并进模型上下文**（已登记为后端待办），
+    # 所以快照与 provider 请求体两条路都查不到；改查 daemon 自己 fsync 的会话事实账本。
+    ok = decision_ref("rejected") in decisions
+    return ok, f"会话事实账本 decision=rejected（turns={states}）"
+
+timeline_text = ""
+timeline_ok = False
+timeline_note = "未查询（非否定模式）"
+if is_negative:
+    deadline = time.monotonic() + 15
+    while time.monotonic() < deadline:
+        try:
+            page = get_json(
+                f"{endpoint}/ringing/v1/sessions/{created_seed}/timeline",
+                {
+                    "Authorization": f"Bearer {token}",
+                    "X-QAQH-Client-Session-Id": client_session_id,
+                },
+            )
+            timeline_text = json.dumps(page, ensure_ascii=False)
+            timeline_ok, timeline_note = negative_evidence(page, ledger_decisions())
+        except Exception as exc:  # noqa: BLE001 — 失败原因要进产物
+            timeline_note = f"{type(exc).__name__}: {exc}"
+            timeline_text = f"<timeline fetch failed: {timeline_note}>"
+        if timeline_ok:
+            break
+        time.sleep(0.5)
+    (D / "timeline.json").write_text(timeline_text)
+    # 诊断产物：provider 每次请求体（否定路径的判据来自这里）。
+    (D / "provider-requests.json").write_text(
+        json.dumps(server.requests, ensure_ascii=False, indent=2)
+    )
+
 if daemon.poll() is None:
     os.killpg(daemon.pid, signal.SIGKILL)
     daemon.wait(timeout=5)
@@ -466,23 +626,37 @@ raw = bytes(capture)
 if base == "permission":
     checks = [
         ("permission modal visible", b"\xe6\x89\xb9\xe5\x87\x86" in raw),
-        ("permission approved", resolved),
+        (
+            "permission denied (d)" if mode == "permission-deny" else "permission approved (a)",
+            resolved,
+        ),
     ]
 elif base == "ask":
     checks = [
         ("ask modal visible", b"Continue with the test?" in raw),
-        ("ask answered", resolved),
+        (
+            "ask dismissed (Esc)" if mode == "ask-dismiss" else "ask answered (1)",
+            resolved,
+        ),
     ]
 elif base == "plan":
     checks = [
         ("plan modal visible", PLAN_TITLE in raw),
-        ("plan approved", resolved),
+        (
+            "plan rejected (r+理由+Enter)"
+            if mode == "plan-reject"
+            else "plan approved (a)",
+            resolved and (sent_reject_reason or mode != "plan-reject"),
+        ),
     ]
 else:
     checks = [
         ("pager body visible", b"pager reasoning body" in raw),
         ("pager returned", quit_sent),
     ]
+if is_negative:
+    # 本组模式的**真正判据**：后端 timeline 快照里出现否定终态。
+    checks += [(f"后端 timeline 记录否定终态：{timeline_note}", timeline_ok)]
 if is_hang:
     # 这三条才是 `*-hang` 模式的**目的**：不是「没崩」，而是
     # ① 应答超时真的变成用户可见的终态；② daemon 被终止后 TUI 能干净退出。

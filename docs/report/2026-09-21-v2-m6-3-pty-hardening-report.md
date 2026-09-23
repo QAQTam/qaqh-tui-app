@@ -258,6 +258,11 @@ scripts/tests/ci-linux-parse-test.sh              15 passed / 0 failed
 
 - permission / ask 已通过 fake provider + 真实 daemon PTY；plan review 尚无
   可控触发入口；
+  → **2026-09-23 更新**：三条否定路径（`permission-deny` / `ask-dismiss` /
+  `plan-reject`）已落地并全绿，判据改用后端权威证据（timeline 快照 + 会话事实
+  账本哈希）；详见
+  [`2026-09-23-v2-interaction-negative-paths-report.md`](2026-09-23-v2-interaction-negative-paths-report.md)。
+  该报告同时登记了 `QAQH_TEST_PLAN_REVIEW` 钩子的两条保真度缺口。
 - Windows ConHost 的 `ClearType::Purge` 是否清理全部历史仍需实机验证；
 - tmux / SSH / WezTerm / iTerm2 / Alacritty / Kitty / GNOME Terminal / Konsole
   尚未完成真实模拟器矩阵；环境能力矩阵已自动化；
@@ -267,6 +272,8 @@ scripts/tests/ci-linux-parse-test.sh              15 passed / 0 failed
 ## 5. 下一步
 
 1. 优先确认后端是否提供 permission / ask / plan 的可控测试钩子；
+   → **2026-09-23**：钩子已到（后端 issue #41 / `QAQH_TEST_*` spec），TUI 侧
+   permission / ask / plan 肯定+否定路径均已接线；剩余四个故障钩子被 issue #42 阻塞；
 2. 若无 hook，先建立真实 LLM/daemon 的手工交互记录，不把模拟当端到端证据；
-3. 增加 `$PAGER` PTY 脚本；
+3. 增加 `$PAGER` PTY 脚本；→ **已完成**；
 4. 开始终端兼容矩阵记录。
