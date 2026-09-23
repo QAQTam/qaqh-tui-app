@@ -1,16 +1,18 @@
 # QAQH TUI v2 终端兼容矩阵
 
-> 日期：2026-09-21（§3 于 2026-09-23 更新：Kitty 已从「待测」变「已测」）
-> 状态：环境能力矩阵已自动化；真实终端模拟器矩阵**已开测**（Kitty ✅，其余待环境）
+> 日期：2026-09-21（§3 于 2026-09-23 更新：Kitty + tmux 已从「待测」变「已测」）
+> 状态：环境能力矩阵已自动化；真实终端模拟器/multiplexer 矩阵**已开测**
+> （Kitty ✅、tmux ✅，其余待环境）
 
 ## 1. 自动化入口
 
 ```bash
 scripts/e2e-v2-terminal-matrix.sh    # 环境能力矩阵（自开 PTY + 解析字节流）
-scripts/e2e-v2-real-terminal.sh      # 真实终端模拟器矩阵（kitty + remote control）
+scripts/e2e-v2-real-terminal.sh      # 真实终端模拟器（kitty + remote control）
+scripts/e2e-v2-tmux.sh               # 真实 multiplexer（tmux，scrollback 语义）
 ```
 
-前者在隔离 daemon + 独立 PTY 中依次运行下列 profile，并断言：
+第一个在隔离 daemon + 独立 PTY 中依次运行下列 profile，并断言：
 
 - TUI 退出码为 0；
 - 无 panic；
@@ -18,9 +20,14 @@ scripts/e2e-v2-real-terminal.sh      # 真实终端模拟器矩阵（kitty + rem
 - **未开启鼠标追踪**（`?1000h/1002h/1003h/1006h/1015h` 一个都不出现）——
   这是「鼠标/复制」维度：开了就吃掉终端原生选择/复制。
 
-后者把 TUI 放进**真正的终端模拟器**（kitty），用 `kitten @ get-text` 读回
-**模拟器解出来的屏幕**，验证只有真模拟器才能回答的问题（见 §3）。缺
-kitty / 无可用显示环境时**显式 SKIP**，不假装通过。
+后两个分别把 TUI 放进**真正的终端模拟器**（kitty）与**真正的 multiplexer**
+（tmux），判据取自对方的回读接口（`kitten @ get-text` / `tmux capture-pane`）。
+缺对应程序时**显式 SKIP**，不假装通过。
+
+为什么 tmux 要单列：TUI 的 scrollback 在 tmux 里由 **tmux 自己**持有
+（`history-limit` + pane history），不在终端模拟器那层。`capture-pane -S -`
+能直接读回「可见区 + 历史」，是这条语义最权威的观测面——`ClearType::Purge`、
+alternate-screen 进出、嵌套清理都在这层出过问题。
 
 ## 2. 环境能力矩阵
 
@@ -59,16 +66,17 @@ RESULT: PASS
 
 ## 3. 真实终端模拟器矩阵
 
-`scripts/e2e-v2-real-terminal.sh` 已落地，逐维度判据都取自**模拟器的屏幕回读**，
-不看 TUI 自述：
+`scripts/e2e-v2-real-terminal.sh`（kitty）与 `scripts/e2e-v2-tmux.sh`（tmux）已落地，
+逐维度判据都取自**对方的回读接口**，不看 TUI 自述：
 
 | 维度 | 判据 | 说明 |
 |---|---|---|
 | render | 屏幕里有 `❯`（composer）与 `ready`（状态行），且无 `panicked at` | Ctrl+L → Enter 打开会话后再读 |
-| truecolor | 屏幕回读含 24-bit SGR | kitty 用 **T.416 冒号形式** `38:2:r:g:b`，不是分号形式——两种都算 |
-| resize | 改字号触发真实 SIGWINCH 后 cell 网格变化 **且屏幕内容确实重排** | 见下方「为什么不是 resize-os-window」 |
-| scrollback | 横幅**滚出屏幕**后仍能从 `--extent=all` 读回，且 `--extent=screen` 里没有 | 用 READY/GO 握手保证「先滚出、再断言」 |
-| exit | Ctrl+Q 后屏幕回显 `TUI_EXIT=0` | 退出码回显到屏幕 = 终端状态已还原、shell 拿回控制权 |
+| truecolor | 屏幕回读含 24-bit SGR | kitty/tmux 都用 **T.416 冒号形式** `38:2:r:g:b`，不是分号形式——两种都算 |
+| resize | 真实几何变化触发 SIGWINCH 后网格变化 **且屏幕内容确实重排** | kitty 走改字号；tmux 走 `resize-window`；见下方说明 |
+| scrollback | 横幅**滚出可见区**后仍能从历史读回，且可见区里没有 | kitty 用 READY/GO 握手；tmux 用 `capture-pane -S -` |
+| exit | Ctrl+Q 后回显 `TUI_EXIT=0` | 退出码回显 = 终端状态已还原、shell 拿回控制权 |
+| 鼠标/复制 | 未申请鼠标追踪 | tmux 用 `#{mouse_any_flag}`；PTY 矩阵扫私有模式序列 |
 
 | 终端 | scrollback | inline viewport | resize | truecolor | 鼠标/复制 | 状态 |
 |---|---|---|---|---|---|---|
@@ -79,10 +87,23 @@ RESULT: PASS
 | Alacritty | 待测 | 待测 | 待测 | 待测 | 待测 | PENDING（环境未安装） |
 | GNOME Terminal | 待测 | 待测 | 待测 | 待测 | 待测 | PENDING（环境未安装） |
 | Konsole | 待测 | 待测 | 待测 | 待测 | 待测 | PENDING（环境未安装） |
-| tmux | 待测 | 待测 | 待测 | 待测 | 待测 | PENDING（环境未安装，无 root 装） |
+| **tmux 3.7c** | ✅ 已测（`capture-pane -S -`） | ✅ 已测（render 维度） | ✅ 已测（`resize-window` → SIGWINCH） | ✅ 已测（透传 `38:2:`） | ✅ `mouse_any_flag=0` | **PASS**（2026-09-23） |
 | SSH | 待测 | 待测 | 待测 | 待测 | 待测 | PENDING（无 sshd） |
 
 **鼠标/复制**这一列对 12 个环境能力 profile 也已验证：全部 `mouse=off`。
+
+### 3.0 tmux 专项：scrollback 语义
+
+tmux 这层最该验证的是「TUI 写出去的行有没有真的进 tmux 的 history」。判据：
+
+- 横幅先打、再灌 40 行 filler ⇒ 横幅必然滚出可见区；
+- `tmux capture-pane -p -S -`（可见区 **+ 历史**）里必须有横幅；
+- 同时 `tmux capture-pane -p`（**仅可见区**）里必须**没有**横幅。
+
+两条都成立才说明「进的是 tmux history，不是还挂在屏幕上」。
+
+**证伪**：把 history 读法换成只读可见区（去掉 `-S -`）→ 该条立刻变红
+（实测 `history=False visible=False`）、`RESULT: FAIL`（已还原）。
 
 ### 3.1 为什么 resize 用改字号而不是 `resize-os-window`
 
@@ -113,6 +134,26 @@ RESULT: PASS
 暴露一个环境陷阱：本机 ambient `NO_COLOR=1`，不显式清掉的话真彩色断言
 必然假红。
 
+### 3.3 tmux 实测输出（2026-09-23）
+
+```text
+[✓] scrollback：横幅已滚出可见区但仍在 history 里
+[✓] 启动渲染：composer 提示符可见
+[✓] 启动渲染：无 panic
+[✓] 启动渲染：tmux pane 尺寸符合预期
+[✓] truecolor：tmux 回读含 24-bit SGR
+[✓] 鼠标/复制：TUI 未向 tmux 申请鼠标追踪
+[✓] resize：pane 尺寸已变（真实 SIGWINCH 路径）
+[✓] resize：重排后 UI 仍在（composer 可见）
+[✓] resize：重排后无 panic
+[✓] 退出：Ctrl+Q 后回显 TUI_EXIT=0
+RESULT: PASS
+```
+
+**鼠标判据的证伪**：在 wrapper 里先 `printf "\033[?1003h"`（模拟应用申请鼠标）
+→ `mouse_any_flag` 立刻变 `1`、该条变红、`RESULT: FAIL`（已实测后还原）。
+说明这条不是恒真断言。
+
 ## 4. 已知风险
 
 - Windows ConHost 的 `crossterm::ClearType::Purge` 当前只清可见 screen buffer，
@@ -120,11 +161,12 @@ RESULT: PASS
 - `TERM=dumb` 的自动 PTY 已通过初始化/退出；真实滚动/复制行为仍未在 dumb
   终端上验证（dumb 终端本身无 scrollback 概念，价值有限）；
 - tmux/SSH 的 cursor query、resize 和 scrollback 行为需要单独记录
-  （环境未安装 tmux/screen、无 sshd，无法本机开测；**不要**拿 `TERM=tmux-*`
-  环境变量分支当 tmux 真机证据）；
+  → **tmux 已补**（`scripts/e2e-v2-tmux.sh`，scrollback/resize/truecolor/exit
+  全绿）；SSH 仍无 sshd，保持 PENDING。**不要**拿 `TERM=tmux-*` 环境变量分支
+  当 tmux 真机证据——那是环境变量分支，不是真 multiplexer；
 - 主题降级已通过「无崩溃」验证，颜色可读性仍需要人工视觉检查；
 - **本机 compositor 下 `resize-os-window` 是空操作**（返回 0 但尺寸不变），
   所以 §3 的 resize 走改字号路径；真实窗口拖拽缩放仍需在有窗口管理器的
   实机上补一次；
-- kitty 是**唯一**已开测的真实模拟器，其余终端在矩阵里保持 PENDING——
-  环境能力分支（`TERM=tmux-256color` 等）**不等于**该终端已测。
+- kitty 与 tmux 是**仅有的两个**已开测的真实终端环境，其余保持 PENDING——
+  环境能力分支（`TERM=tmux-256color` / `TERM=alacritty` 等）**不等于**该终端已测。
