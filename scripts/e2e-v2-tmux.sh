@@ -80,6 +80,15 @@ echo "daemon pid=$DAEMON_PID data=$D"
 
 cleanup() {
     tmux -L "$TMUX_SOCK" kill-server >/dev/null 2>&1 || true
+    # kill-server 偶发会留下死 socket 文件，顺手清掉（只删本脚本的独立 socket，
+    # 绝不碰用户自己的 `default`）。
+    python3 - "$TMUX_SOCK" <<'PYEOF' 2>/dev/null || true
+import os
+import pathlib
+import sys
+
+pathlib.Path(f"/tmp/tmux-{os.getuid()}/{sys.argv[1]}").unlink(missing_ok=True)
+PYEOF
     kill "$DAEMON_PID" 2>/dev/null || true
     wait "$DAEMON_PID" 2>/dev/null || true
 }

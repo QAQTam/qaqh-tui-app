@@ -10,6 +10,8 @@
 scripts/e2e-v2-terminal-matrix.sh    # 环境能力矩阵（自开 PTY + 解析字节流）
 scripts/e2e-v2-real-terminal.sh      # 真实终端模拟器（kitty + remote control）
 scripts/e2e-v2-tmux.sh               # 真实 multiplexer（tmux，scrollback 语义）
+scripts/e2e-v2-wezterm.sh            # 真实终端模拟器（WezTerm cli 回读）
+scripts/e2e-v2-alacritty.sh          # 真实终端模拟器（Alacritty，**仅进程级**）
 ```
 
 第一个在隔离 daemon + 独立 PTY 中依次运行下列 profile，并断言：
@@ -66,25 +68,26 @@ RESULT: PASS
 
 ## 3. 真实终端模拟器矩阵
 
-`scripts/e2e-v2-real-terminal.sh`（kitty）与 `scripts/e2e-v2-tmux.sh`（tmux）已落地，
-逐维度判据都取自**对方的回读接口**，不看 TUI 自述：
+`scripts/e2e-v2-real-terminal.sh`（kitty）、`scripts/e2e-v2-tmux.sh`（tmux）与
+`scripts/e2e-v2-wezterm.sh`（WezTerm）已落地，逐维度判据都取自**对方的回读接口**，
+不看 TUI 自述：
 
 | 维度 | 判据 | 说明 |
 |---|---|---|
 | render | 屏幕里有 `❯`（composer）与 `ready`（状态行），且无 `panicked at` | Ctrl+L → Enter 打开会话后再读 |
-| truecolor | 屏幕回读含 24-bit SGR | kitty/tmux 都用 **T.416 冒号形式** `38:2:r:g:b`，不是分号形式——两种都算 |
-| resize | 真实几何变化触发 SIGWINCH 后网格变化 **且屏幕内容确实重排** | kitty 走改字号；tmux 走 `resize-window`；见下方说明 |
-| scrollback | 横幅**滚出可见区**后仍能从历史读回，且可见区里没有 | kitty 用 READY/GO 握手；tmux 用 `capture-pane -S -` |
+| truecolor | 屏幕回读含 24-bit SGR | 三个环境都用 **T.416 冒号形式**（kitty/tmux `38:2:`、WezTerm `38:2::`），分号形式 `38;2;` 也认 |
+| resize | 真实几何变化触发 SIGWINCH 后网格变化 **且屏幕内容确实重排** | kitty 改字号；tmux `resize-window`；WezTerm `split-pane`；见下方说明 |
+| scrollback | 横幅**滚出可见区**后仍能从历史读回，且可见区里没有 | kitty 用 READY/GO 握手；tmux 用 `capture-pane -S -`；WezTerm 用 `--start-line -1000` |
 | exit | Ctrl+Q 后回显 `TUI_EXIT=0` | 退出码回显 = 终端状态已还原、shell 拿回控制权 |
-| 鼠标/复制 | 未申请鼠标追踪 | tmux 用 `#{mouse_any_flag}`；PTY 矩阵扫私有模式序列 |
+| 鼠标/复制 | 未申请鼠标追踪 | tmux 用 `#{mouse_any_flag}`；PTY 矩阵扫私有模式序列；kitty/WezTerm **无此查询面** |
 
 | 终端 | scrollback | inline viewport | resize | truecolor | 鼠标/复制 | 状态 |
 |---|---|---|---|---|---|---|
 | **Kitty 0.48.2** | ✅ 已测 | ✅ 已测（render 维度） | ✅ 已测（SIGWINCH 重排） | ✅ 已测（`38:2:`） | ✅ 未开捕获 | **PASS**（2026-09-23） |
 | Windows Terminal / PowerShell | 待测 | 待测 | 待测 | 待测 | 待测 | PENDING（无 Windows 实机） |
-| WezTerm | 待测 | 待测 | 待测 | 待测 | 待测 | PENDING（环境未安装） |
+| **WezTerm 20260716** | ✅ 已测（`--start-line -1000`） | ✅ 已测（render 维度） | ✅ 已测（`split-pane` → SIGWINCH） | ✅ 已测（`38:2::`） | ⚠️ 无查询面 | **PASS**（2026-09-23） |
+| Alacritty 0.17.0 | ⚠️ 无回读接口 | ⚠️ 无回读接口 | ⚠️ 无回读接口 | ⚠️ 无回读接口 | ⚠️ 无查询面 | **部分**（进程级，2026-09-23；见 §3.4） |
 | iTerm2 | 待测 | 待测 | 待测 | 待测 | 待测 | PENDING（macOS 专属） |
-| Alacritty | 待测 | 待测 | 待测 | 待测 | 待测 | PENDING（环境未安装） |
 | GNOME Terminal | 待测 | 待测 | 待测 | 待测 | 待测 | PENDING（环境未安装） |
 | Konsole | 待测 | 待测 | 待测 | 待测 | 待测 | PENDING（环境未安装） |
 | **tmux 3.7c** | ✅ 已测（`capture-pane -S -`） | ✅ 已测（render 维度） | ✅ 已测（`resize-window` → SIGWINCH） | ✅ 已测（透传 `38:2:`） | ✅ `mouse_any_flag=0` | **PASS**（2026-09-23） |
@@ -154,6 +157,39 @@ RESULT: PASS
 → `mouse_any_flag` 立刻变 `1`、该条变红、`RESULT: FAIL`（已实测后还原）。
 说明这条不是恒真断言。
 
+### 3.4 WezTerm 专项与 Alacritty 的能力边界
+
+**WezTerm**（`scripts/e2e-v2-wezterm.sh`，9/9 PASS）——踩到两个坑，都写进脚本注释：
+
+1. **必须直连 GUI 自己的 socket**。`wezterm cli --class X ...` 在本版本里**不会**
+   去找 GUI 实例，而是连默认路径 `/run/user/$UID/wezterm/sock`；那儿没有 server
+   时它会**自作主张 spawn 一个 `wezterm-mux-server`**，于是你读到的是一个全新
+   默认 shell 的 pane —— 假绿/假红都可能是它。正确做法：取
+   `gui-sock-<gui-pid>`，用 `WEZTERM_UNIX_SOCKET=<该 socket>` 跑 cli。
+2. **无鼠标查询面**：cli 不暴露「应用有没有申请鼠标」，该列标 ⚠️ 而不是 ✅。
+
+resize 走 `split-pane`（把 TUI 所在 pane 挤窄 → 真 SIGWINCH）——WezTerm cli
+没有「改窗口尺寸」的命令，分屏是它唯一能程序化改 pane 几何的路径。
+
+**Alacritty**（`scripts/e2e-v2-alacritty.sh`）——**只能做到进程级**，理由必须写清：
+
+Alacritty **没有 IPC**（`alacritty msg` 只有窗口/配置子命令，既无屏幕回读也无按键
+注入）。所以 kitty/tmux/WezTerm 那套「读回模拟器解出来的屏幕」在这里做不到。
+本脚本只断言**进程级 + 环境级**事实，11 项：
+
+- TUI 真的跑在 Alacritty 的 pty 里：`TERM=alacritty`、真 `/dev/pts/*`、
+  行列数 = 请求的 100x35、**`infocmp alacritty` 可解析**（terminfo 缺失是
+  crossterm 画不出来的经典原因）；
+- TUI 持续存活、无 panic、写出了诊断日志；
+- **`qaqh-tui doctor` 在 Alacritty 的 pty 内走完 discovery → pid 判活 →
+  `/health` → open 握手并返回 `[4] OK`**（拿 client session + lease）。
+  这条比在日志里 grep "starting new connection" 硬——后者只证明「发起过尝试」。
+
+**渲染 / scrollback / resize / Ctrl+Q 退出不在能力内**，需人工视觉确认；
+脚本末尾会打印 `RESULT: PASS(partial)` 而不是 `PASS`，避免被当成完整覆盖。
+证伪：把 doctor 的 `QAQH_DATA_DIR` 指向不存在的目录 → 三条连通性断言全红、
+`RESULT: FAIL`（已实测后还原）。
+
 ## 4. 已知风险
 
 - Windows ConHost 的 `crossterm::ClearType::Purge` 当前只清可见 screen buffer，
@@ -168,5 +204,9 @@ RESULT: PASS
 - **本机 compositor 下 `resize-os-window` 是空操作**（返回 0 但尺寸不变），
   所以 §3 的 resize 走改字号路径；真实窗口拖拽缩放仍需在有窗口管理器的
   实机上补一次；
-- kitty 与 tmux 是**仅有的两个**已开测的真实终端环境，其余保持 PENDING——
-  环境能力分支（`TERM=tmux-256color` / `TERM=alacritty` 等）**不等于**该终端已测。
+- kitty / tmux / WezTerm 是**已开测**的真实终端环境（各自脚本全绿），Alacritty
+  **只有进程级**（无 IPC，渲染需人工），其余保持 PENDING——环境能力分支
+  （`TERM=tmux-256color` / `TERM=alacritty` 等）**不等于**该终端已测；
+- **GPU 加速终端（WezTerm / Alacritty）的视觉正确性仍缺自动化手段**：WezTerm
+  有 cli 回读所以能测，Alacritty 既无 IPC 也无回读，只能人工看。若将来要补，
+  方向是 xdg-desktop-portal 截图 API（本机 compositor 下未验证可行性）。
