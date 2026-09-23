@@ -1,5 +1,7 @@
 /target
 /out
+# 本机锚点覆盖（path override 指向 ../qaqh-backend-anchor，绝对路径不入库）
+/.cargo/
 Cargo.lock.bak
 *.log
 .codegraph/

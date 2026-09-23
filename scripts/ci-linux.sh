@@ -24,7 +24,8 @@
 # （`report_drift`：只报告、不阻塞 —— 后端改造期间让 CI 因漂移变红只会烧掉
 # 稀缺额度，且那条红不指向本仓的任何改动）。
 # 刷新时机：**后端阶段性收口后由人确认**再改 rev；不要改成跟随 main。
-# 改动这里必须同步 `Cargo.toml` 里 [patch.crates-io] 的注释。
+# 改动这里必须同步 `Cargo.toml` 里 [patch.crates-io] 的注释，以及本机
+# `.cargo/config.toml` 的 paths 覆盖（指向 `../qaqh-backend-anchor`，见 .gitignore）。
 # ratatui 用的是**上游未发版的 main**（ratatui#2743 修复尚未发版）。
 #
 # ── 严格模式 ─────────────────────────────────────────────────────────
@@ -40,7 +41,7 @@ set -euo pipefail
 
 # 与 Cargo.toml 的 path 依赖对应。改动请同步 Cargo.toml 的注释。
 QAQH_BACKEND_REPO="${QAQH_BACKEND_REPO:-https://cnb.cool/QAQ-Harness/qaqh-backend.git}"
-QAQH_BACKEND_REV="${QAQH_BACKEND_REV:-66539a0301cf193119e56b6397946a847d7f02df}"
+QAQH_BACKEND_REV="${QAQH_BACKEND_REV:-5ec1900d6c937b6ff927d8f65fcd37d465de7988}"
 RATATUI_REPO="${RATATUI_REPO:-https://github.com/ratatui/ratatui.git}"
 RATATUI_REV="${RATATUI_REV:-e02e2a622eda6e4cae105df48a48f641cdba0303}"
 

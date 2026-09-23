@@ -23,6 +23,15 @@ impl App {
                         text,
                         images: vec![],
                         attachments: (!content_refs.is_empty()).then_some(content_refs),
+                        // 后端锚点 5ec1900（`45c6b63`）新增的两字段，均为
+                        // `#[serde(default)]`，**行为中性**：
+                        // - `message_id: None` = 回落到 command_id（用户/UI 消息的既定语义）；
+                        // - `input_purpose` 的 `#[default]` 是 `TriggerTurn`，即本行改动前
+                        //   「投递并触发回合」的行为。`QueueOnly` 只服务子代理注入，UI 用不到。
+                        //   （`ConversationInputPurpose` 未被 `qaqh-client` 再导出，
+                        //   故只能走 `Default::default()`；见该 crate types.rs 的再导出纪律。）
+                        message_id: None,
+                        input_purpose: Default::default(),
                         as_system: false,
                     }),
                     Default::default(),

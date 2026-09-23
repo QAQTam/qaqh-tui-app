@@ -15,7 +15,7 @@ M6.1 已完成并推送，当前是干净可继续开发的状态。下一班可
 | 工作树 | 干净 |
 | 后端仓库 | `/home/qaqtamsy/项目/qaqh-backend` |
 | 后端 HEAD | `b80028b Merge PR #201: docs(v2): 回写 P2-1 合并证据` |
-| 最近确认的 TUI 契约锚点 | `50d3dc1dcfef Merge PR #175: replay window status` |
+| 最近确认的 TUI 契约锚点 | `50d3dc1dcfef Merge PR #175: replay window status`（⚠ 已过期，2026-09-23 刷新为 `5ec1900d6c937b6`，见 [锚点刷新报告](../report/2026-09-23-backend-anchor-refresh-5ec1900-report.md)） |
 | 遗留进程 | 无 `qaqh-daemon` / `qaqh-tui` |
 
 ---
