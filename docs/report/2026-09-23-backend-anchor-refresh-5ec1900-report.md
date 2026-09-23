@@ -172,3 +172,91 @@ scripts/e2e-v2-session-switch.sh   RESULT: PASS
 ```
 
 即：**锚点 daemon 产物 → TUI 二进制 → v1 冒烟 + v2 端到端**全链路已跑通。
+
+---
+
+## 9. 第二次刷新：`tui-anchor-2026-09-23-p3`（2026-09-23 同日）
+
+后端随后合并了 P3 与 TUI 契约两批（#288 / #289 / #290 / #291 / #292 / #293），
+并按本仓 §7.1 约定的流程**新开 tag、不移动旧 tag**：
+
+| 项 | 值 |
+|---|---|
+| 新 tag | `tui-anchor-2026-09-23-p3`（annotated，tag 对象 `1d06328`） |
+| 指向 | `8dbe22e03239e95d19770dacd7b4dd0645ca6a7a`（后端 `betav2`） |
+| 旧 tag | `tui-anchor-2026-09-23`（tag 对象 `65a94b6`）→ 仍是 `5ec1900`，未移动 ✓ |
+| 本仓 pin | `scripts/ci-linux.sh` → `8dbe22e`；`.cargo/config.toml` 锚点 worktree 同步切到该 rev |
+| daemon | 锚点 worktree 内重建，sha256 `740cf708d205b8e8a5c79a7490b2f2fe5ac31f38438f1d6fa09bf1fc365fae32` |
+
+> 后端 issue 里把旧锚点写作 `65a94b6`——那是 **tag 对象**的 SHA（`git rev-parse <tag>`），
+> 不是 commit SHA（`git rev-parse <tag>^{commit}` = `5ec1900`）。两者都对，只是口径不同；
+> 本仓 `ci-linux.sh` 必须用 **commit SHA**（`prepare()` 拿 `rev-parse HEAD` 做字符串比对）。
+
+### 9.1 本批后端交付（对应本仓协作需求的 §7 汇总表）
+
+| 请求 | 后端交付 |
+|---|---|
+| 锚点规格 | `tui-anchor-2026-09-23-p3`（#288/#290/#292 全部纳入） |
+| plan review 可控测试钩子 | `QAQH_TEST_PLAN_REVIEW=1`（#290） |
+| 故障注入钩子 | `QAQH_TEST_INTERACTION_FAULT` / `SSE_TERMINATE` / `TIMELINE_GAP` / `COMMAND_ACK` / `SESSION_404_SEED`（#290） |
+| `ConversationInputPurpose` 再导出 | #289 已合入 |
+| 服务面 typed 变体（U-14） | #291 已合入 |
+| 测试开关集中登记 | `docs/spec/2026-09-23-TUI契约测试钩子-spec.md` |
+| typed todo 消费路径 | `docs/spec/2026-09-23-TUI-typed-todo消费路径-spec.md`（#292） |
+| P5 wire 变更交底 | `docs/spec/2026-09-23-TUI-P5-wire变更交底-spec.md`（#293） |
+
+### 9.2 TUI 侧落地（后端 issue #41 的三项待办）
+
+**① `MODE=plan` 并入 `scripts/e2e-v2-interactions.sh`** ✅
+MODE 闭集扩为 `permission|ask|plan|pager|permission-hang|ask-hang`；plan 模式在 daemon
+env 里置 `QAQH_TEST_PLAN_REVIEW=1`，断言 modal 可见 + `a` 批准 + 无残留。
+
+**② `permission-hang` / `ask-hang` 的超时 UI 终态** ✅ —— 这项**暴露了 v2 的一个真缺陷**：
+
+- TUI 侧原本**没有交互应答的 ack 超时**（`spawn_api` 的注释还写着"今后如需统一超时……"），
+  而 `respond_*` 是**乐观下架 modal** 的 → ack 永不返回时用户什么都看不到；
+- 更关键：**v2 Agent View 完全不渲染 toast**（`grep toast src/ui/v2 src/terminal` 零命中），
+  即所有命令失败 / 上传失败 / 超时在 Agent View 里**都不可见**。
+
+处置：
+
+- `app/mod.rs` 新增 `INTERACTION_ACK_TIMEOUT = 10s` 与
+  `ApiCtx::send_interaction_command`（只作用于 permission/ask/plan 三类应答，
+  不碰 compact/undo 等可能合法长耗时的命令）；
+- 超时返回可读 `Err`，走**既有** `ActionResult::CommandAck` 错误分支 → toast；
+- `terminal/agent.rs` 的 `status_line` 补上 toast 面，且 toast 存在时让位掉
+  model/cwd/usage 等常驻项（保证瞬时提示一定画得出来）。
+
+**③ 迁移到 `PlanReviewItem`** ✅ —— 纯改名，字段一字未动；
+另修 `src/ui/modal.rs` 与 `src/ui/v2/modal.rs` 的 `{:?}` → `{}`
+（`complexity` 是 `String`，`{:?}` 会渲染成带引号的 `"small"`）。
+既然 #289 已合入，`input_purpose` 也从 `Default::default()` 改成显式的
+`ConversationInputPurpose::TriggerTurn`。
+
+### 9.3 实测（全部对着新锚点 daemon）
+
+```text
+cargo check --all-targets                   通过
+cargo test --all-targets                    336 passed / 0 failed / 8 ignored
+cargo fmt --check                           通过
+cargo clippy --all-targets -- -D warnings   通过
+
+MODE=permission      scripts/e2e-v2-interactions.sh   PASS
+MODE=ask             scripts/e2e-v2-interactions.sh   PASS
+MODE=plan            scripts/e2e-v2-interactions.sh   PASS（新增）
+MODE=pager           scripts/e2e-v2-interactions.sh   PASS
+MODE=permission-hang scripts/e2e-v2-interactions.sh   PASS（新增）
+   [✓] permission modal visible / [✓] permission approved
+   [✓] 应答超时提示可见 / [✓] 超时后 daemon 已被回收 / [✓] daemon 消失后仍能干净退出
+MODE=ask-hang        scripts/e2e-v2-interactions.sh   PASS（新增）
+scripts/e2e-v2-session-switch.sh                      RESULT: PASS
+scripts/e2e-v2-reconnect.sh                           RESULT: PASS
+```
+
+### 9.4 仍未收口（M6.3 剩余）
+
+- **plan review 的故障注入**（拒绝 / 超时 / 断流）——本批只做了 approve 正路径；
+- **permission-deny / ask-dismiss** 两个一次性钩子尚未接进 harness；
+- 其余故障钩子（`SSE_TERMINATE` / `TIMELINE_GAP` / `COMMAND_ACK` / `SESSION_404_SEED`）
+  后端已备好但 TUI 侧**尚未接线**——这是 M6.3 接下来的主要工作面；
+- 完整终端模拟器矩阵（9 个终端 × 5 维度）仍全 PENDING。

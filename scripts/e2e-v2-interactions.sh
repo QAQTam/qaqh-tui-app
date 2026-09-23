@@ -1,14 +1,21 @@
 #!/bin/bash
-# 真机端到端：V2 permission / ask / $PAGER（fake OpenAI provider + 真实 daemon + PTY）。
+# 真机端到端：V2 permission / ask / plan / $PAGER（fake OpenAI provider + 真实 daemon + PTY）。
 #
 # 不是 UI mock：TUI 连接真实 daemon，daemon 经本地 OpenAI-compatible provider
 # permission：收到 exec tool_call，走真实权限引擎并阻塞在 permission modal。
 # ask：收到 ask tool_call，走真实 InteractionRequested 并阻塞在 ask modal。
+# plan：daemon 侧 `QAQH_TEST_PLAN_REVIEW=1`，在 round 0 调用 provider 前生成真实
+#       `PlanReviewRequested` 并挂起（后端契约测试钩子 spec §1.1）。
+# *-hang：daemon 侧 `QAQH_TEST_INTERACTION_FAULT=<mode>`，应答命令**永不返回 ack**
+#       （spec §1.2），用于验证 TUI 的应答超时终态与 daemon 消失后的干净退出。
 #
 # 用法：
 #   MODE=permission scripts/e2e-v2-interactions.sh
 #   MODE=ask scripts/e2e-v2-interactions.sh
+#   MODE=plan scripts/e2e-v2-interactions.sh
 #   MODE=pager scripts/e2e-v2-interactions.sh
+#   MODE=permission-hang scripts/e2e-v2-interactions.sh
+#   MODE=ask-hang scripts/e2e-v2-interactions.sh
 # 前置：qaqh-daemon 与 qaqh-tui 已构建。
 
 set -u
@@ -21,7 +28,9 @@ REPO_ROOT=$(cd -- "$SCRIPT_DIR/.." && pwd)
 BACKEND_ROOT=${QAQH_BACKEND_ROOT:-$REPO_ROOT/../qaqh-backend-anchor}
 DAEMON=${DAEMON:-$BACKEND_ROOT/target/debug/qaqh-daemon}
 TUI=${TUI:-$REPO_ROOT/target/debug/qaqh-tui}
-D=${D:-/tmp/qaqh-e2e-v2-permission}
+MODE="${MODE:-permission}"
+# 每个 MODE 用各自的隔离 data root，避免不同模式之间（或并行跑）互相踩。
+D=${D:-/tmp/qaqh-e2e-v2-$MODE}
 
 for binary in "$DAEMON" "$TUI"; do
     [ -x "$binary" ] || {
@@ -41,7 +50,7 @@ esac
 rm -rf "$D"
 mkdir -p "$D/qaqh"
 
-DAEMON="$DAEMON" TUI="$TUI" D="$D" MODE="${MODE:-permission}" python3 - <<'PY'
+DAEMON="$DAEMON" TUI="$TUI" D="$D" MODE="$MODE" python3 - <<'PY'
 import fcntl
 import json
 import os
@@ -63,8 +72,15 @@ DATA = D / "qaqh"
 DISCOVERY = DATA / "daemon.json"
 RAW = D / "tui.raw"
 mode = os.environ.get("MODE", "permission")
-if mode not in {"permission", "ask", "pager"}:
-    raise SystemExit(f"MODE must be permission|ask|pager, got {mode!r}")
+# `*-hang` 是「同一个交互 + 注入 ack 永不返回」的组合模式，先拆成 base + is_hang。
+HANG_BASE = {"permission-hang": "permission", "ask-hang": "ask"}
+if mode not in {"permission", "ask", "plan", "pager", *HANG_BASE}:
+    raise SystemExit(
+        "MODE must be permission|ask|plan|pager|permission-hang|ask-hang, "
+        f"got {mode!r}"
+    )
+base = HANG_BASE.get(mode, mode)
+is_hang = mode in HANG_BASE
 
 def post_json(url, payload, headers=None):
     body = json.dumps(payload).encode()
@@ -111,7 +127,7 @@ class FakeProvider(BaseHTTPRequestHandler):
                 },
                 {"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]},
             ]
-        elif mode == "pager":
+        elif base == "pager":
             slow_first = True
             chunks = [
                 {
@@ -138,48 +154,65 @@ class FakeProvider(BaseHTTPRequestHandler):
                 {"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]},
             ]
         else:
-            if mode == "permission":
-                tool_name = "exec"
-                arguments = json.dumps({"command": "echo permission-test"})
-            else:
-                tool_name = "ask"
-                arguments = json.dumps(
+            if base == "plan":
+                # plan 模式：`PlanReviewRequested` 在 round 0、**调用 provider 之前**
+                # 就挂起（spec §1.1），所以走到这里的已经是批准之后的那一轮——
+                # 回一段纯文本即可，被测对象是 plan modal 本身。
+                chunks = [
                     {
-                        "question": "Continue with the test?",
-                        "options": ["Yes", "No"],
-                        "allow_custom": False,
-                    }
-                )
-            chunks = [
-                {
-                    "choices": [
-                        {"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}
-                    ]
-                },
-                {
-                    "choices": [
+                        "choices": [
+                            {
+                                "index": 0,
+                                "delta": {"role": "assistant", "content": "plan approved"},
+                                "finish_reason": None,
+                            }
+                        ]
+                    },
+                    {"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]},
+                ]
+            else:
+                if base == "permission":
+                    tool_name = "exec"
+                    arguments = json.dumps({"command": "echo permission-test"})
+                else:
+                    tool_name = "ask"
+                    arguments = json.dumps(
                         {
-                            "index": 0,
-                            "delta": {
-                                "tool_calls": [
-                                    {
-                                        "index": 0,
-                                        "id": "call_permission_1",
-                                        "type": "function",
-                                        "function": {"name": tool_name, "arguments": arguments},
-                                    }
-                                ]
-                            },
-                            "finish_reason": None,
+                            "question": "Continue with the test?",
+                            "options": ["Yes", "No"],
+                            "allow_custom": False,
                         }
-                    ]
-                },
-                {
-                    "choices": [
-                        {"index": 0, "delta": {}, "finish_reason": "tool_calls"}
-                    ]
-                },
-            ]
+                    )
+                chunks = [
+                    {
+                        "choices": [
+                            {"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}
+                        ]
+                    },
+                    {
+                        "choices": [
+                            {
+                                "index": 0,
+                                "delta": {
+                                    "tool_calls": [
+                                        {
+                                            "index": 0,
+                                            "id": "call_permission_1",
+                                            "type": "function",
+                                            "function": {"name": tool_name, "arguments": arguments},
+                                        }
+                                    ]
+                                },
+                                "finish_reason": None,
+                            }
+                        ]
+                    },
+                    {
+                        "choices": [
+                            {"index": 0, "delta": {}, "finish_reason": "tool_calls"}
+                        ]
+                    },
+                ]
 
         for index, chunk in enumerate(chunks):
             self.wfile.write(f"data: {json.dumps(chunk)}\n\n".encode())
@@ -211,6 +244,12 @@ endpoint = "openai"
 daemon_log = (D / "daemon.out").open("ab")
 daemon_env = os.environ.copy()
 daemon_env["QAQH_DATA_DIR"] = str(DATA)
+# 后端契约测试钩子（后端 `docs/spec/2026-09-23-TUI契约测试钩子-spec.md`）。
+# daemon **启动时读一次**；除 QAQH_TEST_LEASE_TTL_MS 外运行中不重读。
+if base == "plan":
+    daemon_env["QAQH_TEST_PLAN_REVIEW"] = "1"
+if is_hang:
+    daemon_env["QAQH_TEST_INTERACTION_FAULT"] = mode
 daemon = subprocess.Popen(
     [os.environ["DAEMON"], "run"],
     stdin=subprocess.DEVNULL,
@@ -323,7 +362,13 @@ resolved_at = None
 sent_thinking = False
 sent_pager = False
 quit_sent = False
-deadline = start + 35
+daemon_killed = False
+# TUI 侧交互应答的 ack 上限（`INTERACTION_ACK_TIMEOUT`，10s）触发后的 toast 文案。
+# 断言用「子串」而不是整句：文案里带秒数，改上限不该让本脚本变红。
+TIMEOUT_TEXT = "应答超时".encode()
+# plan modal 的标题（`ui/v2/modal.rs` 的 `📋 计划评审 · {review_type}`）。
+PLAN_TITLE = "计划评审".encode()
+deadline = start + 45
 
 while time.monotonic() < deadline:
     elapsed = time.monotonic() - start
@@ -336,19 +381,25 @@ while time.monotonic() < deadline:
     if sent_prompt and not sent_message and elapsed >= 9.0:
         os.write(master, b"run permission test\r")
         sent_message = True
-    if mode == "permission":
+    if base == "permission":
         if b"\xe6\x89\xb9\xe5\x87\x86" in capture and not resolved:
             os.write(master, b"a")
             resolved = True
             resolved_at = time.monotonic()
             print("permission modal detected; approved with a")
-    elif mode == "ask":
+    elif base == "ask":
         if b"Continue with the test?" in capture and not resolved:
             os.write(master, b"1")
             resolved = True
             resolved_at = time.monotonic()
             print("ask modal detected; answered with 1")
-    elif mode == "pager":
+    elif base == "plan":
+        if PLAN_TITLE in capture and not resolved:
+            os.write(master, b"a")
+            resolved = True
+            resolved_at = time.monotonic()
+            print("plan modal detected; approved with a")
+    elif base == "pager":
         if not sent_thinking and elapsed >= 12.0:
             os.write(master, b"\x14")
             sent_thinking = True
@@ -359,7 +410,21 @@ while time.monotonic() < deadline:
             os.write(master, b"\x11")
             quit_sent = True
             print("Ctrl+Q sent after pager")
-    if resolved_at is not None and not quit_sent and time.monotonic() - resolved_at >= 2.0:
+    if is_hang:
+        # hang 钩子让应答命令**永不返回 ack**，且该请求会永久占住连接任务
+        # （后端 spec §1.2 明写：测试结束必须终止 daemon，不能等它自己返回）。
+        # 所以：先断言到超时提示 → 杀 daemon → 再退出，验证 TUI 在 daemon
+        # 消失后仍能干净退出。
+        if not daemon_killed and TIMEOUT_TEXT in capture:
+            os.killpg(daemon.pid, signal.SIGKILL)
+            daemon.wait(timeout=5)
+            daemon_killed = True
+            print("timeout toast observed; daemon killed")
+        if daemon_killed and not quit_sent:
+            os.write(master, b"\x11")
+            quit_sent = True
+            print("Ctrl+Q sent after daemon killed")
+    elif resolved_at is not None and not quit_sent and time.monotonic() - resolved_at >= 2.0:
         os.write(master, b"\x11")
         quit_sent = True
         print("Ctrl+Q sent after interaction resolved")
@@ -389,28 +454,42 @@ if tui.poll() is None:
     except subprocess.TimeoutExpired:
         os.killpg(tui.pid, signal.SIGKILL)
 
-os.killpg(daemon.pid, signal.SIGKILL)
-daemon.wait(timeout=5)
+if daemon.poll() is None:
+    os.killpg(daemon.pid, signal.SIGKILL)
+    daemon.wait(timeout=5)
 server.shutdown()
 
 RAW.write_bytes(capture)
 print(f"tui exit={tui.returncode} bytes={len(capture)} cursor_queries={queries}")
 
 raw = bytes(capture)
-if mode == "permission":
+if base == "permission":
     checks = [
         ("permission modal visible", b"\xe6\x89\xb9\xe5\x87\x86" in raw),
         ("permission approved", resolved),
     ]
-elif mode == "ask":
+elif base == "ask":
     checks = [
         ("ask modal visible", b"Continue with the test?" in raw),
         ("ask answered", resolved),
+    ]
+elif base == "plan":
+    checks = [
+        ("plan modal visible", PLAN_TITLE in raw),
+        ("plan approved", resolved),
     ]
 else:
     checks = [
         ("pager body visible", b"pager reasoning body" in raw),
         ("pager returned", quit_sent),
+    ]
+if is_hang:
+    # 这三条才是 `*-hang` 模式的**目的**：不是「没崩」，而是
+    # ① 应答超时真的变成用户可见的终态；② daemon 被终止后 TUI 能干净退出。
+    checks += [
+        ("应答超时提示可见", TIMEOUT_TEXT in raw),
+        ("超时后 daemon 已被回收", daemon_killed),
+        ("daemon 消失后仍能干净退出", quit_sent and tui.returncode == 0),
     ]
 checks += [
     ("no cursor-position timeout", b"cursor position could not be read" not in raw),

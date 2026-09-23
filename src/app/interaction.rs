@@ -46,7 +46,7 @@ impl App {
                 answer,
             })
             .collect();
-        self.send_control_command(
+        self.send_interaction_command(
             seed,
             ControlCommand::InteractionAskRespond {
                 interaction_id,
@@ -71,7 +71,7 @@ impl App {
         if let Some(sess) = self.sessions.get_mut(&seed) {
             sess.pending_ask = None;
         }
-        self.send_control_command(
+        self.send_interaction_command(
             seed,
             ControlCommand::InteractionAskDismiss { interaction_id },
             "跳过 ask",
@@ -97,7 +97,7 @@ impl App {
         if let Some(sess) = self.sessions.get_mut(&seed) {
             sess.pending_plan = None;
         }
-        self.send_control_command(
+        self.send_interaction_command(
             seed,
             ControlCommand::PlanReviewRespond {
                 interaction_id,
@@ -130,10 +130,7 @@ impl App {
             trust_folder: panel.trust_folder,
         });
         self.spawn_api(move |api, tx| async move {
-            let result = api
-                .send_command(Some(&seed.clone()), cmd, Default::default())
-                .await
-                .map_err(|e| e.to_string());
+            let result = api.send_interaction_command(Some(&seed.clone()), cmd).await;
             let _ = tx.send(AppMsg::Action(ActionResult::CommandAck {
                 seed: Some(seed),
                 label: "权限",

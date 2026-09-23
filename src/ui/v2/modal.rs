@@ -238,7 +238,9 @@ fn draw_plan(f: &mut Frame, panel: &PlanPanel, area: Rect, theme: &Theme) {
         for item in &panel.todo_items {
             lines.push(Line::from(vec![
                 Span::styled(
-                    format!("  [{:?}] ", item.complexity),
+                    // `complexity` 是 String（"small"|"medium"|"large"），`{:?}` 会渲染成
+                    // 带引号的 `"small"`——后端交底 §3 专门点了这处。
+                    format!("  [{}] ", item.complexity),
                     Style::new().fg(theme.text.dim),
                 ),
                 Span::styled(item.title.clone(), Style::new().fg(theme.text.secondary)),

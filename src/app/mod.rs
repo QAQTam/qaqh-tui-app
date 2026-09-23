@@ -43,7 +43,9 @@ use qaqh_client::{
     DomainActivityState as ActivityState, DomainSessionState as SessionStateEvent, NoticeLevel,
     PermissionCategory, PermissionRisk, ToolEvent,
 };
-use qaqh_client::{ControlCommand, ConversationCommand, RingingCommand, ToolCommand};
+use qaqh_client::{
+    ControlCommand, ConversationCommand, ConversationInputPurpose, RingingCommand, ToolCommand,
+};
 use qaqh_client::{RingingCommandState as CommandState, RingingCommandStatus};
 use qaqh_client::{SessionActivity, SessionListEntry};
 use session::{
@@ -152,6 +154,21 @@ pub struct ApiCtx {
     pub client: Option<Arc<qaqh_client::Client>>,
 }
 
+/// 交互应答（permission / ask / plan）的 ack 上限。
+///
+/// **为什么单列这一类**：这三个命令会**乐观下架 modal**（`respond_*` 先把面板置空
+/// 再发命令），所以 ack 永不返回时用户既看不到 modal、也看不到任何反馈——界面看起来
+/// 「什么都没发生」。daemon 是同机进程，正常应答在毫秒级，超过这个上限就是故障，
+/// 必须可见（B1：丢弃必须可见）。
+///
+/// **为什么不加在 `spawn_api` 上**：其余命令（compact / undo / session.delete …）
+/// 可能合法地长耗时，一刀切会误伤。`spawn_api` 的注释早写了「今后如需统一超时……
+/// 叠加在此处」，这里刻意**不**走那条路。
+///
+/// 后端对应钩子：`QAQH_TEST_INTERACTION_FAULT=permission-hang|ask-hang`
+/// （见后端 `docs/spec/2026-09-23-TUI契约测试钩子-spec.md` §1.2）。
+pub(crate) const INTERACTION_ACK_TIMEOUT: Duration = Duration::from_secs(10);
+
 impl ApiCtx {
     /// 取出连接；没有连接时给出可读的错误（测试替身路径）。
     fn client(&self) -> Result<&Arc<qaqh_client::Client>, String> {
@@ -175,6 +192,28 @@ impl ApiCtx {
             .send_command(seed, command, options)
             .await
             .map_err(|e| e.to_string())
+    }
+
+    /// 交互应答专用：与 [`ApiCtx::send_command`] 同款，但带 [`INTERACTION_ACK_TIMEOUT`]
+    /// 上限。超时返回可读的 `Err`——调用方走既有的 `ActionResult::CommandAck` 错误
+    /// 分支，落到状态栏 toast（`{label}: {e}`），不需要新的 UI 通道。
+    pub async fn send_interaction_command(
+        &self,
+        seed: Option<&str>,
+        command: qaqh_client::RingingCommand,
+    ) -> Result<qaqh_client::RingingCommandAck, String> {
+        match tokio::time::timeout(
+            INTERACTION_ACK_TIMEOUT,
+            self.send_command(seed, command, Default::default()),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => Err(format!(
+                "应答超时（{}s 未收到 daemon 确认）",
+                INTERACTION_ACK_TIMEOUT.as_secs()
+            )),
+        }
     }
 
     /// 拉取 timeline 快照页（纯读，不重建流）。

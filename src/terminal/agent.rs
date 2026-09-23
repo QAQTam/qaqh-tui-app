@@ -42,6 +42,7 @@ use crate::ui::v2::runtime::V2TranscriptRuntime;
 use crate::ui::v2::transcript::{BlockState, render_transcript};
 use crate::ui::v2::workspace;
 use qaqh_client::ConversationMode;
+use qaqh_client::NoticeLevel;
 
 const TICK_INTERVAL: Duration = Duration::from_millis(200);
 const COMMIT_CHUNK_BLOCKS: usize = 32;
@@ -993,12 +994,19 @@ fn status_line(app: &App, width: u16, theme: &Theme) -> Line<'static> {
         format!(" {mark} {label}"),
         Style::new().fg(color),
     )];
+    // v2 此前**完全没有 toast 面**：v1 在状态栏中间渲染 `app.toasts`，v2 的
+    // status_line 只画连接相位与常驻信息，于是命令失败 / 应答超时 / 上传失败
+    // 这类反馈在 Agent View 里**完全不可见**（后端 issue #41 第 2 项正是靠
+    // `permission-hang` 把这个洞暴露出来的）。
+    // 这里给 toast 最高优先级：有 toast 时让位掉 model / cwd / usage 这些常驻项，
+    // 保证瞬时的错误提示一定画得出来。
+    let toast = app.toasts.back();
     if let Some(session) = app.active_session() {
         spans.push(Span::styled(
             format!(" · {}", session.activity_label()),
             Style::new().fg(theme.text.secondary),
         ));
-        if width >= 40 {
+        if toast.is_none() && width >= 40 {
             if let Some(model) = session.display_model() {
                 spans.push(Span::styled(
                     format!(" · {model}"),
@@ -1016,7 +1024,8 @@ fn status_line(app: &App, width: u16, theme: &Theme) -> Line<'static> {
                 Style::new().fg(theme.text.dim),
             ));
         }
-        if width >= 70
+        if toast.is_none()
+            && width >= 70
             && let Some(cwd) = app.effective_cwd(None)
         {
             spans.push(Span::styled(
@@ -1024,7 +1033,7 @@ fn status_line(app: &App, width: u16, theme: &Theme) -> Line<'static> {
                 Style::new().fg(theme.text.dim),
             ));
         }
-        if width >= 50 {
+        if toast.is_none() && width >= 50 {
             if let Some(usage) = &session.usage {
                 spans.push(Span::styled(
                     format!(
@@ -1050,6 +1059,17 @@ fn status_line(app: &App, width: u16, theme: &Theme) -> Line<'static> {
                 Style::new().fg(theme.semantic.warning),
             ));
         }
+    }
+    if let Some(toast) = toast {
+        let color = match toast.level {
+            NoticeLevel::Info => theme.text.secondary,
+            NoticeLevel::Warn => theme.semantic.warning,
+            NoticeLevel::Error => theme.accent.error,
+        };
+        spans.push(Span::styled(
+            format!(" · {}", crate::app::truncate_str(&toast.text, 44)),
+            Style::new().fg(color),
+        ));
     }
     spans.push(Span::styled(
         format!(" {}", chrono::Local::now().format("%H:%M")),

@@ -217,7 +217,12 @@ pub struct PlanPanel {
     pub turn_id: String,
     pub plan_content: String,
     pub review_type: String,
-    pub todo_items: Vec<qaqh_client::TodoItem>,
+    /// P3 交底（后端 `docs/spec/2026-09-23-TUI-typed-todo消费路径-spec.md` §2）：
+    /// 旧 `qaqh_client::TodoItem` 已改名为 `PlanReviewItem`，**纯改名、字段一字未动**
+    /// （id / title / description / complexity），wire 形状无变化。
+    /// 注意：它只服务 plan review 预览，与 workspace todo 面板用的 `DashboardTask`
+    /// 不是同一个语义面。
+    pub todo_items: Vec<qaqh_client::PlanReviewItem>,
     /// 拒绝理由输入。
     pub message: String,
     pub entering_message: bool,

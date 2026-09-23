@@ -322,7 +322,8 @@ fn draw_plan(f: &mut Frame, panel: &PlanPanel, area: Rect) {
         )));
         for item in &panel.todo_items {
             lines.push(Line::from(vec![
-                Span::styled(format!("  [{:?}] ", item.complexity), theme::dim()),
+                // `complexity` 是 String，`{:?}` 会渲染成带引号的 `"small"`。
+                Span::styled(format!("  [{}] ", item.complexity), theme::dim()),
                 Span::raw(item.title.clone()),
             ]));
         }
