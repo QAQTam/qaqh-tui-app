@@ -198,6 +198,15 @@ main() {
     cargo test --all-targets
 
     echo
+    echo "== 性能门禁（M6.4）=="
+    # 必须单线程（内存判据走全局分配器计数，并行测试会污染读数）。
+    # 钉的是结构性性质，不是绝对耗时——判据表见 src/app/render/bench.rs。
+    if ! "$root/scripts/perf-gate.sh"; then
+        echo "✗ 性能门禁未通过。" >&2
+        exit 1
+    fi
+
+    echo
     echo "== cargo clippy =="
     cargo clippy --all-targets -- -D warnings
 

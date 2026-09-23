@@ -16,7 +16,7 @@
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use super::*;
 use crate::app::anim;
@@ -559,4 +559,107 @@ fn bench_v2_runtime_scale_curve() {
             kb(runtime_steady),
         );
     }
+}
+
+// ── M6.4 性能门禁 ────────────────────────────────────────────────────
+//
+// **为什么单独一个测试、且要单线程跑**：内存读数走全局分配器计数，`cargo test`
+// 默认并行会让其它测试的分配污染 `live()`。所以本门禁由
+// `scripts/perf-gate.sh` 用 `--test-threads=1 --ignored` 拉起，并已接进
+// `scripts/ci-linux.sh`。
+//
+// **只钉结构性性质（数量级），不钉绝对耗时**：powersave/boost 与 CI 机器差异
+// 能让同一场景差几倍（见 M6.4 报告 §0）。阈值同时满足两条——离实测有 1~2 个
+// 数量级余量，离**被修复过的回归形态**也有 1 个数量级，所以真退化一定抓得到：
+//
+// | 判据 | 实测（2026-09-21） | 阈值 | 回归形态 |
+// |---|---|---|---|
+// | version 未变同步 | 3 µs | < 1 ms | 整历史重扫 27.7 ms/帧 |
+// | live delta/帧 | 7–28 µs | < 2 ms | 每帧随历史线性增长 |
+// | 440 回合常驻 | 545 KB | < 8 MB | 每 block 存完整 seed/turn/block 字符串 |
+// | 440/110 块数比 | 3.996 | 3.5–4.5 | 有界队列把长 replay 截断（4096 上限） |
+// | 440 回合 replay | 104 ms | < 3 s | 超线性扫描 |
+#[test]
+#[ignore = "性能门禁：scripts/perf-gate.sh（--test-threads=1 --ignored）"]
+fn perf_gate_v2_runtime() {
+    let _guard = BENCH_LOCK.lock().unwrap();
+    const TOOLS: usize = 20;
+    const DELTAS: usize = 20;
+
+    // ── ① version 未变时的同步必须 O(1) ──
+    let mut sess = gen_session(110, TOOLS);
+    let version = sess.timeline.version;
+    let mut runtime = V2TranscriptRuntime::new();
+    let first = runtime.replay_from_scratch_versioned("bench", &sess.timeline.turns, version);
+    assert!(!first.is_empty(), "replay 必须产出待提交块");
+    let noop_start = Instant::now();
+    let noop = runtime.sync_timeline_versioned("bench", &sess.timeline.turns, version);
+    let noop_elapsed = noop_start.elapsed();
+    assert!(noop.is_empty(), "version 未变时不得重复 emit");
+    assert!(
+        noop_elapsed < Duration::from_millis(1),
+        "version 未变时的同步必须 O(1)：实测 {noop_elapsed:?}（阈值 1ms；\
+         回归形态是整历史重扫 ~27.7ms/帧）"
+    );
+
+    // ── ② live delta 必须微秒级 ──
+    let delta_start = Instant::now();
+    for _ in 0..DELTAS {
+        push_delta(&mut sess);
+        sess.timeline.version = sess.timeline.version.saturating_add(1);
+        let _ =
+            runtime.sync_timeline_versioned("bench", &sess.timeline.turns, sess.timeline.version);
+    }
+    let per_frame = delta_start.elapsed() / DELTAS as u32;
+    assert!(
+        per_frame < Duration::from_millis(2),
+        "live delta 必须微秒级：实测 {per_frame:?}/帧（阈值 2ms）"
+    );
+
+    // ── ③ 规模线性：块数必须随回合数成比例 ──
+    let small = gen_session(110, TOOLS);
+    let mut small_rt = V2TranscriptRuntime::new();
+    let small_blocks = small_rt
+        .replay_from_scratch_versioned("bench", &small.timeline.turns, small.timeline.version)
+        .len();
+
+    // ── ④ 长会话常驻内存 + replay 时间上界 ──
+    // `live_before` 扣掉会话模型本身的分配，只留 runtime 常驻（与 §2 曲线同口径）。
+    let big = gen_session(440, TOOLS);
+    let live_before = live();
+    let big_start = Instant::now();
+    let mut big_rt = V2TranscriptRuntime::new();
+    let big_blocks = big_rt
+        .replay_from_scratch_versioned("bench", &big.timeline.turns, big.timeline.version)
+        .len();
+    let big_elapsed = big_start.elapsed();
+    let steady = live().saturating_sub(live_before);
+
+    assert!(
+        steady < 8 * 1024 * 1024,
+        "440 回合 runtime 常驻必须 < 8MB：实测 {}（{big_blocks} blocks；\
+         回归形态是每 block 存完整身份字符串）",
+        kb(steady)
+    );
+    assert!(
+        big_elapsed < Duration::from_secs(3),
+        "440 回合 replay 必须 < 3s：实测 {big_elapsed:?}（基线 ~104ms）"
+    );
+
+    let ratio = big_blocks as f64 / small_blocks as f64;
+    assert!(
+        (3.5..=4.5).contains(&ratio),
+        "块数必须随回合数线性（440/110 应≈4）：实测 {ratio:.3}\
+         （比值塌陷 = 有界队列把长 replay 截断了）"
+    );
+
+    println!(
+        "\n=== M6.4 性能门禁（{TOOLS} tools/回合）===\n\
+         version 未变同步: {noop_elapsed:?}（阈值 <1ms）\n\
+         live delta/帧:   {per_frame:?}（阈值 <2ms）\n\
+         440 回合常驻:    {} / {big_blocks} blocks（阈值 <8MB）\n\
+         440 回合 replay: {big_elapsed:?}（阈值 <3s）\n\
+         块数线性度:      {ratio:.3}（阈值 3.5–4.5）",
+        kb(steady)
+    );
 }
