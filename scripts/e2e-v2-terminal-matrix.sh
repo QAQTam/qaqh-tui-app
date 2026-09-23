@@ -168,14 +168,30 @@ def run_profile(name, extra_env):
 
     raw = bytes(capture)
     (out_dir / f"{name}.raw").write_bytes(raw)
+    # 鼠标/复制维度：v2 Agent View **不得**开启鼠标追踪——开了就吃掉终端原生
+    # 选择/复制（README「该模式不启用鼠标捕获」的承诺）。这里直接扫原始字节流，
+    # 因为这是「输出里有没有那几个私有模式序列」的问题，模拟器侧看不出来。
+    mouse_enable = [
+        seq
+        for seq in (
+            b"\x1b[?1000h",  # 基础按键上报
+            b"\x1b[?1002h",  # 按键拖动
+            b"\x1b[?1003h",  # 任意移动
+            b"\x1b[?1006h",  # SGR 扩展坐标
+            b"\x1b[?1015h",  # urxvt 扩展坐标
+        )
+        if seq in raw
+    ]
     passed = (
         proc.returncode == 0
         and b"panicked at" not in raw
         and b"cursor position could not be read" not in raw
+        and not mouse_enable
     )
     print(
         f"  [{'✓' if passed else '✗'}] {name:<16} "
-        f"exit={proc.returncode} queries={queries} bytes={len(raw)}"
+        f"exit={proc.returncode} queries={queries} bytes={len(raw)} "
+        f"mouse={'ON ' + ','.join(s.decode() for s in mouse_enable) if mouse_enable else 'off'}"
     )
     return passed
 
