@@ -86,9 +86,13 @@ decision_ref = sha256:1860011b8369cb09d7bbac77f2fc8ba0d24887708e62ffd09da764acdf
 块（快照里该回合 `rounds: []`），也不把拒绝结果并进模型上下文（后续 provider
 请求里只有 `system` + `user` 两条消息）。这两条路都查不到，只剩 daemon 账本。
 
-## 5. 后端待办：`QAQH_TEST_PLAN_REVIEW` 钩子的保真度缺口（2 条）
+## 5. 后端待办：`QAQH_TEST_PLAN_REVIEW` 钩子的保真度缺口（2 条）——**已修复**
 
-> 已提 **issue #43**（P2，本仓 issue 面，抄送后端）；在 #41 留了交叉引用。
+> **2026-09-23 更新：后端已收口**（PR `QAQ-Harness/qaqh-backend#301`，merge
+> `84e08117`），并给出新锚点 `tui-anchor-2026-09-23-v2.0.0-rc` @ `1e78b7ce`。
+> TUI 侧已升级锚点并把 `MODE=plan-reject` 扩成三重断言，详见
+> [`2026-09-23-backend-anchor-v2.0.0-rc-report.md`](2026-09-23-backend-anchor-v2.0.0-rc-report.md)。
+> 下面保留缺口原始记录，供回溯。
 
 背景：`engine_tool.rs` 里 `pending_plans` 在工具侧**恒为空**，也就是说当前
 plan review **只能**靠 `QAQH_TEST_PLAN_REVIEW` 触发。钩子的保真度直接决定

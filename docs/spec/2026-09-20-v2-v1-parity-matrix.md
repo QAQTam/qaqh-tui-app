@@ -46,7 +46,7 @@ v2 可以在视觉与终端模型上重构，但不能静默降低 QAQH 的核�
 | P-07 | 思考 | ActivityBar + Ctrl+T | ThinkingLine + Ctrl+T | Intentionally changed | 实时可见，seal 后聚合 |
 | P-08 | 权限确认 | modal | alternate-screen modal | Intentionally changed | fake provider + 真实 daemon PTY：modal 可见 + 批准通过；**拒绝路径已补**（`MODE=permission-deny`，判据=后端 timeline `state=failed` + `[DENIED]`） |
 | P-09 | ask_user | modal | 阻塞式单题分页 Modal | Intentionally changed | fake provider + 真实 daemon PTY：modal 可见 + 1-based 应答通过；**跳过路径已补**（`MODE=ask-dismiss`，判据=回合 `cancelled` + 账本 `decision=dismissed`） |
-| P-10 | plan review | modal | alternate-screen modal | Intentionally changed | **PTY 已补**（`MODE=plan`：modal 可见 + `a` 批准通过）；**拒绝路径已补**（`MODE=plan-reject`：`r`+理由+Enter，判据=账本 `decision=rejected` 哈希）；钩子不物化 timeline 块，转写渲染待后端（见 M6.3 报告 §5） |
+| P-10 | plan review | modal | alternate-screen modal | Intentionally changed | **PTY 已补**（`MODE=plan`：modal 可见 + `a` 批准通过）；**拒绝路径三重断言**（`MODE=plan-reject`：timeline `tool:test-plan-review-*` 块 `plan_submit`/`failed` + provider 上下文配对回灌 + 账本 `decision=rejected` 指纹；后端 #301 已补齐钩子保真度） |
 | P-11 | 子代理观测 | Ctrl+↑/↓ 视图栈 | Workspace 子代理视图 | Intentionally changed | 只读观测、返回父会话路由通过 |
 | P-12 | workspace/todo | 右侧栏 | Workspace View | Intentionally changed | F4/`/workspace` 路由与 CJK 渲染通过 |
 | P-13 | 导出 | `/export` | `/export` | Must parity | Markdown 内容完整 |

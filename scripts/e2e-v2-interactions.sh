@@ -396,7 +396,7 @@ TIMEOUT_TEXT = "应答超时".encode()
 PLAN_TITLE = "计划评审".encode()
 # 否定路径的后端权威证据：判据全部取自 `GET /sessions/{seed}/timeline` 的物化快照，
 # 不看 TUI 字节流（「模态消失」只证明面板下架，不证明裁决送达后端）。
-# 出处（后端锚点 `8dbe22e`）：
+# 出处（后端锚点 `1e78b7ce` = `tui-anchor-2026-09-23-v2.0.0-rc`）：
 #   permission-deny → 工具终态 failed + 输出 `[DENIED] '…' (user denied permission)`
 #   ask-dismiss     → `engine_turn.rs::handle_ask_dismiss`：回合落 `TimelineTurnState::Cancelled`
 #   plan-reject     → `engine_turn.rs::handle_plan_response`：工具结果 `Plan rejected: <理由>`
@@ -518,14 +518,13 @@ if tui.poll() is None:
 # TUI 侧「模态消失」只说明它把面板下架了；拒绝/跳过/驳回是否**真的落到后端**，
 # 必须查后端物化 timeline。必须在杀 daemon 之前查。
 def timeline_tools(page):
-    """展平快照里的 tool block → [(turn, tool)]。"""
+    """展平快照里的 tool block → [(turn, block)]（block 里带 tool 字典）。"""
     out = []
     for turn in page.get("snapshot", {}).get("turns", []):
         for rnd in turn.get("rounds", []):
             for block in rnd.get("blocks", []):
-                tool = block.get("tool")
-                if isinstance(tool, dict):
-                    out.append((turn, tool))
+                if isinstance(block.get("tool"), dict):
+                    out.append((turn, block))
     return out
 
 def tool_text(tool):
@@ -564,31 +563,129 @@ def ledger_decisions():
     return refs
 
 def negative_evidence(page, decisions):
-    """返回 (是否满足, 人读描述)。判据全部来自后端侧，不看 TUI 字节流。"""
+    """返回 [(名称, 是否通过, 细节)]。判据全部来自后端侧，不看 TUI 字节流。"""
     turns = page.get("snapshot", {}).get("turns", [])
     states = [t.get("state") for t in turns]
     tools = timeline_tools(page)
     if mode == "permission-deny":
         hit = [
-            t
-            for _, t in tools
-            if t.get("state") == "failed" and "[DENIED]" in tool_text(t)
+            block["tool"]
+            for _, block in tools
+            if block["tool"].get("state") == "failed"
+            and "[DENIED]" in tool_text(block["tool"])
         ]
-        return bool(hit), f"timeline：tool 终态 failed + [DENIED]（turns={states}）"
+        return [
+            (
+                f"timeline：tool 终态 failed + [DENIED]（turns={states}）",
+                bool(hit),
+                "",
+            )
+        ]
     if mode == "ask-dismiss":
         ok = "cancelled" in states and decision_ref("dismissed") in decisions
-        return ok, (
-            f"timeline 回合 cancelled + 账本 decision=dismissed（turns={states}）"
+        return [
+            (
+                f"timeline 回合 cancelled + 账本 decision=dismissed（turns={states}）",
+                ok,
+                "",
+            )
+        ]
+    # plan-reject：三重判据（后端 #301 收口了钩子保真度，见 TUI issue #44）。
+    # ① timeline 物化：块存在 + name/state/output + 回合 rounds 非空；
+    # ② provider 上下文：assistant(tool_calls) 与 role=tool 配对、理由回灌；
+    # ③ 会话事实账本：decision=rejected 指纹（保留为第三重）。
+    out = []
+    plan_blocks = [
+        (turn, block)
+        for turn, block in tools
+        if str(block.get("block_id", "")).startswith("tool:test-plan-review-")
+    ]
+    out.append(
+        (
+            "timeline：存在 tool:test-plan-review-* 块",
+            bool(plan_blocks),
+            f"n={len(plan_blocks)}",
         )
-    # plan-reject：`QAQH_TEST_PLAN_REVIEW` 钩子只发控制面 `PlanReviewRequested`，
-    # **既不物化 timeline 块、也不把拒绝结果并进模型上下文**（已登记为后端待办），
-    # 所以快照与 provider 请求体两条路都查不到；改查 daemon 自己 fsync 的会话事实账本。
-    ok = decision_ref("rejected") in decisions
-    return ok, f"会话事实账本 decision=rejected（turns={states}）"
+    )
+    tool = plan_blocks[0][1].get("tool", {}) if plan_blocks else {}
+    output = str(tool.get("output") or "")
+    out.append(
+        (
+            "timeline：tool.name == plan_submit",
+            tool.get("name") == "plan_submit",
+            f"name={tool.get('name')!r}",
+        )
+    )
+    out.append(
+        (
+            "timeline：tool.state == failed",
+            tool.get("state") == "failed",
+            f"state={tool.get('state')!r}",
+        )
+    )
+    out.append(
+        (
+            "timeline：tool.output 含 `Plan rejected: <理由>`",
+            "Plan rejected:" in output and REJECT_REASON in output,
+            repr(output[:120]),
+        )
+    )
+    rounds = len(plan_blocks[0][0].get("rounds", [])) if plan_blocks else 0
+    out.append(
+        (
+            "timeline：所属回合 rounds 非空",
+            rounds > 0,
+            f"rounds={rounds}（钩子不物化块时这里是 0）",
+        )
+    )
+
+    calls = {}
+    tool_msgs = []
+    for request in server.requests:
+        for message in request.get("messages", []):
+            if message.get("role") == "assistant":
+                for call in message.get("tool_calls") or []:
+                    calls[call.get("id")] = (call.get("function") or {}).get("name")
+            if message.get("role") == "tool":
+                tool_msgs.append(
+                    (message.get("tool_call_id"), str(message.get("content") or ""))
+                )
+    plan_calls = {
+        cid: name for cid, name in calls.items() if str(cid).startswith("test-plan-review-")
+    }
+    out.append(
+        (
+            "provider：assistant tool_calls 含 test-plan-review-*",
+            bool(plan_calls),
+            f"calls={plan_calls}",
+        )
+    )
+    paired = [(cid, content) for cid, content in tool_msgs if cid in plan_calls]
+    out.append(
+        (
+            "provider：存在同 id 的 role=tool 消息",
+            bool(paired),
+            f"tool_call_ids={[cid for cid, _ in tool_msgs]}",
+        )
+    )
+    out.append(
+        (
+            "provider：tool 内容含拒绝理由（理由回灌模型上下文）",
+            any(REJECT_REASON in content for _, content in paired),
+            repr(paired[0][1][:120]) if paired else "",
+        )
+    )
+    out.append(
+        (
+            "账本：decision=rejected 指纹（第三重）",
+            decision_ref("rejected") in decisions,
+            "",
+        )
+    )
+    return out
 
 timeline_text = ""
-timeline_ok = False
-timeline_note = "未查询（非否定模式）"
+negative_checks = []
 if is_negative:
     deadline = time.monotonic() + 15
     while time.monotonic() < deadline:
@@ -601,15 +698,15 @@ if is_negative:
                 },
             )
             timeline_text = json.dumps(page, ensure_ascii=False)
-            timeline_ok, timeline_note = negative_evidence(page, ledger_decisions())
+            negative_checks = negative_evidence(page, ledger_decisions())
         except Exception as exc:  # noqa: BLE001 — 失败原因要进产物
-            timeline_note = f"{type(exc).__name__}: {exc}"
-            timeline_text = f"<timeline fetch failed: {timeline_note}>"
-        if timeline_ok:
+            timeline_text = f"<timeline fetch failed: {type(exc).__name__}: {exc}>"
+            negative_checks = [(f"后端证据查询失败（{exc}）", False, "")]
+        if all(ok for _, ok, _ in negative_checks):
             break
         time.sleep(0.5)
     (D / "timeline.json").write_text(timeline_text)
-    # 诊断产物：provider 每次请求体（否定路径的判据来自这里）。
+    # 诊断产物：provider 每次请求体（plan-reject 的上下文判据来自这里）。
     (D / "provider-requests.json").write_text(
         json.dumps(server.requests, ensure_ascii=False, indent=2)
     )
@@ -655,8 +752,11 @@ else:
         ("pager returned", quit_sent),
     ]
 if is_negative:
-    # 本组模式的**真正判据**：后端 timeline 快照里出现否定终态。
-    checks += [(f"后端 timeline 记录否定终态：{timeline_note}", timeline_ok)]
+    # 本组模式的**真正判据**：后端权威证据（timeline 物化 / provider 上下文 /
+    # 会话事实账本）。每条独立成行，红了能直接看出是哪一层缺。
+    for name, passed, detail in negative_checks:
+        suffix = f"  {detail}" if detail and not passed else ""
+        checks += [(f"后端证据 · {name}{suffix}", passed)]
 if is_hang:
     # 这三条才是 `*-hang` 模式的**目的**：不是「没崩」，而是
     # ① 应答超时真的变成用户可见的终态；② daemon 被终止后 TUI 能干净退出。

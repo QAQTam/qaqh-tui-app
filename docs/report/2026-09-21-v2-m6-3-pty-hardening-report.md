@@ -259,15 +259,22 @@ scripts/tests/ci-linux-parse-test.sh              15 passed / 0 failed
 - permission / ask 已通过 fake provider + 真实 daemon PTY；plan review 尚无
   可控触发入口；
   → **2026-09-23 更新**：三条否定路径（`permission-deny` / `ask-dismiss` /
-  `plan-reject`）已落地并全绿，判据改用后端权威证据（timeline 快照 + 会话事实
-  账本哈希）；详见
-  [`2026-09-23-v2-interaction-negative-paths-report.md`](2026-09-23-v2-interaction-negative-paths-report.md)。
-  该报告同时登记了 `QAQH_TEST_PLAN_REVIEW` 钩子的两条保真度缺口。
+  `plan-reject`）已落地并全绿，判据改用后端权威证据（timeline 快照 + provider
+  上下文 + 会话事实账本哈希）；`plan-reject` 在锚点升到 v2.0.0 RC 后扩成
+  **9 条子断言**。详见
+  [`2026-09-23-v2-interaction-negative-paths-report.md`](2026-09-23-v2-interaction-negative-paths-report.md)
+  与 [`2026-09-23-backend-anchor-v2.0.0-rc-report.md`](2026-09-23-backend-anchor-v2.0.0-rc-report.md)。
+  后者记录了钩子保真度缺口由后端 #301 收口的前后对照。
 - Windows ConHost 的 `ClearType::Purge` 是否清理全部历史仍需实机验证；
 - tmux / SSH / WezTerm / iTerm2 / Alacritty / Kitty / GNOME Terminal / Konsole
   尚未完成真实模拟器矩阵；环境能力矩阵已自动化；
+  → **2026-09-23 更新**：Kitty / tmux / WezTerm 已实测通过，Alacritty 仅进程级
+  （无 IPC）；见 [`2026-09-21-v2-terminal-compatibility-matrix.md`](../spec/2026-09-21-v2-terminal-compatibility-matrix.md) §3；
 - 输入泵暂停期间的事件不重放；
 - `$PAGER` 路径已有真实 PTY 自动化；
+- **四个故障钩子（`SSE_TERMINATE` / `TIMELINE_GAP` / `COMMAND_ACK` /
+  `SESSION_404_SEED`）仍被 #42 阻塞**——新锚点（v2.0.0 RC）下 `MODE=none`
+  基线仍红，接线前提不成立。
 
 ## 5. 下一步
 
