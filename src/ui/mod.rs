@@ -246,6 +246,35 @@ mod tests {
         }
     }
 
+    /// **U-16 回归锁**：v1 slash 一级菜单窗口曾写死 `take(6)`，而候选有 7 条
+    /// （`/export` 是第 7 条）。`↑↓` 能把 `slash_selected` 推到 6，但窗口只画
+    /// 索引 0..5 ⇒ 第 7 条**既不可见也不可高亮**（`idx == selected` 永不成立），
+    /// 用户看到的是「菜单卡在 6 条、最后一条按不出来」。
+    ///
+    /// 修复后窗口以选中项为底对齐（与 v2 Agent View 同策略）。证伪：把
+    /// `SLASH_MENU_ROWS` 窗口改回 `take(6)` → 本锁红。
+    #[test]
+    fn slash_menu_shows_selected_export() {
+        let mut app = app_with(Vec::new());
+        {
+            let sess = app.sessions.get_mut("seed").expect("seed 会话");
+            sess.composer.input = "/".chars().collect();
+            sess.composer.cursor = sess.composer.input.len();
+        }
+        // `/export` 是 SLASH_COMMANDS 的最后一条（索引 6）。
+        assert_eq!(app.slash_candidates().len(), 7, "候选数变了，请同步本锁");
+        app.slash_selected = 6;
+        let text = draw_text(&mut app, 100, 30);
+        assert!(
+            text.contains("/export"),
+            "选中第 7 条时菜单必须把它画出来（U-16）\n{text}"
+        );
+        assert!(
+            text.contains("▸ /export"),
+            "选中项必须带 ▸ 标记，否则用户不知道回车会执行哪条\n{text}"
+        );
+    }
+
     // ───────── M2 验收：TestBackend 端到端快照 ─────────
     // 覆盖：活动区、组行、三态卡、CJK 占位几何（plan §6 M2 验收口径）。
 
