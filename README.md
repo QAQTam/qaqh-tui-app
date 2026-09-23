@@ -19,8 +19,23 @@ cargo build --release
 
 环境变量：`QAQH_DATA_DIR`（数据目录覆盖，默认 `%USERPROFILE%\.qaqh`）、
 `QAQH_BACKEND_ROOT`（daemon 拉起候选根）、`QAQH_THEME`（`night` / `day` /
-`terminal` / `auto`）。`NO_COLOR` 存在时不输出颜色，只保留 glyph 与修饰符。
+`terminal` / `auto`）、`QAQH_TUI_LOG`（诊断日志落盘路径，见下「排障」）。
+`NO_COLOR` 存在时不输出颜色，只保留 glyph 与修饰符。
 Bearer token 只从 `daemon.json` 读入内存，永不落日志/URL。
+
+### 排障：抓客户端诊断日志
+
+```bash
+QAQH_TUI_LOG=/tmp/qaqh-tui.log cargo run -- --v2-agent
+tail -f /tmp/qaqh-tui.log
+```
+
+TUI 自身默认不落日志。设了 `QAQH_TUI_LOG=<path>` 后才安装一个极简文件 logger，
+把 `qaqh-client` 的诊断（timeline 重连原因、快照恢复失败、非法 cursor 告警……）
+按 `[LEVEL] msg` **追加**写入该文件；不设置时 `log` 门面是空操作，行为与之前一致。
+真机排查「timeline 断开 / 重连」「会话恢复为空」这类问题**先开它**——UI 上只剩
+一句「断开，1000ms 后重连」，具体原因只在日志里（`ReconnectReason` 只覆盖服务端
+主动终止流，普通 HTTP 错误如 401 不带 reason）。
 
 ### V2 inline 原型（实验）
 
