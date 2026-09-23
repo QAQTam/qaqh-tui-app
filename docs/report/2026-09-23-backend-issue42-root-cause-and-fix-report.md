@@ -2,6 +2,13 @@
 
 > 日期：2026-09-23
 > 触发：TUI issue **#42**（timeline SSE live 序列缺 seq 1/2 → v2 transcript 永不渲染）
+>
+> ⚠️ **工作面在后端仓**：本文记录的后端缺陷已补提为
+> **`QAQ-Harness/qaqh-backend#314`**（P1，2026-09-23）。
+> 原先提在 TUI 仓属于**提错仓库**——后端侧看不到 TUI 仓的 issue。
+> 本文与 TUI #42 保留为 TUI 侧跟踪；**后端进展以 `qaqh-backend#314` 为准**。
+> （同批迁移：session-title panic → `QAQ-Harness/qaqh-backend#315`。）
+>
 > 修复位置：`/home/qaqtamsy/项目/qaqh-backend-fix42`（专用 worktree，**未提交**，见 §5）
 > 基线：`betav2 @ 9e63c79`（当前后端 HEAD，含 P4 沙箱）
 
