@@ -211,6 +211,15 @@ main() {
     fi
 
     echo
+    echo "== 静态门禁（跨仓契约，Ringing v2 冻结语义）=="
+    # 把「TUI 不碰后端内部」变成可执行检查；白名单显式带理由。
+    # 出处：后端冻结 spec §0/§11/§12、TUI issue #46 task 6。
+    if ! "$root/scripts/static-gates.sh"; then
+        echo "✗ 静态门禁未通过。" >&2
+        exit 1
+    fi
+
+    echo
     echo "== cargo clippy =="
     cargo clippy --all-targets -- -D warnings
 
