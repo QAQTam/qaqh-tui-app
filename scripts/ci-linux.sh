@@ -27,9 +27,8 @@
 # 改动这里必须同步 `Cargo.toml` 里 [patch.crates-io] 的注释，以及本机
 # `.cargo/config.toml` 的 paths 覆盖（指向 `../qaqh-backend-anchor`，见 .gitignore）。
 #
-# 后端侧对应 `tui-ringing-v2-frozen-2026-09-23`（annotated tag，不可移动）——
-# **Ringing v2 冻结语义锚点**（PR #317 合入，spec：
-# `docs/spec/2026-09-23-TUI-Ringing-v2冻结语义-spec.md`）。
+# 后端侧对应 `tui-ringing-v2-types-2026-09-24`（annotated tag，不可移动）——
+# **Ringing v2 最小类型/客户端锚点**（PR #322 合入）。
 # 该 tag 的语义是「任何改变 cursor / reset / replay / interaction / driver 语义的
 # 修改都会另起新 tag」，所以换锚点只会发生在后端另发冻结 tag 时。
 # **注意 rev 必须是完整 40 位 SHA**：下面的 prepare() 用 `git rev-parse HEAD` 与它
@@ -49,7 +48,7 @@ set -euo pipefail
 
 # 与 Cargo.toml 的 path 依赖对应。改动请同步 Cargo.toml 的注释。
 QAQH_BACKEND_REPO="${QAQH_BACKEND_REPO:-https://cnb.cool/QAQ-Harness/qaqh-backend.git}"
-QAQH_BACKEND_REV="${QAQH_BACKEND_REV:-b40ff698f4211526f139c8a620cf159dd4ef9542}"
+QAQH_BACKEND_REV="${QAQH_BACKEND_REV:-a43a8bcfb01e4cf0f97154f942d874f60cd54aa6}"
 RATATUI_REPO="${RATATUI_REPO:-https://github.com/ratatui/ratatui.git}"
 RATATUI_REV="${RATATUI_REV:-e02e2a622eda6e4cae105df48a48f641cdba0303}"
 

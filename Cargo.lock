@@ -1880,6 +1880,7 @@ dependencies = [
  "log",
  "qaqh-domain",
  "qaqh-ringing",
+ "qaqh-session",
  "qaqh-types",
  "reqwest",
  "serde",
@@ -1908,12 +1909,40 @@ dependencies = [
 ]
 
 [[package]]
+name = "qaqh-message"
+version = "2.0.0-alpha1"
+dependencies = [
+ "log",
+ "qaqh-types",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "qaqh-ringing"
 version = "2.0.0-alpha1"
 dependencies = [
+ "base64 0.22.1",
  "qaqh-domain",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "qaqh-session"
+version = "2.0.0-alpha1"
+dependencies = [
+ "hex",
+ "log",
+ "qaqh-domain",
+ "qaqh-message",
+ "qaqh-types",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "thiserror 2.0.20",
+ "toml",
+ "uuid",
 ]
 
 [[package]]
