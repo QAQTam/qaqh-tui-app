@@ -383,8 +383,17 @@ elif mode == "ack-hang":
     ]
 else:  # session-404
     # U-29 判据：非子代理的 404 只提示、不关会话。
+    #
+    # ⚠ 文案对齐（2026-09-23）：钩子拦的是 **bootstrap** 请求，TUI 走的是
+    # `bootstrap 失败[seed]: HTTP 404: …` 这条提示路径；而
+    # `TimelineLostReason::SessionMissing` 的「会话不存在（404）」属于
+    # **timeline 流** 404 的另一条路径，本场景不会出现。原断言写的是后者，
+    # 属于「断言了错误的代码路径」——行为断言（不关会话）一直是绿的。
     checks = [
-        ("404 提示可见", "会话不存在".encode() in raw),
+        (
+            "404 提示可见（bootstrap 失败 + HTTP 404）",
+            b"bootstrap" in raw and b"404" in raw,
+        ),
         ("非子会话未被关闭（仍能干净退出）", quit_sent and tui.returncode == 0),
     ]
 

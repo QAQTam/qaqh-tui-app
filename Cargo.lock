@@ -1873,7 +1873,7 @@ dependencies = [
 
 [[package]]
 name = "qaqh-client"
-version = "2.0.0"
+version = "2.0.0-alpha1"
 dependencies = [
  "bytes",
  "futures-util",
@@ -1893,14 +1893,14 @@ dependencies = [
 
 [[package]]
 name = "qaqh-config-api"
-version = "2.0.0"
+version = "2.0.0-alpha1"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "qaqh-domain"
-version = "2.0.0"
+version = "2.0.0-alpha1"
 dependencies = [
  "qaqh-types",
  "serde",
@@ -1909,7 +1909,7 @@ dependencies = [
 
 [[package]]
 name = "qaqh-ringing"
-version = "2.0.0"
+version = "2.0.0-alpha1"
 dependencies = [
  "qaqh-domain",
  "serde",
@@ -1940,7 +1940,7 @@ dependencies = [
 
 [[package]]
 name = "qaqh-types"
-version = "2.0.0"
+version = "2.0.0-alpha1"
 dependencies = [
  "serde",
  "serde_json",

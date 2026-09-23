@@ -272,15 +272,23 @@ scripts/tests/ci-linux-parse-test.sh              15 passed / 0 failed
   （无 IPC）；见 [`2026-09-21-v2-terminal-compatibility-matrix.md`](../spec/2026-09-21-v2-terminal-compatibility-matrix.md) §3；
 - 输入泵暂停期间的事件不重放；
 - `$PAGER` 路径已有真实 PTY 自动化；
-- **四个故障钩子（`SSE_TERMINATE` / `TIMELINE_GAP` / `COMMAND_ACK` /
-  `SESSION_404_SEED`）仍被 #42 阻塞**——新锚点（v2.0.0 RC）下 `MODE=none`
-  基线仍红，接线前提不成立。
-- **后端 #45**：daemon 每回合在 `session-title` 线程 panic（`there is no reactor
-  running`），**LLM 标题总结实际从未生效**（落盘标题停在截断版）。已提 issue
-  并附 backtrace 与建议修法；TUI 侧**未**为它加断言，避免把后端缺陷钉进门禁。
-  见 <https://cnb.cool/QAQ-Harness/qaqh-tui-app/-/issues/45>。
+- **四个故障钩子已全部接线并全绿**（2026-09-23 收口）：
+  `scripts/e2e-v2-faults.sh` 六个模式 `none` / `lagged` / `gap` / `ack-delay` /
+  `ack-hang` / `session-404` **全部 PASS**。转绿路径：
+  - `none` / `gap` / `ack-*`：**后端两处修复**（#42 的 seq 空间被凭空消耗；
+    seal 时无条件裁剪 journal 导致回合中途重基线后补不齐）——
+    见 [`2026-09-23-backend-issue42-root-cause-and-fix-report.md`](2026-09-23-backend-issue42-root-cause-and-fix-report.md)；
+  - `lagged`：TUI 侧**渲染截断**缺陷——`conn_error` span 写死截断 28 列，
+    把 `服务端终止流（lagged…` 的原因切掉（U-07 的诊断看不见），改为宽度感知；
+  - `session-404`：TUI 侧**断言文案**缺陷——钩子拦的是 bootstrap 请求，
+    原断言却找 timeline 流 404 那条路径的「会话不存在（404）」文案，
+    已对齐到实际渲染的 `bootstrap 失败[seed]: HTTP 404`。
 - 真实终端矩阵已按 §3.5 收口：Kitty/tmux/WezTerm 实测通过，Alacritty 仅进程级，
   其余终端**决定不逐个支持**（唯一保留例外是 Windows ConHost 的 `ClearType::Purge`）。
+- **后端 #45（仍 open）**：daemon 每回合在 `session-title` 线程 panic
+  （`there is no reactor running`），**LLM 标题总结实际从未生效**（落盘标题停在
+  截断版）。已提 issue 并附 backtrace 与建议修法；TUI 侧**未**为它加断言，避免把
+  后端缺陷钉进门禁。见 <https://cnb.cool/QAQ-Harness/qaqh-tui-app/-/issues/45>。
 
 ## 5. 下一步
 

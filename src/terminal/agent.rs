@@ -1054,8 +1054,15 @@ fn status_line(app: &App, width: u16, theme: &Theme) -> Line<'static> {
         if width >= 70
             && let Some(error) = app.conn_error.as_deref()
         {
+            // 连接诊断（含 `reconnect_message` 的 lagged/终止流文案）此前写死
+            // 截断 28 列，恰好把**原因**切掉：实测
+            // `timeline[0ea0909d]服务端终止流（l…`——连 "lagged" 都看不到，
+            // U-07 的 e2e 因此断言不到。改为按剩余宽度给额度（至少 28 列，
+            // 保住原来窄屏时的下限）。
+            let used: usize = spans.iter().map(|span| span.content.width()).sum();
+            let budget = (width as usize).saturating_sub(used + 8).max(28);
             spans.push(Span::styled(
-                format!(" · {}", crate::app::truncate_str(error, 28)),
+                format!(" · {}", crate::app::truncate_str(error, budget)),
                 Style::new().fg(theme.semantic.warning),
             ));
         }
@@ -1066,8 +1073,15 @@ fn status_line(app: &App, width: u16, theme: &Theme) -> Line<'static> {
             NoticeLevel::Warn => theme.semantic.warning,
             NoticeLevel::Error => theme.accent.error,
         };
+        // 宽度感知的截断。此前写死 44 列，在 130 列的终端上白白切掉诊断的
+        // **关键部分**：实测 `timeline[0ea0909d] 服务端终止流（lagged，…`
+        // 被切成 `…服务端终止流（l…`——连 "lagged" 都看不到，e2e 因此断言不到
+        // （U-07）。这里按「已用宽度 + 时间戳」算剩余额度，并留 8 列余量；
+        // 至少给 24 列，避免窄屏时把提示压成一个词。
+        let used: usize = spans.iter().map(|span| span.content.width()).sum();
+        let budget = (width as usize).saturating_sub(used + 8).max(24);
         spans.push(Span::styled(
-            format!(" · {}", crate::app::truncate_str(&toast.text, 44)),
+            format!(" · {}", crate::app::truncate_str(&toast.text, budget)),
             Style::new().fg(color),
         ));
     }
