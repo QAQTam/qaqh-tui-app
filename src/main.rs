@@ -93,9 +93,16 @@ fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         Some("doctor") => return doctor(),
+        Some("--version") | Some("-V") | Some("version") => {
+            // 版本号此前只存在于 Cargo metadata 里，运行时没有任何观测面——
+            // 升到 2.0.0-alpha1 时补上，让「装的到底是哪个版本」可直接问二进制。
+            println!("qaqh-tui {}", env!("CARGO_PKG_VERSION"));
+            return Ok(());
+        }
         Some("--help") | Some("-h") | Some("help") => {
             println!(
-                "qaqh-tui — QAQ-Harness 终端客户端 (qaqh.Ringing v{})",
+                "qaqh-tui {} — QAQ-Harness 终端客户端 (qaqh.Ringing v{})",
+                env!("CARGO_PKG_VERSION"),
                 qaqh_client::RINGING_VERSION
             );
             println!();
@@ -106,6 +113,7 @@ fn main() -> Result<()> {
             println!("  qaqh-tui --v2-agent 启动 V2 Agent View（实验，连接 daemon）");
             println!("  qaqh-tui --v1       强制 v1 全屏模式（覆盖 QAQH_V2_AGENT）");
             println!("  qaqh-tui doctor     自检：发现/pid 判活/open 握手");
+            println!("  qaqh-tui --version  打印版本");
             println!();
             println!(
                 "环境: QAQH_DATA_DIR（数据目录覆盖）、QAQH_BACKEND_ROOT（daemon 拉起候选）、QAQH_DEFAULT_CWD（新建会话默认目录，支持 ~/ 展开）、QAQH_THEME=night|day|terminal|auto"

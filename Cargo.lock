@@ -1918,7 +1918,7 @@ dependencies = [
 
 [[package]]
 name = "qaqh-tui"
-version = "1.0.1"
+version = "2.0.0-alpha1"
 dependencies = [
  "anyhow",
  "chrono",
