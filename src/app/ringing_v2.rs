@@ -331,6 +331,7 @@ pub enum DriverOutcome {
     Applied,
     Duplicate,
     Stale,
+    Conflict,
 }
 
 /// 单 seed 的 Ringing v2 会话状态。
@@ -592,6 +593,9 @@ impl RingingV2SessionModel {
             {
                 return DriverOutcome::Duplicate;
             }
+            if driver.driver_epoch == current.driver_epoch {
+                return DriverOutcome::Conflict;
+            }
         }
         self.driver = Some(driver);
         DriverOutcome::Applied
@@ -773,6 +777,14 @@ mod tests {
             DriverOutcome::Applied
         );
         assert_eq!(model.apply_driver_state(current), DriverOutcome::Duplicate);
+        assert_eq!(
+            model.apply_driver_state(DriverState {
+                holder: Some("cs-2".into()),
+                driver_epoch: 4,
+                can_claim: false,
+            }),
+            DriverOutcome::Conflict
+        );
         assert_eq!(
             model.apply_driver_state(DriverState {
                 holder: Some("cs-2".into()),
