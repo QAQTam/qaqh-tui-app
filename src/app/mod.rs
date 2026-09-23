@@ -15,6 +15,7 @@ mod paste_guard;
 pub(crate) mod render;
 pub mod render_line;
 pub mod render_transcript;
+pub(crate) mod ringing_v2;
 pub mod session;
 mod session_ops;
 pub mod settings;
