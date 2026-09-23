@@ -18,6 +18,50 @@ use tokio::sync::mpsc;
 use app::{App, AppMsg, FrameStats};
 use runtime::{Runtime, RuntimeMsg};
 
+/// 极简文件 logger：设了 `QAQH_TUI_LOG=<path>` 才安装。
+///
+/// **为什么需要**：TUI 自身不记日志，而 `qaqh-client` 的诊断（timeline 重连原因、
+/// 快照恢复失败、非法 cursor 告警……）全部走 `log` 门面。没有 logger 时这些**全被
+/// 丢掉**——真机排查只剩 UI 上那句「timeline[….] 断开，1000ms 后重连」，而
+/// `ReconnectReason` 只覆盖「服务端主动终止流」，普通 HTTP 错误（401 等）不带
+/// reason，等于**没有原因**。这个缺口直接卡住过故障钩子的接线排查。
+///
+/// 默认关闭：不安装 logger 时 `log` 门面是空操作，行为与之前完全一致。
+struct FileLogger;
+
+impl log::Log for FileLogger {
+    fn enabled(&self, _metadata: &log::Metadata<'_>) -> bool {
+        true
+    }
+
+    fn log(&self, record: &log::Record<'_>) {
+        let Ok(path) = std::env::var("QAQH_TUI_LOG") else {
+            return;
+        };
+        // 每条记录开关一次文件：这是**诊断开关**，不在热路径上，不值得为它引入
+        // 全局文件句柄与锁。
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+        {
+            use std::io::Write as _;
+            let _ = writeln!(file, "[{}] {}", record.level(), record.args());
+        }
+    }
+
+    fn flush(&self) {}
+}
+
+fn init_logging() {
+    if std::env::var_os("QAQH_TUI_LOG").is_none() {
+        return;
+    }
+    static LOGGER: FileLogger = FileLogger;
+    let _ = log::set_logger(&LOGGER);
+    log::set_max_level(log::LevelFilter::Debug);
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StartupMode {
     V1,
@@ -45,6 +89,7 @@ fn select_startup_mode(args: &[String], v2_agent_env: bool, v2_inline_env: bool)
 }
 
 fn main() -> Result<()> {
+    init_logging();
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         Some("doctor") => return doctor(),

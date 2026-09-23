@@ -1924,6 +1924,7 @@ dependencies = [
  "chrono",
  "crossterm",
  "futures",
+ "log",
  "pulldown-cmark",
  "qaqh-client",
  "qaqh-config-api",
