@@ -88,6 +88,8 @@ decision_ref = sha256:1860011b8369cb09d7bbac77f2fc8ba0d24887708e62ffd09da764acdf
 
 ## 5. 后端待办：`QAQH_TEST_PLAN_REVIEW` 钩子的保真度缺口（2 条）
 
+> 已提 **issue #43**（P2，本仓 issue 面，抄送后端）；在 #41 留了交叉引用。
+
 背景：`engine_tool.rs` 里 `pending_plans` 在工具侧**恒为空**，也就是说当前
 plan review **只能**靠 `QAQH_TEST_PLAN_REVIEW` 触发。钩子的保真度直接决定
 TUI 侧能验证到哪一步。
