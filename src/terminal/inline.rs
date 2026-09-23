@@ -7,7 +7,7 @@
 //! 2. Enter 可把已封口文本 `insert_before` 到终端 scrollback；
 //! 3. 同一 `CommitId` 重放不会重复提交。
 //!
-//! 这不是最终 v2 UI；默认 v1 路径不受影响。
+//! 这不是最终 v2 UI；默认 Agent View 不依赖本原型，`--v1` 回退路径也不受影响。
 
 use anyhow::Result;
 use ratatui::crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers, read};

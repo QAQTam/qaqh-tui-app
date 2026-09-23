@@ -1,4 +1,4 @@
-//! qaqh-tui：QAQ-Harness 的终端前端（qaqh.Ringing v1）。
+//! qaqh-tui：QAQ-Harness 的终端前端（默认 V2 Agent View；Ringing v1）。
 
 mod app;
 mod protocol;
@@ -69,11 +69,13 @@ enum StartupMode {
     V2Inline,
 }
 
-/// 启动模式优先级：`--v1` > `--v2-inline`/env > `--v2-agent`/env > 默认 v1。
+/// 启动模式优先级：`--v1` > `--v2-inline`/env > 默认 `V2Agent`。
 ///
-/// `--v1` 是显式回退闸，必须压过环境变量；否则一旦 shell 里残留
-/// `QAQH_V2_AGENT=1`，用户无法在单次启动里回到 v1。
-fn select_startup_mode(args: &[String], v2_agent_env: bool, v2_inline_env: bool) -> StartupMode {
+/// alpha1 起 Agent View 是默认 UI；协议切换单独推进，当前仍使用 Ringing v1。
+/// `--v2-agent` 与 `QAQH_V2_AGENT` 保留为显式选择/旧脚本兼容，不再是进入
+/// v2 UI 的前置条件。`--v1` 是显式回退闸，必须压过环境变量；否则一旦 shell
+/// 里残留 `QAQH_V2_AGENT=1`，用户无法在单次启动里回到 v1。
+fn select_startup_mode(args: &[String], _v2_agent_env: bool, v2_inline_env: bool) -> StartupMode {
     let force_v1 = args.iter().any(|arg| arg == "--v1");
     if !force_v1 && (args.iter().any(|arg| arg == "--v2-inline") || v2_inline_env) {
         return StartupMode::V2Inline;
@@ -81,11 +83,9 @@ fn select_startup_mode(args: &[String], v2_agent_env: bool, v2_inline_env: bool)
     if force_v1 {
         return StartupMode::V1;
     }
-    if args.iter().any(|arg| arg == "--v2-agent") || v2_agent_env {
-        StartupMode::V2Agent
-    } else {
-        StartupMode::V1
-    }
+    // `--v2-agent` / `QAQH_V2_AGENT` 仍被接受，但默认值已经相同；参数与 env
+    // 保留是为了不打断既有脚本，并把“显式选择 Agent View”与“默认选择”表达清楚。
+    StartupMode::V2Agent
 }
 
 fn main() -> Result<()> {
@@ -110,7 +110,7 @@ fn main() -> Result<()> {
             println!("  qaqh-tui            连接本地 daemon 并进入 TUI");
             println!("  qaqh-tui --no-spawn 不自动拉起 daemon（仅连接已有实例）");
             println!("  qaqh-tui --v2-inline 启动 V2 inline 原型（实验，不连接 daemon）");
-            println!("  qaqh-tui --v2-agent 启动 V2 Agent View（实验，连接 daemon）");
+            println!("  qaqh-tui --v2-agent 显式选择 V2 Agent View（alpha1 起已是默认）");
             println!("  qaqh-tui --v1       强制 v1 全屏模式（覆盖 QAQH_V2_AGENT）");
             println!("  qaqh-tui doctor     自检：发现/pid 判活/open 握手");
             println!("  qaqh-tui --version  打印版本");
@@ -423,15 +423,15 @@ mod tests {
     }
 
     #[test]
-    fn startup_mode_defaults_to_v1() {
+    fn startup_mode_defaults_to_v2_agent() {
         assert_eq!(
             select_startup_mode(&args(&[]), false, false),
-            StartupMode::V1
+            StartupMode::V2Agent
         );
     }
 
     #[test]
-    fn startup_mode_env_enables_v2_agent() {
+    fn startup_mode_env_keeps_v2_agent_explicit() {
         assert_eq!(
             select_startup_mode(&args(&[]), true, false),
             StartupMode::V2Agent

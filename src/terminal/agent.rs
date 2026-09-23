@@ -1,12 +1,12 @@
 //! V2 Agent View：真实 Runtime/App 状态驱动的 inline 外壳（M4.1）。
 //!
-//! 运行：`qaqh-tui --v2-agent`
+//! 运行：`qaqh-tui`（alpha1 起默认；`--v2-agent` 仍可显式选择）
 //!
 //! 与 `--v2-inline` 原型的区别：
 //! - 复用生产 `Runtime` / `App`，因此会连接 daemon 并处理真实 timeline 事件；
 //! - 已封口 transcript 经 V2 projector + commit ledger 写入终端 scrollback；
 //! - inline viewport 只绘制 live transcript、composer、status 与 shortcuts；
-//! - 不启用鼠标捕获，保留终端原生选择/复制；v1 默认全屏路径不受影响。
+//! - 不启用鼠标捕获，保留终端原生选择/复制；`--v1` 仍可强制回退全屏路径。
 
 use std::collections::VecDeque;
 use std::io::stdout;
