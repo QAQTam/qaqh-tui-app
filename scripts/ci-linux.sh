@@ -26,6 +26,10 @@
 # 刷新时机：**后端阶段性收口后由人确认**再改 rev；不要改成跟随 main。
 # 改动这里必须同步 `Cargo.toml` 里 [patch.crates-io] 的注释，以及本机
 # `.cargo/config.toml` 的 paths 覆盖（指向 `../qaqh-backend-anchor`，见 .gitignore）。
+#
+# 后端侧对应 `tui-anchor-2026-09-23`（annotated tag，不可移动）。**注意 rev 必须是
+# 完整 40 位 SHA**：下面的 prepare() 用 `git rev-parse HEAD` 与它做字符串比对，
+# 写 tag 名会判不等。换锚点时后端会新开 tag（如 `-r2`），**不要移动旧 tag**。
 # ratatui 用的是**上游未发版的 main**（ratatui#2743 修复尚未发版）。
 #
 # ── 严格模式 ─────────────────────────────────────────────────────────

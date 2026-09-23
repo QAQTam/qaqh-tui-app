@@ -26,7 +26,10 @@ set -u
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 REPO_ROOT=$(cd -- "$SCRIPT_DIR/.." && pwd)
-BACKEND_ROOT=${QAQH_BACKEND_ROOT:-$REPO_ROOT/../qaqh-backend}
+# 默认吃**锚点 worktree**（TUI 钉的 rev，见 scripts/ci-linux.sh 的 QAQH_BACKEND_REV），
+# 而不是开发者正在用的 ../qaqh-backend 工作树——否则 e2e 会跑到别人分支构建的
+# daemon 上，与本仓门禁的锚点不是同一个东西。
+BACKEND_ROOT=${QAQH_BACKEND_ROOT:-$REPO_ROOT/../qaqh-backend-anchor}
 DAEMON=${DAEMON:-$BACKEND_ROOT/target/debug/qaqh-daemon}
 TUI=${TUI:-$REPO_ROOT/target/debug/qaqh-tui}
 # `script -qec` 只吃字符串：用 %q 安全引用（路径带空格/元字符不再失败或注入）

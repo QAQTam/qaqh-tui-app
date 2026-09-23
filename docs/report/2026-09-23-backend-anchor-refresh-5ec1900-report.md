@@ -107,3 +107,68 @@ cargo clippy --all-targets -- -D warnings         通过
   `src/app/session.rs` 仍在用 —— **该迁移按机主要求延后**，P5 批次一并处理；
 - 本机 `.cargo/config.toml` 含绝对路径，**不入库**（`.gitignore` 的 `/.cargo/`）；
   入库的只有 `scripts/ci-linux.sh` 的 rev 与文档锚点。
+
+---
+
+## 7. 后端回应（2026-09-23，同日）
+
+按 [TUI 对后端的协作需求](../spec/2026-09-23-TUI对后端的协作需求-spec.md) §1 的锚点规格，
+后端同日给出正式锚点：
+
+| 项 | 值 | 核验 |
+|---|---|---|
+| tag | `tui-anchor-2026-09-23` | `git cat-file -t` = **`tag`**（annotated，非轻量）✓ |
+| 指向 | `5ec1900d6c937b6ff927d8f65fcd37d465de7988` | `git rev-parse tui-anchor-2026-09-23^{commit}` 逐字相符 ✓ |
+| 分支 | 后端 `betav2`（集成分支） | 满足规格 A1 ✓ |
+| daemon | `../qaqh-backend-anchor/target/debug/qaqh-daemon` | sha256 `00642081e52a557cf332463090f964aa49e6b9a08b48e232974774cace490644`，与后端给的逐字相符 ✓ |
+| 破坏性变更 | 无（`ConversationSendMessage` 两字段均 serde default） | 与 §3 的实测一致 ✓ |
+
+**结论：TUI 侧的 pin 无需改动**——`scripts/ci-linux.sh` 的 rev 本来就是 `5ec1900`，
+本次只是补上 tag 名作为可读引用。
+
+### 7.1 `ConversationInputPurpose` 走独立小 PR
+
+后端没有把该 re-export 挂在大 PR 上，而是基于 `betav2` 单开：
+
+- PR **#289** `fix(client): re-export ConversationInputPurpose for TUI anchor`
+- head `d60adea85c1581cbe286e2298ed931de18e2e112`，base `betav2`，**open / 未 merge**
+
+**TUI 侧的处置：不锚 feature head**（违反规格 A1，且收益只是"能显式命名枚举"，
+不阻塞任何功能）。按后端建议的流程走：
+
+1. 等 #289 merge；
+2. 后端**新开** tag `tui-anchor-2026-09-23-r2`（**不移动**旧 tag）；
+3. TUI 升锚点，并把 `src/app/transcript_ops.rs` 的
+   `input_purpose: Default::default()` 改为显式
+   `ConversationInputPurpose::TriggerTurn`（该文件已留注释指向这条升级路径）。
+
+## 8. 端到端验证（本次一并补上）
+
+发现**同一类问题的第二个面**：9 个 e2e/smoke 脚本默认指向
+`$REPO_ROOT/../qaqh-backend/target/debug/qaqh-daemon`，即**开发者正在移动的工作树**——
+构建钉了锚点，但 e2e 没有，等于"门禁用的 daemon 和编译用的 client 不是同一个 rev"。
+
+已全部改为默认吃锚点 worktree（`QAQH_BACKEND_ROOT` / `DAEMON` 覆盖保留）：
+
+```text
+scripts/e2e-lease-expiry.sh · e2e-v2-interactions.sh · e2e-v2-reconnect.sh
+scripts/e2e-v2-resize-stress.sh · e2e-v2-session-switch.sh · e2e-v2-terminal-matrix.sh
+scripts/smoke-tui.sh
+```
+
+顺带修掉两个更早的脚本（`e2e-restart.sh` / `e2e-session-list.sh`）——它们硬编码
+`$HOME/Projects/...`，在非该目录布局的机器上直接找不到二进制。
+
+实测（全部对着锚点 daemon）：
+
+```text
+scripts/smoke-tui.sh               ✓ 首帧渲染且未 panic（daemon pid=528581）
+scripts/e2e-v2-session-switch.sh   RESULT: PASS
+                                     [✓] 无 cursor-position timeout
+                                     [✓] 两个会话标题均渲染
+                                     [✓] 至少两次 scrollback purge
+                                     [✓] alternate screen 进出
+                                     [✓] 无 panic
+```
+
+即：**锚点 daemon 产物 → TUI 二进制 → v1 冒烟 + v2 端到端**全链路已跑通。

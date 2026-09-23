@@ -29,7 +29,9 @@ impl App {
                         // - `input_purpose` 的 `#[default]` 是 `TriggerTurn`，即本行改动前
                         //   「投递并触发回合」的行为。`QueueOnly` 只服务子代理注入，UI 用不到。
                         //   （`ConversationInputPurpose` 未被 `qaqh-client` 再导出，
-                        //   故只能走 `Default::default()`；见该 crate types.rs 的再导出纪律。）
+                        //   故只能走 `Default::default()`；见该 crate types.rs 的再导出纪律。
+                        //   后端已开 PR #289 补该 re-export——合并后锚点升 `-r2`，
+                        //   这里可改为显式 `ConversationInputPurpose::TriggerTurn`。）
                         message_id: None,
                         input_purpose: Default::default(),
                         as_system: false,
