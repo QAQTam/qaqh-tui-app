@@ -473,12 +473,39 @@ fn bench_v2_commit_runtime() {
     let render_elapsed = render_start.elapsed();
     let v2_first_frame = replay_elapsed + first_chunk_elapsed;
 
+    // ── 渲染拆分（M6.4）：全量读数把「每帧热路径」与「历史提交」混在一起 ──
+    //
+    // 生产有两条**完全不同**的渲染路径（`terminal/agent.rs`）：
+    //   ① 每帧 live viewport（:784）：只渲染 `BlockState::Live` 的块，即
+    //      **正在进行的那个回合**，然后按视口行数切片；
+    //   ② scrollback commit（:584）：每次最多 `COMMIT_CHUNK_BLOCKS` 块，
+    //      分块把历史写进 scrollback。
+    //
+    // 旧的 `render: 24432 lines / 841 ms` 是**整段历史**的一次性总成本，
+    // 既不是每帧成本、也不是单块成本 —— 拿它当"渲染开销"会严重高估热路径。
+    // 这里把两者分开量。
+    // ① 每帧 live viewport：用**最后一个回合的块**近似其载荷 —— 生产里 Live
+    //    块就是当前回合尚未封口的部分（每回合 ≈ TOOLS 工具 + 文本/思考）。
+    let live_turn_blocks: Vec<_> = blocks.iter().rev().take(TOOLS + 2).rev().cloned().collect();
+    let live_render_start = Instant::now();
+    let live_lines = render_transcript(&live_turn_blocks, WIDTH, Theme::current());
+    let live_render_elapsed = live_render_start.elapsed();
+
+    let chunk_start = Instant::now();
+    let _ = render_transcript(&first_chunk, WIDTH, Theme::current());
+    let chunk_elapsed = chunk_start.elapsed();
+
+    let per_chunk = render_elapsed.as_secs_f64() * 1000.0
+        / (blocks.len() as f64 / COMMIT_CHUNK_BLOCKS_FOR_BENCH as f64).max(1.0);
+
     println!(
         "\n=== V2 commit runtime（{TURNS} turns × {TOOLS} tools）===\n\
          ⑤ replay: {} blocks / {:.2} ms；runtime live {} / peak {}\n\
            高水位增量: {} blocks / {} µs\n\
            live delta ×{DELTAS}: avg {} µs/帧\n\
-           render: {} lines / {:.2} ms\n\
+           render 拆分: live viewport {} 块 → {} 行 / {:.2} ms（每帧热路径）\n\
+                        commit chunk {} 块 / {:.2} ms（每次提交；均值 {:.2} ms）\n\
+                        全量 {} 块 → {} 行 / {:.2} ms（分块摊还）\n\
            first frame: v1 cache {:.2} ms | v2 lazy replay+chunk {:.2} ms | \
            v2 full replay+chunk {:.2} ms",
         emitted.len(),
@@ -488,6 +515,13 @@ fn bench_v2_commit_runtime() {
         incremental.len(),
         incremental_elapsed.as_micros(),
         delta_elapsed.as_micros() / DELTAS as u128,
+        live_turn_blocks.len(),
+        live_lines.len(),
+        live_render_elapsed.as_secs_f64() * 1000.0,
+        first_chunk.len(),
+        chunk_elapsed.as_secs_f64() * 1000.0,
+        per_chunk,
+        blocks.len(),
         lines.len(),
         render_elapsed.as_secs_f64() * 1000.0,
         v1_first_frame.as_secs_f64() * 1000.0,
