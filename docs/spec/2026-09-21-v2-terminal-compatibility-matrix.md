@@ -1,8 +1,9 @@
 # QAQH TUI v2 终端兼容矩阵
 
-> 日期：2026-09-21（§3 于 2026-09-23 更新：Kitty + tmux 已从「待测」变「已测」）
-> 状态：环境能力矩阵已自动化；真实终端模拟器/multiplexer 矩阵**已开测**
-> （Kitty ✅、tmux ✅，其余待环境）
+> 日期：2026-09-21（§3 于 2026-09-23 更新：Kitty/tmux/WezTerm 已测；
+> **其余终端决定不逐个支持**，理由见 §3.5）
+> 状态：环境能力矩阵已自动化；真实终端矩阵**已收口**——Kitty ✅、tmux ✅、
+> WezTerm ✅、Alacritty ⚠️ 部分，其余不计划
 
 ## 1. 自动化入口
 
@@ -84,14 +85,14 @@ RESULT: PASS
 | 终端 | scrollback | inline viewport | resize | truecolor | 鼠标/复制 | 状态 |
 |---|---|---|---|---|---|---|
 | **Kitty 0.48.2** | ✅ 已测 | ✅ 已测（render 维度） | ✅ 已测（SIGWINCH 重排） | ✅ 已测（`38:2:`） | ✅ 未开捕获 | **PASS**（2026-09-23） |
-| Windows Terminal / PowerShell | 待测 | 待测 | 待测 | 待测 | 待测 | PENDING（无 Windows 实机） |
+| **tmux 3.7c** | ✅ 已测（`capture-pane -S -`） | ✅ 已测（render 维度） | ✅ 已测（`resize-window` → SIGWINCH） | ✅ 已测（透传 `38:2:`） | ✅ `mouse_any_flag=0` | **PASS**（2026-09-23） |
 | **WezTerm 20260716** | ✅ 已测（`--start-line -1000`） | ✅ 已测（render 维度） | ✅ 已测（`split-pane` → SIGWINCH） | ✅ 已测（`38:2::`） | ⚠️ 无查询面 | **PASS**（2026-09-23） |
 | Alacritty 0.17.0 | ⚠️ 无回读接口 | ⚠️ 无回读接口 | ⚠️ 无回读接口 | ⚠️ 无回读接口 | ⚠️ 无查询面 | **部分**（进程级，2026-09-23；见 §3.4） |
-| iTerm2 | 待测 | 待测 | 待测 | 待测 | 待测 | PENDING（macOS 专属） |
-| GNOME Terminal | 待测 | 待测 | 待测 | 待测 | 待测 | PENDING（环境未安装） |
-| Konsole | 待测 | 待测 | 待测 | 待测 | 待测 | PENDING（环境未安装） |
-| **tmux 3.7c** | ✅ 已测（`capture-pane -S -`） | ✅ 已测（render 维度） | ✅ 已测（`resize-window` → SIGWINCH） | ✅ 已测（透传 `38:2:`） | ✅ `mouse_any_flag=0` | **PASS**（2026-09-23） |
-| SSH | 待测 | 待测 | 待测 | 待测 | 待测 | PENDING（无 sshd） |
+| Windows Terminal / PowerShell | — | — | — | — | — | **不计划**（仅 ConHost `ClearType::Purge` 保留人工确认，见 §3.5） |
+| iTerm2 | — | — | — | — | — | **不计划**（macOS 专属；kitty 已覆盖同类行为） |
+| GNOME Terminal | — | — | — | — | — | **不计划**（无回读接口，增量≈Alacritty 的进程级） |
+| Konsole | — | — | — | — | — | **不计划**（同上） |
+| SSH | — | — | — | — | — | **不计划**（传输层；终端行为由本地终端决定，`SSH_TTY` 分支已在 §2 覆盖） |
 
 **鼠标/复制**这一列对 12 个环境能力 profile 也已验证：全部 `mouse=off`。
 
@@ -190,6 +191,33 @@ Alacritty **没有 IPC**（`alacritty msg` 只有窗口/配置子命令，既无
 证伪：把 doctor 的 `QAQH_DATA_DIR` 指向不存在的目录 → 三条连通性断言全红、
 `RESULT: FAIL`（已实测后还原）。
 
+### 3.5 范围决定：其余终端**不再逐个支持**（2026-09-23）
+
+**决策**：终端矩阵到此收口，剩下的 GNOME Terminal / Konsole / iTerm2 /
+Windows Terminal / SSH **不逐个补**。
+
+**理由**：
+
+- kitty 兼容 + tmux + WezTerm 三者已经把「终端世界」的**行为大类**磨平了：
+  真彩色（三种 SGR 变体都实测过）、inline viewport、SIGWINCH 重排、
+  scrollback 语义（模拟器侧与 multiplexer 侧各一遍）、鼠标捕获关闭、
+  退出后终端状态还原。其余终端在这些维度上要么走同一套 ANSI/terminfo
+  路径，要么**根本没有回读接口**（GNOME Terminal / Konsole / Alacritty
+  同一类），补上去的增量只有「进程级 PASS」，价值远低于维护成本；
+- SSH 是**传输层**，终端行为由本地终端决定——`SSH_TTY` 环境分支已在 §2
+  的 12 个 profile 里覆盖，再单列没有新信息；
+- iTerm2 是 macOS 专属，Windows Terminal 需要 Windows 实机，本仓 CI 都跑不了，
+  写成 PENDING 只会长期挂着没人管——**明确「不计划」比长期 PENDING 诚实**。
+
+**唯一保留的例外**：Windows ConHost 的 `crossterm::ClearType::Purge` 只清可见
+screen buffer，**会话切换后的历史清理能力**是 Windows 特有的真实风险，kitty
+覆盖不到。它保留为「需要 Windows 实机人工确认一次」的已知风险（见 §4），
+不假装测过。
+
+**如果将来要补**：优先补**有回读接口**的（判定方法：`cli`/IPC 能否 dump 屏幕或
+scrollback）。没有回读接口的终端（Alacritty / GNOME Terminal / Konsole）只能做
+进程级，除非引入 xdg-desktop-portal 截图 API（本机 compositor 下未验证可行性）。
+
 ## 4. 已知风险
 
 - Windows ConHost 的 `crossterm::ClearType::Purge` 当前只清可见 screen buffer，
@@ -205,8 +233,11 @@ Alacritty **没有 IPC**（`alacritty msg` 只有窗口/配置子命令，既无
   所以 §3 的 resize 走改字号路径；真实窗口拖拽缩放仍需在有窗口管理器的
   实机上补一次；
 - kitty / tmux / WezTerm 是**已开测**的真实终端环境（各自脚本全绿），Alacritty
-  **只有进程级**（无 IPC，渲染需人工），其余保持 PENDING——环境能力分支
-  （`TERM=tmux-256color` / `TERM=alacritty` 等）**不等于**该终端已测；
+  **只有进程级**（无 IPC，渲染需人工）；其余终端**已决定不逐个支持**（§3.5），
+  不再列 PENDING——环境能力分支（`TERM=tmux-256color` / `TERM=alacritty` 等）
+  **不等于**该终端已测；
 - **GPU 加速终端（WezTerm / Alacritty）的视觉正确性仍缺自动化手段**：WezTerm
   有 cli 回读所以能测，Alacritty 既无 IPC 也无回读，只能人工看。若将来要补，
-  方向是 xdg-desktop-portal 截图 API（本机 compositor 下未验证可行性）。
+  方向是 xdg-desktop-portal 截图 API（本机 compositor 下未验证可行性）；
+- **Windows ConHost 的 `ClearType::Purge` 是唯一保留的例外**：它影响会话切换后的
+  历史清理，kitty 覆盖不到，需要 Windows 实机人工确认一次（§3.5）。

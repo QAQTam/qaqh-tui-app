@@ -275,6 +275,12 @@ scripts/tests/ci-linux-parse-test.sh              15 passed / 0 failed
 - **四个故障钩子（`SSE_TERMINATE` / `TIMELINE_GAP` / `COMMAND_ACK` /
   `SESSION_404_SEED`）仍被 #42 阻塞**——新锚点（v2.0.0 RC）下 `MODE=none`
   基线仍红，接线前提不成立。
+- **后端 #45**：daemon 每回合在 `session-title` 线程 panic（`there is no reactor
+  running`），**LLM 标题总结实际从未生效**（落盘标题停在截断版）。已提 issue
+  并附 backtrace 与建议修法；TUI 侧**未**为它加断言，避免把后端缺陷钉进门禁。
+  见 <https://cnb.cool/QAQ-Harness/qaqh-tui-app/-/issues/45>。
+- 真实终端矩阵已按 §3.5 收口：Kitty/tmux/WezTerm 实测通过，Alacritty 仅进程级，
+  其余终端**决定不逐个支持**（唯一保留例外是 Windows ConHost 的 `ClearType::Purge`）。
 
 ## 5. 下一步
 
