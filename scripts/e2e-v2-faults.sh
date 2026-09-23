@@ -15,12 +15,21 @@
 #   MODE=session-404  SESSION_404_SEED=* → 非子代理 404 只提示、不关会话（U-29 判据）
 # 前置：qaqh-daemon 与 qaqh-tui 已构建。
 #
-# ⚠ **当前预期 FAIL**：`MODE=none` 基线就不通过——新会话跑一个短回合时
-#   timeline SSE 的 live 序列从 seq 3 开始（1、2 不下发），客户端 `cursor+1`
-#   判 gap → 恢复拿到的又是未封口的快照 → v2 transcript 永远为空。
-#   与本脚本的故障钩子无关，根因在跨仓 timeline 投递。证据链见
-#   `docs/report/2026-09-23-timeline-seq-gap-blocks-v2-transcript-report.md`。
-#   该缺陷修好之前，本脚本的红是**预期的**，不要据此判定钩子接线有问题。
+# ⚠ **默认锚点下 6 个模式里有 5 个会红（预期）**：
+#   `none` / `lagged` / `gap` / `ack-delay` / `ack-hang`
+#   —— 共同点是都断言**回复出现在 transcript 里**，而这依赖**后端两处修复**：
+#     ① timeline seq 空间被「投影重建」凭空消耗（新会话首回合 seq 从 3 起）；
+#     ② seal 即时裁剪导致「回合中途重基线」后补不齐（gap 模式）。
+#   唯一不依赖回复渲染的是 `session-404`（只断言 404 提示 + 不关会话），默认锚点下**绿**。
+#
+#   两处修复已定位并在本地验证（`docs/report/2026-09-23-backend-issue42-root-cause-and-fix-report.md`），
+#   但**尚未合入后端**（后端仓 issue `qaqh-backend#314`）。默认锚点
+#   `tui-anchor-2026-09-23-v2.0.0-rc`（`1e78b7ce`）不含修复 ⇒ 上述 5 个模式会红。
+#
+#   带修复的 daemon 验证方式（2026-09-23 实测**六个模式全绿**）：
+#     DAEMON=<qaqh-backend-fix42>/target/debug/qaqh-daemon \
+#       MODE=<mode> scripts/e2e-v2-faults.sh
+#   锚点升级到含修复的 rev 后，本注记即可删除。
 
 set -u
 
