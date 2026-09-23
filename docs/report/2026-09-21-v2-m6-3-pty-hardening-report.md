@@ -288,7 +288,9 @@ scripts/tests/ci-linux-parse-test.sh              15 passed / 0 failed
 - **后端 #45（仍 open）**：daemon 每回合在 `session-title` 线程 panic
   （`there is no reactor running`），**LLM 标题总结实际从未生效**（落盘标题停在
   截断版）。已提 issue 并附 backtrace 与建议修法；TUI 侧**未**为它加断言，避免把
-  后端缺陷钉进门禁。见 <https://cnb.cool/QAQ-Harness/qaqh-tui-app/-/issues/45>。
+  后端缺陷钉进门禁。
+  → **工作面在后端仓**：已补提为 **`QAQ-Harness/qaqh-backend#315`**（P2）；
+  TUI #45 保留为跟踪（原先提在 TUI 仓属提错仓库，后端看不到）。
 
 ## 5. 下一步
 

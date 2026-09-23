@@ -27,9 +27,13 @@
 # 改动这里必须同步 `Cargo.toml` 里 [patch.crates-io] 的注释，以及本机
 # `.cargo/config.toml` 的 paths 覆盖（指向 `../qaqh-backend-anchor`，见 .gitignore）。
 #
-# 后端侧对应 `tui-anchor-2026-09-23-v2.0.0-rc`（annotated tag，不可移动）。**注意 rev 必须是
-# 完整 40 位 SHA**：下面的 prepare() 用 `git rev-parse HEAD` 与它做字符串比对，
-# 写 tag 名会判不等。换锚点时后端会新开 tag（如 `-r2`），**不要移动旧 tag**。
+# 后端侧对应 `tui-ringing-v2-frozen-2026-09-23`（annotated tag，不可移动）——
+# **Ringing v2 冻结语义锚点**（PR #317 合入，spec：
+# `docs/spec/2026-09-23-TUI-Ringing-v2冻结语义-spec.md`）。
+# 该 tag 的语义是「任何改变 cursor / reset / replay / interaction / driver 语义的
+# 修改都会另起新 tag」，所以换锚点只会发生在后端另发冻结 tag 时。
+# **注意 rev 必须是完整 40 位 SHA**：下面的 prepare() 用 `git rev-parse HEAD` 与它
+# 做字符串比对，写 tag 名会判不等。换锚点时后端会新开 tag，**不要移动旧 tag**。
 # ratatui 用的是**上游未发版的 main**（ratatui#2743 修复尚未发版）。
 #
 # ── 严格模式 ─────────────────────────────────────────────────────────
@@ -45,7 +49,7 @@ set -euo pipefail
 
 # 与 Cargo.toml 的 path 依赖对应。改动请同步 Cargo.toml 的注释。
 QAQH_BACKEND_REPO="${QAQH_BACKEND_REPO:-https://cnb.cool/QAQ-Harness/qaqh-backend.git}"
-QAQH_BACKEND_REV="${QAQH_BACKEND_REV:-1e78b7ce98df2875f036dc8aec1e2371779d0f58}"
+QAQH_BACKEND_REV="${QAQH_BACKEND_REV:-b40ff698f4211526f139c8a620cf159dd4ef9542}"
 RATATUI_REPO="${RATATUI_REPO:-https://github.com/ratatui/ratatui.git}"
 RATATUI_REV="${RATATUI_REV:-e02e2a622eda6e4cae105df48a48f641cdba0303}"
 
@@ -203,6 +207,15 @@ main() {
     # 钉的是结构性性质，不是绝对耗时——判据表见 src/app/render/bench.rs。
     if ! "$root/scripts/perf-gate.sh"; then
         echo "✗ 性能门禁未通过。" >&2
+        exit 1
+    fi
+
+    echo
+    echo "== 静态门禁（跨仓契约，Ringing v2 冻结语义）=="
+    # 把「TUI 不碰后端内部」变成可执行检查；白名单显式带理由。
+    # 出处：后端冻结 spec §0/§11/§12、TUI issue #46 task 6。
+    if ! "$root/scripts/static-gates.sh"; then
+        echo "✗ 静态门禁未通过。" >&2
         exit 1
     fi
 

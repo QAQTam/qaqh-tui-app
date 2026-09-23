@@ -184,7 +184,8 @@ cargo fmt --check                                 通过
 
 - ~~尚未建立首帧延迟、长会话 UI 驻留和 resize replay 的定量 v1/v2 对照~~ →
   §10 的门禁已把「首帧/长会话驻留」纳入**结构判据**；逐项 v1/v2 定量对照见 §4；
-- render 基准包含全量 24432 行，尚未拆分 live viewport 与 scrollback commit；
+- ~~render 基准包含全量 24432 行，尚未拆分 live viewport 与 scrollback commit~~
+  → **§11 已拆分**；
 - v2 runtime steady memory 已低于 v1 淘汰后的 render cache；
 - 默认切换仍属 M7；显式 `--v1` 回退已就绪。
 
@@ -275,3 +276,53 @@ live delta/帧:   11.146µs（阈值 <2ms）
 
 v2 live delta（11 µs）比 v1 流式刷新（810 µs）低约 **70×**；v2 440 回合常驻
 （545 KB）比 v1 淘汰后 render cache（2297 KB）低约 **4×**。
+
+## 11. render 基准拆分（2026-09-23）
+
+### 11.1 为什么必须拆
+
+§2 那条 `render: 24432 lines / 529–841 ms` 是**整段历史**的一次性总成本。
+把它当成「渲染开销」会严重误导：生产有两条**完全不同**的渲染路径
+（`terminal/agent.rs`）：
+
+| 路径 | 位置 | 载荷 | 频次 |
+|---|---|---|---|
+| **live viewport** | `agent.rs:784` | 只渲染 `BlockState::Live` 的块（**正在进行的那个回合**），再按视口行数切片 | **每帧** |
+| **scrollback commit** | `agent.rs:584` | 每次最多 `COMMIT_CHUNK_BLOCKS = 32` 块，分块写入 scrollback | 每块/每提交 |
+
+也就是说：**热路径只渲染一个回合，不是整段历史**；而全量读数其实是
+「把历史全部提交完」的摊还成本。
+
+### 11.2 拆分后的读数（110 回合 × 20 工具，2533 块）
+
+```text
+render 拆分: live viewport 22 块 → 210 行 / 1.76 ms（每帧热路径）
+             commit chunk 32 块 / 2.62 ms（每次提交；均值 2.56 ms）
+             全量 2533 块 → 24432 行 / 203.02 ms（分块摊还）
+```
+
+| 指标 | 值 | 说明 |
+|---|---:|---|
+| 每帧 live viewport | **1.76 ms** / 22 块 | 一个回合的载荷（20 工具 + 文本/思考） |
+| 每次 commit chunk | **2.62 ms** / 32 块 | 分块提交，不是一次性 |
+| 全量提交总成本 | 203 ms / 2533 块 | 摊到 ~80 个 chunk |
+
+比例自洽：22/2533 = 0.87%，1.76/203 = 0.87% —— 渲染成本与块数**线性**。
+
+### 11.3 结论与一个观察
+
+- 全量那条数字**不该再被当成渲染开销引用**；要引用就用拆分后的三条；
+- **每帧 1.76 ms 值得留意**：live viewport 是每帧重渲的（不缓存），一个
+  22 块的活动回合就会吃掉 1.76 ms/帧。当前不成问题（60 fps 预算 16.7 ms），
+  但若出现「单回合上百块」的形态（多工具并发），这条会线性放大 ——
+  届时的优化方向是给 live viewport 加按 `rev` 的渲染缓存，而不是继续调
+  全量提交。
+
+### 11.4 复现
+
+```bash
+cargo test --bin qaqh-tui render::bench::bench_v2_commit_runtime -- \
+  --ignored --nocapture --test-threads=1
+```
+
+（`scripts/perf-gate.sh --full` 也会带上这条。）
