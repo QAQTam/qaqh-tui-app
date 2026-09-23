@@ -1,6 +1,6 @@
 [package]
 name = "qaqh-tui"
-version = "1.0.1"
+version = "2.0.0-alpha1"
 edition = "2024"
 description = "Terminal UI client for the QAQ-Harness daemon (Ringing protocol v1)"
 license = "MIT"
@@ -38,6 +38,10 @@ anyhow = "1"
 thiserror = "2"
 futures = "0.3"
 chrono = "0.4"
+# 日志门面：`qaqh-client` 的诊断（timeline 重连原因 / 快照恢复失败 / cursor
+# 解析告警）全部走 `log`。本仓**只**在 `QAQH_TUI_LOG=<path>` 时安装一个极简
+# 文件 logger（见 main.rs），默认不安装、不写盘、不改变行为。
+log = "0.4"
 pulldown-cmark = { version = "0.12", default-features = false }
 syntect = "5"
 

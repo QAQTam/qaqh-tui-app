@@ -7,20 +7,38 @@
 # ⚠ Linux CI 依赖两个兄弟仓库（`../qaqh-backend`、`../ratatui`），而 CNB 的仓库根是
 # `/workspace`，相对路径会解析成 `/ratatui` 等不存在的目录 → 依赖解析阶段即失败。
 # 因此 CI 必须先按固定 rev 拉取这两个仓库，逻辑集中在 `scripts/ci-linux.sh`。
+#
+# ── 2026-09-20 · W-05 三项 CI 决策（issue #22）──────────────────────────
+# U-26：`build-npc-image` 加 `ifModify`，只在构建输入变动时重建镜像（见该 pipeline）。
+# U-28：镜像 tag 一律对齐 `rust-toolchain.toml` 的 **1.98.0**（原为 1.98.1）。
+#       已核实 `rust:1.98.0` 在 Docker Hub 存在（负向对照 `rust:9.9.9` → 403）。
+#       对齐后 CI 不再需要现场下载第二套 toolchain，`ci-linux.sh` 里那段
+#       「两套 toolchain 并存」的解释随之作废。
+# U-30：后端 rev **保持钉死**（跨仓 gate 要可归因），但 `ci-linux.sh` 现在会打印
+#       「钉住的 rev 落后 origin/main 多少提交」，避免像 8c1c154 那样悄悄落后 44 个。
 
 main:
   push:
     - name: build-npc-image
+      # U-26：镜像只在**构建输入**变动时重建（CNB 的 `ifModify` 在 Pipeline 级生效，
+      # glob 语义、支持 `!` 取反；push 事件对比 before/after 的变更文件，
+      # 见 docs.cnb.cool/zh/build/grammar.md 的 ifModify 节）。
+      # ⚠ 已知边界：**新建分支的 push 没有对比基准，CNB 会忽略 ifModify 检查**，
+      # 该 pipeline 仍会跑 —— 节省发生在 main 的常规推送，不是全部。
+      ifModify:
+        - Dockerfile
+        - .cnb.yml
+        - .cnb/**
       services:
         - docker
       stages:
         - name: Docker build
-          script: docker build -t ${CNB_DOCKER_REGISTRY}/${CNB_REPO_SLUG_LOWERCASE}:npc-ubuntu26-rust1981 .
+          script: docker build -t ${CNB_DOCKER_REGISTRY}/${CNB_REPO_SLUG_LOWERCASE}:npc-ubuntu26-rust1980 .
         - name: Docker push
-          script: docker push ${CNB_DOCKER_REGISTRY}/${CNB_REPO_SLUG_LOWERCASE}:npc-ubuntu26-rust1981
+          script: docker push ${CNB_DOCKER_REGISTRY}/${CNB_REPO_SLUG_LOWERCASE}:npc-ubuntu26-rust1980
     - name: linux-ci
       docker:
-        image: rust:1.98.1
+        image: rust:1.98.0
       env:
         # 严格模式：兄弟仓库目录已存在时也要校验 rev（不符就地修正，修不了则失败）。
         # 挡住「clone 成功但 checkout 失败」留下的半成品目录让 CI 用错版本。
@@ -30,14 +48,14 @@ main:
         - name: test+clippy+fmt
           script: bash scripts/ci-linux.sh
 
-# NPC 事件：自定义镜像（Ubuntu 26.04 + Rust 1.98.1 + OpenSSL dev）
+# NPC 事件：自定义镜像（Ubuntu 26.04 + Rust 1.98.0 + OpenSSL dev）
 $:
   # 手动/API 触发：`cnb build start-build --repo <repo> --branch <分支> --event api_trigger`
   # 用途是在**合并前**验证 CI 本身（PR 事件只跑 NPC 审查，不跑 Linux CI）。
   api_trigger:
     - name: linux-ci
       docker:
-        image: rust:1.98.1
+        image: rust:1.98.0
       env:
         STRICT_DEPS: "1"
       stages:
@@ -46,13 +64,13 @@ $:
 
   issue.comment@npc:
     - docker:
-        image: ${CNB_DOCKER_REGISTRY}/${CNB_REPO_SLUG_LOWERCASE}:npc-ubuntu26-rust1981
+        image: ${CNB_DOCKER_REGISTRY}/${CNB_REPO_SLUG_LOWERCASE}:npc-ubuntu26-rust1980
       stages:
         - name: npc go
           type: npc:go
   pull_request.comment@npc:
     - docker:
-        image: ${CNB_DOCKER_REGISTRY}/${CNB_REPO_SLUG_LOWERCASE}:npc-ubuntu26-rust1981
+        image: ${CNB_DOCKER_REGISTRY}/${CNB_REPO_SLUG_LOWERCASE}:npc-ubuntu26-rust1980
       stages:
         - name: npc go
           type: npc:go
@@ -60,7 +78,7 @@ $:
   pull_request:
     - name: npc-auto-review
       docker:
-        image: ${CNB_DOCKER_REGISTRY}/${CNB_REPO_SLUG_LOWERCASE}:npc-ubuntu26-rust1981
+        image: ${CNB_DOCKER_REGISTRY}/${CNB_REPO_SLUG_LOWERCASE}:npc-ubuntu26-rust1980
       stages:
         - name: npc go
           type: npc:go

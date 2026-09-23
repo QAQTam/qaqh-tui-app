@@ -11,11 +11,60 @@ cargo build --release
 
 # 自检：发现 → 存活 → /health → open 握手
 ./target/release/qaqh-tui.exe doctor
+
+# v2 实验模式；显式 --v1 可覆盖 QAQH_V2_AGENT 环境变量并强制回退
+./target/release/qaqh-tui.exe --v2-agent
+./target/release/qaqh-tui.exe --v1
 ```
 
 环境变量：`QAQH_DATA_DIR`（数据目录覆盖，默认 `%USERPROFILE%\.qaqh`）、
-`QAQH_BACKEND_ROOT`（daemon 拉起候选根）。Bearer token 只从 `daemon.json`
-读入内存，永不落日志/URL。
+`QAQH_BACKEND_ROOT`（daemon 拉起候选根）、`QAQH_THEME`（`night` / `day` /
+`terminal` / `auto`）、`QAQH_TUI_LOG`（诊断日志落盘路径，见下「排障」）。
+`NO_COLOR` 存在时不输出颜色，只保留 glyph 与修饰符。
+Bearer token 只从 `daemon.json` 读入内存，永不落日志/URL。
+
+### 排障：抓客户端诊断日志
+
+```bash
+QAQH_TUI_LOG=/tmp/qaqh-tui.log cargo run -- --v2-agent
+tail -f /tmp/qaqh-tui.log
+```
+
+TUI 自身默认不落日志。设了 `QAQH_TUI_LOG=<path>` 后才安装一个极简文件 logger，
+把 `qaqh-client` 的诊断（timeline 重连原因、快照恢复失败、非法 cursor 告警……）
+按 `[LEVEL] msg` **追加**写入该文件；不设置时 `log` 门面是空操作，行为与之前一致。
+真机排查「timeline 断开 / 重连」「会话恢复为空」这类问题**先开它**——UI 上只剩
+一句「断开，1000ms 后重连」，具体原因只在日志里（`ReconnectReason` 只覆盖服务端
+主动终止流，普通 HTTP 错误如 401 不带 reason）。
+
+### V2 inline 原型（实验）
+
+```bash
+cargo run -- --v2-inline
+```
+
+不连接 daemon、不进入 alternate screen；用于验证终端 scrollback + inline viewport +
+commit ledger。`Enter` 提交一行，`r` 重放最近一次提交（应被幂等拒绝），`q` 退出。
+正式 v1 默认路径不受影响。
+
+### V2 Agent View（实验，M4）
+
+```bash
+cargo run -- --v2-agent
+```
+
+连接 daemon，复用现有 Runtime/App 状态；已封口 transcript 通过 V2 projector 与
+commit ledger 写入终端 scrollback，live block、composer、status 与 shortcuts 留在
+底部 inline viewport。composer 支持多行与宽字符折行，slash 菜单、model/mode/cwd、
+usage、附件与连接告警均已接入。该模式不启用鼠标捕获，保留终端原生选择/复制；
+`Ctrl+Q` 退出。
+
+Workspace/Modal、会话选择器、设置、权限/ask/plan 仍由 M5 迁移；M4 只覆盖默认
+Agent View 的输入、状态、shortcuts 与 live transcript。`--no-spawn` 与 v1 语义一致。
+
+ask_user 在 v2 中采用阻塞式单题分页：`←/→` 切题，`↑/↓` 移动选项，`Enter`
+选择并前进，`Space` 只选择，`1-9/a-f` 直接选择，`e`/`z` 输入自定义答案，
+`Esc` 跳过。快捷键与屏幕编号统一为 1-based。
 
 ## 界面与按键
 

@@ -14,12 +14,17 @@ impl App {
         else {
             return;
         };
+        let missing = panel.first_unanswered();
         let answers = match panel.collect_answers() {
             Ok(a) => a,
             Err(e) => {
                 if let Some(sess) = self.sessions.get_mut(&seed)
                     && let Some(p) = sess.pending_ask.as_mut()
                 {
+                    if let Some(idx) = missing {
+                        p.focus = idx;
+                        p.scroll = 0;
+                    }
                     p.error = Some(e);
                 }
                 return;
@@ -41,7 +46,7 @@ impl App {
                 answer,
             })
             .collect();
-        self.send_control_command(
+        self.send_interaction_command(
             seed,
             ControlCommand::InteractionAskRespond {
                 interaction_id,
@@ -66,7 +71,7 @@ impl App {
         if let Some(sess) = self.sessions.get_mut(&seed) {
             sess.pending_ask = None;
         }
-        self.send_control_command(
+        self.send_interaction_command(
             seed,
             ControlCommand::InteractionAskDismiss { interaction_id },
             "跳过 ask",
@@ -92,7 +97,7 @@ impl App {
         if let Some(sess) = self.sessions.get_mut(&seed) {
             sess.pending_plan = None;
         }
-        self.send_control_command(
+        self.send_interaction_command(
             seed,
             ControlCommand::PlanReviewRespond {
                 interaction_id,
@@ -125,10 +130,7 @@ impl App {
             trust_folder: panel.trust_folder,
         });
         self.spawn_api(move |api, tx| async move {
-            let result = api
-                .send_command(Some(&seed.clone()), cmd, Default::default())
-                .await
-                .map_err(|e| e.to_string());
+            let result = api.send_interaction_command(Some(&seed.clone()), cmd).await;
             let _ = tx.send(AppMsg::Action(ActionResult::CommandAck {
                 seed: Some(seed),
                 label: "权限",
@@ -202,17 +204,30 @@ impl App {
     }
 
     pub(super) fn ask_key(&mut self, seed: &str, key: KeyEvent) -> bool {
-        use ratatui::crossterm::event::KeyCode;
+        use crate::app::session::option_index_for_key;
+        use ratatui::crossterm::event::{KeyCode, KeyModifiers};
         enum D {
-            FocusUp,
-            FocusDown,
-            Select { focus: usize, option: usize },
-            StartEdit { focus: usize },
+            Switch(i32),
+            Cursor(i32),
+            CursorFirst,
+            CursorLast,
+            Scroll(i32),
+            Select {
+                question: usize,
+                option: usize,
+                advance: bool,
+            },
+            Toggle {
+                question: usize,
+                option: usize,
+            },
+            StartEdit {
+                question: usize,
+            },
             EditChar(char),
             EditBackspace,
             EditCommit,
             EditCancel,
-            Submit,
             Dismiss,
             None,
         }
@@ -224,71 +239,159 @@ impl App {
                 return true;
             };
             let focus = ask.focus.min(ask.questions.len().saturating_sub(1));
+            let Some(question) = ask.questions.get(focus) else {
+                return true;
+            };
+            let on_custom = ask.is_on_custom_row();
             if ask.editing_custom.is_some() {
                 match key.code {
                     KeyCode::Enter => D::EditCommit,
                     KeyCode::Esc => D::EditCancel,
                     KeyCode::Backspace => D::EditBackspace,
-                    KeyCode::Char(c) => D::EditChar(c),
+                    KeyCode::Char(c) if !c.is_control() => D::EditChar(c),
                     _ => D::None,
                 }
             } else {
                 match key.code {
-                    KeyCode::Up => D::FocusUp,
-                    KeyCode::Down | KeyCode::Tab => D::FocusDown,
-                    KeyCode::Char(c @ '1'..='9') => D::Select {
-                        focus,
-                        option: (c as u8 - b'1') as usize,
-                    },
-                    KeyCode::Char('e')
-                        if ask
-                            .questions
-                            .get(focus)
-                            .map(|q| q.allow_custom)
-                            .unwrap_or(false) =>
-                    {
-                        D::StartEdit { focus }
+                    KeyCode::Left | KeyCode::BackTab => D::Switch(-1),
+                    KeyCode::Right | KeyCode::Tab => D::Switch(1),
+                    KeyCode::Up | KeyCode::Char('k') if key.modifiers.is_empty() => D::Cursor(-1),
+                    KeyCode::Down | KeyCode::Char('j') if key.modifiers.is_empty() => D::Cursor(1),
+                    KeyCode::Home | KeyCode::Char('g') if key.modifiers.is_empty() => {
+                        D::CursorFirst
                     }
-                    KeyCode::Enter => D::Submit,
+                    KeyCode::End => D::CursorLast,
+                    KeyCode::Char('G') if key.modifiers == KeyModifiers::SHIFT => D::CursorLast,
+                    KeyCode::PageUp => D::Scroll(-5),
+                    KeyCode::PageDown => D::Scroll(5),
+                    KeyCode::Char(' ') if on_custom => D::StartEdit { question: focus },
+                    KeyCode::Char(' ') => D::Toggle {
+                        question: focus,
+                        option: ask.option_cursor(focus),
+                    },
+                    KeyCode::Enter if on_custom => D::StartEdit { question: focus },
+                    KeyCode::Enter => D::Select {
+                        question: focus,
+                        option: ask.option_cursor(focus),
+                        advance: true,
+                    },
+                    KeyCode::Char('z') if key.modifiers.is_empty() && question.allow_custom => {
+                        D::StartEdit { question: focus }
+                    }
+                    KeyCode::Char('e')
+                        if key.modifiers.is_empty()
+                            && question.allow_custom
+                            && option_index_for_key('e')
+                                .is_none_or(|index| index >= question.options.len()) =>
+                    {
+                        D::StartEdit { question: focus }
+                    }
+                    KeyCode::Char(c)
+                        if key.modifiers.is_empty() && option_index_for_key(c).is_some() =>
+                    {
+                        let option = option_index_for_key(c).unwrap_or_default();
+                        if option < question.options.len() {
+                            D::Select {
+                                question: focus,
+                                option,
+                                advance: true,
+                            }
+                        } else {
+                            D::None
+                        }
+                    }
                     KeyCode::Esc => D::Dismiss,
                     _ => D::None,
                 }
             }
         };
+        let mut submit_after = false;
         match decision {
-            D::FocusUp => {
+            D::Switch(delta) => {
                 if let Some(s) = self.sessions.get_mut(seed)
                     && let Some(p) = s.pending_ask.as_mut()
+                    && !p.questions.is_empty()
                 {
-                    p.focus = p.focus.saturating_sub(1);
+                    let last = p.questions.len().saturating_sub(1);
+                    p.focus = (p.focus as i32 + delta).clamp(0, last as i32) as usize;
+                    p.scroll = 0;
                 }
             }
-            D::FocusDown => {
+            D::Cursor(delta) => {
                 if let Some(s) = self.sessions.get_mut(seed)
                     && let Some(p) = s.pending_ask.as_mut()
-                    && p.focus + 1 < p.questions.len()
                 {
-                    p.focus += 1;
+                    p.move_option_cursor(p.focus, delta);
                 }
             }
-            D::Select { focus, option } => {
+            D::CursorFirst => {
                 if let Some(s) = self.sessions.get_mut(seed)
                     && let Some(p) = s.pending_ask.as_mut()
-                    && p.questions
-                        .get(focus)
-                        .map(|q| option < q.options.len())
-                        .unwrap_or(false)
+                    && let Some(cursor) = p.option_cursor.get_mut(p.focus)
                 {
-                    p.selections[focus] = Some(option);
+                    *cursor = 0;
+                }
+            }
+            D::CursorLast => {
+                if let Some(s) = self.sessions.get_mut(seed)
+                    && let Some(p) = s.pending_ask.as_mut()
+                {
+                    let last = p.option_count(p.focus).saturating_sub(1);
+                    if let Some(cursor) = p.option_cursor.get_mut(p.focus) {
+                        *cursor = last;
+                    }
+                }
+            }
+            D::Scroll(delta) => {
+                if let Some(s) = self.sessions.get_mut(seed)
+                    && let Some(p) = s.pending_ask.as_mut()
+                {
+                    p.scroll = if delta < 0 {
+                        p.scroll.saturating_sub(delta.unsigned_abs() as u16)
+                    } else {
+                        p.scroll.saturating_add(delta as u16)
+                    };
+                }
+            }
+            D::Select {
+                question,
+                option,
+                advance,
+            } => {
+                let mut on_last = false;
+                if let Some(s) = self.sessions.get_mut(seed)
+                    && let Some(p) = s.pending_ask.as_mut()
+                {
+                    p.select_option(question, option);
+                    if advance {
+                        on_last = p.focus + 1 >= p.questions.len();
+                        if !on_last {
+                            p.focus += 1;
+                            p.scroll = 0;
+                        }
+                    }
+                }
+                submit_after = on_last;
+            }
+            D::Toggle { question, option } => {
+                if let Some(s) = self.sessions.get_mut(seed)
+                    && let Some(p) = s.pending_ask.as_mut()
+                {
+                    p.toggle_option(question, option);
+                }
+            }
+            D::StartEdit { question } => {
+                if let Some(s) = self.sessions.get_mut(seed)
+                    && let Some(p) = s.pending_ask.as_mut()
+                {
+                    p.editing_custom = Some(question);
+                    if let Some(cursor) = p.option_cursor.get_mut(question)
+                        && let Some(q) = p.questions.get(question)
+                    {
+                        *cursor = q.options.len();
+                    }
+                    p.input = p.customs[question].clone();
                     p.error = None;
-                }
-            }
-            D::StartEdit { focus } => {
-                if let Some(s) = self.sessions.get_mut(seed)
-                    && let Some(p) = s.pending_ask.as_mut()
-                {
-                    p.editing_custom = Some(focus);
-                    p.input = p.customs[focus].clone();
                 }
             }
             D::EditChar(c) => {
@@ -314,9 +417,18 @@ impl App {
                         p.customs[qi].clear();
                     } else {
                         p.customs[qi] = p.input.trim().to_owned();
+                        if let Some(selection) = p.selections.get_mut(qi) {
+                            *selection = None;
+                        }
                     }
                     p.input.clear();
                     p.error = None;
+                    if p.focus + 1 < p.questions.len() {
+                        p.focus += 1;
+                        p.scroll = 0;
+                    } else {
+                        submit_after = true;
+                    }
                 }
             }
             D::EditCancel => {
@@ -327,9 +439,11 @@ impl App {
                     p.input.clear();
                 }
             }
-            D::Submit => self.submit_ask(),
             D::Dismiss => self.dismiss_ask(),
             D::None => {}
+        }
+        if submit_after {
+            self.submit_ask();
         }
         true
     }
@@ -426,5 +540,171 @@ impl App {
             D::None => {}
         }
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::session::{AskPanel, SessionState};
+    use qaqh_client::{AskMode, DomainAskQuestion as AskQuestion};
+    use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    fn app_with_ask() -> App {
+        let (mut app, _rx) = App::new_for_test();
+        let seed = "seed-ask".to_string();
+        let mut session = SessionState::new(seed.clone());
+        session.pending_ask = Some(AskPanel::new(
+            "interaction-1".into(),
+            "turn-1".into(),
+            AskMode::Batch,
+            vec![
+                AskQuestion {
+                    id: "q1".into(),
+                    question: "第一题".into(),
+                    options: vec!["A".into(), "B".into(), "C".into()],
+                    allow_custom: true,
+                },
+                AskQuestion {
+                    id: "q2".into(),
+                    question: "第二题".into(),
+                    options: vec!["D".into(), "E".into()],
+                    allow_custom: true,
+                },
+            ],
+        ));
+        app.tabs.push(seed.clone());
+        app.sessions.insert(seed, session);
+        app
+    }
+
+    #[test]
+    fn number_shortcut_selects_one_based_option_and_advances() {
+        let mut app = app_with_ask();
+        app.ask_key(
+            "seed-ask",
+            KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE),
+        );
+
+        let ask = app
+            .sessions
+            .get("seed-ask")
+            .and_then(|s| s.pending_ask.as_ref())
+            .expect("ask panel");
+        assert_eq!(ask.focus, 1);
+        assert_eq!(ask.selections[0], Some(1));
+    }
+
+    #[test]
+    fn left_and_right_switch_question_pages() {
+        let mut app = app_with_ask();
+        app.ask_key(
+            "seed-ask",
+            KeyEvent::new(KeyCode::Right, KeyModifiers::NONE),
+        );
+        assert_eq!(
+            app.sessions["seed-ask"]
+                .pending_ask
+                .as_ref()
+                .expect("ask")
+                .focus,
+            1
+        );
+        app.ask_key("seed-ask", KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+        assert_eq!(
+            app.sessions["seed-ask"]
+                .pending_ask
+                .as_ref()
+                .expect("ask")
+                .focus,
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn enter_on_last_question_submits_complete_answers() {
+        let mut app = app_with_ask();
+        {
+            let ask = app
+                .sessions
+                .get_mut("seed-ask")
+                .and_then(|s| s.pending_ask.as_mut())
+                .expect("ask panel");
+            ask.selections[0] = Some(0);
+            ask.focus = 1;
+            ask.option_cursor[1] = 1;
+        }
+        app.ask_key(
+            "seed-ask",
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        );
+
+        assert!(
+            app.sessions["seed-ask"].pending_ask.is_none(),
+            "last question Enter should submit"
+        );
+    }
+
+    #[test]
+    fn enter_on_custom_row_enters_input_mode() {
+        let mut app = app_with_ask();
+        {
+            let ask = app
+                .sessions
+                .get_mut("seed-ask")
+                .and_then(|s| s.pending_ask.as_mut())
+                .expect("ask panel");
+            ask.option_cursor[0] = ask.questions[0].options.len();
+        }
+        app.ask_key(
+            "seed-ask",
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        );
+
+        let ask = app
+            .sessions
+            .get("seed-ask")
+            .and_then(|s| s.pending_ask.as_ref())
+            .expect("ask panel");
+        assert_eq!(ask.editing_custom, Some(0));
+    }
+
+    #[test]
+    fn blocking_modal_consumes_global_workspace_keys() {
+        let mut app = app_with_ask();
+        app.handle(AppMsg::Key(KeyEvent::new(
+            KeyCode::Char('l'),
+            KeyModifiers::CONTROL,
+        )));
+        assert!(
+            app.overlays.is_empty(),
+            "阻塞式 ask 不应被 Ctrl+L 压到 SessionList 下面"
+        );
+    }
+
+    #[tokio::test]
+    async fn incomplete_submit_returns_to_first_missing_question() {
+        let mut app = app_with_ask();
+        {
+            let ask = app
+                .sessions
+                .get_mut("seed-ask")
+                .and_then(|s| s.pending_ask.as_mut())
+                .expect("ask panel");
+            ask.focus = 1;
+            ask.selections[1] = Some(0);
+        }
+        app.ask_key(
+            "seed-ask",
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        );
+
+        let ask = app
+            .sessions
+            .get("seed-ask")
+            .and_then(|s| s.pending_ask.as_ref())
+            .expect("ask panel");
+        assert_eq!(ask.focus, 0);
+        assert!(ask.error.is_some());
     }
 }

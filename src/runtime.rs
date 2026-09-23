@@ -24,7 +24,7 @@ use std::time::{Duration, Instant};
 
 use qaqh_client::{
     Channel as WireChannel, ChannelStatus, Client, ClientError, ClientHandlers, ClientOptions,
-    TimelineStatus,
+    ReconnectReason, TimelineStatus,
 };
 use tokio::sync::mpsc;
 
@@ -460,6 +460,22 @@ async fn watch_stall(
     }
 }
 
+/// 把 qaqh-client 的结构化重连原因转成 TUI 可诊断文案。
+///
+/// `None` 是普通网络断开；`Lagged` 是服务端事件缓冲溢出终止流；其他稳定 code
+/// 原样透出。该文案同时覆盖 U-07 要求的 `lagged` 诊断。
+fn reconnect_message(label: &str, reason: Option<&ReconnectReason>, retry_ms: u64) -> String {
+    match reason {
+        Some(ReconnectReason::Lagged { skipped }) => {
+            format!("{label} 服务端终止流（lagged，丢弃 {skipped} 事件），{retry_ms}ms 后重连")
+        }
+        Some(ReconnectReason::StreamTerminated { code }) => {
+            format!("{label} 服务端终止流（{code}），{retry_ms}ms 后重连")
+        }
+        None => format!("{label} 断开，{retry_ms}ms 后重连"),
+    }
+}
+
 /// 构造回调：把 `qaqh-client` 的权威类型转投为本仓 `RuntimeMsg`。
 fn build_handlers(
     msg_tx: mpsc::UnboundedSender<RuntimeMsg>,
@@ -491,10 +507,12 @@ fn build_handlers(
                             stream: StreamKey::Channel(channel),
                         }));
                     }
-                    ChannelStatus::Reconnecting { retry_ms, .. } => {
+                    ChannelStatus::Reconnecting {
+                        retry_ms, reason, ..
+                    } => {
                         let _ = msg_tx.send(RuntimeMsg::Conn(ConnEvent::StreamIssue {
                             stream: StreamKey::Channel(channel),
-                            error: format!("连接断开，{retry_ms}ms 后重连"),
+                            error: reconnect_message("连接", reason.as_ref(), retry_ms),
                         }));
                     }
                     ChannelStatus::Closed { reason } => {
@@ -549,10 +567,16 @@ fn build_handlers(
                         stream: StreamKey::Timeline(seed),
                     }));
                 }
-                TimelineStatus::Reconnecting { seed, retry_ms, .. } => {
+                TimelineStatus::Reconnecting {
+                    seed,
+                    retry_ms,
+                    reason,
+                    ..
+                } => {
+                    let label = format!("timeline[{seed}]");
                     let _ = msg_tx.send(RuntimeMsg::Conn(ConnEvent::StreamIssue {
-                        stream: StreamKey::Timeline(seed.clone()),
-                        error: format!("timeline[{seed}] 断开，{retry_ms}ms 后重连"),
+                        stream: StreamKey::Timeline(seed),
+                        error: reconnect_message(&label, reason.as_ref(), retry_ms),
                     }));
                 }
                 TimelineStatus::Open { seed, .. } => {
@@ -621,6 +645,7 @@ mod tests {
             ChannelStatus::Reconnecting {
                 retry_ms: 500,
                 last_cursor: 3,
+                reason: None,
             },
         );
         (handlers.on_status)(
@@ -646,6 +671,24 @@ mod tests {
         );
     }
 
+    /// U-07：qaqh-client 已把服务端终止帧归一为结构化原因，TUI 必须把
+    /// `lagged` / 稳定 code 带到用户可见的诊断文案里。
+    #[test]
+    fn reconnect_message_exposes_structured_reason() {
+        let lagged = reconnect_message("连接", Some(&ReconnectReason::Lagged { skipped: 7 }), 500);
+        assert!(lagged.contains("lagged"), "{lagged}");
+        assert!(lagged.contains('7'), "{lagged}");
+
+        let terminated = reconnect_message(
+            "timeline[A]",
+            Some(&ReconnectReason::StreamTerminated {
+                code: "protocol_version".into(),
+            }),
+            800,
+        );
+        assert!(terminated.contains("protocol_version"), "{terminated}");
+    }
+
     /// timeline 流的告警/恢复也必须按 seed 记账；被关闭（不再重连）的流要撤销告警，
     /// 否则那条告警会永久留在 app 的账本里。
     #[test]
@@ -658,6 +701,7 @@ mod tests {
             seed: "A".into(),
             retry_ms: 800,
             cursor: 1,
+            reason: None,
         });
         (handlers.on_timeline_status)(TimelineStatus::Open {
             seed: "A".into(),

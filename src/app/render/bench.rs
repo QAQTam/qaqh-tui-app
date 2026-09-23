@@ -16,12 +16,15 @@
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use super::*;
 use crate::app::anim;
 use crate::app::session::SessionState;
 use crate::app::timeline_model::{Block, Round, ToolCard};
+use crate::theme::Theme;
+use crate::ui::v2::runtime::V2TranscriptRuntime;
+use crate::ui::v2::transcript::render_transcript;
 use qaqh_client::{TimelineBlockKind, TimelineBlockState, TimelineToolState, TimelineTurnState};
 
 // ── 计数分配器 ──────────────────────────────────────────────────────
@@ -398,5 +401,265 @@ fn bench_long_stream_delta() {
           ④ 增量(carry) avg {}µs/delta（封口 {inc_sealed} 行） | 全量(init) avg {}µs/delta",
         inc_us / DELTAS as u128,
         full_us / DELTAS as u128,
+    );
+}
+
+// ── 基准 4：V2 projector + commit ledger + render ─────────────────
+
+#[test]
+#[ignore = "基准：cargo test render::bench -- --ignored --nocapture"]
+fn bench_v2_commit_runtime() {
+    let _guard = BENCH_LOCK.lock().unwrap();
+    const TURNS: usize = 110;
+    const TOOLS: usize = 20;
+
+    let mut sess = gen_session(TURNS, TOOLS);
+    let turns = &sess.timeline.turns;
+
+    let mut v1_cache = TranscriptCache::new(WIDTH);
+    let v1_start = Instant::now();
+    let _ = refresh(&sess, WIDTH, None, &mut v1_cache);
+    let v1_first_frame = v1_start.elapsed();
+
+    let lazy_start = Instant::now();
+    let mut lazy_runtime = V2TranscriptRuntime::new();
+    lazy_runtime.begin_replay("bench");
+    let lazy_pending = lazy_runtime.replay_slice("bench", &turns[..8.min(turns.len())]);
+    let lazy_blocks: Vec<_> = lazy_pending
+        .iter()
+        .take(COMMIT_CHUNK_BLOCKS_FOR_BENCH)
+        .map(|pending| pending.block.clone())
+        .collect();
+    let _ = render_transcript(&lazy_blocks, WIDTH, Theme::current());
+    let lazy_first_frame = lazy_start.elapsed();
+
+    reset_counters();
+    let replay_start = Instant::now();
+    let mut runtime = V2TranscriptRuntime::new();
+    let emitted = runtime.replay_from_scratch_versioned("bench", turns, sess.timeline.version);
+    let replay_elapsed = replay_start.elapsed();
+    let runtime_live = live();
+    let runtime_peak = peak();
+
+    let incremental_start = Instant::now();
+    let incremental = runtime.sync_timeline_versioned("bench", turns, sess.timeline.version);
+    let incremental_elapsed = incremental_start.elapsed();
+    assert!(incremental.is_empty(), "高水位重放后不得重复 emit");
+
+    const DELTAS: usize = 20;
+    let delta_start = Instant::now();
+    for _ in 0..DELTAS {
+        push_delta(&mut sess);
+        sess.timeline.version = sess.timeline.version.saturating_add(1);
+        let _ =
+            runtime.sync_timeline_versioned("bench", &sess.timeline.turns, sess.timeline.version);
+    }
+    let delta_elapsed = delta_start.elapsed();
+
+    let blocks: Vec<_> = emitted
+        .iter()
+        .map(|pending| pending.block.clone())
+        .collect();
+    let first_chunk_start = Instant::now();
+    let first_chunk: Vec<_> = emitted
+        .iter()
+        .take(COMMIT_CHUNK_BLOCKS_FOR_BENCH)
+        .map(|pending| pending.block.clone())
+        .collect();
+    let _ = render_transcript(&first_chunk, WIDTH, Theme::current());
+    let first_chunk_elapsed = first_chunk_start.elapsed();
+    let render_start = Instant::now();
+    let lines = render_transcript(&blocks, WIDTH, Theme::current());
+    let render_elapsed = render_start.elapsed();
+    let v2_first_frame = replay_elapsed + first_chunk_elapsed;
+
+    println!(
+        "\n=== V2 commit runtime（{TURNS} turns × {TOOLS} tools）===\n\
+         ⑤ replay: {} blocks / {:.2} ms；runtime live {} / peak {}\n\
+           高水位增量: {} blocks / {} µs\n\
+           live delta ×{DELTAS}: avg {} µs/帧\n\
+           render: {} lines / {:.2} ms\n\
+           first frame: v1 cache {:.2} ms | v2 lazy replay+chunk {:.2} ms | \
+           v2 full replay+chunk {:.2} ms",
+        emitted.len(),
+        replay_elapsed.as_secs_f64() * 1000.0,
+        kb(runtime_live),
+        kb(runtime_peak),
+        incremental.len(),
+        incremental_elapsed.as_micros(),
+        delta_elapsed.as_micros() / DELTAS as u128,
+        lines.len(),
+        render_elapsed.as_secs_f64() * 1000.0,
+        v1_first_frame.as_secs_f64() * 1000.0,
+        lazy_first_frame.as_secs_f64() * 1000.0,
+        v2_first_frame.as_secs_f64() * 1000.0,
+    );
+}
+
+const COMMIT_CHUNK_BLOCKS_FOR_BENCH: usize = 32;
+
+#[test]
+#[ignore = "基准：cargo test render::bench -- --ignored --nocapture"]
+fn bench_v2_runtime_scale_curve() {
+    let _guard = BENCH_LOCK.lock().unwrap();
+    const TOOLS: usize = 20;
+    const DELTAS: usize = 20;
+
+    println!("\n=== V2 commit runtime 规模曲线（每回合 {TOOLS} 工具）===");
+    reset_counters();
+    println!(
+        "{:>6} {:>8} {:>12} {:>13} {:>15} {:>12}",
+        "turns", "blocks", "replay ms", "live delta µs", "render ms", "steady live"
+    );
+
+    for &turns_n in &[25usize, 50, 110, 220, 440] {
+        let mut sess = gen_session(turns_n, TOOLS);
+
+        let live_before = live();
+        let replay_start = Instant::now();
+        let mut runtime = V2TranscriptRuntime::new();
+        let emitted = runtime.replay_from_scratch_versioned(
+            "bench",
+            &sess.timeline.turns,
+            sess.timeline.version,
+        );
+        let emitted_len = emitted.len();
+        let replay_elapsed = replay_start.elapsed();
+
+        let delta_start = Instant::now();
+        for _ in 0..DELTAS {
+            push_delta(&mut sess);
+            sess.timeline.version = sess.timeline.version.saturating_add(1);
+            let _ = runtime.sync_timeline_versioned(
+                "bench",
+                &sess.timeline.turns,
+                sess.timeline.version,
+            );
+        }
+        let delta_elapsed = delta_start.elapsed();
+
+        let blocks: Vec<_> = emitted
+            .iter()
+            .map(|pending| pending.block.clone())
+            .collect();
+        let render_start = Instant::now();
+        let lines = render_transcript(&blocks, WIDTH, Theme::current());
+        let render_elapsed = render_start.elapsed();
+        drop(lines);
+        drop(blocks);
+        drop(emitted);
+        let runtime_steady = live().saturating_sub(live_before);
+
+        println!(
+            "{turns_n:>6} {:>8} {:>12.2} {:>13} {:>15.2} {:>12}",
+            emitted_len,
+            replay_elapsed.as_secs_f64() * 1000.0,
+            delta_elapsed.as_micros() / DELTAS as u128,
+            render_elapsed.as_secs_f64() * 1000.0,
+            kb(runtime_steady),
+        );
+    }
+}
+
+// ── M6.4 性能门禁 ────────────────────────────────────────────────────
+//
+// **为什么单独一个测试、且要单线程跑**：内存读数走全局分配器计数，`cargo test`
+// 默认并行会让其它测试的分配污染 `live()`。所以本门禁由
+// `scripts/perf-gate.sh` 用 `--test-threads=1 --ignored` 拉起，并已接进
+// `scripts/ci-linux.sh`。
+//
+// **只钉结构性性质（数量级），不钉绝对耗时**：powersave/boost 与 CI 机器差异
+// 能让同一场景差几倍（见 M6.4 报告 §0）。阈值同时满足两条——离实测有 1~2 个
+// 数量级余量，离**被修复过的回归形态**也有 1 个数量级，所以真退化一定抓得到：
+//
+// | 判据 | 实测（2026-09-21） | 阈值 | 回归形态 |
+// |---|---|---|---|
+// | version 未变同步 | 3 µs | < 1 ms | 整历史重扫 27.7 ms/帧 |
+// | live delta/帧 | 7–28 µs | < 2 ms | 每帧随历史线性增长 |
+// | 440 回合常驻 | 545 KB | < 8 MB | 每 block 存完整 seed/turn/block 字符串 |
+// | 440/110 块数比 | 3.996 | 3.5–4.5 | 有界队列把长 replay 截断（4096 上限） |
+// | 440 回合 replay | 104 ms | < 3 s | 超线性扫描 |
+#[test]
+#[ignore = "性能门禁：scripts/perf-gate.sh（--test-threads=1 --ignored）"]
+fn perf_gate_v2_runtime() {
+    let _guard = BENCH_LOCK.lock().unwrap();
+    const TOOLS: usize = 20;
+    const DELTAS: usize = 20;
+
+    // ── ① version 未变时的同步必须 O(1) ──
+    let mut sess = gen_session(110, TOOLS);
+    let version = sess.timeline.version;
+    let mut runtime = V2TranscriptRuntime::new();
+    let first = runtime.replay_from_scratch_versioned("bench", &sess.timeline.turns, version);
+    assert!(!first.is_empty(), "replay 必须产出待提交块");
+    let noop_start = Instant::now();
+    let noop = runtime.sync_timeline_versioned("bench", &sess.timeline.turns, version);
+    let noop_elapsed = noop_start.elapsed();
+    assert!(noop.is_empty(), "version 未变时不得重复 emit");
+    assert!(
+        noop_elapsed < Duration::from_millis(1),
+        "version 未变时的同步必须 O(1)：实测 {noop_elapsed:?}（阈值 1ms；\
+         回归形态是整历史重扫 ~27.7ms/帧）"
+    );
+
+    // ── ② live delta 必须微秒级 ──
+    let delta_start = Instant::now();
+    for _ in 0..DELTAS {
+        push_delta(&mut sess);
+        sess.timeline.version = sess.timeline.version.saturating_add(1);
+        let _ =
+            runtime.sync_timeline_versioned("bench", &sess.timeline.turns, sess.timeline.version);
+    }
+    let per_frame = delta_start.elapsed() / DELTAS as u32;
+    assert!(
+        per_frame < Duration::from_millis(2),
+        "live delta 必须微秒级：实测 {per_frame:?}/帧（阈值 2ms）"
+    );
+
+    // ── ③ 规模线性：块数必须随回合数成比例 ──
+    let small = gen_session(110, TOOLS);
+    let mut small_rt = V2TranscriptRuntime::new();
+    let small_blocks = small_rt
+        .replay_from_scratch_versioned("bench", &small.timeline.turns, small.timeline.version)
+        .len();
+
+    // ── ④ 长会话常驻内存 + replay 时间上界 ──
+    // `live_before` 扣掉会话模型本身的分配，只留 runtime 常驻（与 §2 曲线同口径）。
+    let big = gen_session(440, TOOLS);
+    let live_before = live();
+    let big_start = Instant::now();
+    let mut big_rt = V2TranscriptRuntime::new();
+    let big_blocks = big_rt
+        .replay_from_scratch_versioned("bench", &big.timeline.turns, big.timeline.version)
+        .len();
+    let big_elapsed = big_start.elapsed();
+    let steady = live().saturating_sub(live_before);
+
+    assert!(
+        steady < 8 * 1024 * 1024,
+        "440 回合 runtime 常驻必须 < 8MB：实测 {}（{big_blocks} blocks；\
+         回归形态是每 block 存完整身份字符串）",
+        kb(steady)
+    );
+    assert!(
+        big_elapsed < Duration::from_secs(3),
+        "440 回合 replay 必须 < 3s：实测 {big_elapsed:?}（基线 ~104ms）"
+    );
+
+    let ratio = big_blocks as f64 / small_blocks as f64;
+    assert!(
+        (3.5..=4.5).contains(&ratio),
+        "块数必须随回合数线性（440/110 应≈4）：实测 {ratio:.3}\
+         （比值塌陷 = 有界队列把长 replay 截断了）"
+    );
+
+    println!(
+        "\n=== M6.4 性能门禁（{TOOLS} tools/回合）===\n\
+         version 未变同步: {noop_elapsed:?}（阈值 <1ms）\n\
+         live delta/帧:   {per_frame:?}（阈值 <2ms）\n\
+         440 回合常驻:    {} / {big_blocks} blocks（阈值 <8MB）\n\
+         440 回合 replay: {big_elapsed:?}（阈值 <3s）\n\
+         块数线性度:      {ratio:.3}（阈值 3.5–4.5）",
+        kb(steady)
     );
 }

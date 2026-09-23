@@ -23,6 +23,15 @@ impl App {
                         text,
                         images: vec![],
                         attachments: (!content_refs.is_empty()).then_some(content_refs),
+                        // 后端锚点 8dbe22e（`45c6b63`）新增的两字段，均为
+                        // `#[serde(default)]`，**行为中性**：
+                        // - `message_id: None` = 回落到 command_id（用户/UI 消息的既定语义）；
+                        // - `input_purpose: TriggerTurn` = 本行改动前「投递并触发回合」的行为。
+                        //   `QueueOnly` 只服务子代理注入，UI 用不到。
+                        //   类型名显式写出依赖后端 PR #289 的再导出（已合入 8dbe22e）；
+                        //   在旧锚点 5ec1900 上只能写 `Default::default()`。
+                        message_id: None,
+                        input_purpose: ConversationInputPurpose::TriggerTurn,
                         as_system: false,
                     }),
                     Default::default(),
@@ -248,6 +257,27 @@ impl App {
                     RingingCommand::Control(command),
                     Default::default(),
                 )
+                .await;
+            let _ = tx.send(AppMsg::Action(ActionResult::CommandAck {
+                seed: Some(seed),
+                label,
+                result,
+            }));
+        });
+    }
+
+    /// 交互应答（permission / ask / plan）专用：与 [`App::send_control_command`] 同款，
+    /// 但走带 ack 上限的 `send_interaction_command`。超时经既有 `CommandAck` 错误分支
+    /// 落到状态栏 toast。
+    pub(super) fn send_interaction_command(
+        &mut self,
+        seed: String,
+        command: ControlCommand,
+        label: &'static str,
+    ) {
+        self.spawn_api(move |api, tx| async move {
+            let result = api
+                .send_interaction_command(Some(&seed), RingingCommand::Control(command))
                 .await;
             let _ = tx.send(AppMsg::Action(ActionResult::CommandAck {
                 seed: Some(seed),

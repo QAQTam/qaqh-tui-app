@@ -23,7 +23,7 @@ mod estimates;
 mod seg;
 mod stream;
 
-pub(crate) use seg::{AnimKind, AnimSlot, TranscriptCache, ViewportSlot};
+pub(crate) use seg::{AnimKind, AnimSlot, BlockBody, TranscriptCache, ViewportSlot};
 
 use std::collections::HashMap;
 
@@ -36,9 +36,12 @@ use crate::app::session::SessionState;
 use crate::app::timeline_model::{Block, Turn};
 use qaqh_client::{TimelineBlockKind, TimelineBlockState, TimelineToolState};
 
-use seg::{BlockBody, BlockSeg, RenderStats, TurnSeg};
+use seg::{BlockSeg, RenderStats, TurnSeg};
 
-/// 布局不动点迭代上限（与旧 `MAX_LAYOUT_PASSES` 同值，防御性护栏）。
+/// 布局不动点迭代上限（防御性护栏）。
+///
+/// ⚠ 与 `app::VIEWPORT_FIXPOINT_PASSES` **数值相同但语义不同**（那个是「视口不动点」）：
+/// 两者分居两文件，**改一个不必改另一个**。
 const MAX_LAYOUT_PASSES: usize = 4;
 
 /// 块级刷新：与 `refresh_segments_at` 同语义，粒度为块。
@@ -125,7 +128,7 @@ pub(crate) fn refresh(
             for (block, bseg) in blocks.zip(tseg.content.iter_mut()) {
                 // Height(0) = 折叠组中间块（§4.2）：0 行即精确，重渲会泄漏完整卡。
                 if !bseg.body.is_rendered() && bseg.body.height() > 0 {
-                    render_block_into(bseg, session, block, width);
+                    render_block_into(bseg, block, width);
                     stats.rebuilt_blocks += 1;
                     rendered += 1;
                 }
@@ -167,7 +170,7 @@ pub(crate) fn refresh(
             for (block, bseg) in blocks.zip(tseg.content.iter_mut()) {
                 // Height(0) = 折叠组中间块（§4.2）：0 行即精确，重渲会泄漏完整卡。
                 if !bseg.body.is_rendered() && bseg.body.height() > 0 {
-                    render_block_into(bseg, session, block, width);
+                    render_block_into(bseg, block, width);
                     stats.rebuilt_blocks += 1;
                 }
             }
@@ -215,6 +218,9 @@ pub(crate) fn refresh(
     stats.render_us = t0.elapsed().as_micros() as u64;
     stats.resident_blocks = count_resident(cache);
     cache.stats = stats;
+    // 把本次实际用的视口记进缓存，供 `ui::transcript::draw` 复用**同一份**几何
+    // （issue #33：draw 自己重算会用 refresh **之后**的 total，与这里用的 top 不一致）。
+    cache.viewport = viewport;
     stats
 }
 
@@ -272,7 +278,7 @@ fn lines_body(lines: Vec<RenderLine>) -> BlockBody {
 }
 
 /// 渲染一个块并挂上动画槽位（Slots 出带——锁 8 生产端唯一入口）。
-fn render_block_into(bseg: &mut BlockSeg, session: &SessionState, block: &Block, width: u16) {
+fn render_block_into(bseg: &mut BlockSeg, block: &Block, width: u16) {
     // T7：Open text 块走流式增量（纯文本+光标；seal 才上 markdown/syntect）。
     // 走到这里 body 必然未渲染 ⇒ 无可续 stream（增量在对齐期完成、evict 已弃）
     // ⇒ 从全文初始化。
@@ -281,12 +287,7 @@ fn render_block_into(bseg: &mut BlockSeg, session: &SessionState, block: &Block,
         return;
     }
     let mut sink = AnimSink::Slots(Vec::new());
-    let lines = render_block_lines(
-        &session.expanded_tools,
-        block,
-        usize::from(width),
-        &mut sink,
-    );
+    let lines = render_block_lines(block, usize::from(width), &mut sink);
     bseg.body = lines_body(lines);
     bseg.anim = sink.into_vec();
     bseg.stream = None; // 不变式护栏：全量体不携带流式状态
@@ -347,14 +348,14 @@ fn empty_seg() -> BlockSeg {
     }
 }
 
-fn render_block_seg(session: &SessionState, block: &Block, width: u16, key: u64) -> BlockSeg {
+fn render_block_seg(block: &Block, width: u16, key: u64) -> BlockSeg {
     let mut seg = BlockSeg {
         key,
         body: BlockBody::Height(0),
         anim: Vec::new(),
         stream: None,
     };
-    render_block_into(&mut seg, session, block, width);
+    render_block_into(&mut seg, block, width);
     seg
 }
 
@@ -363,7 +364,7 @@ fn render_block_seg(session: &SessionState, block: &Block, width: u16, key: u64)
 ///
 /// - 折叠态：首块 = 组行（key 含组签名）；中间块 = Height(0)；组内最后一张
 ///   Failed 卡**内联**（错误不许藏，用原块 key 走完整渲染路径）。
-/// - 展开态：卡片列表（per-card expanded_tools 语义照旧）。
+/// - 展开态：卡片列表（W-02：卡片正文窗口恒定，无卡片级展开位）。
 #[allow(clippy::too_many_arguments)]
 fn flush_tool_group(
     turn: &Turn,
@@ -408,7 +409,7 @@ fn flush_tool_group(
             if Some(i) == last_failed {
                 continue; // 失败例外：单独内联（下方）
             }
-            let key = seg::block_cache_key(b, width, false) ^ sig;
+            let key = seg::block_cache_key(b, width) ^ sig;
             let body = if i == 0 {
                 BlockBody::Lines(
                     vec![crate::app::render_transcript::render_group_line(
@@ -422,7 +423,18 @@ fn flush_tool_group(
                 BlockBody::Height(0) // 组中间块：折叠态零行
             };
             let seg = match old_by_id.remove(b.block_id.as_str()) {
-                Some(s) if s.key == key => s,
+                Some(mut s) if s.key == key => {
+                    // 组行是 O(1) 的便宜物化：**复用时不得沿用淘汰后的 `Height` 占位**。
+                    //
+                    // 否则：淘汰把 `Lines(组行, 1 行)` 转成 `Height(1)`（保高度、丢内容）
+                    // → 下次对齐按键复用 → 物化循环发现「未渲染且高度>0」，用
+                    // `render_block_into` 按**单块**重渲——而它不认识「组」，会把组首块
+                    // 渲成整张卡（1 行 → 2 行），总行数随滚动漂移（锁 2 / W-09）。
+                    if !s.body.is_rendered() {
+                        s.body = body;
+                    }
+                    s
+                }
                 _ => BlockSeg {
                     key,
                     body,
@@ -434,7 +446,7 @@ fn flush_tool_group(
         }
         if let Some(i) = last_failed {
             let b = group[i];
-            let key = seg::block_cache_key(b, width, false);
+            let key = seg::block_cache_key(b, width);
             let seg = match old_by_id.remove(b.block_id.as_str()) {
                 Some(s) if s.key == key => s,
                 _ => BlockSeg {
@@ -448,11 +460,7 @@ fn flush_tool_group(
         }
     } else {
         for b in group.iter() {
-            let expanded = b
-                .tool
-                .as_ref()
-                .is_some_and(|t| session.expanded_tools.contains(&t.tool_call_id));
-            let key = seg::block_cache_key(b, width, expanded);
+            let key = seg::block_cache_key(b, width);
             let seg = match old_by_id.remove(b.block_id.as_str()) {
                 Some(s) if s.key == key => s,
                 Some(mut stale) => {
@@ -550,11 +558,7 @@ fn align_turn_seg(
                 stats,
             );
             // 组外单块：T1 工具 / 文本 / reasoning(0行) / notice——原路径。
-            let expanded = block
-                .tool
-                .as_ref()
-                .is_some_and(|t| session.expanded_tools.contains(&t.tool_call_id));
-            let key = seg::block_cache_key(block, width, expanded);
+            let key = seg::block_cache_key(block, width);
             let seg = match old_content_by_id.remove(block.block_id.as_str()) {
                 Some(s) if s.key == key => s,
                 Some(mut stale) => {
@@ -957,6 +961,373 @@ mod tests {
         anim::frame_override::clear();
     }
 
+    // ── 锁 2：**任意滚动位置**的窗口逐行与全量渲染一致（几何不漂移）──
+
+    /// 锁 2 的夹具：回合数够深（能扫出多屏），四种形态轮转——纯文本 / 文本+工具卡 /
+    /// 工具卡 / 超长行，并混入归档回合。目的是让「估算高度」与「精确高度」
+    /// 有机会不一致（漂移只在这种情况下暴露）。
+    fn sweep_fixture(n: usize) -> SessionState {
+        let mut s = SessionState::new("seed".to_string());
+        for i in 0..n {
+            let blocks = match i % 4 {
+                0 => vec![blk(
+                    &format!("b{i}"),
+                    0,
+                    TimelineBlockKind::Text,
+                    TimelineBlockState::Sealed,
+                    "第一行\n第二行\n第三行",
+                )],
+                1 => vec![
+                    blk(
+                        &format!("b{i}"),
+                        0,
+                        TimelineBlockKind::Text,
+                        TimelineBlockState::Sealed,
+                        "```rust\nfn main() {}\n```",
+                    ),
+                    tool_blk(&format!("b{i}t"), 1, TimelineToolState::Succeeded),
+                ],
+                2 => vec![tool_blk(&format!("b{i}t"), 0, TimelineToolState::Failed)],
+                _ => vec![blk(
+                    &format!("b{i}"),
+                    0,
+                    TimelineBlockKind::Text,
+                    TimelineBlockState::Sealed,
+                    "这一行特别长用来测 CJK 宽字符在窄视口下的折行行为是否与全量渲染一致存在差异",
+                )],
+            };
+            let offloaded = i % 7 == 6;
+            s.timeline.turns.push(turn_of(
+                &format!("t{i}"),
+                &format!("问题 {i}"),
+                TimelineTurnState::Completed,
+                None,
+                offloaded,
+                blocks,
+            ));
+        }
+        s
+    }
+
+    /// ①a 定价：把**工具卡**实渲一遍取行数（= 用渲染器做单一事实源的代价）。
+    #[ignore = "W-11 量化诊断（非锁）：手动重跑用 `cargo test --bin qaqh-tui -- --ignored --nocapture`"]
+    #[test]
+    fn zz_w11_price_card() {
+        let sess = sweep_fixture(120);
+        let blocks: Vec<_> = sess
+            .timeline
+            .turns
+            .iter()
+            .flat_map(|t| t.rounds.iter())
+            .flat_map(|r| r.blocks.iter())
+            .filter(|b| b.kind == TimelineBlockKind::Tool)
+            .collect();
+        let n = blocks.len();
+        let mut sink = crate::app::render::AnimSink::Slots(Vec::new());
+        for b in blocks.iter().take(4) {
+            let _ = crate::app::render_transcript::render_block_lines(b, 80, &mut sink);
+        }
+        let t0 = std::time::Instant::now();
+        let mut h = 0usize;
+        for b in blocks.iter() {
+            h += crate::app::render_transcript::render_block_lines(b, 80, &mut sink).len();
+        }
+        let us = t0.elapsed().as_micros();
+        println!(
+            "①a: {} 个工具卡实渲共 {} 行，耗时 {us}µs（{:.2}µs/卡）",
+            n,
+            h,
+            us as f64 / n as f64
+        );
+    }
+
+    /// ①b 定价：给一个 markdown 文本块跑**真实渲染**要多久（估算若复用渲染器口径，
+    /// 每个离屏文本块都要付这个成本）。
+    #[ignore = "W-11 量化诊断（非锁）：手动重跑用 `cargo test -- --ignored --nocapture`"]
+    #[test]
+    fn zz_w11_price_markdown() {
+        let sess = sweep_fixture(120);
+        let blocks: Vec<_> = sess
+            .timeline
+            .turns
+            .iter()
+            .flat_map(|t| t.rounds.iter())
+            .flat_map(|r| r.blocks.iter())
+            .filter(|b| b.kind == TimelineBlockKind::Text)
+            .collect();
+        let n = blocks.len();
+        // 热身后计时
+        let mut sink = crate::app::render::AnimSink::Slots(Vec::new());
+        for b in blocks.iter().take(4) {
+            let _ = crate::app::render_transcript::render_block_lines(b, 80, &mut sink);
+        }
+        let t0 = std::time::Instant::now();
+        let mut total_lines = 0usize;
+        for b in blocks.iter() {
+            total_lines +=
+                crate::app::render_transcript::render_block_lines(b, 80, &mut sink).len();
+        }
+        let us = t0.elapsed().as_micros();
+        println!(
+            "①b: {} 个文本块实渲共 {} 行，耗时 {us}µs（{:.2}µs/块）",
+            n,
+            total_lines,
+            us as f64 / n as f64
+        );
+    }
+
+    /// **W-11 量化诊断**（不是锁，是测量；已 `#[ignore]`，手动重跑）：首帧（空缓存 + 视口）下估算 total 与
+    /// 全量渲染 total 的差，按夹具四种形态拆分，并逐块给出 `est` vs 实渲高度。
+    #[ignore = "W-11 量化诊断（非锁）：手动重跑用 `cargo test -- --ignored --nocapture`"]
+    #[test]
+    fn zz_w11_quantify() {
+        let sess = sweep_fixture(120);
+        let h = 30usize;
+        // 精确基准：无视口 = 全驻留全渲染
+        let mut exact = TranscriptCache::new(80);
+        refresh(&sess, 80, None, &mut exact);
+        let exact_total = exact.total_lines();
+        // 首帧：空缓存 + 视口（betav2 的路径：用刷新前的 total=0 算 top）
+        let mut fresh = TranscriptCache::new(80);
+        let top = crate::ui::viewport_top(0, h, true, 0);
+        refresh(&sess, 80, Some((top, h)), &mut fresh);
+        let first_total = fresh.total_lines();
+        println!(
+            "W-11 首帧 total={first_total} 精确 total={exact_total} 差={}",
+            first_total as i64 - exact_total as i64
+        );
+        // 按形态聚合
+        let mut by_form = [0i64; 4];
+        for i in 0..120usize {
+            by_form[i % 4] += fresh.turns[i].height() as i64 - exact.turns[i].height() as i64;
+        }
+        for (f, d) in by_form.iter().enumerate() {
+            println!("  form{f}: 合计差 {d}（{} 回合）", 120 / 4);
+        }
+        // 拆 pre / content / post 定位那 53 行到底在哪一段
+        let mut acc = [[0i64; 3]; 4];
+        for i in 0..120usize {
+            let f = i % 4;
+            let (e, c) = (&exact.turns[i], &fresh.turns[i]);
+            acc[f][0] += c.pre.body.height() as i64 - e.pre.body.height() as i64;
+            acc[f][1] += c.content.iter().map(|b| b.body.height()).sum::<usize>() as i64
+                - e.content.iter().map(|b| b.body.height()).sum::<usize>() as i64;
+            acc[f][2] += c.post.body.height() as i64 - e.post.body.height() as i64;
+        }
+        for (f, row) in acc.iter().enumerate() {
+            println!(
+                "  form{f}: pre {:+} / content {:+} / post {:+}",
+                row[0], row[1], row[2]
+            );
+        }
+        // 抽两个具体回合看 pre 与块
+        for i in [1usize, 2] {
+            let (e, c) = (&exact.turns[i], &fresh.turns[i]);
+            println!(
+                "  turn{i}: pre 精确 {} 首帧 {} | post 精确 {} 首帧 {}",
+                e.pre.body.height(),
+                c.pre.body.height(),
+                e.post.body.height(),
+                c.post.body.height()
+            );
+            let turn = &sess.timeline.turns[i];
+            let blocks: Vec<_> = turn.rounds.iter().flat_map(|r| r.blocks.iter()).collect();
+            for (bi, b) in blocks.iter().enumerate() {
+                println!(
+                    "    block{bi} kind={:?} est={} 精确={} 首帧={}",
+                    b.kind,
+                    estimates::estimate_block_lines(b, 80),
+                    e.content[bi].body.height(),
+                    c.content[bi].body.height()
+                );
+            }
+        }
+    }
+
+    /// **P0 回归锁（issue #33）**：按 app 的真实两步流程——
+    /// ① `ensure_render_caches` 用 refresh **之前**的 total 算 top（首帧缓存为空 ⇒ 0）；
+    /// ② `draw` 用 refresh **之后**的 total 重算 top。
+    /// 修复前两者不一致（`0` vs `670`）→ 窗口落在未渲染块 → `window()` 的 debug_assert 炸
+    /// （release 下静默取到 0 行）。修复后：app 侧迭代到不动点 + `draw` 复用
+    /// `cache.viewport` ⇒ 两处共用同一份几何。
+    #[test]
+    fn first_frame_viewport_is_fully_rendered() {
+        let sess = sweep_fixture(120);
+        let h = 30usize;
+        let mut cache = TranscriptCache::new(80);
+        // ① 首帧：缓存为空 → total=0 → top=0（调用方只能这么算）
+        // 走**生产路径**：`App::ensure_render_caches` 调的就是这个函数，
+        // 锁不去复刻那套循环（否则测的是锁自己，不是实现）。
+        crate::app::refresh_at_viewport(&sess, 80, h, &mut cache);
+        // ② draw 侧：用刷新后的 total 重算（现在应与 refresh 用的同一份）
+        let top_window = crate::ui::viewport_top(cache.total_lines(), h, true, 0);
+        assert_eq!(
+            cache.viewport,
+            Some((top_window, h)),
+            "refresh 与 draw 必须共用同一份视口几何（修复前：0 vs {top_window}）"
+        );
+        assert_eq!(
+            cache.unrendered_lines(top_window, h),
+            0,
+            "窗口内不得有未渲染块"
+        );
+        assert_eq!(
+            cache.window(top_window, h).len(),
+            h.min(cache.total_lines()),
+            "窗口应取满（修复前 release 下取到 0 行）"
+        );
+    }
+
+    /// B1「丢弃必须可见」：未渲染块占的行数必须能被报出来——`draw` 据此显式提示，
+    /// 而不是 release 下静默少行。
+    #[test]
+    fn unrendered_lines_reports_shortfall() {
+        let sess = sweep_fixture(20);
+        let mut cache = TranscriptCache::new(80);
+        refresh(&sess, 80, None, &mut cache); // 无视口 → 全驻留
+        assert_eq!(
+            cache.unrendered_lines(0, cache.total_lines()),
+            0,
+            "全驻留时不应有未渲染行"
+        );
+        // 人为淘汰第一回合：body 由 Lines 变成精确高度占位（未渲染）
+        let h0 = {
+            let t = &mut cache.turns[0];
+            evict_turn(t);
+            t.height()
+        };
+        assert!(h0 > 0);
+        assert_eq!(
+            cache.unrendered_lines(0, h0),
+            h0,
+            "淘汰后的行数必须被报为未渲染（否则 release 下就是静默少行）"
+        );
+    }
+
+    /// **不变式**：`window()` 取出的每一行都必须真实存在，且**在任意滚动位置上**
+    /// 都与一次性全量渲染逐行一致（视口内不得有未渲染块、几何不得漂移）。
+    ///
+    /// 这是虚拟化最容易破的地方：几何用估算、渲染用精确，两者一旦不同步，
+    /// 窗口就会缺行或错位（视觉上表现为「内容突然少了一截」）。
+    ///
+    /// **2026-09-20 补回**：本锁在 M1 迁移（`4372e11`）中随旧 `SegmentCache` 路径
+    /// 一起被删（旧位置 `render_transcript.rs:3775`），此后只剩
+    /// `offscreen_eviction_counts_blocks` 的**两个位置**（底/顶）作弱化替代，
+    /// 中间滚动位置的漂移无人覆盖。plan §3.7 的锁 2 即此。
+    ///
+    /// ⚠ **本锁一写出来就是红的**，它抓到的是：折叠组的**首块被淘汰后**，`evict_turn`
+    /// 把 `Lines(组行, 1 行)` 转成 `Height(1)`（保高度、丢内容）；下次对齐按键复用这个
+    /// 占位，物化循环发现「未渲染且高度>0」后用 `render_block_into` 按**单块**重渲——
+    /// 而它不认识「组」，把组首块渲成整张卡（1 行 → 2 行）→ 总行数随滚动漂移。
+    /// `sweep_fixture(120)` 实测 **21 个滚动位置全部漂移**（`total` 647 → 649/650/652…）。
+    ///
+    /// 修法见 `flush_tool_group`：组行是 O(1) 的便宜物化，复用时不得沿用淘汰占位。
+    #[test]
+    fn window_never_contains_unrendered_segments() {
+        let sess = sweep_fixture(120);
+        let full = render_transcript_with_opts(&sess, 80);
+        let full_flat: Vec<String> = full.iter().map(|l| flatten(&[l])).collect();
+
+        let mut cache = TranscriptCache::new(80);
+        refresh(&sess, 80, None, &mut cache);
+        let total = cache.total_lines();
+        assert_eq!(total, full_flat.len(), "无视口总行数必须与全量渲染一致");
+
+        let height = 30usize;
+        let mut top = total.saturating_sub(height);
+        let mut checked = 0usize;
+        loop {
+            refresh(&sess, 80, Some((top, height)), &mut cache);
+            assert_eq!(cache.total_lines(), total, "淘汰不得改变总行数");
+            let win = cache.window(top, height);
+            assert!(!win.is_empty() || top >= total, "top={top} 窗口不得为空");
+            for (i, line) in win.iter().enumerate() {
+                assert_eq!(
+                    flatten(&[*line]),
+                    full_flat[top + i],
+                    "top={top} 第 {i} 行与全量渲染不一致（几何漂移）"
+                );
+            }
+            checked += 1;
+            if top == 0 {
+                break;
+            }
+            top = top.saturating_sub(height);
+            assert!(checked <= 200, "滚动循环未终止");
+        }
+        assert!(checked > 1, "应至少检查两屏，实际 {checked}");
+    }
+
+    /// **首帧几何（W-11）**：生产首帧是「空缓存 + 视口」——此时视口外的块只有估算
+    /// 高度，总行数因此不得偏离全量渲染，否则滚动条与滚动位置随物化漂移。
+    ///
+    /// W-11（2026-09-20）已把**工具卡**这一类做成恒等：估算直接问渲染器要行数
+    /// （单一事实源，实测 5.15 µs/卡、每块只算一次），`sweep_fixture(120)` 里
+    /// form2（单张 Failed 卡）由 **+27 → 0**。
+    ///
+    /// **仍有已知残余：markdown 文本**（form1，每回合 +1、合计 +26——估算按**原始行**
+    /// 折行，markdown 会把 fence 合并）。**不追它**的理由是实测成本：让估算跑 markdown
+    /// 要 **55 µs/块**（≈估算预算两个数量级，千块会话 55ms/帧），远超它换来的 4% 行数精度。
+    ///
+    /// 所以本锁**把可控形态钉成精确、把残余钉成有界**（每回合最多 +1）——
+    /// 这样任何**新的**漂移源都会让本锁变红，而不是被一个宽松的总量阈值盖住。
+    #[test]
+    fn first_frame_estimate_matches_full_render() {
+        let sess = sweep_fixture(120);
+        let mut exact = TranscriptCache::new(80);
+        refresh(&sess, 80, None, &mut exact);
+        let exact_total = exact.total_lines();
+
+        let mut fresh = TranscriptCache::new(80);
+        let top = crate::ui::viewport_top(0, 30, true, 0);
+        refresh(&sess, 80, Some((top, 30)), &mut fresh);
+
+        // ① 可控形态必须**精确**：逐回合比对（比总量更严——能定位到具体回合）
+        let mut drift = [0i64; 4];
+        for i in 0..120usize {
+            drift[i % 4] += fresh.turns[i].height() as i64 - exact.turns[i].height() as i64;
+        }
+        assert_eq!(drift[0], 0, "form0（纯文本）必须精确");
+        assert_eq!(
+            drift[2], 0,
+            "form2（单张 Failed 卡）必须精确——W-11 ①a 已做成恒等"
+        );
+        assert_eq!(drift[3], 0, "form3（超长单行）必须精确");
+        // ② markdown 残余：有界且**不得少算**（估算「宁少不多」的反面也不能有）
+        assert!(
+            (0..=30).contains(&drift[1]),
+            "form1（markdown 文本）残余应在 [0, 30]（每回合 +1 以内），实测 {}",
+            drift[1]
+        );
+        // ③ 总量：落在 [精确, 精确 + markdown 回合数]
+        let total = fresh.total_lines();
+        assert!(
+            total >= exact_total && total <= exact_total + 30,
+            "首帧 total 应落在 [{exact_total}, {}]，实测 {total}",
+            exact_total + 30
+        );
+    }
+
+    /// **不动点稳定性**（NPC 建议 ①）：连跑两帧 `refresh_at_viewport`（同 width/height），
+    /// 第二帧必须**零重炳**且 total 不变——否则「每帧都在重算几何」，不动点没收敛。
+    #[test]
+    fn second_frame_refreshes_nothing() {
+        let sess = sweep_fixture(120);
+        let mut cache = TranscriptCache::new(80);
+        crate::app::refresh_at_viewport(&sess, 80, 30, &mut cache);
+        let total = cache.total_lines();
+        crate::app::refresh_at_viewport(&sess, 80, 30, &mut cache);
+        assert_eq!(
+            cache.total_lines(),
+            total,
+            "第二帧 total 不得变（几何已不动点）"
+        );
+        assert_eq!(
+            cache.stats.rebuilt_blocks, 0,
+            "第二帧不应重炳任何块（否则每帧都在重算）"
+        );
+    }
+
     // ── 锁 3：流式 delta 只重渲一个块（且不惊动邻居的 Arc 身份） ────
     #[test]
     fn streaming_delta_renders_single_block() {
@@ -1024,18 +1395,14 @@ mod tests {
             TimelineBlockState::Open,
             "x",
         );
-        let k_open = seg::block_cache_key(&b, 80, false);
+        let k_open = seg::block_cache_key(&b, 80);
         b.state = TimelineBlockState::Sealed;
-        assert_ne!(
-            seg::block_cache_key(&b, 80, false),
-            k_open,
-            "state 必须进键"
-        );
-        // rev / 宽度 / 展开态同理（防回退）。
-        let k0 = seg::block_cache_key(&b, 80, false);
+        assert_ne!(seg::block_cache_key(&b, 80), k_open, "state 必须进键");
+        // rev / 宽度同理（防回退）。
+        let k0 = seg::block_cache_key(&b, 80);
         b.rev += 1;
-        assert_ne!(seg::block_cache_key(&b, 80, false), k0);
-        assert_ne!(seg::block_cache_key(&b, 100, false), k0);
+        assert_ne!(seg::block_cache_key(&b, 80), k0);
+        assert_ne!(seg::block_cache_key(&b, 100), k0);
 
         // 集成：refresh 后 seal 一个流式块 → 恰好一个块重渲。
         let mut sess = fixture_session();
@@ -1876,49 +2243,39 @@ mod tests {
         s
     }
 
-    /// T9 验收主体：宽 × F3 × 工具展开 × 动画帧 的等价矩阵 + 淘汰态窗口对照。
+    /// T9 验收主体：宽 × F3 × 动画帧 的等价矩阵 + 淘汰态窗口对照。
     /// 失败 = M1 管线与旧全量渲染不再等价，必须先修后行。
+    ///
+    /// W-02：原矩阵还有一个「工具展开」维度（`expanded_tools`）——卡片级展开态
+    /// 已删除、正文窗口恒定，该维度随之消失。
     #[test]
     fn m1_acceptance_equivalence_matrix() {
         for w in [40usize, 100] {
-            for expand in [false, true] {
-                for frame in [0u64, 7] {
-                    let ww = w as u16;
-                    let mut sess = fixture_rich();
-                    if expand {
-                        let ids: Vec<String> = sess
-                            .timeline
-                            .turns
-                            .iter()
-                            .flat_map(|t| t.rounds.iter().flat_map(|r| r.blocks.iter()))
-                            .filter(|b| b.kind == TimelineBlockKind::Tool)
-                            .map(|b| b.tool.as_ref().expect("tool").tool_call_id.clone())
-                            .collect();
-                        sess.expanded_tools.extend(ids);
-                    }
-                    let ctx = format!("w={w} expand={expand} frame={frame}");
-                    // oracle 烘焙与槽位覆盖必须同帧（锁 1 同款前提）。
-                    anim::frame_override::set(frame);
+            for frame in [0u64, 7] {
+                let ww = w as u16;
+                let sess = fixture_rich();
+                let ctx = format!("w={w} frame={frame}");
+                // oracle 烘焙与槽位覆盖必须同帧（锁 1 同款前提）。
+                anim::frame_override::set(frame);
 
-                    // 全量几何口径：缓存行（占位）+ 槽位覆盖 == oracle。
-                    let mut cache = TranscriptCache::new(ww);
-                    refresh(&sess, ww, None, &mut cache);
-                    let old = render_transcript_with_opts(&sess, ww);
-                    assert_lines_eq(&flatten_with_anim(&cache, frame), &old, &ctx);
+                // 全量几何口径：缓存行（占位）+ 槽位覆盖 == oracle。
+                let mut cache = TranscriptCache::new(ww);
+                refresh(&sess, ww, None, &mut cache);
+                let old = render_transcript_with_opts(&sess, ww);
+                assert_lines_eq(&flatten_with_anim(&cache, frame), &old, &ctx);
 
-                    // 淘汰态窗口对照：先建全量几何，再模拟滚到底淘汰离屏，
-                    // 窗口行必须与 oracle 尾部区间逐行一致。
-                    let total = cache.total_lines();
-                    refresh(&sess, ww, bottom_vp(total), &mut cache);
-                    let win = flatten_with_anim(&cache, frame);
-                    let top = total - win.len();
-                    assert_lines_eq(
-                        &win,
-                        &old[top..total],
-                        &format!("{ctx} [淘汰窗口 {top}..{total}]"),
-                    );
-                    anim::frame_override::clear();
-                }
+                // 淘汰态窗口对照：先建全量几何，再模拟滚到底淘汰离屏，
+                // 窗口行必须与 oracle 尾部区间逐行一致。
+                let total = cache.total_lines();
+                refresh(&sess, ww, bottom_vp(total), &mut cache);
+                let win = flatten_with_anim(&cache, frame);
+                let top = total - win.len();
+                assert_lines_eq(
+                    &win,
+                    &old[top..total],
+                    &format!("{ctx} [淘汰窗口 {top}..{total}]"),
+                );
+                anim::frame_override::clear();
             }
         }
     }

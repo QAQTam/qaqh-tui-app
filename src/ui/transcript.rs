@@ -10,6 +10,28 @@ use crate::app::App;
 use crate::app::render_line::{RenderStyle, SpanStyle};
 use crate::ui::theme;
 
+/// 把「未渲染」提示拼到窗口行上（`draw` 的唯一实现；抽成函数是为了能在 debug 下直接测——
+/// 坏缓存态在 debug 下会先撞上 `window()` 里的 `debug_assert`，走不到 `draw`）。
+///
+/// ⚠ 提示必须占住**最后一行**：`window()` 可能仍取满 `height` 行（未渲染段被跳过、
+/// 后面的已渲染段把窗口补齐），此时直接 `push` 会把提示放到第 `height + 1` 行，而
+/// `Paragraph` 只画 `height` 行 → 提示被裁掉，等于没提示（评审阻断 1 实测复现）。
+/// 代价是**视口少一行真实内容**——刻意取舍：几何不一致本来就是异常态，
+/// 宁可少一行也要让人看见。
+pub(super) fn attach_unrendered_hint(
+    visible: &mut Vec<Line<'static>>,
+    unrendered: usize,
+    height: usize,
+) {
+    if unrendered == 0 || height == 0 {
+        return;
+    }
+    visible.truncate(height - 1);
+    visible.push(Line::from(format!(
+        "⛔ 视口内有 {unrendered} 行未渲染（内部几何不一致；复现条件见 issue #33）"
+    )));
+}
+
 pub fn draw(f: &mut Frame, app: &App, area: Rect) {
     let Some(seed) = app.view_seed() else {
         return;
@@ -26,15 +48,34 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) {
     //
     // 滚动几何与缓存共用 `ui::viewport_top`，避免两处各算一份而错位。
     let fresh: Vec<crate::app::render_line::RenderLine>;
-    let (total, visible_lines, anim_slots): (
+    let (total, top, visible_lines, anim_slots, unrendered): (
+        usize,
         usize,
         Vec<&crate::app::render_line::RenderLine>,
         Vec<crate::app::render::ViewportSlot>,
+        usize,
     ) = if let Some(bc) = sess.block_cache.as_ref().filter(|c| c.width == width) {
         // M1 块级缓存（T8 接线后为唯一来源）：行窗口与动画槽位同源。
+        //
+        // ⚠ 视口必须取 `refresh` 当时用的那一份（`bc.viewport`），**不能自己重算**：
+        // refresh 会把估算高度换成精确高度、总行数随之改变，自己重算就会落到另一个
+        // 窗口上（issue #33：窗口压在未渲染块 → debug 直接 panic、release 静默空屏）。
+        // 高度不一致（同帧内不该发生）才退回重算——宁可晚一帧收敛，也不取错窗口。
         let total = bc.total_lines();
-        let top = crate::ui::viewport_top(total, height, sess.scroll.follow, sess.scroll.offset);
-        (total, bc.window(top, height), bc.visible_slots(top, height))
+        let (top, height) = match bc.viewport {
+            Some((t, h)) if h == height => (t, height),
+            _ => (
+                crate::ui::viewport_top(total, height, sess.scroll.follow, sess.scroll.offset),
+                height,
+            ),
+        };
+        (
+            total,
+            top,
+            bc.window(top, height),
+            bc.visible_slots(top, height),
+            bc.unrendered_lines(top, height),
+        )
     } else {
         // 兑底：缓存未就绪（首帧 / 宽度突变同一帧）→ 现场全量渲一次。
         fresh = crate::app::render_transcript::render_transcript_with_opts(sess, width);
@@ -42,12 +83,14 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) {
         let top = crate::ui::viewport_top(total, height, sess.scroll.follow, sess.scroll.offset);
         (
             total,
+            top,
             fresh.iter().skip(top).take(height).collect(),
             Vec::new(),
+            0,
         )
     };
 
-    let visible: Vec<Line> = visible_lines
+    let mut visible: Vec<Line> = visible_lines
         .into_iter()
         .map(|rl| {
             let spans: Vec<Span> = rl
@@ -65,7 +108,10 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) {
         })
         .collect();
 
-    let top = crate::ui::viewport_top(total, height, sess.scroll.follow, sess.scroll.offset);
+    // B1「丢弃必须可见」：release 下 `window()` 里的 `debug_assert` 会被编译掉，未渲染段
+    // 既不产出行也不推进 `skip` → 实测「请求 30 行取到 0 行」的**静默空屏**（issue #33）。
+    // 正常路径 `unrendered == 0`；>0 时显式提示，绝不无声少行。
+    attach_unrendered_hint(&mut visible, unrendered, height);
 
     f.render_widget(Paragraph::new(visible), area);
 

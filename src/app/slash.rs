@@ -20,6 +20,21 @@ pub const SLASH_COMMANDS: &[SlashDef] = &[
         hint: "/help  打开帮助",
     },
     SlashDef {
+        name: "sessions",
+        desc: "会话列表",
+        hint: "/sessions  打开会话列表 Workspace",
+    },
+    SlashDef {
+        name: "settings",
+        desc: "设置",
+        hint: "/settings  打开设置 Workspace",
+    },
+    SlashDef {
+        name: "workspace",
+        desc: "todo / 工作区",
+        hint: "/workspace  打开 todo Workspace",
+    },
+    SlashDef {
         name: "clear",
         desc: "清空输入",
         hint: "/clear  清空当前输入",
@@ -35,6 +50,9 @@ pub const SLASH_COMMANDS: &[SlashDef] = &[
 pub enum SlashCmd {
     New { cwd: Option<String> },
     Help,
+    Sessions,
+    Settings,
+    Workspace,
     Clear,
     Export { path: Option<String> },
     Unknown(String),
@@ -72,6 +90,9 @@ pub fn parse(input: &str) -> Option<SlashCmd> {
             Some(SlashCmd::New { cwd })
         }
         "help" => Some(SlashCmd::Help),
+        "sessions" => Some(SlashCmd::Sessions),
+        "settings" => Some(SlashCmd::Settings),
+        "workspace" => Some(SlashCmd::Workspace),
         "clear" => Some(SlashCmd::Clear),
         "export" => {
             let path = if raw_args.is_empty() {
@@ -226,6 +247,19 @@ mod tests {
         );
         // 补全菜单自动包含 export（SLASH_COMMANDS 驱动）。
         assert!(completions_for("/ex").iter().any(|d| d.name == "export"));
+    }
+
+    #[test]
+    fn parse_workspace_entrypoints() {
+        assert_eq!(parse("/sessions"), Some(SlashCmd::Sessions));
+        assert_eq!(parse("/settings"), Some(SlashCmd::Settings));
+        assert_eq!(parse("/workspace"), Some(SlashCmd::Workspace));
+        for command in ["/ses", "/set", "/work"] {
+            assert!(
+                !completions_for(command).is_empty(),
+                "{command} 应进入补全候选"
+            );
+        }
     }
 
     #[test]

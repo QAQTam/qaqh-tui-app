@@ -14,8 +14,14 @@
 # pkill 会把自己的 shell 一起杀掉（实测 exit 144）。全程按显式 PID 操作。
 
 set -u
-DAEMON=${DAEMON:-$HOME/Projects/qaqh-backend/target/debug/qaqh-daemon}
-TUI=${TUI:-$HOME/Projects/qaqh-tui-app/target/debug/qaqh-tui}
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+REPO_ROOT=$(cd -- "$SCRIPT_DIR/.." && pwd)
+# 默认吃**锚点 worktree**（TUI 钉的 rev，见 scripts/ci-linux.sh 的 QAQH_BACKEND_REV），
+# 而不是开发者正在用的 ../qaqh-backend 工作树——否则 e2e 会跑到别人分支构建的
+# daemon 上。原先这里硬编码 $HOME/Projects/...，在非该布局的机器上直接找不到。
+BACKEND_ROOT=${QAQH_BACKEND_ROOT:-$REPO_ROOT/../qaqh-backend-anchor}
+DAEMON=${DAEMON:-$BACKEND_ROOT/target/debug/qaqh-daemon}
+TUI=${TUI:-$REPO_ROOT/target/debug/qaqh-tui}
 D=/tmp/qaqh-e2e-restart
 PROBE_DELAY=${PROBE_DELAY:-30}   # 杀 daemon 后等多久按 Ctrl+R（须 > STALL_AFTER=20s）
 

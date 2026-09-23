@@ -3,6 +3,8 @@
 mod app;
 mod protocol;
 mod runtime;
+mod terminal;
+mod theme;
 mod ui;
 
 use anyhow::{Context, Result, bail};
@@ -16,34 +18,133 @@ use tokio::sync::mpsc;
 use app::{App, AppMsg, FrameStats};
 use runtime::{Runtime, RuntimeMsg};
 
+/// 极简文件 logger：设了 `QAQH_TUI_LOG=<path>` 才安装。
+///
+/// **为什么需要**：TUI 自身不记日志，而 `qaqh-client` 的诊断（timeline 重连原因、
+/// 快照恢复失败、非法 cursor 告警……）全部走 `log` 门面。没有 logger 时这些**全被
+/// 丢掉**——真机排查只剩 UI 上那句「timeline[….] 断开，1000ms 后重连」，而
+/// `ReconnectReason` 只覆盖「服务端主动终止流」，普通 HTTP 错误（401 等）不带
+/// reason，等于**没有原因**。这个缺口直接卡住过故障钩子的接线排查。
+///
+/// 默认关闭：不安装 logger 时 `log` 门面是空操作，行为与之前完全一致。
+struct FileLogger;
+
+impl log::Log for FileLogger {
+    fn enabled(&self, _metadata: &log::Metadata<'_>) -> bool {
+        true
+    }
+
+    fn log(&self, record: &log::Record<'_>) {
+        let Ok(path) = std::env::var("QAQH_TUI_LOG") else {
+            return;
+        };
+        // 每条记录开关一次文件：这是**诊断开关**，不在热路径上，不值得为它引入
+        // 全局文件句柄与锁。
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+        {
+            use std::io::Write as _;
+            let _ = writeln!(file, "[{}] {}", record.level(), record.args());
+        }
+    }
+
+    fn flush(&self) {}
+}
+
+fn init_logging() {
+    if std::env::var_os("QAQH_TUI_LOG").is_none() {
+        return;
+    }
+    static LOGGER: FileLogger = FileLogger;
+    let _ = log::set_logger(&LOGGER);
+    log::set_max_level(log::LevelFilter::Debug);
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StartupMode {
+    V1,
+    V2Agent,
+    V2Inline,
+}
+
+/// 启动模式优先级：`--v1` > `--v2-inline`/env > `--v2-agent`/env > 默认 v1。
+///
+/// `--v1` 是显式回退闸，必须压过环境变量；否则一旦 shell 里残留
+/// `QAQH_V2_AGENT=1`，用户无法在单次启动里回到 v1。
+fn select_startup_mode(args: &[String], v2_agent_env: bool, v2_inline_env: bool) -> StartupMode {
+    let force_v1 = args.iter().any(|arg| arg == "--v1");
+    if !force_v1 && (args.iter().any(|arg| arg == "--v2-inline") || v2_inline_env) {
+        return StartupMode::V2Inline;
+    }
+    if force_v1 {
+        return StartupMode::V1;
+    }
+    if args.iter().any(|arg| arg == "--v2-agent") || v2_agent_env {
+        StartupMode::V2Agent
+    } else {
+        StartupMode::V1
+    }
+}
+
 fn main() -> Result<()> {
+    init_logging();
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         Some("doctor") => return doctor(),
+        Some("--version") | Some("-V") | Some("version") => {
+            // 版本号此前只存在于 Cargo metadata 里，运行时没有任何观测面——
+            // 升到 2.0.0-alpha1 时补上，让「装的到底是哪个版本」可直接问二进制。
+            println!("qaqh-tui {}", env!("CARGO_PKG_VERSION"));
+            return Ok(());
+        }
         Some("--help") | Some("-h") | Some("help") => {
             println!(
-                "qaqh-tui — QAQ-Harness 终端客户端 (qaqh.Ringing v{})",
+                "qaqh-tui {} — QAQ-Harness 终端客户端 (qaqh.Ringing v{})",
+                env!("CARGO_PKG_VERSION"),
                 qaqh_client::RINGING_VERSION
             );
             println!();
             println!("用法:");
             println!("  qaqh-tui            连接本地 daemon 并进入 TUI");
             println!("  qaqh-tui --no-spawn 不自动拉起 daemon（仅连接已有实例）");
+            println!("  qaqh-tui --v2-inline 启动 V2 inline 原型（实验，不连接 daemon）");
+            println!("  qaqh-tui --v2-agent 启动 V2 Agent View（实验，连接 daemon）");
+            println!("  qaqh-tui --v1       强制 v1 全屏模式（覆盖 QAQH_V2_AGENT）");
             println!("  qaqh-tui doctor     自检：发现/pid 判活/open 握手");
+            println!("  qaqh-tui --version  打印版本");
             println!();
             println!(
-                "环境: QAQH_DATA_DIR（数据目录覆盖）、QAQH_BACKEND_ROOT（daemon 拉起候选）、QAQH_DEFAULT_CWD（新建会话默认目录，支持 ~/ 展开）"
+                "环境: QAQH_DATA_DIR（数据目录覆盖）、QAQH_BACKEND_ROOT（daemon 拉起候选）、QAQH_DEFAULT_CWD（新建会话默认目录，支持 ~/ 展开）、QAQH_THEME=night|day|terminal|auto"
             );
             return Ok(());
         }
         _ => {}
     }
 
+    let mode = select_startup_mode(
+        &args,
+        std::env::var_os("QAQH_V2_AGENT").is_some(),
+        std::env::var_os("QAQH_V2_INLINE").is_some(),
+    );
+
+    if mode == StartupMode::V2Inline {
+        // V2-M1 隔离原型：不连接 daemon、不进入 alternate screen。
+        return terminal::inline::run_prototype();
+    }
+
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .context("构建 tokio runtime")?;
-    runtime.block_on(run_tui(args.iter().any(|a| a == "--no-spawn")))
+    match mode {
+        StartupMode::V2Agent => runtime.block_on(terminal::agent::run(
+            !args.iter().any(|arg| arg == "--no-spawn"),
+        )),
+        StartupMode::V1 => runtime.block_on(run_tui(args.iter().any(|a| a == "--no-spawn"))),
+        StartupMode::V2Inline => unreachable!("handled before runtime construction"),
+    }
 }
 
 async fn run_tui(no_spawn: bool) -> Result<()> {
@@ -310,5 +411,54 @@ async fn doctor_async() -> Result<()> {
             bail!("[3] open 被拒（协议代差）: {m} —— 请更新客户端或 daemon")
         }
         Err(e) => bail!("[3] open 失败: {e}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{StartupMode, select_startup_mode};
+
+    fn args(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| (*value).to_string()).collect()
+    }
+
+    #[test]
+    fn startup_mode_defaults_to_v1() {
+        assert_eq!(
+            select_startup_mode(&args(&[]), false, false),
+            StartupMode::V1
+        );
+    }
+
+    #[test]
+    fn startup_mode_env_enables_v2_agent() {
+        assert_eq!(
+            select_startup_mode(&args(&[]), true, false),
+            StartupMode::V2Agent
+        );
+    }
+
+    #[test]
+    fn cli_v1_overrides_v2_env_and_flags() {
+        assert_eq!(
+            select_startup_mode(&args(&["--v1", "--v2-agent"]), true, true),
+            StartupMode::V1
+        );
+        assert_eq!(
+            select_startup_mode(&args(&["--v1", "--v2-inline"]), true, true),
+            StartupMode::V1
+        );
+    }
+
+    #[test]
+    fn inline_takes_precedence_over_agent() {
+        assert_eq!(
+            select_startup_mode(&args(&["--v2-agent", "--v2-inline"]), true, false),
+            StartupMode::V2Inline
+        );
+        assert_eq!(
+            select_startup_mode(&args(&[]), false, true),
+            StartupMode::V2Inline
+        );
     }
 }

@@ -1,6 +1,14 @@
 /target
 /out
+# 本机锚点覆盖（path override 指向 ../qaqh-backend-anchor，绝对路径不入库）
+/.cargo/
 Cargo.lock.bak
 *.log
 .codegraph/
 /.qaqh/
+
+# cnb-chat 运行态（游标 + 收件箱）：本机状态，不入库
+/cnb-chat/state/
+# Python 字节码（跑 py_compile / 导入探针时会生成）
+__pycache__/
+*.pyc

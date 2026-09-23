@@ -163,25 +163,14 @@ fn draw_permission(f: &mut Frame, perm: &PermissionPanel, area: Rect) {
 
 fn draw_ask(f: &mut Frame, panel: &AskPanel, area: Rect) {
     let w = 70u16.min(area.width.saturating_sub(4));
-    // 高度估算：每题 2 行 + 选项 + 输入 + 页脚。
-    let est: usize = panel
-        .questions
-        .iter()
-        .enumerate()
-        .map(|(i, q)| {
-            let opts = q.options.len().min(6);
-            let custom = if panel.editing_custom == Some(i) {
-                2
-            } else {
-                0
-            };
-            3 + opts + custom
-        })
-        .sum::<usize>()
-        + 4;
-    let h = (est as u16 + 3).min(area.height.saturating_sub(2));
+    let h = area.height.saturating_sub(4).min(30);
     let rect = centered_rect(w, h, area);
     f.render_widget(Clear, rect);
+    let question_count = panel.questions.len().max(1);
+    let focus = panel.focus.min(question_count.saturating_sub(1));
+    let Some(question) = panel.questions.get(focus) else {
+        return;
+    };
     let mode_tag = match panel.mode {
         qaqh_client::AskMode::Single => "single",
         qaqh_client::AskMode::Batch => "batch",
@@ -189,77 +178,96 @@ fn draw_ask(f: &mut Frame, panel: &AskPanel, area: Rect) {
     let block = Block::new()
         .borders(Borders::ALL)
         .border_style(theme::modal_border())
-        .title(format!(" ❓ 需要你的回答 ({mode_tag}) "));
+        .title(format!(
+            " ❓ 问题 {}/{} ({mode_tag}) ",
+            focus + 1,
+            question_count
+        ));
     f.render_widget(block, rect);
 
     let inner_w = rect.width.saturating_sub(2) as usize;
-    let mut lines: Vec<Line> = Vec::new();
-    for (qi, q) in panel.questions.iter().enumerate() {
-        let focus_mark = if qi == panel.focus { "▶" } else { " " };
-        push_wrapped(
-            &mut lines,
-            &format!("{focus_mark} Q{}: ", qi + 1),
-            &q.question,
-            inner_w,
-            Style::new().add_modifier(Modifier::BOLD),
-        );
-        if !q.options.is_empty() {
-            for (oi, opt) in q.options.iter().enumerate() {
-                let selected = panel.selections[qi] == Some(oi);
-                let mark = if selected { "◉" } else { "○" };
-                let style = if selected {
-                    Style::new()
-                        .fg(ratatui::style::Color::Cyan)
-                        .add_modifier(Modifier::BOLD)
+    let mut lines = Vec::new();
+    push_wrapped(
+        &mut lines,
+        "  ",
+        &question.question,
+        inner_w,
+        Style::new().add_modifier(Modifier::BOLD),
+    );
+    lines.push(Line::from(""));
+    let cursor = panel.option_cursor(focus);
+    for (oi, option) in question.options.iter().enumerate() {
+        let selected = panel.selections[focus] == Some(oi);
+        let focused = cursor == oi;
+        let mark = if selected { "◉" } else { "○" };
+        let style = if selected {
+            Style::new()
+                .fg(ratatui::style::Color::Cyan)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::new()
+        };
+        let shortcut = crate::app::session::option_shortcut_label(oi).unwrap_or('·');
+        lines.push(Line::from(vec![
+            Span::styled(
+                if focused { " ▶ " } else { "   " },
+                if focused {
+                    theme::accent()
                 } else {
                     Style::new()
-                };
-                lines.push(Line::from(vec![
-                    Span::styled("    ", Style::new()),
-                    Span::styled(format!("{mark} "), style),
-                    Span::styled(format!("[{oi}] "), theme::dim()),
-                    Span::styled(opt.clone(), style),
-                ]));
-            }
-        }
-        let custom = panel.customs[qi].trim();
-        if !custom.is_empty() {
-            lines.push(Line::from(vec![
-                Span::styled("    ✎ ", theme::accent()),
-                Span::styled(
-                    custom.to_owned(),
-                    Style::new().fg(ratatui::style::Color::Cyan),
-                ),
-            ]));
-        }
-        if panel.editing_custom == Some(qi) {
-            lines.push(Line::from(vec![
-                Span::styled("    自定义> ", theme::accent()),
-                Span::styled(
-                    format!("{}_", panel.input),
-                    Style::new().add_modifier(Modifier::REVERSED),
-                ),
-            ]));
-        }
+                },
+            ),
+            Span::styled(format!("{shortcut} "), theme::dim()),
+            Span::styled(format!("{mark} "), style),
+            Span::styled(option.clone(), style),
+        ]));
+    }
+    if question.allow_custom {
+        let custom_focused = cursor == question.options.len();
+        let custom = panel.customs[focus].trim();
+        let custom_mark = if custom.is_empty() { "○" } else { "◉" };
+        let text = if panel.editing_custom == Some(focus) {
+            format!("自定义> {}_", panel.input)
+        } else if custom.is_empty() {
+            "自定义输入".to_string()
+        } else {
+            format!("自定义: {custom}")
+        };
+        lines.push(Line::from(vec![
+            Span::styled(
+                if custom_focused { " ▶ " } else { "   " },
+                if custom_focused {
+                    theme::accent()
+                } else {
+                    Style::new()
+                },
+            ),
+            Span::styled("z ", theme::dim()),
+            Span::styled(format!("{custom_mark} "), theme::accent()),
+            Span::styled(text, theme::accent()),
+        ]));
     }
     if let Some(err) = &panel.error {
         lines.push(Line::from(Span::styled(format!("  ✗ {err}"), theme::err())));
     }
     lines.push(Line::from(""));
     if panel.editing_custom.is_some() {
-        lines.push(footer_line(&[("Enter", "结束本输入"), ("Esc", "取消输入")]));
+        lines.push(footer_line(&[("Enter", "提交并继续"), ("Esc", "取消输入")]));
     } else {
         lines.push(footer_line(&[
-            ("↑↓", "切换问题"),
-            ("1-9", "选择选项"),
-            ("e", "自定义输入"),
-            ("Enter", "提交"),
+            ("←→", "切换问题"),
+            ("↑↓", "选择选项"),
+            ("Enter/Space", "选择"),
+            ("1-9/a-f", "快捷键"),
+            ("e/z", "自定义"),
             ("Esc", "跳过(中止回合)"),
         ]));
     }
 
     f.render_widget(
-        Paragraph::new(lines).wrap(Wrap { trim: false }),
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .scroll((panel.scroll, 0)),
         Rect {
             x: rect.x + 1,
             y: rect.y + 1,
@@ -314,7 +322,8 @@ fn draw_plan(f: &mut Frame, panel: &PlanPanel, area: Rect) {
         )));
         for item in &panel.todo_items {
             lines.push(Line::from(vec![
-                Span::styled(format!("  [{:?}] ", item.complexity), theme::dim()),
+                // `complexity` 是 String，`{:?}` 会渲染成带引号的 `"small"`。
+                Span::styled(format!("  [{}] ", item.complexity), theme::dim()),
                 Span::raw(item.title.clone()),
             ]));
         }

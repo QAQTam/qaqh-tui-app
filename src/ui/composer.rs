@@ -16,6 +16,13 @@ use crate::ui::theme;
 /// composer 显示行数上限（超出后以尾部窗口展示，光标行恒可见）。
 const MAX_ROWS: usize = 6;
 
+/// slash 一级菜单一次最多展示的候选行数。
+///
+/// **必须**与选中窗口共用同一常量：候选数可以超过它（当前 7 条命令 > 6），
+/// 若展示用 `take(N)` 而选中索引按候选全长走，超出的那几条会既画不出来
+/// 也高亮不到（U-16：`/export` 是第 7 条，正是这么丢的）。
+const SLASH_MENU_ROWS: usize = 6;
+
 /// 自适应高度：上下边框 + min(输入行数, MAX_ROWS)。观测子代理时降为单行只读提示。
 pub fn height(app: &App) -> u16 {
     if app.inspecting() {
@@ -34,9 +41,15 @@ pub fn draw_slash_menu(f: &mut Frame, app: &App, composer_area: Rect) {
         return;
     }
     let selected = app.slash_selected.min(candidates.len().saturating_sub(1));
-    // 在 composer 上方弹出，最多 5 行
-    let visible = candidates.iter().take(6).collect::<Vec<_>>();
-    let h = (visible.len() as u16).min(6) + 2; // border
+    // 在 composer 上方弹出，最多 SLASH_MENU_ROWS 行。
+    // 窗口以选中项为底对齐（与 v2 Agent View `slash_menu_lines` 同策略）：
+    // 候选多于窗口时，最后一条仍可被 ↑↓ 选中并高亮，而不是消失在窗口外。
+    let visible_n = candidates.len().min(SLASH_MENU_ROWS);
+    let start = selected
+        .saturating_sub(visible_n.saturating_sub(1))
+        .min(candidates.len().saturating_sub(visible_n));
+    let visible = &candidates[start..start + visible_n];
+    let h = visible_n as u16 + 2; // border
     let w = 58u16.min(composer_area.width.saturating_sub(2));
     let menu_area = Rect {
         x: composer_area.x + 2,
@@ -60,7 +73,8 @@ pub fn draw_slash_menu(f: &mut Frame, app: &App, composer_area: Rect) {
     };
     f.render_widget(block, menu_area);
     let mut lines: Vec<Line> = Vec::new();
-    for (idx, def) in visible.iter().enumerate() {
+    for (offset, def) in visible.iter().enumerate() {
+        let idx = start + offset;
         let is_sel = idx == selected;
         let marker = if is_sel { "▸" } else { " " };
         let style = if is_sel {
