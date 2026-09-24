@@ -220,12 +220,32 @@ async fn run_loop(
         }
         let route = route::resolve(app);
         let size = terminal.terminal.size()?;
+        let previous_size = terminal.last_terminal_size;
+        let terminal_resized = terminal.note_terminal_size(size.width, size.height);
         let desired_height = inline_viewport_height(app, size.width, size.height, theme);
         terminal.set_inline_height(desired_height);
-        reconcile_screen(terminal, input, &route, app, agent, theme).await?;
-        if route == ScreenRoute::Agent && terminal.needs_inline_rebuild() {
+
+        if terminal_resized
+            && size.height < previous_size.1
+            && route == ScreenRoute::Agent
+            && terminal.mode == ScreenMode::Inline
+        {
+            // 缩小会把旧 viewport 的可见行留在新 origin 上方。清掉 scrollback 后
+            // 用 timeline 重放，避免旧 logo / 工具卡 / 状态栏残留成重影。
             input.suspend().await;
-            let result = terminal.ensure_inline_height();
+            let result = terminal.purge_scrollback_for_replay();
+            input.resume();
+            result?;
+            agent.force_replay(app);
+        } else if terminal_resized {
+            // 其他尺寸变化交给 ratatui autoresize；不要手工重建 inline viewport。
+            terminal.terminal.autoresize()?;
+        }
+
+        reconcile_screen(terminal, input, &route, app, agent, theme).await?;
+        if route == ScreenRoute::Agent && terminal.needs_inline_rebuild(size.height) {
+            input.suspend().await;
+            let result = terminal.ensure_inline_height(size.height);
             input.resume();
             result?;
         }
@@ -361,37 +381,60 @@ fn screen_transition(mode: ScreenMode, route: &ScreenRoute) -> ScreenTransition 
 struct TerminalHost {
     terminal: DefaultTerminal,
     mode: ScreenMode,
-    inline_height: u16,
+    requested_inline_height: u16,
     desired_inline_height: u16,
+    last_terminal_size: (u16, u16),
 }
 
 impl TerminalHost {
     fn init(inline_height: u16) -> Self {
         let inline_height = inline_height.max(1);
+        let terminal = ratatui::init_with_options(TerminalOptions {
+            viewport: Viewport::Inline(inline_height),
+        });
+        let terminal_size = ratatui::crossterm::terminal::size().unwrap_or((0, 0));
         Self {
-            terminal: ratatui::init_with_options(TerminalOptions {
-                viewport: Viewport::Inline(inline_height),
-            }),
+            terminal,
             mode: ScreenMode::Inline,
-            inline_height,
+            requested_inline_height: inline_height,
             desired_inline_height: inline_height,
+            last_terminal_size: terminal_size,
         }
+    }
+
+    fn note_terminal_size(&mut self, width: u16, height: u16) -> bool {
+        let next = (width, height);
+        let changed = self.last_terminal_size != next;
+        self.last_terminal_size = next;
+        changed
     }
 
     fn set_inline_height(&mut self, height: u16) {
         self.desired_inline_height = height.max(1);
     }
 
-    fn needs_inline_rebuild(&self) -> bool {
-        self.mode == ScreenMode::Inline && self.inline_height != self.desired_inline_height
+    fn needs_inline_rebuild(&self, terminal_height: u16) -> bool {
+        if self.mode != ScreenMode::Inline
+            || self.requested_inline_height == self.desired_inline_height
+        {
+            return false;
+        }
+        // 终端高度把目标 viewport 夹住了：这是 ratatui 的 autoresize 职责，
+        // 不要在这里重建一个更矮的 inline viewport，否则放大再缩小会留下旧行。
+        let terminal_height = terminal_height.max(1);
+        if self.desired_inline_height >= terminal_height
+            && self.requested_inline_height > self.desired_inline_height
+        {
+            return false;
+        }
+        true
     }
 
     /// 在当前 inline viewport 高度与布局需求不一致时重建 viewport。
     ///
-    /// 只清理旧 viewport 区域，并把它锚定在原来的顶部；不会触碰已提交到
-    /// scrollback 的内容，也不会重放 transcript。
-    fn ensure_inline_height(&mut self) -> Result<()> {
-        if !self.needs_inline_rebuild() {
+    /// 只清理旧 viewport 区域：增高锚定顶部，缩高锚定底边；不会重放 transcript。
+    fn ensure_inline_height(&mut self, terminal_height: u16) -> Result<()> {
+        if !self.needs_inline_rebuild(terminal_height) {
             return Ok(());
         }
         self.rebuild_inline(self.desired_inline_height)
@@ -400,16 +443,26 @@ impl TerminalHost {
     fn rebuild_inline(&mut self, height: u16) -> Result<()> {
         let height = height.max(1);
         let old_area = self.terminal.get_frame().area();
+        // 缩高时保持 viewport 底边不动，否则旧底部行会留在新 viewport 下面，
+        // 表现为状态栏/输入框重影；增高仍锚定顶部，避免侵入上方 scrollback。
+        let anchor_y = if height < old_area.height {
+            old_area
+                .y
+                .saturating_add(old_area.height)
+                .saturating_sub(height)
+        } else {
+            old_area.y
+        };
         self.terminal.clear()?;
         self.terminal
-            .set_cursor_position(Position::new(0, old_area.y))?;
+            .set_cursor_position(Position::new(0, anchor_y))?;
         self.terminal = Terminal::with_options(
             CrosstermBackend::new(stdout()),
             TerminalOptions {
                 viewport: Viewport::Inline(height),
             },
         )?;
-        self.inline_height = height;
+        self.requested_inline_height = height;
         self.desired_inline_height = height;
         self.mode = ScreenMode::Inline;
         Ok(())
@@ -436,16 +489,17 @@ impl TerminalHost {
                 viewport: Viewport::Inline(inline_height),
             },
         )?;
-        self.inline_height = inline_height;
+        self.requested_inline_height = inline_height;
+        self.desired_inline_height = inline_height;
         self.mode = ScreenMode::Inline;
         Ok(())
     }
 
     /// 清空屏幕与终端 scrollback，并把 inline viewport 重新锚定到顶部。
     ///
-    /// 只用于会话切换：旧会话的历史必须从终端历史里移除，否则新会话只能被
-    /// 追加到旧历史后面，无法满足“清屏 + 按 ledger 顺序重放”。调用后由
-    /// `commit_pending` 写入新 seed 的完整已封口快照。
+    /// 只用于会话切换与终端缩屏重建：旧会话/旧 viewport 的历史必须从终端历史里
+    /// 移除，否则新内容只能被追加到旧历史后面，无法满足“清屏 + 按 ledger 顺序重放”。
+    /// 调用后由 `commit_pending` 写入新 seed 的完整已封口快照。
     fn purge_scrollback_for_replay(&mut self) -> Result<()> {
         let inline_height = self.desired_inline_height.max(1);
         execute!(
@@ -460,7 +514,8 @@ impl TerminalHost {
                 viewport: Viewport::Inline(inline_height),
             },
         )?;
-        self.inline_height = inline_height;
+        self.requested_inline_height = inline_height;
+        self.desired_inline_height = inline_height;
         self.mode = ScreenMode::Inline;
         Ok(())
     }
@@ -491,7 +546,8 @@ impl TerminalHost {
         self.terminal = ratatui::init_with_options(TerminalOptions {
             viewport: Viewport::Inline(inline_height),
         });
-        self.inline_height = inline_height;
+        self.requested_inline_height = inline_height;
+        self.desired_inline_height = inline_height;
         self.mode = ScreenMode::Inline;
         execute!(stdout(), EnableBracketedPaste)?;
         if was_alternate {
@@ -656,6 +712,34 @@ impl AgentState {
         self.pending_stream_lines.clear();
         self.streaming.reset();
         self.streamed_blocks.clear();
+    }
+
+    /// 终端缩小时，旧 inline viewport 的可见行会变成屏幕残留；清 scrollback 后
+    /// 用权威 timeline 重放，等价于一次会话切换的干净重建。
+    fn force_replay(&mut self, app: &App) {
+        self.pending_commits.clear();
+        self.reset_streaming();
+        let Some(seed) = app.active_seed() else {
+            self.seed = None;
+            self.transcript.clear();
+            self.replay_active = false;
+            self.replay_cursor = 0;
+            self.replay_version = None;
+            return;
+        };
+        let Some(session) = app.sessions.get(&seed) else {
+            self.seed = None;
+            self.transcript.clear();
+            self.replay_active = false;
+            self.replay_cursor = 0;
+            self.replay_version = None;
+            return;
+        };
+        self.seed = Some(seed.clone());
+        self.transcript.begin_replay(&seed);
+        self.replay_active = true;
+        self.replay_cursor = 0;
+        self.replay_version = Some(session.timeline.version);
     }
 
     fn was_streamed(&self, block: &TranscriptBlock) -> bool {
@@ -1959,6 +2043,22 @@ mod tests {
         let second = state.sync(&app);
         assert!(!second.reset_scrollback);
         assert!(second.pending.is_empty());
+    }
+
+    #[test]
+    fn forced_replay_resets_and_replays_after_scrollback_purge() {
+        let app = app_with_model(model_with_sealed_answer());
+        let mut state = AgentState::default();
+        let first = state.sync(&app);
+        assert_eq!(first.pending.len(), 2);
+
+        state.force_replay(&app);
+        assert!(state.replay_active);
+        assert!(state.pending_commits.is_empty());
+        assert!(state.pending_stream_lines.is_empty());
+
+        let replayed = state.sync(&app);
+        assert_eq!(replayed.pending.len(), 2, "缩屏重建后必须从 timeline 重放");
     }
 
     #[test]

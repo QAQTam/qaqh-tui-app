@@ -22,7 +22,7 @@ v2 Agent View 初始化 inline viewport 时会发 `ESC[6n`（DSR / 光标位置�
 
     scripts/lib/pty-driver.py --tui <TUI 路径> --raw <原始输出> --seconds <N> \
         [--key <秒>:<两位十六进制字节>]... [--type <秒>:<文本>]... \
-        [--quit] [--exit-code-file <路径>]
+        [--resize <秒>:<行>x<列>]... [--quit] [--exit-code-file <路径>]
 
 环境变量**原样继承**（调用方在 shell 里设好 `QAQH_DATA_DIR` 等即可）；
 `TUI_ARGS` 与 smoke 同款，按 shell 分词后追加到命令行。
@@ -81,6 +81,8 @@ def main() -> int:
     parser.add_argument("--rows", type=int, default=40)
     parser.add_argument("--cols", type=int, default=130)
     parser.add_argument("--key", action="append", default=[])
+    # `--resize 3:50x120` → 第 3 秒把 PTY 窗口改成 50 行 120 列。
+    parser.add_argument("--resize", action="append", default=[])
     # `--type 8:hello` → 第 8 秒把 "hello" 的 UTF-8 字节按原样写进 pty（模拟用户
     # 在 composer 里打字）。回车等控制字节用 `--key`，例如 `--key 8.5:0d`。
     parser.add_argument("--type", action="append", default=[])
@@ -100,6 +102,17 @@ def main() -> int:
             raise SystemExit(f"--type 需要 <秒>:<文本>，收到 {spec!r}")
         keys.append((float(at), text.encode()))
     keys.sort(key=lambda item: item[0])
+    resizes: list[tuple[float, int, int]] = []
+    for spec in args.resize:
+        try:
+            at, size = spec.split(":", 1)
+            rows, cols = size.lower().split("x", 1)
+            resizes.append((float(at), int(rows), int(cols)))
+        except ValueError as exc:
+            raise SystemExit(
+                f"--resize 需要 <秒>:<行>x<列>，收到 {spec!r}"
+            ) from exc
+    resizes.sort(key=lambda item: item[0])
     # (needle 字节, 回什么字节, 是否已回过)
     responds: list[list[object]] = []
     for spec in args.respond:
@@ -136,6 +149,7 @@ def main() -> int:
     respond_tail = bytearray()
     start = time.monotonic()
     pending = list(keys)
+    pending_resizes = list(resizes)
     quit_at = args.seconds
     quit_sent = False
     # Ctrl+Q 之后留 3 秒让它走完收尾（smoke 同款）。
@@ -149,6 +163,18 @@ def main() -> int:
             try:
                 os.write(master, byte)
             except OSError:
+                pass
+
+        while pending_resizes and elapsed >= pending_resizes[0][0]:
+            _, rows, cols = pending_resizes.pop(0)
+            try:
+                fcntl.ioctl(
+                    master,
+                    termios.TIOCSWINSZ,
+                    struct.pack("HHHH", rows, cols, 0, 0),
+                )
+                os.killpg(tui.pid, signal.SIGWINCH)
+            except (OSError, ProcessLookupError):
                 pass
 
         if args.quit and not quit_sent and elapsed >= quit_at:
