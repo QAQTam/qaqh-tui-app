@@ -553,6 +553,30 @@ pub struct FrameStats {
     pub peak_rebuilt: u32,
 }
 
+/// 弹窗里一个**可点目标**。
+///
+/// 这是"语义目标"，不是坐标：坐标由渲染层按同一套布局算（见
+/// `ui::v2::modal::hit_test`），命中后回填到这里，绘制时按它上色。
+/// 刻意不含任何 ratatui 类型，保持 app 层不依赖渲染细节。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModalHit {
+    /// ask 的第 `question` 题的第 `option` 个选项。
+    AskOption {
+        question: usize,
+        option: usize,
+    },
+    /// ask 的「自定义输入」项。
+    AskCustom {
+        question: usize,
+    },
+    PermissionApprove,
+    PermissionDeny,
+    PermissionTrust,
+    PlanApprove,
+    PlanApproveAutonomous,
+    PlanReject,
+}
+
 pub struct App {
     pub quit: bool,
     pub runtime: Arc<Runtime>,
@@ -568,6 +592,12 @@ pub struct App {
     pub conn_error: Option<String>,
     /// 处于告警状态的流账本（相位与 `conn_error` 由它推导，见 [`reconcile_conn`]）。
     pub stream_issues: StreamIssues,
+
+    /// 鼠标当前悬停的弹窗目标（`?1003h` 移动上报；只对弹窗有意义）。
+    pub modal_hover: Option<ModalHit>,
+    /// 鼠标**按下且未松开**的目标。松开时若仍命中同一目标才提交——
+    /// 这是按钮的基本语义（按下后拖出去 = 取消）。
+    pub modal_pressed: Option<ModalHit>,
 
     pub toasts: VecDeque<Toast>,
     /// 新建会话的 command_id → 发起时间（等 causation_id 关联）。
@@ -679,6 +709,8 @@ impl App {
             epoch: String::new(),
             conn_error: None,
             stream_issues: StreamIssues::default(),
+            modal_hover: None,
+            modal_pressed: None,
             toasts: VecDeque::new(),
             pending_creates: HashMap::new(),
             session_list_cache: Vec::new(),

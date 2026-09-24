@@ -3,6 +3,78 @@
 use super::*;
 
 impl App {
+    // ───────────────────── 鼠标：弹窗按钮的动作 ─────────────────────
+    //
+    // 鼠标与键盘必须走**同一条语义路径**：这里刻意不重写决策，而是复用
+    // `ask_key` / `permission_key` / `plan_key` 已经用到的那些动作
+    // （`select_option` / `respond_permission` / `respond_plan` / `entering_message`），
+    // 否则键盘与鼠标迟早分叉出两套行为。
+
+    /// 点击 ask 的某个选项：等价于在该项上按 **Enter**（选中 + 前进，最后一题提交）。
+    pub fn mouse_ask_option(&mut self, question: usize, option: usize) {
+        let Some(seed) = self.active_seed() else {
+            return;
+        };
+        let mut submit_after = false;
+        if let Some(sess) = self.sessions.get_mut(&seed)
+            && let Some(panel) = sess.pending_ask.as_mut()
+        {
+            panel.select_option(question, option);
+            let on_last = panel.focus + 1 >= panel.questions.len();
+            if !on_last {
+                panel.focus += 1;
+                panel.scroll = 0;
+            }
+            submit_after = on_last;
+        }
+        if submit_after {
+            self.submit_ask();
+        }
+    }
+
+    /// 点击 ask 的「自定义输入」行：等价于按 `e`/`z`（进入编辑态）。
+    pub fn mouse_ask_custom(&mut self, question: usize) {
+        let Some(seed) = self.active_seed() else {
+            return;
+        };
+        if let Some(sess) = self.sessions.get_mut(&seed)
+            && let Some(panel) = sess.pending_ask.as_mut()
+        {
+            panel.editing_custom = Some(question);
+            if let Some(cursor) = panel.option_cursor.get_mut(question)
+                && let Some(q) = panel.questions.get(question)
+            {
+                *cursor = q.options.len();
+            }
+            panel.input = panel.customs[question].clone();
+            panel.error = None;
+        }
+    }
+
+    /// 点击 permission 的「信任此目录」：等价于按 `t`。
+    pub fn mouse_permission_toggle_trust(&mut self) {
+        let Some(seed) = self.active_seed() else {
+            return;
+        };
+        if let Some(sess) = self.sessions.get_mut(&seed)
+            && let Some(panel) = sess.pending_permissions.first_mut()
+        {
+            panel.trust_folder = !panel.trust_folder;
+        }
+    }
+
+    /// 点击 plan 的「拒绝并填写理由」：等价于按 `r`（进入理由输入态，**不是**直接拒绝）。
+    pub fn mouse_plan_start_reject(&mut self) {
+        let Some(seed) = self.active_seed() else {
+            return;
+        };
+        if let Some(sess) = self.sessions.get_mut(&seed)
+            && let Some(panel) = sess.pending_plan.as_mut()
+        {
+            panel.entering_message = true;
+        }
+    }
+
     pub fn submit_ask(&mut self) {
         let Some(seed) = self.active_seed() else {
             return;

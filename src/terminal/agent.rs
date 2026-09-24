@@ -19,7 +19,8 @@ use anyhow::{Context, Result};
 use ratatui::backend::CrosstermBackend;
 use ratatui::crossterm::cursor::MoveTo;
 use ratatui::crossterm::event::{
-    DisableBracketedPaste, EnableBracketedPaste, Event, KeyEventKind, poll, read,
+    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, Event,
+    KeyEventKind, poll, read,
 };
 use ratatui::crossterm::terminal::{Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen};
 use ratatui::crossterm::{event::KeyCode, execute};
@@ -32,7 +33,7 @@ use tokio::sync::mpsc;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::app::timeline_model::Turn;
-use crate::app::{App, AppMsg, ConnPhase, Overlay};
+use crate::app::{App, AppMsg, ConnPhase, ModalHit, Overlay};
 use crate::runtime::{Runtime, RuntimeMsg};
 use crate::terminal::transcript::PendingCommit;
 use crate::theme::Theme;
@@ -143,6 +144,9 @@ impl InputPump {
                                 }
                                 Event::Paste(text) => AppMsg::Paste(text),
                                 Event::Resize(_, _) => AppMsg::Resize,
+                                // 鼠标只在弹窗（alternate screen）期间被捕获，
+                                // 见 `TerminalHost::enter_alternate`。
+                                Event::Mouse(mouse) => AppMsg::Mouse(mouse),
                                 _ => continue,
                             };
                             if tx.send(msg).is_err() {
@@ -218,9 +222,9 @@ async fn run_loop(
         let Some(msg) = app_rx.recv().await else {
             break;
         };
-        handle_message(app, msg);
+        handle_message(app, msg, terminal, &route)?;
         while let Ok(msg) = app_rx.try_recv() {
-            handle_message(app, msg);
+            handle_message(app, msg, terminal, &route)?;
             if app.quit {
                 break;
             }
@@ -235,15 +239,84 @@ async fn run_loop(
     Ok(())
 }
 
-fn handle_message(app: &mut App, msg: AppMsg) {
+fn handle_message(
+    app: &mut App,
+    msg: AppMsg,
+    terminal: &TerminalHost,
+    route: &ScreenRoute,
+) -> Result<()> {
+    // 鼠标在 v2 里由**渲染层**接管：命中测试需要弹窗几何（只有这里知道当前
+    // 屏幕区域），而 v1 那套 `App::handle_mouse`（第 0 行 = tab bar）在 v2 是错的
+    // ——alt screen 的第 0 行不是 tab bar，点一下历史区就切标签页。
+    if let AppMsg::Mouse(mouse) = msg {
+        if let ScreenRoute::Modal(modal) = route {
+            let size = terminal.terminal.size()?;
+            let area = ratatui::layout::Rect::new(0, 0, size.width, size.height);
+            handle_modal_mouse(app, *modal, area, mouse);
+        }
+        // inline 主界面不捕获鼠标；工作区（alt screen）本轮不接鼠标。
+        return Ok(());
+    }
     if let AppMsg::Key(key) = &msg
         && key.code == KeyCode::Esc
         && route::resolve(app) == ScreenRoute::Workspace(route::WorkspaceRoute::Todo)
     {
         app.show_workspace = false;
-        return;
+        return Ok(());
     }
     app.handle(msg);
+    Ok(())
+}
+
+/// 弹窗里的鼠标：移动只改悬停；按下记目标；**松开且仍在同一目标上**才提交。
+///
+/// 事件量：`EnableMouseCapture` 会开 `?1003h`（任意移动上报），移动事件可能很密。
+/// 这里不排队也不重绘——`run_loop` 每次循环先把 `app_rx` 里积压的消息一次性抽干
+/// 再画一帧，天然就是"合并到最新一帧"。
+fn handle_modal_mouse(
+    app: &mut App,
+    modal: route::ModalRoute,
+    area: ratatui::layout::Rect,
+    mouse: ratatui::crossterm::event::MouseEvent,
+) {
+    use ratatui::crossterm::event::{MouseButton, MouseEventKind};
+    let hit = |app: &App| crate::ui::v2::modal::hit_test(app, modal, area, mouse.column, mouse.row);
+    match mouse.kind {
+        MouseEventKind::Moved => {
+            app.modal_hover = hit(app);
+        }
+        MouseEventKind::Down(MouseButton::Left) => {
+            let target = hit(app);
+            app.modal_hover = target;
+            app.modal_pressed = target;
+        }
+        MouseEventKind::Up(MouseButton::Left) => {
+            let released = hit(app);
+            app.modal_hover = released;
+            let pressed = app.modal_pressed.take();
+            if let (Some(pressed), Some(released)) = (pressed, released)
+                && pressed == released
+            {
+                dispatch_modal_hit(app, pressed);
+            }
+        }
+        // 其它按钮（右键/中键）与滚轮：弹窗里暂不接。
+        _ => {}
+    }
+}
+
+/// 命中 → 动作。全部复用键盘路径已有的方法，不另开语义。
+fn dispatch_modal_hit(app: &mut App, hit: ModalHit) {
+    match hit {
+        ModalHit::AskOption { question, option } => app.mouse_ask_option(question, option),
+        ModalHit::AskCustom { question } => app.mouse_ask_custom(question),
+        ModalHit::PermissionApprove => app.respond_permission(true),
+        ModalHit::PermissionDeny => app.respond_permission(false),
+        ModalHit::PermissionTrust => app.mouse_permission_toggle_trust(),
+        ModalHit::PlanApprove => app.respond_plan(true, false),
+        ModalHit::PlanApproveAutonomous => app.respond_plan(true, true),
+        ModalHit::PlanReject => app.mouse_plan_start_reject(),
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -328,8 +401,13 @@ impl TerminalHost {
         Ok(())
     }
 
+    /// 进 alternate screen（弹窗 / 工作区）。
+    ///
+    /// **鼠标捕获只在这里开**：alt screen 里没有 scrollback，终端原生滚轮/选择
+    /// 本来也用不上，所以"吃掉原生鼠标"在这里代价最小；回到 inline 必须立刻
+    /// 关掉（见 `leave_alternate`），否则主界面的原生选择/复制就废了。
     fn enter_alternate(&mut self) -> Result<()> {
-        execute!(stdout(), EnterAlternateScreen)?;
+        execute!(stdout(), EnterAlternateScreen, EnableMouseCapture)?;
         self.terminal = Terminal::new(CrosstermBackend::new(stdout()))?;
         self.mode = ScreenMode::Alternate;
         Ok(())
@@ -337,7 +415,7 @@ impl TerminalHost {
 
     fn leave_alternate(&mut self) -> Result<()> {
         let inline_height = self.desired_inline_height.max(1);
-        execute!(stdout(), LeaveAlternateScreen)?;
+        execute!(stdout(), DisableMouseCapture, LeaveAlternateScreen)?;
         self.terminal = Terminal::with_options(
             CrosstermBackend::new(stdout()),
             TerminalOptions {

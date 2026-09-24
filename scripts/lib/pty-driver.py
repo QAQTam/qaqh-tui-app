@@ -27,7 +27,9 @@ v2 Agent View 初始化 inline viewport 时会发 `ESC[6n`（DSR / 光标位置�
 环境变量**原样继承**（调用方在 shell 里设好 `QAQH_DATA_DIR` 等即可）；
 `TUI_ARGS` 与 smoke 同款，按 shell 分词后追加到命令行。
 
-- `--key 30:12`：第 30 秒往 pty 写一个字节 `0x12`（Ctrl+R）。可重复，按时间排序。
+- `--key 30:12`：第 30 秒往 pty 写字节 `0x12`（Ctrl+R）。可重复，按时间排序；
+  参数是**十六进制字节串**，所以多字节序列也能直接发，例如 SGR 鼠标：
+  `--key 9:1b5b3c303b32363b31304d`（`ESC[<0;26;10M` = 左键在第 10 行第 26 列按下）。
 - `--type 8:hello`：第 8 秒把 `hello` 的 UTF-8 字节原样写进去（模拟打字）；
   回车另给 `--key 8.5:0d`。
 - `--quit`：到 `--seconds` 时先发 Ctrl+Q（干净退出路径），再等 3 秒。
@@ -54,14 +56,20 @@ DSR_REPLY = b"\x1b[1;1R"
 
 
 def parse_key(spec: str) -> tuple[float, bytes]:
-    """`30:12` → (30.0, b'\\x12')。"""
+    """`30:12` → (30.0, b'\\x12')；也接受多字节十六进制串（SGR 鼠标等）。
+
+    多字节是给鼠标用的：一次按下就是 `ESC [ < 0 ; 列 ; 行 M` 一整串，
+    拆成单字节按键再拼时间表既难写又容易错位。例：
+
+        1b5b3c303b32363b31304d   # ESC[<0;26;10M —— SGR 左键按下
+    """
     try:
-        at, hex_byte = spec.split(":", 1)
-        value = bytes([int(hex_byte, 16)])
+        at, hex_bytes = spec.split(":", 1)
+        value = bytes.fromhex(hex_bytes)
     except ValueError as exc:  # noqa: TRY003 - CLI 用法错误，直接给原文更清楚
-        raise SystemExit(f"--key 需要 <秒>:<两位十六进制>，收到 {spec!r}") from exc
-    if len(value) != 1:
-        raise SystemExit(f"--key 的字节必须恰好 1 字节，收到 {spec!r}")
+        raise SystemExit(f"--key 需要 <秒>:<十六进制字节串>，收到 {spec!r}") from exc
+    if not value:
+        raise SystemExit(f"--key 的字节串不能为空，收到 {spec!r}")
     return float(at), value
 
 
