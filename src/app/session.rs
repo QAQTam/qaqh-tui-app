@@ -48,6 +48,7 @@ pub struct StreamingState {
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub struct AskPanel {
+    /// canonical v2 interaction id；用于 resolved / expired 匹配，也是 v2 答复 id。
     pub interaction_id: String,
     pub turn_id: String,
     pub mode: AskMode,
@@ -213,6 +214,7 @@ pub fn option_index_for_key(ch: char) -> Option<usize> {
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub struct PlanPanel {
+    /// canonical v2 interaction id；用于 resolved / expired 匹配，也是 v2 答复 id。
     pub interaction_id: String,
     pub turn_id: String,
     pub plan_content: String,

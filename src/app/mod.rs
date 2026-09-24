@@ -197,18 +197,41 @@ impl ApiCtx {
             .map_err(|e| e.to_string())
     }
 
-    /// 交互应答专用：与 [`ApiCtx::send_command`] 同款，但带 [`INTERACTION_ACK_TIMEOUT`]
-    /// 上限。超时返回可读的 `Err`——调用方走既有的 `ActionResult::CommandAck` 错误
-    /// 分支，落到状态栏 toast（`{label}: {e}`），不需要新的 UI 通道。
+    /// 交互应答专用：与 [`ApiCtx::send_command`] 同款，但等待命令进入终态，
+    /// 并带 [`INTERACTION_ACK_TIMEOUT`] 上限。
+    ///
+    /// v2 的 HTTP ack 只表示命令已受理；业务完成必须轮询 receipt。若只等 ack，
+    /// daemon 卡在 worker 时 UI 永远不会给出超时反馈（ask-hang 的原始回归）。
     pub async fn send_interaction_command(
         &self,
         seed: Option<&str>,
         command: qaqh_client::RingingCommand,
     ) -> Result<qaqh_client::RingingCommandAck, String> {
-        match tokio::time::timeout(
-            INTERACTION_ACK_TIMEOUT,
-            self.send_command(seed, command, Default::default()),
-        )
+        let command_id = uuid::Uuid::new_v4().to_string();
+        let options = qaqh_client::CommandOptions {
+            command_id: Some(command_id.clone()),
+            ..Default::default()
+        };
+        match tokio::time::timeout(INTERACTION_ACK_TIMEOUT, async {
+            let ack = self.send_command(seed, command, options).await?;
+            if ack.status == qaqh_client::RingingCommandAckStatus::Rejected {
+                return Ok(ack);
+            }
+            loop {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                let Ok(status) = self.command_status(&command_id).await else {
+                    continue;
+                };
+                match status.state {
+                    CommandState::Succeeded => return Ok(ack.clone()),
+                    CommandState::Failed | CommandState::Rejected => {
+                        let detail = status.error_code.as_deref().unwrap_or("command_failed");
+                        return Err(format!("命令未成功：{detail}"));
+                    }
+                    CommandState::Accepted | CommandState::Running => {}
+                }
+            }
+        })
         .await
         {
             Ok(result) => result,
@@ -647,6 +670,9 @@ pub struct App {
     /// 设置页鼠标悬停/按下目标；只在 Settings Workspace 生效。
     pub settings_hover: Option<SettingsHit>,
     pub settings_pressed: Option<SettingsHit>,
+    /// 本进程已提交的交互 id（ask / plan / permission）。提交后不能再被
+    /// bootstrap 快照复活成幽灵面板；超时反馈必须能留在可见的 Agent 状态栏。
+    suppressed_interactions: HashSet<String>,
 
     pub toasts: VecDeque<Toast>,
     /// 新建会话的 command_id → 发起时间（等 causation_id 关联）。
@@ -771,6 +797,7 @@ impl App {
             modal_pressed: None,
             settings_hover: None,
             settings_pressed: None,
+            suppressed_interactions: HashSet::new(),
             toasts: VecDeque::new(),
             pending_creates: HashMap::new(),
             session_list_cache: Vec::new(),
@@ -1263,24 +1290,102 @@ impl App {
                     self.apply_interaction_body(&seed, &interaction_id, text.as_bytes());
                 }
                 qaqh_client::ClientV2ContentValue::Ref { content_ref } => {
-                    let seed2 = seed.clone();
-                    let iid = interaction_id.clone();
-                    let content_id = content_ref.hash().as_str().to_string();
-                    self.spawn_api(move |api, tx| async move {
-                        let result = match api.download_content_by_id(&content_id).await {
-                            Ok(bytes) => Ok(bytes),
-                            Err(error) => Err(error.to_string()),
-                        };
-                        let _ = tx.send(AppMsg::Action(ActionResult::InteractionBody {
-                            seed: seed2,
-                            interaction_id: iid,
-                            result,
-                        }));
-                    });
+                    self.download_interaction_body(
+                        seed,
+                        interaction_id,
+                        content_ref.hash().as_str(),
+                    );
                 }
                 qaqh_client::ClientV2ContentValue::Unavailable(_) => {}
             },
         }
+    }
+
+    /// v2 bootstrap 中的挂起交互 → 本仓面板。
+    ///
+    /// 这条路径不是实时事件的重复实现：v2 客户端按 snapshot cursor 起流，
+    /// snapshot 与 subscribe 之间的事实不会再从流里 replay，必须由 bootstrap
+    /// 补齐。permission 的详情仍来自 timeline；ask / plan 的正文按 bootstrap
+    /// 携带的 content value 取回。
+    fn restore_pending_interaction(
+        &mut self,
+        seed: String,
+        interaction: qaqh_client::ClientV2PendingInteraction,
+    ) {
+        use qaqh_client::ClientV2InteractionKind as K;
+        if self
+            .suppressed_interactions
+            .contains(&interaction.interaction_id)
+            || (!interaction.call_id.is_empty()
+                && self.suppressed_interactions.contains(&interaction.call_id))
+        {
+            return;
+        }
+        match interaction.kind {
+            K::Permission => {
+                if interaction.call_id.is_empty() {
+                    return;
+                }
+                if let Some(sess) = self.sessions.get_mut(&seed) {
+                    let panel = sess.permission_panel_for(&interaction.call_id);
+                    sess.restore_permission_from_snapshot(panel);
+                }
+            }
+            K::Ask | K::PlanReview => {
+                if self.has_pending_interaction(&seed, &interaction.interaction_id) {
+                    return;
+                }
+                match interaction.request {
+                    Some(qaqh_client::ClientV2PendingContentValue::Inline { text }) => {
+                        self.apply_interaction_body(
+                            &seed,
+                            &interaction.interaction_id,
+                            text.as_bytes(),
+                        );
+                    }
+                    Some(qaqh_client::ClientV2PendingContentValue::Ref { content_ref }) => {
+                        self.download_interaction_body(
+                            seed,
+                            interaction.interaction_id,
+                            &content_ref,
+                        );
+                    }
+                    Some(qaqh_client::ClientV2PendingContentValue::Unavailable(_)) | None => {}
+                }
+            }
+        }
+    }
+
+    fn has_pending_interaction(&self, seed: &str, interaction_id: &str) -> bool {
+        self.sessions.get(seed).is_some_and(|sess| {
+            sess.pending_ask
+                .as_ref()
+                .is_some_and(|panel| panel.interaction_id == interaction_id)
+                || sess
+                    .pending_plan
+                    .as_ref()
+                    .is_some_and(|panel| panel.interaction_id == interaction_id)
+        })
+    }
+
+    fn download_interaction_body(
+        &mut self,
+        seed: String,
+        interaction_id: String,
+        content_id: &str,
+    ) {
+        let content_id = content_id.to_string();
+        self.spawn_api(move |api, tx| async move {
+            let result = match api.download_content_by_id(&content_id).await {
+                Ok(bytes) => Ok(bytes),
+                Err(error) => Err(error.to_string()),
+            };
+            let _ = tx.send(AppMsg::Action(ActionResult::InteractionBody {
+                seed,
+                interaction_id,
+                result,
+            }));
+        });
     }
 
     /// 从 timeline 工具卡补齐 permission 面板详情（v2 交互正文不含 permission 详情）。
@@ -1301,6 +1406,9 @@ impl App {
             .get("kind")
             .and_then(|k| k.as_str())
             .unwrap_or_default();
+        if self.suppressed_interactions.contains(interaction_id) {
+            return;
+        }
         let Some(sess) = self.sessions.get_mut(seed) else {
             return;
         };
@@ -1477,7 +1585,7 @@ impl App {
             ActionResult::Bootstrap { seed, result } => match result {
                 Ok(b) => {
                     let bootstrap_seed = seed.clone();
-                    let mut pending_permissions: Vec<String> = Vec::new();
+                    let mut pending_interactions = Vec::new();
                     if let Some(sess) = self.sessions.get_mut(&bootstrap_seed) {
                         // 纯 v2：bootstrap 是 canonical 三频道 typed 快照
                         // （`control` / `conversation` / `tool`），不再是 v1 领域
@@ -1501,24 +1609,13 @@ impl App {
                             conv.context_limit.map(|v| v.min(u32::MAX as u64) as u32);
                         sess.conversation = Some(conv);
                         // v2 bootstrap 的 `interactions` 已由 daemon 过滤为未决集合。
-                        pending_permissions = ctl
-                            .interactions
-                            .iter()
-                            .filter(|interaction| {
-                                interaction.kind == qaqh_client::ClientV2InteractionKind::Permission
-                            })
-                            .map(|interaction| interaction.call_id.clone())
-                            .collect();
+                        // 不能只恢复 permission：v2 流的 snapshot cursor 会跳过
+                        // “快照中已经挂起”的事实，ask / plan 也必须从这里补面板。
+                        pending_interactions = ctl.interactions.clone();
                         sess.block_cache = None;
                     }
-                    // bootstrap 恢复挂起权限（详情取 timeline 工具卡，缺则占位）。
-                    // 只补不换：快照可能落后于实时事件，不许覆盖已有面板详情，也不许
-                    // 复活已解决的 id。
-                    for call_id in pending_permissions {
-                        if let Some(sess) = self.sessions.get_mut(&bootstrap_seed) {
-                            let panel = sess.permission_panel_for(&call_id);
-                            sess.restore_permission_from_snapshot(panel);
-                        }
+                    for interaction in pending_interactions {
+                        self.restore_pending_interaction(bootstrap_seed.clone(), interaction);
                     }
                     // v2 control 投影不携带 dashboard 快照（v1 领域 control state
                     // 才有），workspace 面板一律回退到 `session.dashboard` 拉取。
@@ -2075,6 +2172,81 @@ mod tests {
             running: false,
             workspace_id: None,
         }
+    }
+
+    #[tokio::test]
+    async fn bootstrap_restores_pending_ask_from_snapshot() {
+        let (mut app, _rx) = App::new_for_test();
+        app.sessions
+            .insert("seed".into(), SessionState::new("seed".into()));
+
+        let cursor = qaqh_client::ClientV2CursorToken::encode_snapshot(
+            &qaqh_client::ClientV2Cursor::snapshot("log-1", 1),
+        )
+        .expect("snapshot cursor");
+        let mut control = serde_json::to_value(qaqh_client::ClientV2ControlState::default())
+            .expect("control baseline");
+        control["interactions"] = serde_json::json!([{
+            "interaction_id": "int-ask-1",
+            "call_id": "call-ask-1",
+            "turn_id": "turn-1",
+            "kind": "ask",
+            "request": {
+                "kind": "inline",
+                "data": {
+                    "text": serde_json::json!({
+                        "kind": "ask",
+                        "mode": "single",
+                        "questions": [{
+                            "id": "q1",
+                            "question": "选哪个？",
+                            "options": ["甲", "乙"],
+                            "allow_custom": false
+                        }]
+                    }).to_string()
+                }
+            }
+        }]);
+        let bootstrap: qaqh_client::ClientV2Bootstrap = serde_json::from_value(serde_json::json!({
+            "schema": "qaqh.Ringing",
+            "version": 2,
+            "server_epoch": "epoch-1",
+            "seed": "seed",
+            "snapshot_cursor": cursor.as_str(),
+            "control": {
+                "channel": "control",
+                "state_revision": 1,
+                "snapshot_version": 1,
+                "state": control
+            },
+            "conversation": {
+                "channel": "conversation",
+                "state_revision": 1,
+                "snapshot_version": 1,
+                "state": serde_json::to_value(qaqh_client::ClientV2ConversationState::default())
+                    .expect("conversation baseline")
+            },
+            "tool": {
+                "channel": "tool",
+                "state_revision": 1,
+                "snapshot_version": 1,
+                "state": serde_json::to_value(qaqh_client::ClientV2ToolState::default())
+                    .expect("tool baseline")
+            }
+        }))
+        .expect("client bootstrap");
+
+        app.handle(AppMsg::Action(ActionResult::Bootstrap {
+            seed: "seed".into(),
+            result: Ok(bootstrap),
+        }));
+
+        let ask = app.sessions["seed"]
+            .pending_ask
+            .as_ref()
+            .expect("ask restored from bootstrap");
+        assert_eq!(ask.interaction_id, "int-ask-1");
+        assert_eq!(ask.questions[0].question, "选哪个？");
     }
 
     #[test]

@@ -108,6 +108,7 @@ impl App {
             .and_then(|s| s.pending_ask.as_ref())
             .map(|p| p.interaction_id.clone())
             .expect("panel");
+        self.suppressed_interactions.insert(interaction_id.clone());
         if let Some(sess) = self.sessions.get_mut(&seed) {
             sess.pending_ask = None;
         }
@@ -140,6 +141,7 @@ impl App {
         else {
             return;
         };
+        self.suppressed_interactions.insert(interaction_id.clone());
         if let Some(sess) = self.sessions.get_mut(&seed) {
             sess.pending_ask = None;
         }
@@ -160,6 +162,7 @@ impl App {
             .and_then(|s| s.pending_plan.as_ref());
         let Some(panel) = panel else { return };
         let interaction_id = panel.interaction_id.clone();
+        self.suppressed_interactions.insert(interaction_id.clone());
         let message = if approved {
             None
         } else {
@@ -192,6 +195,8 @@ impl App {
         else {
             return;
         };
+        self.suppressed_interactions
+            .insert(panel.tool_call_id.clone());
         if let Some(sess) = self.sessions.get_mut(&seed) {
             // 下架 + 记入已解决：应答之后补投的同 id 权限请求不再入队（防幽灵面板）。
             sess.resolve_permission(&panel.tool_call_id);
