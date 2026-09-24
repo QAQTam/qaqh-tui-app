@@ -11,7 +11,7 @@ use ratatui::widgets::{Block, Clear, Paragraph, Wrap};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::app::render_line::edit_window;
-use crate::app::settings::{FieldKind, ROWS, SettingsState};
+use crate::app::settings::{FieldKind, ROWS, SettingsHit, SettingsState};
 use crate::app::{App, Overlay};
 use crate::protocol::ConfigDto;
 use crate::theme::Theme;
@@ -339,11 +339,23 @@ fn draw_settings(f: &mut Frame, app: &App, area: Rect, theme: &Theme) {
         return;
     };
     let width = usize::from(area.width);
-    let (lines, row_lines) = settings_lines(state, app.config.as_ref(), width, theme);
+    let (mut lines, row_lines) = settings_lines(state, app.config.as_ref(), width, theme);
     let height = usize::from(area.height).max(1);
     let focus = state.focus.min(ROWS.len().saturating_sub(1));
     let focus_line = row_lines.get(focus).copied().unwrap_or(0);
     let scroll = focus_line.saturating_sub(height.saturating_sub(1));
+    for (index, line_index) in row_lines.iter().enumerate() {
+        let target = SettingsHit::Row(index);
+        let hovered = app.settings_hover == Some(target);
+        let pressed = app.settings_pressed == Some(target);
+        if (hovered || pressed)
+            && let Some(line) = lines.get_mut(*line_index)
+        {
+            *line = line
+                .clone()
+                .style(settings_row_style(hovered, pressed, theme));
+        }
+    }
     f.render_widget(
         Paragraph::new(lines)
             .wrap(Wrap { trim: false })
@@ -364,6 +376,51 @@ fn draw_settings(f: &mut Frame, app: &App, area: Rect, theme: &Theme) {
             }
         }
     }
+}
+
+fn settings_row_style(hovered: bool, pressed: bool, theme: &Theme) -> Style {
+    let surface = |color| {
+        if color == ratatui::style::Color::Reset {
+            Style::new().add_modifier(Modifier::REVERSED)
+        } else {
+            Style::new().bg(color)
+        }
+    };
+    if pressed {
+        surface(theme.surface.highlight).add_modifier(Modifier::BOLD)
+    } else if hovered {
+        surface(theme.surface.hover)
+    } else {
+        Style::new()
+    }
+}
+
+pub fn settings_hit_test(app: &App, area: Rect, column: u16, row: u16) -> Option<SettingsHit> {
+    let Some(Overlay::Settings(state)) = app.overlays.last() else {
+        return None;
+    };
+    if column < area.x
+        || column >= area.x.saturating_add(area.width)
+        || row < area.y
+        || row >= area.y.saturating_add(area.height)
+    {
+        return None;
+    }
+    let (_, row_lines) = settings_lines(
+        state,
+        app.config.as_ref(),
+        usize::from(area.width),
+        Theme::current(),
+    );
+    let focus = state.focus.min(ROWS.len().saturating_sub(1));
+    let focus_line = row_lines.get(focus).copied().unwrap_or(0);
+    let height = usize::from(area.height).max(1);
+    let scroll = focus_line.saturating_sub(height.saturating_sub(1));
+    let line = scroll.saturating_add(usize::from(row.saturating_sub(area.y)));
+    row_lines
+        .iter()
+        .position(|row_line| *row_line == line)
+        .map(SettingsHit::Row)
 }
 
 fn settings_lines(
@@ -878,6 +935,24 @@ mod tests {
         assert!(output.contains("/settings"));
         assert!(output.contains("/sessions"));
         assert!(output.contains("/workspace"));
+    }
+
+    #[test]
+    fn settings_hit_test_maps_visible_rows_to_focus_targets() {
+        let (mut app, _rx) = App::new_for_test();
+        app.overlays
+            .push(Overlay::Settings(SettingsState::default()));
+        let body = Rect::new(0, 1, 100, 22);
+
+        assert_eq!(
+            settings_hit_test(&app, body, 5, body.y + 1),
+            Some(SettingsHit::Row(0))
+        );
+        assert_eq!(
+            settings_hit_test(&app, body, 5, body.y),
+            None,
+            "section header is not clickable"
+        );
     }
 
     #[test]

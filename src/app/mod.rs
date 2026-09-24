@@ -553,7 +553,7 @@ pub fn prune_seed_bound_overlays(overlays: &mut Vec<Overlay>, seed: Option<&str>
     });
 }
 
-use self::settings::{FieldKind, SettingsState};
+use self::settings::{FieldKind, SettingsHit, SettingsState};
 
 /// 主循环帧统计（`QAQH_TUI_DEBUG=1` 展示）。
 ///
@@ -623,6 +623,9 @@ pub struct App {
     /// 鼠标**按下且未松开**的目标。松开时若仍命中同一目标才提交——
     /// 这是按钮的基本语义（按下后拖出去 = 取消）。
     pub modal_pressed: Option<ModalHit>,
+    /// 设置页鼠标悬停/按下目标；只在 Settings Workspace 生效。
+    pub settings_hover: Option<SettingsHit>,
+    pub settings_pressed: Option<SettingsHit>,
 
     pub toasts: VecDeque<Toast>,
     /// 新建会话的 command_id → 发起时间（等 causation_id 关联）。
@@ -745,6 +748,8 @@ impl App {
             stream_issues: StreamIssues::default(),
             modal_hover: None,
             modal_pressed: None,
+            settings_hover: None,
+            settings_pressed: None,
             toasts: VecDeque::new(),
             pending_creates: HashMap::new(),
             session_list_cache: Vec::new(),

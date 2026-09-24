@@ -215,6 +215,12 @@ pub struct EditBuffer {
     pub cursor: usize,
 }
 
+/// 设置页鼠标语义目标。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SettingsHit {
+    Row(usize),
+}
+
 /// 设置页 UI 状态。随 `Overlay::Settings` 持有，Esc 关闭即丢弃草稿（取消）。
 #[derive(Debug, Clone, Default)]
 pub struct SettingsState {

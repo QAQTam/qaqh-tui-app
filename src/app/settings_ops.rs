@@ -3,6 +3,31 @@
 use super::*;
 
 impl App {
+    /// 设置页鼠标点击一行：先聚焦，再执行与 Enter 相同的语义。
+    pub fn mouse_settings_row(&mut self, index: usize) {
+        let Some(Overlay::Settings(mut st)) = self.overlays.last().cloned() else {
+            return;
+        };
+        st.focus = index.min(settings::ROWS.len().saturating_sub(1));
+        st.editing = None;
+        let row = st.row();
+        match row.kind {
+            settings::FieldKind::Text
+            | settings::FieldKind::Secret
+            | settings::FieldKind::Number
+            | settings::FieldKind::Float => {
+                st.editing = st.start_edit(self.config.as_ref());
+            }
+            settings::FieldKind::Enum | settings::FieldKind::Toggle => {
+                if let Err(error) = st.cycle(self.config.as_ref(), 1) {
+                    self.toast(NoticeLevel::Error, error);
+                }
+            }
+            settings::FieldKind::Port => self.settings_port_activate(&mut st),
+        }
+        self.replace_overlay(Overlay::Settings(st));
+    }
+
     pub fn fetch_config(&mut self) {
         self.spawn_api(move |api, tx| async move {
             let result = api.query(QueryRequest::ConfigLoad).await;

@@ -331,13 +331,23 @@ fn handle_message(
                 let area = ratatui::layout::Rect::new(0, 0, size.width, size.height);
                 handle_fullscreen_agent_mouse(app, fullscreen_view, area, mouse);
             }
+            (_, ScreenRoute::Workspace(route::WorkspaceRoute::Settings)) => {
+                fullscreen_view.pointer.clear_pointer();
+                let size = terminal.terminal.size()?;
+                let area = ratatui::layout::Rect::new(0, 0, size.width, size.height);
+                handle_settings_mouse(app, area, mouse);
+            }
             (_, ScreenRoute::Modal(modal)) => {
                 fullscreen_view.pointer.clear_pointer();
                 let size = terminal.terminal.size()?;
                 let area = ratatui::layout::Rect::new(0, 0, size.width, size.height);
                 handle_modal_mouse(app, *modal, area, mouse);
             }
-            _ => fullscreen_view.pointer.clear_pointer(),
+            _ => {
+                fullscreen_view.pointer.clear_pointer();
+                app.settings_hover = None;
+                app.settings_pressed = None;
+            }
         }
         // inline 主界面不捕获鼠标；全屏 Workspace 本轮不接鼠标。
         return Ok(());
@@ -460,6 +470,35 @@ fn handle_fullscreen_agent_mouse(
                 app.scroll_bottom();
             }
             view.pointer.back_to_latest_pressed = false;
+        }
+        _ => {}
+    }
+}
+
+fn handle_settings_mouse(
+    app: &mut App,
+    area: ratatui::layout::Rect,
+    mouse: ratatui::crossterm::event::MouseEvent,
+) {
+    use crate::app::settings::SettingsHit;
+    use ratatui::crossterm::event::{MouseButton, MouseEventKind};
+
+    let hit = crate::ui::v2::workspace::settings_hit_test(app, area, mouse.column, mouse.row);
+    match mouse.kind {
+        MouseEventKind::Moved => app.settings_hover = hit,
+        MouseEventKind::Down(MouseButton::Left) => {
+            app.settings_hover = hit;
+            app.settings_pressed = hit;
+        }
+        MouseEventKind::Up(MouseButton::Left) => {
+            let pressed = app.settings_pressed.take();
+            app.settings_hover = hit;
+            if pressed.is_some()
+                && pressed == hit
+                && let Some(SettingsHit::Row(index)) = hit
+            {
+                app.mouse_settings_row(index);
+            }
         }
         _ => {}
     }
