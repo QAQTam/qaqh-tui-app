@@ -43,7 +43,7 @@ use crate::runtime::{Runtime, RuntimeMsg};
 use crate::terminal::transcript::PendingCommit;
 use crate::theme::Theme;
 use crate::ui::v2::adapter;
-use crate::ui::v2::fullscreen::{self, FullscreenState};
+use crate::ui::v2::fullscreen::{self, FullscreenState, MessageAction, MessageMenu};
 use crate::ui::v2::route::{self, ScreenRoute};
 use crate::ui::v2::runtime::V2TranscriptRuntime;
 use crate::ui::v2::transcript::{BlockKind, BlockState, TranscriptBlock, render_transcript};
@@ -238,6 +238,9 @@ async fn run_loop(
             break;
         }
         let route = route::resolve(app);
+        if terminal.mode == ScreenMode::Fullscreen && route != ScreenRoute::Agent {
+            fullscreen_view.close_menu();
+        }
         let size = terminal.terminal.size()?;
         let previous_size = terminal.last_terminal_size;
         let terminal_resized = terminal.note_terminal_size(size.width, size.height);
@@ -246,6 +249,7 @@ async fn run_loop(
             // 全屏 shell 自己渲染整张 transcript；resize 只交给 ratatui
             // autoresize，不再重建 inline viewport，也不 purge scrollback。
             if terminal_resized {
+                fullscreen_view.close_menu();
                 terminal.terminal.autoresize()?;
             }
         } else {
@@ -338,6 +342,21 @@ fn handle_message(
         // inline 主界面不捕获鼠标；全屏 Workspace 本轮不接鼠标。
         return Ok(());
     }
+    if terminal.mode == ScreenMode::Fullscreen
+        && *route == ScreenRoute::Agent
+        && fullscreen_view.menu.is_some()
+        && matches!(&msg, AppMsg::Paste(_))
+    {
+        return Ok(());
+    }
+    if terminal.mode == ScreenMode::Fullscreen
+        && *route == ScreenRoute::Agent
+        && fullscreen_view.menu.is_some()
+        && let AppMsg::Key(key) = &msg
+    {
+        handle_fullscreen_menu_key(app, fullscreen_view, key);
+        return Ok(());
+    }
     if let AppMsg::Key(key) = &msg
         && terminal.mode == ScreenMode::Fullscreen
         && *route == ScreenRoute::Agent
@@ -373,9 +392,46 @@ fn handle_fullscreen_agent_mouse(
 ) {
     use ratatui::crossterm::event::{MouseButton, MouseEventKind};
 
+    if view.menu.is_some() {
+        let hit = view.menu.as_ref().and_then(|menu| {
+            fullscreen::message_menu_hit_test(area, menu, mouse.column, mouse.row)
+        });
+        match mouse.kind {
+            MouseEventKind::Moved => {
+                if let Some(menu) = view.menu.as_mut() {
+                    menu.hover = hit;
+                }
+            }
+            MouseEventKind::Down(MouseButton::Left) => {
+                if hit.is_none() {
+                    view.close_menu();
+                    return;
+                }
+                if let Some(menu) = view.menu.as_mut() {
+                    menu.hover = hit;
+                    menu.pressed = hit;
+                }
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                let pressed = view.menu.as_mut().and_then(|menu| menu.pressed.take());
+                if let Some(menu) = view.menu.as_mut() {
+                    menu.hover = hit;
+                }
+                if pressed.is_some()
+                    && pressed == hit
+                    && let Some(action) = view.menu.as_ref().and_then(MessageMenu::activate)
+                {
+                    activate_message_action(app, view, action);
+                }
+            }
+            _ => {}
+        }
+        return;
+    }
+
     let show_back_to_latest =
         view.can_scroll() && !app.active_session().is_some_and(|s| s.scroll.follow);
-    let hit = || {
+    let hit_back_to_latest = || {
         show_back_to_latest
             .then(|| fullscreen::hit_test(area, mouse.column, mouse.row))
             .flatten()
@@ -385,15 +441,20 @@ fn handle_fullscreen_agent_mouse(
         MouseEventKind::ScrollUp => view.scroll_up(app, 3),
         MouseEventKind::ScrollDown => view.scroll_down(app, 3),
         MouseEventKind::Moved => {
-            view.pointer.back_to_latest_hover = hit().is_some();
+            view.pointer.back_to_latest_hover = hit_back_to_latest().is_some();
         }
         MouseEventKind::Down(MouseButton::Left) => {
-            let target = hit();
+            let target = hit_back_to_latest();
             view.pointer.back_to_latest_hover = target.is_some();
             view.pointer.back_to_latest_pressed = target.is_some();
+            if target.is_none()
+                && let Some(hit) = view.assistant_at(mouse.column, mouse.row)
+            {
+                view.open_menu(hit, mouse.column, mouse.row);
+            }
         }
         MouseEventKind::Up(MouseButton::Left) => {
-            let released = hit();
+            let released = hit_back_to_latest();
             view.pointer.back_to_latest_hover = released.is_some();
             if view.pointer.back_to_latest_pressed && released.is_some() {
                 app.scroll_bottom();
@@ -402,6 +463,85 @@ fn handle_fullscreen_agent_mouse(
         }
         _ => {}
     }
+}
+
+fn handle_fullscreen_menu_key(
+    app: &mut App,
+    view: &mut FullscreenView,
+    key: &ratatui::crossterm::event::KeyEvent,
+) {
+    use ratatui::crossterm::event::KeyModifiers;
+
+    match key.code {
+        KeyCode::Char('q' | 'c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            app.quit = true;
+        }
+        KeyCode::Up => {
+            if let Some(menu) = view.menu.as_mut() {
+                menu.move_selection(-1);
+            }
+        }
+        KeyCode::Down => {
+            if let Some(menu) = view.menu.as_mut() {
+                menu.move_selection(1);
+            }
+        }
+        KeyCode::Enter | KeyCode::Char('c') => {
+            if let Some(action) = view.menu.as_ref().and_then(MessageMenu::activate) {
+                activate_message_action(app, view, action);
+            }
+        }
+        KeyCode::Esc => view.close_menu(),
+        _ => {}
+    }
+}
+
+fn activate_message_action(app: &mut App, view: &mut FullscreenView, action: MessageAction) {
+    match action {
+        MessageAction::CopyMarkdown => {
+            let copied = view.menu.as_ref().and_then(|menu| {
+                assistant_markdown(app, &menu.turn_id, &menu.block_id).map(|markdown| {
+                    crate::terminal::clipboard::copy_osc52(&markdown)
+                        .map_err(|error| error.to_string())
+                })
+            });
+            match copied {
+                Some(Ok(())) => {
+                    app.toast(NoticeLevel::Info, "已复制 Markdown");
+                    view.close_menu();
+                }
+                Some(Err(error)) => {
+                    app.toast(NoticeLevel::Error, format!("复制失败：{error}"));
+                }
+                None => {
+                    app.toast(NoticeLevel::Error, "找不到可复制的助手正文");
+                    view.close_menu();
+                }
+            }
+        }
+        MessageAction::Retry | MessageAction::Fork => {}
+    }
+}
+
+fn assistant_markdown(app: &App, turn_id: &str, block_id: &str) -> Option<String> {
+    let session = app.active_session()?;
+    let turn = session
+        .timeline
+        .turns
+        .iter()
+        .find(|turn| turn.turn_id == turn_id)?;
+    let mut exact = None;
+    let mut all = Vec::new();
+    for block in turn.rounds.iter().flat_map(|round| &round.blocks) {
+        if block.kind != TimelineBlockKind::Text || block.text.trim().is_empty() {
+            continue;
+        }
+        all.push(block.text.as_str());
+        if block.block_id == block_id {
+            exact = Some(block.text.clone());
+        }
+    }
+    exact.or_else(|| (!all.is_empty()).then(|| all.join("\n\n")))
 }
 
 /// 弹窗里的鼠标：移动只改悬停；按下记目标；**松开且仍在同一目标上**才提交。
@@ -1152,6 +1292,9 @@ fn draw_fullscreen_agent(frame: &mut Frame, app: &App, theme: &Theme, view: &mut
     {
         fullscreen::draw_back_to_latest(frame, body, view.pointer, theme);
     }
+    if let Some(menu) = view.menu.as_ref() {
+        fullscreen::draw_message_menu(frame, area, menu, theme);
+    }
 }
 
 struct AgentRender {
@@ -1557,22 +1700,27 @@ fn render_fullscreen_agent(
 ) -> AgentRender {
     if app.active_session().is_none() {
         view.transcript.clear();
+        view.body_area = Rect::new(0, 0, width, height);
+        view.visible_start = 0;
         view.body_height = height;
+        view.close_menu();
         return render_brand(app, width, height, theme);
     }
 
     let area = Rect::new(0, 0, width, height.max(1));
     let (body_area, bottom_area) = fullscreen_layout(app, area, theme);
+    view.body_area = body_area;
     view.body_height = body_area.height;
     // 右侧固定留一列给滚动条，避免内容宽度在“出现/消失滚动条”时抖动。
     let history_width = body_area.width.saturating_sub(1).max(1);
-    let mut lines = render_fullscreen_history(
+    let (mut lines, visible_start) = render_fullscreen_history(
         app,
         history_width,
         body_area.height,
         theme,
         &mut view.transcript,
     );
+    view.visible_start = visible_start;
     while lines.len() < usize::from(body_area.height) {
         lines.push(Line::default());
     }
@@ -1717,7 +1865,51 @@ fn render_fullscreen_chrome(app: &App, width: u16, height: u16, theme: &Theme) -
 struct FullscreenView {
     pointer: FullscreenState,
     transcript: FullscreenTranscriptCache,
+    body_area: Rect,
+    visible_start: usize,
     body_height: u16,
+    menu: Option<MessageMenu>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AssistantHit {
+    turn_id: String,
+    block_id: String,
+}
+
+impl FullscreenView {
+    fn assistant_at(&self, column: u16, row: u16) -> Option<AssistantHit> {
+        if column < self.body_area.x
+            || column >= self.body_area.x.saturating_add(self.body_area.width)
+            || row < self.body_area.y
+            || row >= self.body_area.y.saturating_add(self.body_area.height)
+        {
+            return None;
+        }
+        let line = self
+            .visible_start
+            .saturating_add(usize::from(row.saturating_sub(self.body_area.y)));
+        self.transcript
+            .spans
+            .iter()
+            .find(|span| span.assistant && line >= span.start && line < span.end)
+            .map(|span| AssistantHit {
+                turn_id: span.turn_id.clone(),
+                block_id: span.block_id.clone(),
+            })
+    }
+
+    fn open_menu(&mut self, hit: AssistantHit, column: u16, row: u16) {
+        self.menu = Some(MessageMenu::new(
+            hit.turn_id,
+            hit.block_id,
+            Position::new(column, row),
+        ));
+    }
+
+    fn close_menu(&mut self) {
+        self.menu = None;
+    }
 }
 
 impl FullscreenView {
@@ -1781,9 +1973,19 @@ impl FullscreenView {
 struct FullscreenTranscriptCache {
     key: Option<FullscreenTranscriptKey>,
     blocks: HashMap<FullscreenBlockKey, Vec<Line<'static>>>,
+    spans: Vec<FullscreenBlockSpan>,
     lines: Vec<Line<'static>>,
     #[cfg(test)]
     render_misses: usize,
+}
+
+#[derive(Debug, Clone)]
+struct FullscreenBlockSpan {
+    turn_id: String,
+    block_id: String,
+    assistant: bool,
+    start: usize,
+    end: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1807,6 +2009,7 @@ impl FullscreenTranscriptCache {
     fn clear(&mut self) {
         self.key = None;
         self.blocks.clear();
+        self.spans.clear();
         self.lines.clear();
     }
 
@@ -1837,11 +2040,13 @@ impl FullscreenTranscriptCache {
             .collect();
 
         let mut used = HashSet::with_capacity(blocks.len());
+        let mut spans = Vec::with_capacity(blocks.len());
         let mut lines = Vec::new();
         for (index, block) in blocks.iter().enumerate() {
             if index > 0 {
                 lines.push(Line::default());
             }
+            let start = lines.len();
             let block_key = FullscreenBlockKey::from_block(block, width);
             used.insert(block_key.clone());
             let rendered = self.blocks.entry(block_key).or_insert_with(|| {
@@ -1852,8 +2057,16 @@ impl FullscreenTranscriptCache {
                 crate::ui::v2::transcript::render_block(block, usize::from(width), theme)
             });
             lines.extend(rendered.iter().cloned());
+            spans.push(FullscreenBlockSpan {
+                turn_id: block.turn_id.clone(),
+                block_id: block.id.to_string(),
+                assistant: matches!(block.kind, BlockKind::Assistant { .. }),
+                start,
+                end: lines.len(),
+            });
         }
         self.blocks.retain(|key, _| used.contains(key));
+        self.spans = spans;
         self.lines = lines;
         self.key = Some(key);
     }
@@ -1880,21 +2093,21 @@ fn render_fullscreen_history(
     height: u16,
     theme: &Theme,
     cache: &mut FullscreenTranscriptCache,
-) -> Vec<Line<'static>> {
+) -> (Vec<Line<'static>>, usize) {
     let Some(session) = app.active_session() else {
         cache.clear();
-        return Vec::new();
+        return (Vec::new(), 0);
     };
     let height = usize::from(height);
     if height == 0 {
-        return Vec::new();
+        return (Vec::new(), 0);
     }
 
     cache.sync(app, width, theme);
     let total = cache.lines.len();
     let top = crate::ui::viewport_top(total, height, session.scroll.follow, session.scroll.offset);
     let end = top.saturating_add(height).min(total);
-    cache.lines[top.min(total)..end].to_vec()
+    (cache.lines[top.min(total)..end].to_vec(), top)
 }
 
 /// 当前 open assistant 的未完成尾行。稳定行已经写进 scrollback，这里只画
@@ -3193,6 +3406,50 @@ mod tests {
     }
 
     #[test]
+    fn fullscreen_context_menu_renders_copy_and_disabled_actions() {
+        let mut app = app_with_model(model_with_sealed_answer());
+        app.show_workspace = false;
+        let theme = test_theme();
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).expect("fullscreen terminal");
+        let route = route::resolve(&app);
+        let mut view = FullscreenView {
+            menu: Some(MessageMenu::new(
+                "turn-1".into(),
+                "b1".into(),
+                Position::new(20, 5),
+            )),
+            ..Default::default()
+        };
+
+        terminal
+            .draw(|frame| {
+                draw(
+                    frame,
+                    &app,
+                    &theme,
+                    &route,
+                    ScreenMode::Fullscreen,
+                    &mut view,
+                )
+            })
+            .expect("draw context menu");
+
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        let compact: String = text.chars().filter(|ch| !ch.is_whitespace()).collect();
+        assert!(compact.contains("消息操作"), "{text}");
+        assert!(compact.contains("复制成Markdown"), "{text}");
+        assert!(compact.contains("重新回答"), "{text}");
+        assert!(compact.contains("从这里继续"), "{text}");
+    }
+
+    #[test]
     fn fullscreen_scroll_clamps_to_rendered_content() {
         let mut app = app_with_model(model_with_many_sealed_turns(30));
         app.show_workspace = false;
@@ -3258,6 +3515,34 @@ mod tests {
             cache.render_misses,
             before + 1,
             "only the changed block should render again"
+        );
+    }
+
+    #[test]
+    fn fullscreen_assistant_hit_uses_semantic_block_spans() {
+        let app = app_with_model(model_with_many_sealed_turns(3));
+        let theme = test_theme();
+        let mut view = FullscreenView::default();
+        view.transcript.sync(&app, 79, &theme);
+        view.body_area = Rect::new(0, 0, 80, 10);
+        view.visible_start = 0;
+
+        assert_eq!(view.assistant_at(2, 0), None, "row 0 is the user block");
+        assert_eq!(
+            view.assistant_at(2, 2),
+            Some(AssistantHit {
+                turn_id: "turn-0".into(),
+                block_id: "block-0".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn assistant_markdown_prefers_the_clicked_block() {
+        let app = app_with_model(model_with_many_sealed_turns(2));
+        assert_eq!(
+            assistant_markdown(&app, "turn-1", "block-1").as_deref(),
+            Some("answer-1")
         );
     }
 

@@ -8,6 +8,7 @@
 //! alpha1 起 Agent View 是默认 UI；Ringing 协议切换另行推进，当前仍走 v1。
 
 pub mod agent;
+pub mod clipboard;
 pub mod commit;
 pub mod inline;
 pub mod transcript;

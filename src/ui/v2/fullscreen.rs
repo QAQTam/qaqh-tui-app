@@ -5,7 +5,7 @@
 //! “按钮画在这里、点击命中在那里”。
 
 use ratatui::Frame;
-use ratatui::layout::{Alignment, Rect};
+use ratatui::layout::{Alignment, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
@@ -33,6 +33,87 @@ impl FullscreenState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Hit {
     BackToLatest,
+}
+
+/// 助手消息上的上下文动作。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MessageAction {
+    CopyMarkdown,
+    Retry,
+    Fork,
+}
+
+impl MessageAction {
+    pub const ALL: [Self; 3] = [Self::CopyMarkdown, Self::Retry, Self::Fork];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::CopyMarkdown => "复制成 Markdown",
+            Self::Retry => "重新回答",
+            Self::Fork => "从这里继续",
+        }
+    }
+
+    pub const fn glyph(self) -> &'static str {
+        match self {
+            Self::CopyMarkdown => "⧉",
+            Self::Retry => "↻",
+            Self::Fork => "⑂",
+        }
+    }
+
+    /// Retry/Fork 要等后端原子语义，先以禁用项固定菜单形状。
+    pub const fn enabled(self) -> bool {
+        matches!(self, Self::CopyMarkdown)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MessageMenu {
+    pub turn_id: String,
+    pub block_id: String,
+    pub selected: usize,
+    pub hover: Option<usize>,
+    pub pressed: Option<usize>,
+    pub anchor: Position,
+}
+
+impl MessageMenu {
+    pub fn new(turn_id: String, block_id: String, anchor: Position) -> Self {
+        Self {
+            turn_id,
+            block_id,
+            selected: 0,
+            hover: None,
+            pressed: None,
+            anchor,
+        }
+    }
+
+    pub fn selected_action(&self) -> MessageAction {
+        MessageAction::ALL[self.selected.min(MessageAction::ALL.len() - 1)]
+    }
+
+    pub fn move_selection(&mut self, delta: isize) {
+        let count = MessageAction::ALL.len();
+        let mut index = self.selected;
+        for _ in 0..count {
+            index = if delta < 0 {
+                (index + count - 1) % count
+            } else {
+                (index + 1) % count
+            };
+            if MessageAction::ALL[index].enabled() {
+                self.selected = index;
+                return;
+            }
+        }
+    }
+
+    pub fn activate(&self) -> Option<MessageAction> {
+        let action = self.selected_action();
+        action.enabled().then_some(action)
+    }
 }
 
 /// “回到最新消息”按钮的矩形。渲染与 hit-test 必须共用。
@@ -109,6 +190,105 @@ pub fn draw_back_to_latest(frame: &mut Frame, area: Rect, state: FullscreenState
         Paragraph::new(Line::from(Span::styled(label, style))).alignment(Alignment::Center),
         inner,
     );
+}
+
+const MENU_WIDTH: u16 = 34;
+
+fn message_menu_rect(area: Rect, anchor: Position) -> Rect {
+    let height = MessageAction::ALL.len() as u16 + 2;
+    let width = MENU_WIDTH.min(area.width.max(1)).max(8);
+    let max_x = area.x.saturating_add(area.width.saturating_sub(width));
+    let max_y = area
+        .y
+        .saturating_add(area.height.saturating_sub(height.min(area.height)));
+    let x = anchor.x.saturating_add(1).min(max_x).max(area.x);
+    let y = anchor.y.saturating_add(1).min(max_y).max(area.y);
+    Rect::new(x, y, width, height.min(area.height))
+}
+
+pub fn message_menu_hit_test(
+    area: Rect,
+    menu: &MessageMenu,
+    column: u16,
+    row: u16,
+) -> Option<usize> {
+    let rect = message_menu_rect(area, menu.anchor);
+    let inner_x = rect.x.saturating_add(1);
+    let inner_y = rect.y.saturating_add(1);
+    let inner_width = rect.width.saturating_sub(2);
+    if column < inner_x
+        || column >= inner_x.saturating_add(inner_width)
+        || row < inner_y
+        || row >= rect.y.saturating_add(rect.height).saturating_sub(1)
+    {
+        return None;
+    }
+    let index = usize::from(row.saturating_sub(inner_y));
+    MessageAction::ALL
+        .get(index)
+        .filter(|action| action.enabled())
+        .map(|_| index)
+}
+
+pub fn draw_message_menu(frame: &mut Frame, area: Rect, menu: &MessageMenu, theme: &Theme) {
+    let rect = message_menu_rect(area, menu.anchor);
+    frame.render_widget(Clear, rect);
+    frame.render_widget(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::new().fg(theme.chrome.border))
+            .style(Style::new().bg(theme.surface.base).fg(theme.text.primary))
+            .title(Span::styled(
+                " 消息操作 ",
+                Style::new().fg(theme.text.secondary),
+            )),
+        rect,
+    );
+
+    let inner = Rect::new(
+        rect.x.saturating_add(1),
+        rect.y.saturating_add(1),
+        rect.width.saturating_sub(2),
+        rect.height.saturating_sub(2),
+    );
+    for (index, action) in MessageAction::ALL.iter().enumerate() {
+        let hovered = menu.hover == Some(index);
+        let pressed = menu.pressed == Some(index);
+        let selected = menu.selected == index;
+        let style = if !action.enabled() {
+            Style::new().fg(theme.text.dim)
+        } else if pressed {
+            button_style(true, true, theme)
+        } else if hovered || selected {
+            button_style(true, false, theme).fg(theme.text.bright)
+        } else {
+            Style::new().fg(theme.text.primary)
+        };
+        let marker = if selected && action.enabled() {
+            "▸"
+        } else {
+            " "
+        };
+        let suffix = if action.enabled() {
+            ""
+        } else {
+            "  · 待后端"
+        };
+        let line = Line::from(vec![
+            Span::styled(format!(" {marker} {} ", action.glyph()), style),
+            Span::styled(action.label(), style),
+            Span::styled(suffix, Style::new().fg(theme.text.dim)),
+        ]);
+        frame.render_widget(
+            Paragraph::new(line).style(style),
+            Rect::new(
+                inner.x,
+                inner.y.saturating_add(index as u16),
+                inner.width,
+                1,
+            ),
+        );
+    }
 }
 
 /// 右侧滚动条。无内容可滚时完全隐藏，不占视觉注意力。
@@ -226,5 +406,37 @@ mod tests {
         let (top, height) = scrollbar_thumb(100, 50, 20, 25);
         assert_eq!(height, 10);
         assert_eq!(top, 5);
+    }
+
+    #[test]
+    fn message_menu_hit_only_returns_enabled_rows() {
+        let area = Rect::new(0, 0, 80, 24);
+        let menu = MessageMenu::new("turn".into(), "block".into(), Position::new(10, 5));
+        let rect = message_menu_rect(area, menu.anchor);
+
+        assert_eq!(
+            message_menu_hit_test(area, &menu, rect.x + 2, rect.y + 1),
+            Some(0)
+        );
+        assert_eq!(
+            message_menu_hit_test(area, &menu, rect.x + 2, rect.y + 2),
+            None,
+            "retry is disabled"
+        );
+        assert_eq!(
+            message_menu_hit_test(area, &menu, rect.x + 2, rect.y + 3),
+            None,
+            "fork is disabled"
+        );
+    }
+
+    #[test]
+    fn message_menu_selection_skips_disabled_actions() {
+        let mut menu = MessageMenu::new("turn".into(), "block".into(), Position::new(0, 0));
+        assert_eq!(menu.selected_action(), MessageAction::CopyMarkdown);
+        menu.move_selection(1);
+        assert_eq!(menu.selected_action(), MessageAction::CopyMarkdown);
+        menu.move_selection(-1);
+        assert_eq!(menu.selected_action(), MessageAction::CopyMarkdown);
     }
 }
