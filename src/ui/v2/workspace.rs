@@ -58,12 +58,13 @@ fn header_line(route: &WorkspaceRoute, app: &App, theme: &Theme) -> Line<'static
     let (title, meta) = match route {
         WorkspaceRoute::Sessions { show_archived, .. } => (
             "Sessions",
-            if *show_archived {
-                "含归档"
+            if let Some(cwd) = app.session_cwd_filter.as_deref() {
+                format!("当前 cwd · {}", crate::app::truncate_str(cwd, 48))
+            } else if *show_archived {
+                "含归档".to_owned()
             } else {
-                "活动会话"
-            }
-            .to_owned(),
+                "活动会话".to_owned()
+            },
         ),
         WorkspaceRoute::Settings => ("Settings", "daemon 配置".to_owned()),
         WorkspaceRoute::Help => ("Help", "按键与斜杠命令".to_owned()),
@@ -139,11 +140,10 @@ fn draw_sessions(
     show_archived: bool,
     theme: &Theme,
 ) {
-    let entries: Vec<_> = app
-        .session_list_cache
+    let indices = app.filtered_sessions(show_archived);
+    let entries: Vec<_> = indices
         .iter()
-        .filter(|m| show_archived || !m.meta.archived)
-        .filter(|m| !m.meta.ephemeral)
+        .filter_map(|index| app.session_list_cache.get(*index))
         .collect();
     let height = usize::from(area.height);
     let selected = selected.min(entries.len().saturating_sub(1));

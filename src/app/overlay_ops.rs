@@ -70,13 +70,33 @@ impl App {
     }
 
     /// 会话列表的过滤谓词（与渲染一致）。
-    pub(super) fn filtered_sessions(&self, show_archived: bool) -> Vec<usize> {
+    pub(crate) fn filtered_sessions(&self, show_archived: bool) -> Vec<usize> {
         self.session_list_cache
             .iter()
             .enumerate()
             .filter(|(_, m)| (show_archived || !m.meta.archived) && !m.meta.ephemeral)
+            .filter(|(_, m)| self.session_matches_cwd_filter(m))
             .map(|(i, _)| i)
             .collect()
+    }
+
+    /// `resume` 模式只显示当前 cwd 及其子目录下的会话。
+    fn session_matches_cwd_filter(&self, entry: &SessionListEntry) -> bool {
+        let Some(filter) = self.session_cwd_filter.as_deref() else {
+            return true;
+        };
+        let Some(cwd) = entry.meta.cwd.as_deref() else {
+            return false;
+        };
+
+        fn trim_trailing_separators(path: &str) -> &str {
+            let trimmed = path.trim_end_matches(['/', '\\']);
+            if trimmed.is_empty() { path } else { trimmed }
+        }
+
+        let filter = trim_trailing_separators(filter);
+        let cwd = trim_trailing_separators(cwd);
+        std::path::Path::new(cwd).starts_with(std::path::Path::new(filter))
     }
 
     /// 首页（无 tab 时）按键：复用会话列表的导航，视觉更直接

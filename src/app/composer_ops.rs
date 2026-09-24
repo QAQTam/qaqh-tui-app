@@ -246,6 +246,65 @@ impl App {
         self.new_session_with_cwd(Some(cwd));
     }
 
+    /// 品牌首屏输入框按键：复用 [`Composer`] 的编辑语义，但发送动作先走
+    /// [`Self::start_draft_conversation`]，由 `SessionCreate` 落成后再发消息。
+    pub(super) fn draft_key(&mut self, key: KeyEvent) {
+        use ratatui::crossterm::event::{KeyCode, KeyModifiers};
+        if !self.pending_creates.is_empty() {
+            return;
+        }
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let alt = key.modifiers.contains(KeyModifiers::ALT);
+        match key.code {
+            KeyCode::Enter if alt => {
+                self.draft_composer.insert('\n');
+            }
+            KeyCode::Char('j') if ctrl => self.draft_composer.insert('\n'),
+            KeyCode::Enter => self.start_draft_conversation(),
+            KeyCode::Esc => self.draft_composer.clear(),
+            KeyCode::Backspace => {
+                if ctrl {
+                    self.draft_composer.word_left();
+                    let cursor = self.draft_composer.cursor;
+                    self.draft_composer.input.truncate(cursor);
+                } else {
+                    self.draft_composer.backspace();
+                }
+            }
+            KeyCode::Delete => self.draft_composer.delete(),
+            KeyCode::Left => {
+                if ctrl {
+                    self.draft_composer.word_left();
+                } else {
+                    self.draft_composer.left();
+                }
+            }
+            KeyCode::Right => {
+                if ctrl {
+                    self.draft_composer.word_right();
+                } else {
+                    self.draft_composer.right();
+                }
+            }
+            KeyCode::Home => self.draft_composer.home(),
+            KeyCode::End => self.draft_composer.end(),
+            KeyCode::Char('u') if ctrl => self.draft_composer.clear(),
+            KeyCode::Char('k') if ctrl => {
+                let cursor = self.draft_composer.cursor;
+                self.draft_composer.input.truncate(cursor);
+            }
+            KeyCode::Char('w') if ctrl => {
+                self.draft_composer.word_left();
+                let cursor = self.draft_composer.cursor;
+                self.draft_composer.input.truncate(cursor);
+            }
+            KeyCode::Char(c) if !ctrl && !alt => {
+                self.draft_composer.insert(c);
+            }
+            _ => {}
+        }
+    }
+
     /// Composer 按键。
     pub(super) fn composer_key(&mut self, key: KeyEvent) {
         use ratatui::crossterm::event::{KeyCode, KeyModifiers};

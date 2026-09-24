@@ -34,7 +34,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::app::session::SessionState;
 use crate::app::timeline_model::Turn;
-use crate::app::{App, AppMsg, ConnPhase, ModalHit, Overlay};
+use crate::app::{App, AppMsg, ConnPhase, ModalHit, Overlay, StartupIntent};
 use crate::runtime::{Runtime, RuntimeMsg};
 use crate::terminal::transcript::PendingCommit;
 use crate::theme::Theme;
@@ -55,7 +55,7 @@ const NARROW_VIEWPORT_WIDTH: u16 = 40;
 const VIEWPORT_HEIGHT_PERCENT: u16 = 60;
 
 /// 启动真实 V2 Agent View。
-pub async fn run(no_spawn: bool) -> Result<()> {
+pub async fn run(no_spawn: bool, resume: bool) -> Result<()> {
     let (app_tx, mut app_rx) = mpsc::unbounded_channel::<AppMsg>();
     let (rt_tx, mut rt_rx) = mpsc::unbounded_channel::<RuntimeMsg>();
     {
@@ -77,6 +77,16 @@ pub async fn run(no_spawn: bool) -> Result<()> {
     // V2 的 F4/Workspace 是 alternate-screen 工作区，不再复用 v1 常驻 sidebar。
     app.show_workspace = false;
     app.fetch_session_list();
+    if resume {
+        app.startup_intent = StartupIntent::Resume;
+        app.session_cwd_filter = app.initial_cwd.clone().map(|cwd| {
+            std::fs::canonicalize(&cwd)
+                .ok()
+                .map(|path| path.to_string_lossy().into_owned())
+                .unwrap_or(cwd)
+        });
+        app.open_session_list();
+    }
     let theme = Theme::current();
     let initial_height = initial_inline_height(&app, theme);
     let mut terminal = TerminalHost::init(initial_height);
@@ -790,13 +800,119 @@ fn inline_viewport_height(app: &App, width: u16, terminal_height: u16, theme: &T
     let max_height = ratio_height.min(terminal_height).max(1);
 
     if app.active_session().is_none() {
-        return max_height.clamp(1, 3);
+        // 普通启动要容纳品牌标识、输入框和提示；`resume` 首帧就是全屏
+        // Workspace，inline 高度只需要一个安全占位。
+        let desired = if app.startup_intent == StartupIntent::New {
+            14
+        } else {
+            3
+        };
+        return desired.min(max_height).max(1);
     }
 
     u16::try_from(agent_layout(app, width, max_height, theme).height())
         .unwrap_or(u16::MAX)
         .min(max_height)
         .max(1)
+}
+
+/// 普通启动的品牌首屏：品牌标识 + 输入框 + 一行状态提示。
+///
+/// 这里不预造 session，也不写 scrollback；`Enter` 由 app 层转成
+/// `SessionCreate`，首条消息在 seed 确认后补发。
+fn render_brand(app: &App, width: u16, height: u16, theme: &Theme) -> AgentRender {
+    let height = usize::from(height.max(1));
+    let width = usize::from(width.max(1));
+    let mut lines = brand_lines(width, theme);
+
+    let box_width = width;
+    let inner_width = box_width.saturating_sub(4).max(1);
+    let composer = composer_lines(
+        &app.draft_composer.input,
+        app.draft_composer.cursor,
+        u16::try_from(inner_width).unwrap_or(u16::MAX),
+        theme,
+        3,
+    );
+    let border_style = Style::new().fg(theme.chrome.border);
+    let composer_start = lines.len();
+    lines.push(Line::from(Span::styled(
+        format!("╭{}╮", "─".repeat(box_width.saturating_sub(2))),
+        border_style,
+    )));
+    for line in composer.lines {
+        let mut spans = Vec::with_capacity(line.spans.len() + 2);
+        spans.push(Span::styled("│ ".to_string(), border_style));
+        spans.extend(line.spans);
+        spans.push(Span::styled(" │".to_string(), border_style));
+        lines.push(Line::from(spans));
+    }
+    lines.push(Line::from(Span::styled(
+        format!("╰{}╯", "─".repeat(box_width.saturating_sub(2))),
+        border_style,
+    )));
+    lines.push(Line::default());
+
+    let hint = if !app.pending_creates.is_empty() {
+        " 正在创建会话…"
+    } else {
+        " Enter 开始 · Alt+Enter 换行 · Ctrl+L 会话 · F1 帮助 · Ctrl+Q 退出"
+    };
+    lines.push(Line::from(Span::styled(
+        hint,
+        Style::new().fg(theme.text.dim),
+    )));
+    lines.truncate(height);
+
+    let cursor_y = composer_start
+        .saturating_add(1)
+        .saturating_add(composer.cursor_row);
+    let cursor_x = 2u16.saturating_add(composer.cursor_x);
+    let cursor = (cursor_y < height && usize::from(cursor_x) < width)
+        .then_some(Position::new(cursor_x, cursor_y as u16));
+    AgentRender { lines, cursor }
+}
+
+fn brand_lines(width: usize, theme: &Theme) -> Vec<Line<'static>> {
+    let accent = Style::new()
+        .fg(theme.accent.assistant)
+        .add_modifier(ratatui::style::Modifier::BOLD);
+    let muted = Style::new().fg(theme.text.dim);
+    if width < 40 {
+        return vec![
+            Line::from(Span::styled("  QAQH", accent)),
+            Line::from(Span::styled("  QAQ-Harness Terminal", muted)),
+            Line::default(),
+        ];
+    }
+
+    const ART: [&str; 6] = [
+        "  ██████╗  █████╗  ██████╗ ██╗  ██╗",
+        " ██╔═══██╗██╔══██╗██╔═══██╗██║  ██║",
+        " ██║   ██║███████║██║   ██║███████║",
+        " ██║   ██║██╔══██║██║   ██║██╔══██║",
+        " ╚██████╔╝██║  ██║╚██████╔╝██║  ██║",
+        "  ╚═════╝ ╚═╝  ╚═╝ ╚═════╝ ╚═╝  ╚═╝",
+    ];
+    let mut lines: Vec<Line<'static>> = ART
+        .into_iter()
+        .map(|text| centered_line(text, width, accent))
+        .collect();
+    lines.push(centered_line(
+        "Q A Q - H A R N E S S   ·   T E R M I N A L",
+        width,
+        muted,
+    ));
+    lines.push(Line::default());
+    lines
+}
+
+fn centered_line(text: &str, width: usize, style: Style) -> Line<'static> {
+    let padding = width.saturating_sub(text.width()) / 2;
+    Line::from(Span::styled(
+        format!("{}{}", " ".repeat(padding), text),
+        style,
+    ))
 }
 
 fn session_is_working(session: &SessionState) -> bool {
@@ -911,30 +1027,10 @@ fn composer_visual_rows(
 }
 
 fn render_agent(app: &App, width: u16, height: u16, theme: &Theme) -> AgentRender {
-    let height = usize::from(height.max(1));
     let Some(session) = app.active_session() else {
-        // 空态也要给「在途 create」一个可见信号：新会话靠列表兜底发现（约一个
-        // 刷新节拍），中间这段如果什么都不显示，用户会以为 Ctrl+N 没生效而
-        // 反复按 —— 每按一次就真的多建一个会话（实测过）。
-        let hint = if app.pending_creates.is_empty() {
-            " Ctrl+N 新建会话 · Ctrl+L 会话列表 · F1 帮助 · Ctrl+Q 退出"
-        } else {
-            " 正在创建会话…"
-        };
-        let mut lines = vec![
-            Line::from(Span::styled(
-                " QAQH Agent View",
-                Style::new().fg(theme.accent.assistant),
-            )),
-            Line::default(),
-            Line::from(Span::styled(hint, Style::new().fg(theme.text.dim))),
-        ];
-        lines.truncate(height);
-        return AgentRender {
-            lines,
-            cursor: None,
-        };
+        return render_brand(app, width, height, theme);
     };
+    let height = usize::from(height.max(1));
 
     let layout = agent_layout(app, width, u16::try_from(height).unwrap_or(u16::MAX), theme);
 
@@ -1797,6 +1893,39 @@ mod tests {
         let rendered = render_agent(&app, 20, 8, &test_theme());
         let cursor = rendered.cursor.expect("composer cursor");
         assert!(cursor.y < 8);
+    }
+
+    #[test]
+    fn brand_page_renders_draft_input_box_and_cursor() {
+        let (mut app, _rx) = App::new_for_test();
+        app.draft_composer.insert_str("hello 世界");
+        let rendered = render_agent(&app, 80, 14, &test_theme());
+        let text: String = rendered
+            .lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .map(|span| span.content.as_ref())
+            .collect();
+
+        assert!(text.contains("Q A Q"), "{text}");
+        assert!(text.contains("hello 世界"), "{text}");
+        assert!(text.contains('╭'), "{text}");
+        assert!(
+            rendered.cursor.is_some(),
+            "draft composer must expose cursor"
+        );
+        assert!(rendered.lines.len() <= 14);
+    }
+
+    #[test]
+    fn brand_page_gets_more_than_old_three_row_empty_state() {
+        let (app, _rx) = App::new_for_test();
+        let height = inline_viewport_height(&app, 80, 40, &test_theme());
+        assert!(
+            height > 3,
+            "brand page needs room for logo + input: {height}"
+        );
+        assert!(height <= MAX_VIEWPORT_HEIGHT);
     }
 
     #[test]

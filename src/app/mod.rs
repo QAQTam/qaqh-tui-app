@@ -50,7 +50,7 @@ use qaqh_client::{
 use qaqh_client::{RingingCommandState as CommandState, RingingCommandStatus};
 use qaqh_client::{SessionActivity, SessionListEntry};
 use session::{
-    AskPanel, PermissionPanel, PlanPanel, SessionState, StreamPhase, streaming_done,
+    AskPanel, Composer, PermissionPanel, PlanPanel, SessionState, StreamPhase, streaming_done,
     sync_streaming_from_timeline,
 };
 
@@ -318,6 +318,16 @@ impl ConnPhase {
             other => other.clone(),
         }
     }
+}
+
+/// 进程启动意图。
+///
+/// `New` 显示品牌首屏，用户提交后才创建会话；`Resume` 直接进入当前 cwd 的
+/// 会话列表，不在首屏做任何隐式会话创建。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StartupIntent {
+    New,
+    Resume,
 }
 
 /// 「当前有哪些流在告警」的账本：流身份 → 最近一条告警文案。
@@ -617,6 +627,13 @@ pub struct App {
     pub pending_creates: HashMap<String, Instant>,
     pub session_list_cache: Vec<SessionListEntry>,
     pub session_list_at: Option<Instant>,
+    /// `qaqh-tui resume` 的当前 cwd 过滤；普通启动为 `None`。
+    pub session_cwd_filter: Option<String>,
+    /// 无活动会话时的品牌首屏输入框。提交后才创建会话。
+    pub draft_composer: Composer,
+    /// 品牌首屏提交的首条消息：等 `SessionCreate` 落成后自动发送。
+    pub pending_initial_prompt: Option<String>,
+    pub startup_intent: StartupIntent,
     pub activity_cache: HashMap<String, ActivityState>,
     dashboard_fetching: HashSet<String>,
     /// config.load 的 typed 快照（ConfigDto 镜像；ConfigChanged 到达时重拉）。
@@ -728,6 +745,10 @@ impl App {
             pending_creates: HashMap::new(),
             session_list_cache: Vec::new(),
             session_list_at: None,
+            session_cwd_filter: None,
+            draft_composer: Composer::default(),
+            pending_initial_prompt: None,
+            startup_intent: StartupIntent::New,
             activity_cache: HashMap::new(),
             dashboard_fetching: HashSet::new(),
             config: None,
@@ -841,6 +862,10 @@ impl App {
                     buf.cursor += 1;
                 }
             }
+            return;
+        }
+        if self.overlays.is_empty() && self.tabs.is_empty() {
+            self.draft_composer.insert_str(&text);
             return;
         }
         if self.inspecting() {
@@ -1091,6 +1116,7 @@ impl App {
                             && self.pending_creates.remove(&cid).is_some()
                         {
                             self.open_session_tab(&seed);
+                            self.consume_pending_initial_prompt();
                             self.toast(NoticeLevel::Info, format!("新会话已创建 {seed}"));
                         }
                     }
@@ -1612,6 +1638,9 @@ impl App {
                             &ack,
                             is_create,
                         );
+                        if is_create && let Some(text) = self.pending_initial_prompt.take() {
+                            self.draft_composer.insert_str(&text);
+                        }
                         self.toast(NoticeLevel::Error, msg.clone());
                         if let Some(seed) = seed
                             && let Some(sess) = self.sessions.get_mut(&seed)
@@ -1647,6 +1676,7 @@ impl App {
                     if !self.tabs.contains(&seed) {
                         self.open_session_tab(&seed);
                         self.pending_creates.clear();
+                        self.consume_pending_initial_prompt();
                         self.toast(NoticeLevel::Info, format!("新会话已创建 {seed}"));
                     }
                 }
@@ -1859,7 +1889,11 @@ impl App {
                 return;
             }
             Some(GlobalKey::NewSession) => {
-                self.new_session();
+                if self.tabs.is_empty() && self.startup_intent == StartupIntent::New {
+                    self.start_draft_conversation();
+                } else {
+                    self.new_session();
+                }
                 return;
             }
             Some(GlobalKey::ThinkingOverlay) => {
@@ -1949,9 +1983,18 @@ impl App {
             return;
         }
 
-        // 首页（无 tab 且无覆盖层时，会话列表即首页）
-        if self.tabs.is_empty() && self.home_key(key) {
-            return;
+        // 首页（无 tab 且无覆盖层时）。
+        //
+        // 普通启动的品牌首屏把按键全部交给 draft composer：用户输入第一句后
+        // 才创建会话，不再要求先按 Ctrl+N。`resume` 的列表关闭后也回到同一输入框。
+        if self.tabs.is_empty() {
+            if self.overlays.is_empty() {
+                self.draft_key(key);
+                return;
+            }
+            if self.home_key(key) {
+                return;
+            }
         }
 
         // Composer。
@@ -2093,6 +2136,65 @@ mod tests {
             running: false,
             workspace_id: None,
         }
+    }
+
+    fn list_entry_with_cwd(seed: &str, cwd: Option<&str>) -> SessionListEntry {
+        SessionListEntry {
+            meta: SessionMeta {
+                seed: seed.to_string(),
+                cwd: cwd.map(str::to_owned),
+                ..SessionMeta::default()
+            },
+            running: false,
+            workspace_id: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn draft_enter_queues_first_prompt_before_create() {
+        let (mut app, _rx) = App::new_for_test();
+        app.draft_composer.insert_str("第一句");
+        app.handle(AppMsg::Key(KeyEvent::new(
+            ratatui::crossterm::event::KeyCode::Enter,
+            ratatui::crossterm::event::KeyModifiers::NONE,
+        )));
+
+        assert!(app.draft_composer.is_empty());
+        assert_eq!(app.pending_initial_prompt.as_deref(), Some("第一句"));
+        assert_eq!(app.pending_creates.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn pending_initial_prompt_is_consumed_when_create_lands() {
+        let (mut app, _rx) = App::new_for_test();
+        app.pending_initial_prompt = Some("hello".into());
+        app.pending_creates
+            .insert("cmd-create".into(), Instant::now());
+
+        app.handle(AppMsg::Action(ActionResult::SessionList(Ok(vec![
+            list_entry("new-seed", 200),
+        ]))));
+
+        assert_eq!(app.tabs, vec!["new-seed".to_string()]);
+        assert!(app.pending_initial_prompt.is_none());
+        assert!(
+            app.sessions["new-seed"].composer.is_empty(),
+            "首条消息应已交给发送路径，不再滞留在 composer"
+        );
+    }
+
+    #[test]
+    fn resume_cwd_filter_keeps_current_directory_tree_only() {
+        let (mut app, _rx) = App::new_for_test();
+        app.session_list_cache = vec![
+            list_entry_with_cwd("a", Some("/work/project")),
+            list_entry_with_cwd("b", Some("/work/project/sub")),
+            list_entry_with_cwd("c", Some("/work/other")),
+            list_entry_with_cwd("d", None),
+        ];
+        app.session_cwd_filter = Some("/work/project".into());
+
+        assert_eq!(app.filtered_sessions(false), vec![0, 1]);
     }
 
     /// 新建会话的**兜底发现**回归锁。

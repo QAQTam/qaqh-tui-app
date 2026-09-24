@@ -108,6 +108,7 @@ fn main() -> Result<()> {
             println!();
             println!("用法:");
             println!("  qaqh-tui            连接本地 daemon 并进入 TUI");
+            println!("  qaqh-tui resume     直接浏览当前 cwd 下的会话");
             println!("  qaqh-tui --no-spawn 不自动拉起 daemon（仅连接已有实例）");
             println!("  qaqh-tui --v2-inline 启动 V2 inline 原型（实验，不连接 daemon）");
             println!("  qaqh-tui --v2-agent 显式选择 V2 Agent View（alpha1 起已是默认）");
@@ -123,11 +124,16 @@ fn main() -> Result<()> {
         _ => {}
     }
 
-    let mode = select_startup_mode(
-        &args,
-        std::env::var_os("QAQH_V2_AGENT").is_some(),
-        std::env::var_os("QAQH_V2_INLINE").is_some(),
-    );
+    let resume = args.iter().any(|arg| arg == "resume");
+    let mode = if resume {
+        StartupMode::V2Agent
+    } else {
+        select_startup_mode(
+            &args,
+            std::env::var_os("QAQH_V2_AGENT").is_some(),
+            std::env::var_os("QAQH_V2_INLINE").is_some(),
+        )
+    };
 
     if mode == StartupMode::V2Inline {
         // V2-M1 隔离原型：不连接 daemon、不进入 alternate screen。
@@ -141,6 +147,7 @@ fn main() -> Result<()> {
     match mode {
         StartupMode::V2Agent => runtime.block_on(terminal::agent::run(
             !args.iter().any(|arg| arg == "--no-spawn"),
+            resume,
         )),
         StartupMode::V1 => runtime.block_on(run_tui(args.iter().any(|a| a == "--no-spawn"))),
         StartupMode::V2Inline => unreachable!("handled before runtime construction"),
