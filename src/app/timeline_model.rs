@@ -809,6 +809,19 @@ impl TimelineModel {
             .find(|t| t.turn_id == turn_id)
             .map(|t| t.is_streaming())
     }
+
+    /// 按 `tool_call_id` 在窗口内找工具卡（v2 permission 交互的面板详情来源）。
+    pub fn tool_card(&self, call_id: &str) -> Option<&ToolCard> {
+        self.turns.iter().find_map(|turn| {
+            turn.rounds.iter().find_map(|round| {
+                round
+                    .blocks
+                    .iter()
+                    .filter_map(|block| block.tool.as_ref())
+                    .find(|card| card.tool_call_id == call_id)
+            })
+        })
+    }
 }
 
 #[cfg(test)]

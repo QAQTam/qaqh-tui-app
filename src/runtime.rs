@@ -23,12 +23,12 @@ use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use qaqh_client::{
-    Channel as WireChannel, ChannelStatus, Client, ClientError, ClientHandlers, ClientOptions,
-    ReconnectReason, TimelineStatus,
+    Client, ClientError, ClientHandlers, ClientOptions, ReconnectReason, TimelineStatus,
+    V2StreamStatus,
 };
 use tokio::sync::mpsc;
 
-use qaqh_client::RingingEventEnvelope;
+use qaqh_client::ClientV2Event;
 use qaqh_client::{TimelineEntry, TimelinePage};
 
 /// timeline 翻页窗口（`request_rebaseline` / `load_older` 使用）。
@@ -64,8 +64,8 @@ const ATTACH_RETRY_ATTEMPTS: u32 = 75; // ≈30s
 /// 成功，不能把前者的告警当成「一切正常」清掉（反向顺序下文案也会串成后者）。
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum StreamKey {
-    /// 主频道 SSE 流（control / conversation / tool）。
-    Channel(WireChannel),
+    /// 某个 seed 的 canonical v2 单流（control / conversation / tool / … 全在一条上）。
+    V2(String),
     /// 某个 seed 的 timeline 流。
     Timeline(String),
 }
@@ -94,10 +94,19 @@ pub enum ConnEvent {
 #[derive(Debug)]
 pub enum RuntimeMsg {
     Conn(ConnEvent),
-    /// 一条已过桥的事件。频道不另存字段——`env.channel()` 即是权威来源，
-    /// 再存一份只会有漂移的机会。
-    Ringing {
-        env: Box<RingingEventEnvelope>,
+    /// 一条 canonical v2 投影事件（每 seed 一条单流）。
+    V2Event {
+        seed: String,
+        event: Box<ClientV2Event>,
+    },
+    /// v2 单流刚建立（或重连成功）：app 必须重新 bootstrap 该会话。
+    ///
+    /// 规范顺序是 `open -> bootstrap -> subscribe`：流自身只从 bootstrap 的
+    /// snapshot cursor 起放 replay，**快照本身不进流**。新建会话在首个 canonical
+    /// 事实落盘前 v2 快照是 404/409，流要等到物化后才能连上；这段时间里写入的
+    /// 交互请求只能靠这次 bootstrap 补齐。
+    V2StreamOpen {
+        seed: String,
     },
     ResetRequired {
         seed: String,
@@ -482,48 +491,46 @@ fn build_handlers(
     last_open: Arc<std::sync::Mutex<Instant>>,
 ) -> ClientHandlers {
     ClientHandlers {
-        on_batch: {
+        on_v2_event: {
             let msg_tx = msg_tx.clone();
-            // 类型已权威化：信封直达 app 层，不再有「过桥失败 → 丢帧」这条路径。
-            // 形状对不上现在会是**编译错误**，而不是运行时的静默丢弃。
-            Arc::new(move |batch: qaqh_client::EventBatch| {
-                for env in &batch.envelopes {
-                    let _ = msg_tx.send(RuntimeMsg::Ringing {
-                        env: Box::new(env.clone()),
-                    });
-                }
+            // 类型已权威化：typed payload 直达 app 层，形状对不上是编译错误。
+            Arc::new(move |seed: String, event: ClientV2Event| {
+                let _ = msg_tx.send(RuntimeMsg::V2Event {
+                    seed,
+                    event: Box::new(event),
+                });
             })
         },
-        on_status: {
+        on_v2_status: {
             let last_open = last_open.clone();
             let msg_tx = msg_tx.clone();
-            Arc::new(
-                move |channel: WireChannel, status: ChannelStatus| match status {
-                    ChannelStatus::Open { .. } => {
-                        note_daemon_activity(&last_open);
-                        // 这条流重连成功 → 只撤它自己的告警（否则 `ReadyWithIssue`
-                        // 会一直挂在状态栏上，直到下一次 daemon 重启）。
-                        let _ = msg_tx.send(RuntimeMsg::Conn(ConnEvent::StreamRecovered {
-                            stream: StreamKey::Channel(channel),
-                        }));
-                    }
-                    ChannelStatus::Reconnecting {
-                        retry_ms, reason, ..
-                    } => {
-                        let _ = msg_tx.send(RuntimeMsg::Conn(ConnEvent::StreamIssue {
-                            stream: StreamKey::Channel(channel),
-                            error: reconnect_message("连接", reason.as_ref(), retry_ms),
-                        }));
-                    }
-                    ChannelStatus::Closed { reason } => {
-                        let _ = msg_tx.send(RuntimeMsg::Conn(ConnEvent::StreamIssue {
-                            stream: StreamKey::Channel(channel),
-                            error: format!("流已关闭：{reason}"),
-                        }));
-                    }
-                    ChannelStatus::Connecting => {}
-                },
-            )
+            Arc::new(move |seed: String, status: V2StreamStatus| match status {
+                V2StreamStatus::Open { .. } => {
+                    note_daemon_activity(&last_open);
+                    // 这条流重连成功 → 只撤它自己的告警。
+                    let _ = msg_tx.send(RuntimeMsg::Conn(ConnEvent::StreamRecovered {
+                        stream: StreamKey::V2(seed.clone()),
+                    }));
+                    // 规范顺序 open -> bootstrap -> subscribe：快照不进流，故每次
+                    // 建立/重建流都要让 app 重新 bootstrap 该 seed。
+                    let _ = msg_tx.send(RuntimeMsg::V2StreamOpen { seed });
+                }
+                V2StreamStatus::Reconnecting {
+                    retry_ms, reason, ..
+                } => {
+                    let _ = msg_tx.send(RuntimeMsg::Conn(ConnEvent::StreamIssue {
+                        stream: StreamKey::V2(seed),
+                        error: reconnect_message("v2 流", reason.as_ref(), retry_ms),
+                    }));
+                }
+                V2StreamStatus::Closed { reason } => {
+                    let _ = msg_tx.send(RuntimeMsg::Conn(ConnEvent::StreamIssue {
+                        stream: StreamKey::V2(seed),
+                        error: format!("v2 流已关闭：{reason}"),
+                    }));
+                }
+                V2StreamStatus::Connecting => {}
+            })
         },
         on_liveness: {
             // 唯一的存活信号源：客户端每从 socket 读到一块字节就调一次，
@@ -531,14 +538,12 @@ fn build_handlers(
             let last_open = last_open.clone();
             Arc::new(move || note_daemon_activity(&last_open))
         },
-        on_reset: {
+        on_v2_reset: {
             let msg_tx = msg_tx.clone();
-            Some(Arc::new(
-                // 类型已权威化：直达，不再过桥。
-                move |reset: qaqh_client::ResetRequired| {
-                    let _ = msg_tx.send(RuntimeMsg::ResetRequired { seed: reset.seed });
-                },
-            ))
+            Arc::new(move |seed: String, _reset: qaqh_client::ClientV2Reset| {
+                // reset → app 重新 bootstrap 该会话；v2 单流自会按新 cursor 重连。
+                let _ = msg_tx.send(RuntimeMsg::ResetRequired { seed });
+            })
         },
         on_timeline_entry: {
             let msg_tx = msg_tx.clone();
@@ -631,43 +636,43 @@ mod tests {
 
     /// 阻断项 1 的运行时半边：`Open` 只能为**它自己**那条流发恢复信号。
     ///
-    /// 证伪方式：把 `on_status` 改回「任意 channel 的 Open 都发一个无身份的
-    /// `StreamRecovered`」（本次审查指出的旧写法）——下面「control 不得被别人的
-    /// Open 恢复」与「恢复信号必须带 conversation 身份」两条断言同时变红。
+    /// 证伪方式：把 `on_v2_status` 改回「任意 seed 的 Open 都发一个无身份的
+    /// `StreamRecovered`」——下面「A 不得被别人的 Open 恢复」与「恢复信号必须带
+    /// B 身份」两条断言同时变红。
     #[test]
-    fn channel_open_recovers_only_its_own_stream() {
+    fn v2_open_recovers_only_its_own_stream() {
         let (handlers, mut rx) = handlers_and_rx();
-        let control = StreamKey::Channel(WireChannel::Control);
-        let conversation = StreamKey::Channel(WireChannel::Conversation);
+        let a = StreamKey::V2("A".into());
+        let b = StreamKey::V2("B".into());
 
-        (handlers.on_status)(
-            WireChannel::Control,
-            ChannelStatus::Reconnecting {
+        (handlers.on_v2_status)(
+            "A".into(),
+            V2StreamStatus::Reconnecting {
                 retry_ms: 500,
-                last_cursor: 3,
                 reason: None,
+                last_cursor: None,
             },
         );
-        (handlers.on_status)(
-            WireChannel::Conversation,
-            ChannelStatus::Open {
+        (handlers.on_v2_status)(
+            "B".into(),
+            V2StreamStatus::Open {
                 server_epoch: "e1".into(),
-                cursor: 9,
+                cursor: Some("v2.e1.9".into()),
             },
         );
 
         let msgs = drain(&mut rx);
         assert!(
-            msgs.iter().any(|m| is_issue(m, &control)),
-            "control 的重连必须只标 control：{msgs:?}"
+            msgs.iter().any(|m| is_issue(m, &a)),
+            "A 的重连必须只标 A：{msgs:?}"
         );
         assert!(
-            msgs.iter().any(|m| is_recovered(m, &conversation)),
-            "conversation 的 Open 必须带 conversation 身份：{msgs:?}"
+            msgs.iter().any(|m| is_recovered(m, &b)),
+            "B 的 Open 必须带 B 身份：{msgs:?}"
         );
         assert!(
-            !msgs.iter().any(|m| is_recovered(m, &control)),
-            "control 仍在重连，不得被别人的 Open 当成已恢复：{msgs:?}"
+            !msgs.iter().any(|m| is_recovered(m, &a)),
+            "A 仍在重连，不得被别人的 Open 当成已恢复：{msgs:?}"
         );
     }
 
@@ -736,7 +741,7 @@ mod tests {
         assert!(
             !msgs
                 .iter()
-                .any(|m| is_recovered(m, &StreamKey::Channel(WireChannel::Tool))),
+                .any(|m| is_recovered(m, &StreamKey::V2("C".into()))),
             "timeline 事件不得影响频道流的账本：{msgs:?}"
         );
     }

@@ -10,7 +10,7 @@ use qaqh_client::ConversationMode;
 use qaqh_client::ConversationState;
 use qaqh_client::{
     AskMode, ContentRef, DomainActivityState as ActivityState, DomainAskQuestion as AskQuestion,
-    DomainError, PermissionCategory, PermissionRisk, SkillsStatus, UsageInfo,
+    DomainError, PermissionCategory, PermissionRisk, UsageInfo,
 };
 
 // ───────────────────────── 流式相位 ─────────────────────────
@@ -538,7 +538,6 @@ pub struct SessionState {
     pub pending_permissions: Vec<PermissionPanel>,
     /// 已解决的权限请求 id（防「幽灵面板」补投，见 [`RespondedPermissions`]）。
     pub responded_permissions: RespondedPermissions,
-    pub skills: Option<SkillsStatus>,
     /// workspace 面板数据（bootstrap control state + DashboardSnapshot 推送）。
     pub dashboard: Option<qaqh_client::DomainDashboardSnapshot>,
     /// 压缩进度动画（Some = 压缩进行中）。
@@ -582,7 +581,6 @@ impl SessionState {
             pending_plan: None,
             pending_permissions: Vec::new(),
             responded_permissions: RespondedPermissions::default(),
-            skills: None,
             dashboard: None,
             compact_anim: None,
             code_added: 0,
@@ -675,6 +673,39 @@ impl SessionState {
         true
     }
 
+    /// 从 timeline 工具卡构造 permission 面板（v2 交互正文不含 permission 详情）。
+    /// 找不到卡片时退化为「（恢复中）」占位——详情等 tool 事件补全。
+    pub fn permission_panel_for(&self, call_id: &str) -> PermissionPanel {
+        let card = self.timeline.tool_card(call_id);
+        let tool_name = card
+            .map(|c| c.name.clone())
+            .unwrap_or_else(|| "（恢复中）".into());
+        let perm = card.and_then(|c| c.permission.clone());
+        let (reason, paths, category, level, risk, consequence) = match perm {
+            Some(p) => (p.reason, p.paths, p.category, p.level, p.risk, p.consequence),
+            None => (
+                String::new(),
+                Vec::new(),
+                String::new(),
+                0u8,
+                String::new(),
+                String::new(),
+            ),
+        };
+        PermissionPanel {
+            tool_call_id: call_id.to_string(),
+            tool_name,
+            action_summary: None,
+            reason,
+            paths,
+            category: permission_category_from_tag(&category),
+            level,
+            risk: permission_risk_from_tag(&risk),
+            consequence,
+            trust_folder: false,
+        }
+    }
+
     pub fn is_waiting_user(&self) -> bool {
         self.activity == Some(ActivityState::WaitingUser)
             || !self.pending_permissions.is_empty()
@@ -702,15 +733,6 @@ impl SessionState {
             Some(ActivityState::WaitingUser) => "waiting_user".into(),
             Some(ActivityState::Disconnected) => "disconnected".into(),
             _ => "idle".into(),
-        }
-    }
-
-    pub fn apply_usage(&mut self, usage: UsageInfo, context_limit: u32, model: String) {
-        self.usage = Some(usage);
-        self.context_limit = Some(context_limit);
-        if let Some(conv) = self.conversation.as_mut() {
-            conv.model = Some(model);
-            conv.context_limit = Some(context_limit as u64);
         }
     }
 }
@@ -763,6 +785,18 @@ pub fn conversation_cache_from_v2(
         }
     }
     cache
+}
+
+/// timeline 工具卡的 `category` 字符串（snake_case）→ 面板枚举。
+pub fn permission_category_from_tag(tag: &str) -> PermissionCategory {
+    serde_json::from_value(serde_json::Value::String(tag.to_string()))
+        .unwrap_or(PermissionCategory::Read)
+}
+
+/// timeline 工具卡的 `risk` 字符串（snake_case）→ 面板枚举。
+pub fn permission_risk_from_tag(tag: &str) -> PermissionRisk {
+    serde_json::from_value(serde_json::Value::String(tag.to_string()))
+        .unwrap_or(PermissionRisk::Medium)
 }
 
 /// timeline（transcript 与 turn 生命周期权威）→ streaming 状态收敛。
