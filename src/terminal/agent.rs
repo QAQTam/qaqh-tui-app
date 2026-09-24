@@ -10,7 +10,9 @@
 //! - inline 不启用鼠标捕获，保留终端原生选择/复制；fullscreen 捕获滚轮并支持
 //!   浮层按钮，原生复制需要终端级绕过（通常是 Shift+选择）。
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::hash_map::DefaultHasher;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::hash::{Hash, Hasher};
 use std::io::stdout;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -1778,7 +1780,10 @@ impl FullscreenView {
 #[derive(Debug, Default)]
 struct FullscreenTranscriptCache {
     key: Option<FullscreenTranscriptKey>,
+    blocks: HashMap<FullscreenBlockKey, Vec<Line<'static>>>,
     lines: Vec<Line<'static>>,
+    #[cfg(test)]
+    render_misses: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1788,9 +1793,20 @@ struct FullscreenTranscriptKey {
     width: u16,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct FullscreenBlockKey {
+    turn_id: String,
+    block_id: String,
+    revision: u64,
+    state: BlockState,
+    width: u16,
+    content_hash: u64,
+}
+
 impl FullscreenTranscriptCache {
     fn clear(&mut self) {
         self.key = None;
+        self.blocks.clear();
         self.lines.clear();
     }
 
@@ -1819,8 +1835,42 @@ impl FullscreenTranscriptCache {
                         && matches!(block.kind, BlockKind::Thinking { .. }))
             })
             .collect();
-        self.lines = render_transcript(&blocks, width, theme);
+
+        let mut used = HashSet::with_capacity(blocks.len());
+        let mut lines = Vec::new();
+        for (index, block) in blocks.iter().enumerate() {
+            if index > 0 {
+                lines.push(Line::default());
+            }
+            let block_key = FullscreenBlockKey::from_block(block, width);
+            used.insert(block_key.clone());
+            let rendered = self.blocks.entry(block_key).or_insert_with(|| {
+                #[cfg(test)]
+                {
+                    self.render_misses = self.render_misses.saturating_add(1);
+                }
+                crate::ui::v2::transcript::render_block(block, usize::from(width), theme)
+            });
+            lines.extend(rendered.iter().cloned());
+        }
+        self.blocks.retain(|key, _| used.contains(key));
+        self.lines = lines;
         self.key = Some(key);
+    }
+}
+
+impl FullscreenBlockKey {
+    fn from_block(block: &TranscriptBlock, width: u16) -> Self {
+        let mut hasher = DefaultHasher::new();
+        block.kind.hash(&mut hasher);
+        Self {
+            turn_id: block.turn_id.clone(),
+            block_id: block.id.to_string(),
+            revision: block.revision,
+            state: block.state,
+            width,
+            content_hash: hasher.finish(),
+        }
     }
 }
 
@@ -3177,6 +3227,38 @@ mod tests {
         view.page_up(&mut app);
 
         assert!(app.sessions["seed-1"].loading_older);
+    }
+
+    #[test]
+    fn fullscreen_block_cache_reuses_unchanged_blocks() {
+        let mut app = app_with_model(model_with_many_sealed_turns(3));
+        let theme = test_theme();
+        let mut cache = FullscreenTranscriptCache::default();
+
+        cache.sync(&app, 79, &theme);
+        assert_eq!(cache.render_misses, 6);
+        let before = cache.render_misses;
+
+        cache.sync(&app, 79, &theme);
+        assert_eq!(cache.render_misses, before, "same version must be a no-op");
+
+        let session = app.sessions.get_mut("seed-1").expect("session");
+        session.timeline.version = session.timeline.version.saturating_add(1);
+        let turn = session.timeline.turns.last_mut().expect("turn");
+        let block = turn
+            .rounds
+            .iter_mut()
+            .flat_map(|round| &mut round.blocks)
+            .find(|block| block.kind == TimelineBlockKind::Text)
+            .expect("text block");
+        block.text.push_str(" updated");
+
+        cache.sync(&app, 79, &theme);
+        assert_eq!(
+            cache.render_misses,
+            before + 1,
+            "only the changed block should render again"
+        );
     }
 
     #[test]

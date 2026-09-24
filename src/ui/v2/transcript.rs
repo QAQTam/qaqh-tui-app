@@ -59,7 +59,7 @@ impl From<String> for BlockId {
 }
 
 /// 块在终端提交协议中的生命周期。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum BlockState {
     Live,
     Sealed,
@@ -77,7 +77,7 @@ impl BlockState {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ToolState {
     Prepared,
     Running,
@@ -93,7 +93,7 @@ impl ToolState {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SystemLevel {
     Info,
     Warning,
@@ -101,7 +101,7 @@ pub enum SystemLevel {
 }
 
 /// ToolBlock 的 V2 view model。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ToolBlock {
     pub name: String,
     pub summary: Option<String>,
@@ -130,7 +130,7 @@ impl ToolBlock {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum BlockKind {
     User {
         text: String,
