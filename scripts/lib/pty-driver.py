@@ -21,12 +21,15 @@ v2 Agent View 初始化 inline viewport 时会发 `ESC[6n`（DSR / 光标位置�
 ## 用法
 
     scripts/lib/pty-driver.py --tui <TUI 路径> --raw <原始输出> --seconds <N> \
-        [--key <秒>:<两位十六进制字节>]... [--quit] [--exit-code-file <路径>]
+        [--key <秒>:<两位十六进制字节>]... [--type <秒>:<文本>]... \
+        [--quit] [--exit-code-file <路径>]
 
 环境变量**原样继承**（调用方在 shell 里设好 `QAQH_DATA_DIR` 等即可）；
 `TUI_ARGS` 与 smoke 同款，按 shell 分词后追加到命令行。
 
 - `--key 30:12`：第 30 秒往 pty 写一个字节 `0x12`（Ctrl+R）。可重复，按时间排序。
+- `--type 8:hello`：第 8 秒把 `hello` 的 UTF-8 字节原样写进去（模拟打字）；
+  回车另给 `--key 8.5:0d`。
 - `--quit`：到 `--seconds` 时先发 Ctrl+Q（干净退出路径），再等 3 秒。
 - 无论走哪条路，最后都按进程组收尸（SIGTERM → SIGKILL），不留孤儿。
 - `--exit-code-file`：把 TUI 退出码写进去（`smoke-tui.sh` 的判据③需要它）。
@@ -70,11 +73,32 @@ def main() -> int:
     parser.add_argument("--rows", type=int, default=40)
     parser.add_argument("--cols", type=int, default=130)
     parser.add_argument("--key", action="append", default=[])
+    # `--type 8:hello` → 第 8 秒把 "hello" 的 UTF-8 字节按原样写进 pty（模拟用户
+    # 在 composer 里打字）。回车等控制字节用 `--key`，例如 `--key 8.5:0d`。
+    parser.add_argument("--type", action="append", default=[])
+    # `--respond 工具权限:61` → 输出里出现 `工具权限` 时回一个字节 `0x61`（'a'）。
+    # 用于"界面出现某个弹窗就应答"的场景（如权限 modal 出现就批准）。只回一次。
+    # ⚠ needle 必须是在**字节流里连续出现**的串：TUI 按光标定位分段写，
+    # 跨段的长句（如英文说明）会搜不到 —— 用短的、成段写出的标记（如标题）。
+    parser.add_argument("--respond", action="append", default=[])
     parser.add_argument("--quit", action="store_true")
     parser.add_argument("--exit-code-file")
     args = parser.parse_args()
 
-    keys = sorted((parse_key(spec) for spec in args.key), key=lambda item: item[0])
+    keys = [parse_key(spec) for spec in args.key]
+    for spec in args.type:
+        at, _, text = spec.partition(":")
+        if not text:
+            raise SystemExit(f"--type 需要 <秒>:<文本>，收到 {spec!r}")
+        keys.append((float(at), text.encode()))
+    keys.sort(key=lambda item: item[0])
+    # (needle 字节, 回什么字节, 是否已回过)
+    responds: list[list[object]] = []
+    for spec in args.respond:
+        needle, _, hex_byte = spec.partition(":")
+        if not needle or not hex_byte:
+            raise SystemExit(f"--respond 需要 <标记>:<两位十六进制>，收到 {spec!r}")
+        responds.append([needle.encode(), bytes([int(hex_byte, 16)]), False])
     raw_path = pathlib.Path(args.raw)
 
     master, slave = pty.openpty()
@@ -100,6 +124,8 @@ def main() -> int:
     capture = bytearray()
     # 只保留尾部窗口：`ESC[6n` 可能被切在两次 read 之间，留一点重叠避免漏答。
     query_tail = bytearray()
+    # 与 DSR 用的 `query_tail` 分开：那个会被"就地消费"，respond 需要看完整历史。
+    respond_tail = bytearray()
     start = time.monotonic()
     pending = list(keys)
     quit_at = args.seconds
@@ -143,6 +169,16 @@ def main() -> int:
                 # 兜底：极长的非 DSR 输出不该无限增长。
                 if len(query_tail) > 1 << 16:
                     del query_tail[: len(query_tail) - len(DSR_QUERY)]
+                respond_tail.extend(chunk)
+                if len(respond_tail) > 1 << 16:
+                    del respond_tail[: len(respond_tail) - (1 << 15)]
+                for rule in responds:
+                    if not rule[2] and rule[0] in respond_tail:
+                        rule[2] = True
+                        try:
+                            os.write(master, rule[1])
+                        except OSError:
+                            pass
 
         if tui.poll() is not None:
             break

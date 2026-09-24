@@ -93,6 +93,14 @@ class Screen:
                     self.grid[self.row][self.col - 1] += ch
                 continue
             self._ensure(self.row, self.col + width)
+            # diff 渲染器会重发宽字符的**尾格**（实测 `col=11 ' 本'`，前一个
+            # `基` 占 10-11）：真终端里宽字形覆盖尾格、看不出缝，把那个空格当
+            # 普通格写就会凭空多一个空格、断言假红。所以「空格落在尾格上」忽略。
+            # ⚠ 只忽略空格：非空格落在尾格上是真覆盖（前一个宽字符被替换），
+            # 一律忽略会吃掉正常字符（实测把 `exec exit 0` 啃成 `exe xt0`）。
+            if ch == " " and self.grid[self.row][self.col] == "":
+                self.col += width
+                continue
             self.grid[self.row][self.col] = ch
             if width == 2 and self.col + 1 < self.cols:
                 self.grid[self.row][self.col + 1] = ""
