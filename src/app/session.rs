@@ -734,6 +734,37 @@ pub fn streaming_done(session: &mut SessionState, turn_id: Option<&str>) {
 /// "timeline 暂时还没出现这个 turn" 不被误判成 "turn 已终结"。
 pub const STREAM_GHOST_GRACE: Duration = Duration::from_secs(2);
 
+/// v2 control 投影的 activity 词汇（idle / running / interrupted）→ 领域
+/// `ActivityState`（本仓状态栏仍用领域词汇）。
+///
+/// `waiting_user` 不由 activity 表达，而由挂起交互面板（permission / ask /
+/// plan）判定，见 [`SessionState::is_waiting_user`]。
+pub fn activity_from_v2(activity: qaqh_client::ClientV2ActivityState) -> ActivityState {
+    match activity {
+        qaqh_client::ClientV2ActivityState::Idle => ActivityState::Idle,
+        qaqh_client::ClientV2ActivityState::Running => ActivityState::Working,
+        qaqh_client::ClientV2ActivityState::Interrupted => ActivityState::Disconnected,
+    }
+}
+
+/// 从 v2 conversation 投影抽出本仓 `conversation` 缓存（只保留 model/usage）。
+///
+/// v2 投影没有聚合的 `usage_totals` / `context_limit`：model/usage 取**最新**
+/// assistant block 的字段，其余留给实时 `UsageUpdated` 事件补全。
+pub fn conversation_cache_from_v2(
+    snapshot: &qaqh_client::ClientV2ConversationState,
+) -> ConversationState {
+    let mut cache = ConversationState::default();
+    for entry in snapshot.context.iter().rev() {
+        if let qaqh_client::ClientV2ConversationContextKind::AssistantBlock(block) = &entry.kind {
+            cache.model = Some(block.model.clone());
+            cache.usage = block.usage.clone();
+            break;
+        }
+    }
+    cache
+}
+
 /// timeline（transcript 与 turn 生命周期权威）→ streaming 状态收敛。
 ///
 /// 收敛矩阵（本函数是 "working 卡死" 的唯一自愈点）：

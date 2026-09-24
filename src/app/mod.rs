@@ -50,8 +50,8 @@ use qaqh_client::{
 use qaqh_client::{RingingCommandState as CommandState, RingingCommandStatus};
 use qaqh_client::{SessionActivity, SessionListEntry};
 use session::{
-    AskPanel, Composer, PermissionPanel, PlanPanel, SessionState, StreamPhase, streaming_done,
-    sync_streaming_from_timeline,
+    AskPanel, Composer, PermissionPanel, PlanPanel, SessionState, StreamPhase, activity_from_v2,
+    conversation_cache_from_v2, streaming_done, sync_streaming_from_timeline,
 };
 
 /// `ensure_render_caches` 里「refresh → 用刷新后的总行数重算视口顶端」的迭代上限。
@@ -92,7 +92,7 @@ const ACTIVE_MODELS: usize = 4;
 pub enum ActionResult {
     Bootstrap {
         seed: String,
-        result: Result<qaqh_client::RingingSessionBootstrap, String>,
+        result: Result<qaqh_client::ClientV2Bootstrap, String>,
     },
     CommandAck {
         seed: Option<String>,
@@ -235,11 +235,8 @@ impl ApiCtx {
             .map_err(|e| e.to_string())
     }
 
-    /// 会话 bootstrap（三频道快照原子恢复）。
-    pub async fn bootstrap(
-        &self,
-        seed: &str,
-    ) -> Result<qaqh_client::RingingSessionBootstrap, String> {
+    /// 会话 bootstrap（v2 三频道 typed 快照原子恢复）。
+    pub async fn bootstrap(&self, seed: &str) -> Result<qaqh_client::ClientV2Bootstrap, String> {
         self.client()?
             .bootstrap(seed)
             .await
@@ -1571,48 +1568,37 @@ impl App {
             ActionResult::Bootstrap { seed, result } => match result {
                 Ok(b) => {
                     let bootstrap_seed = seed.clone();
-                    let mut needs_fetch = false;
                     if let Some(sess) = self.sessions.get_mut(&bootstrap_seed) {
-                        // G1：用权威类型化视图，本仓不再手解三频道 state。
-                        // `unwrap_or_default` 不隐藏问题——权威类型每个字段都带
-                        // `#[serde(default)]`，形状漂移表现为「字段变缺省」，而漂移由
-                        // 后端的产出方往返测试兜住（`typed_state_views_recover_every_producer_field`）；
-                        // 真走到 `Err` 已是 state 根本不是对象的病态情形。
-                        let conv = b.conversation_state().unwrap_or_default();
-                        sess.usage = conv.usage.clone();
-                        sess.usage_totals = conv.usage_totals.clone();
-                        sess.context_limit =
-                            conv.context_limit.map(|v| v.min(u32::MAX as u64) as u32);
-                        let model = conv.model.clone();
-                        sess.conversation = Some(conv);
-                        let ctl = b.control_state().unwrap_or_default();
-                        sess.activity = ctl.activity.or(sess.activity);
+                        // 纯 v2：bootstrap 是 canonical 三频道 typed 快照
+                        // （`control` / `conversation` / `tool`），不再是 v1 领域
+                        // `state`。v2 control 投影的 activity 词汇比领域粗
+                        // （idle / running / interrupted），映射见下方 helper；
+                        // 挂起交互直接从 `control.state.interactions` 恢复。
+                        let ctl = &b.control.state;
+                        sess.activity = Some(activity_from_v2(ctl.activity));
                         // bootstrap 是 control 域快照的权威刷新点；这里与 timeline
                         // 收敛一次，避免上一次连接遗留的 Working/Starting 与
                         // streaming 状态把 UI 钉在 working（timeline 空则不误判）。
                         sync_streaming_from_timeline(sess);
-                        // 这里原有「从 SessionState::meta 的 mode 位同步会话模式」一段，
-                        // 因 meta 恒为 None 从未生效，G2 随该字段一并删除。会话模式的实际
-                        // 来源是 transcript_ops.rs 的乐观更新 + SessionMetaChanged 刷新。
-                        match ctl.dashboard_snapshot {
-                            Some(dash) => {
-                                let is_empty = dash.tasks.is_empty()
-                                    && dash.documents.is_empty()
-                                    && dash.recent_edits.is_empty();
-                                sess.dashboard = Some(dash);
-                                needs_fetch = is_empty;
-                            }
-                            None => {
-                                needs_fetch = true;
-                            }
-                        }
-                        let tool = b.tool_state().unwrap_or_default();
-                        if let Some(perm) = tool.pending_permission {
+                        // 会话模式的实际来源是 transcript_ops.rs 的乐观更新 +
+                        // SessionMetaChanged 刷新，bootstrap 不携带该字段。
+                        // conversation 快照里本仓只缓存 model/usage（v2 投影不再
+                        // 有聚合的 usage_totals / context_limit）。
+                        let conv = conversation_cache_from_v2(&b.conversation.state);
+                        sess.usage = conv.usage.clone();
+                        sess.usage_totals = conv.usage_totals.clone();
+                        sess.context_limit =
+                            conv.context_limit.map(|v| v.min(u32::MAX as u64) as u32);
+                        sess.conversation = Some(conv);
+                        // v2 bootstrap 的 `interactions` 已由 daemon 过滤为未决集合。
+                        if let Some(perm) = ctl.interactions.iter().find(|interaction| {
+                            interaction.kind == qaqh_client::ClientV2InteractionKind::Permission
+                        }) {
                             // bootstrap 恢复挂起权限（详情等 tool 事件补全）。只补不换：
                             // 快照可能落后于实时事件，不许用「（恢复中）」占位符覆盖
                             // 已有面板的详情，也不许复活已解决的 id。
                             sess.restore_permission_from_snapshot(PermissionPanel {
-                                tool_call_id: perm,
+                                tool_call_id: perm.call_id.clone(),
                                 tool_name: "（恢复中）".into(),
                                 action_summary: None,
                                 reason: String::new(),
@@ -1624,14 +1610,11 @@ impl App {
                                 trust_folder: false,
                             });
                         }
-                        if let Some(m) = model {
-                            let _ = m;
-                        }
                         sess.block_cache = None;
                     }
-                    if needs_fetch {
-                        self.fetch_dashboard(bootstrap_seed);
-                    }
+                    // v2 control 投影不携带 dashboard 快照（v1 领域 control state
+                    // 才有），workspace 面板一律回退到 `session.dashboard` 拉取。
+                    self.fetch_dashboard(bootstrap_seed);
                 }
                 Err(e) => self.toast(NoticeLevel::Error, format!("bootstrap 失败[{seed}]: {e}")),
             },
