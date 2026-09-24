@@ -27,12 +27,11 @@
 # 改动这里必须同步 `Cargo.toml` 里 [patch.crates-io] 的注释，以及本机
 # `.cargo/config.toml` 的 paths 覆盖（指向 `../qaqh-backend-anchor`，见 .gitignore）。
 #
-# 后端侧对应 rev `c2a5d4093e105e08a31a3057c17f4ef33d820807`
-#（tag `tui-ringing-v2-v1-removed-2026-09-24`）：
-# **Ringing v2 typed bootstrap + interaction content + timeline/session/command
-# cutover + per-seed single stream + canonical approvals + v1 wire removal**
-#（后端 main，MR #353–#354）。旧锚点：
-# `tui-ringing-v2-interaction-causation-2026-09-24` @ `b77c251`。
+# 后端侧对应 rev `07cd172b7578e25e9d0682f584bca7644a3c2a01`（后端 main）：
+# **bootstrap plan wire 统一为 `plan`；ask / plan / permission 的 canonical
+# interaction request 正文全部走 content store**。该 rev 尚无新 tag；旧锚点
+# `tui-ringing-v2-v1-removed-2026-09-24` @ `c2a5d40` 仍按 `plan_review` 解码，
+# permission bootstrap 也不暴露正文，不能用于本轮协议。
 # **注意 rev 必须是完整 40 位 SHA**：下面的 prepare() 用 `git rev-parse HEAD` 与它
 # 做字符串比对，写 tag 名会判不等。换锚点时后端会新开 tag，**不要移动旧 tag**。
 # ratatui 用的是**上游未发版的 main**（ratatui#2743 修复尚未发版）。
@@ -50,7 +49,7 @@ set -euo pipefail
 
 # 与 Cargo.toml 的 path 依赖对应。改动请同步 Cargo.toml 的注释。
 QAQH_BACKEND_REPO="${QAQH_BACKEND_REPO:-https://cnb.cool/QAQ-Harness/qaqh-backend.git}"
-QAQH_BACKEND_REV="${QAQH_BACKEND_REV:-c2a5d4093e105e08a31a3057c17f4ef33d820807}"
+QAQH_BACKEND_REV="${QAQH_BACKEND_REV:-07cd172b7578e25e9d0682f584bca7644a3c2a01}"
 RATATUI_REPO="${RATATUI_REPO:-https://github.com/ratatui/ratatui.git}"
 RATATUI_REV="${RATATUI_REV:-e02e2a622eda6e4cae105df48a48f641cdba0303}"
 
