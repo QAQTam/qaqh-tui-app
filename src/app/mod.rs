@@ -1361,6 +1361,11 @@ impl App {
                 }
             }
             ControlEvent::OperationCompleted { .. } => {}
+            // v1 control 事件仍在扩展（例如 v2 driver 席位变更）；TUI 当前
+            // 只消费会影响 UI 状态的事件，其余保持前向兼容。对固定旧锚点，
+            // 编译器会认为此分支不可达；这正是跨版本兼容的预期状态。
+            #[allow(unreachable_patterns)]
+            _ => {}
         }
     }
 

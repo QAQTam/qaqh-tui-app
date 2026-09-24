@@ -158,8 +158,8 @@ panic = "panicked" in s
 text = [line for line in s.split("\n") if line.strip()]
 first = text[0] if text else ""
 # 真 TUI 标识：默认 V2 Agent View 首帧画 `AgentView`；`--v1` 回退路径保留
-# 含二进制名的 tab bar。假 TUI 打一行错误就退，不会有任一标识。
-marker = "qaqh-tui" in s or "AgentView" in s
+# 含二进制名的 tab bar；`--v2-fullscreen` 空会话首帧画 QAQH 品牌页。
+marker = "qaqh-tui" in s or "AgentView" in s or "QAQ-HARNESS" in s
 startup_error = bool(re.match(r"\s*(Error|error|thread .*panicked)", first))
 print(f"  去 ANSI 后非空行: {len(text)}")
 print(f"  panic           : {'✗ 有' if panic else '✓ 无'}")

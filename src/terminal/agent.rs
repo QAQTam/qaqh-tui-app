@@ -1,12 +1,14 @@
-//! V2 Agent View：真实 Runtime/App 状态驱动的 inline 外壳（M4.1）。
+//! V2 Agent View：真实 Runtime/App 状态驱动的终端外壳（M4.1）。
 //!
-//! 运行：`qaqh-tui`（alpha1 起默认；`--v2-agent` 仍可显式选择）
+//! 运行：`qaqh-tui`（alpha1 起默认 inline；`--v2-fullscreen` 可切全屏）
 //!
 //! 与 `--v2-inline` 原型的区别：
 //! - 复用生产 `Runtime` / `App`，因此会连接 daemon 并处理真实 timeline 事件；
-//! - 已封口 transcript 经 V2 projector + commit ledger 写入终端 scrollback；
+//! - inline 模式把已封口 transcript 经 V2 projector + commit ledger 写入终端
+//!   scrollback；fullscreen 模式改由 App 自己持有 transcript 视口与滚动状态；
 //! - inline viewport 只绘制 live transcript、composer、status 与 shortcuts；
-//! - 不启用鼠标捕获，保留终端原生选择/复制；`--v1` 仍可强制回退全屏路径。
+//! - inline 不启用鼠标捕获，保留终端原生选择/复制；fullscreen 捕获滚轮并支持
+//!   浮层按钮，原生复制需要终端级绕过（通常是 Shift+选择）。
 
 use std::collections::{HashSet, VecDeque};
 use std::io::stdout;
@@ -24,7 +26,7 @@ use ratatui::crossterm::event::{
 };
 use ratatui::crossterm::terminal::{Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen};
 use ratatui::crossterm::{event::KeyCode, execute};
-use ratatui::layout::Position;
+use ratatui::layout::{Position, Rect};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Widget};
@@ -39,6 +41,7 @@ use crate::runtime::{Runtime, RuntimeMsg};
 use crate::terminal::transcript::PendingCommit;
 use crate::theme::Theme;
 use crate::ui::v2::adapter;
+use crate::ui::v2::fullscreen::{self, FullscreenState};
 use crate::ui::v2::route::{self, ScreenRoute};
 use crate::ui::v2::runtime::V2TranscriptRuntime;
 use crate::ui::v2::transcript::{BlockKind, BlockState, TranscriptBlock, render_transcript};
@@ -55,7 +58,10 @@ const NARROW_VIEWPORT_WIDTH: u16 = 40;
 const VIEWPORT_HEIGHT_PERCENT: u16 = 60;
 
 /// 启动真实 V2 Agent View。
-pub async fn run(no_spawn: bool, resume: bool) -> Result<()> {
+///
+/// `fullscreen=false` 保留 alpha1 的 inline + scrollback 外壳；`true` 使用
+/// alternate-screen 全屏 shell，由 App 自己持有 transcript 视口与滚动状态。
+pub async fn run(no_spawn: bool, resume: bool, fullscreen: bool) -> Result<()> {
     let (app_tx, mut app_rx) = mpsc::unbounded_channel::<AppMsg>();
     let (rt_tx, mut rt_rx) = mpsc::unbounded_channel::<RuntimeMsg>();
     {
@@ -88,18 +94,27 @@ pub async fn run(no_spawn: bool, resume: bool) -> Result<()> {
         app.open_session_list();
     }
     let theme = Theme::current();
-    let initial_height = initial_inline_height(&app, theme);
-    let mut terminal = TerminalHost::init(initial_height);
-    if let Err(error) = execute!(stdout(), EnableBracketedPaste) {
+    let mut terminal = if fullscreen {
+        TerminalHost::init_fullscreen()
+    } else {
+        TerminalHost::init(initial_inline_height(&app, theme))
+    };
+    let input_setup = if fullscreen {
+        execute!(stdout(), EnableMouseCapture, EnableBracketedPaste)
+    } else {
+        execute!(stdout(), EnableBracketedPaste)
+    };
+    if let Err(error) = input_setup {
         ratatui::restore();
         runtime.shutdown().await;
-        return Err(error).context("启用括号粘贴");
+        return Err(error).context("启用终端输入");
     }
 
     let mut input = InputPump::new(app_tx.clone());
     spawn_tick(app_tx.clone());
 
     let mut agent = AgentState::default();
+    let mut fullscreen_state = FullscreenState::default();
 
     let result = run_loop(
         &mut terminal,
@@ -107,6 +122,7 @@ pub async fn run(no_spawn: bool, resume: bool) -> Result<()> {
         &mut app_rx,
         &mut app,
         &mut agent,
+        &mut fullscreen_state,
         theme,
     )
     .await;
@@ -212,6 +228,7 @@ async fn run_loop(
     app_rx: &mut mpsc::UnboundedReceiver<AppMsg>,
     app: &mut App,
     agent: &mut AgentState,
+    fullscreen_state: &mut FullscreenState,
     theme: &'static Theme,
 ) -> Result<()> {
     loop {
@@ -222,47 +239,58 @@ async fn run_loop(
         let size = terminal.terminal.size()?;
         let previous_size = terminal.last_terminal_size;
         let terminal_resized = terminal.note_terminal_size(size.width, size.height);
-        let desired_height = inline_viewport_height(app, size.width, size.height, theme);
-        terminal.set_inline_height(desired_height);
 
-        if terminal_resized
-            && size.height < previous_size.1
-            && route == ScreenRoute::Agent
-            && terminal.mode == ScreenMode::Inline
-        {
-            // 缩小会把旧 viewport 的可见行留在新 origin 上方。清掉 scrollback 后
-            // 用 timeline 重放，避免旧 logo / 工具卡 / 状态栏残留成重影。
-            input.suspend().await;
-            let result = terminal.purge_scrollback_for_replay();
-            input.resume();
-            result?;
-            agent.force_replay(app);
-        } else if terminal_resized {
-            // 其他尺寸变化交给 ratatui autoresize；不要手工重建 inline viewport。
-            terminal.terminal.autoresize()?;
+        if terminal.mode == ScreenMode::Fullscreen {
+            // 全屏 shell 自己渲染整张 transcript；resize 只交给 ratatui
+            // autoresize，不再重建 inline viewport，也不 purge scrollback。
+            if terminal_resized {
+                terminal.terminal.autoresize()?;
+            }
+        } else {
+            let desired_height = inline_viewport_height(app, size.width, size.height, theme);
+            terminal.set_inline_height(desired_height);
+
+            if terminal_resized
+                && size.height < previous_size.1
+                && route == ScreenRoute::Agent
+                && terminal.mode == ScreenMode::Inline
+            {
+                // 缩小会把旧 viewport 的可见行留在新 origin 上方。清掉 scrollback 后
+                // 用 timeline 重放，避免旧 logo / 工具卡 / 状态栏残留成重影。
+                input.suspend().await;
+                let result = terminal.purge_scrollback_for_replay();
+                input.resume();
+                result?;
+                agent.force_replay(app);
+            } else if terminal_resized {
+                // 其他尺寸变化交给 ratatui autoresize；不要手工重建 inline viewport。
+                terminal.terminal.autoresize()?;
+            }
+
+            reconcile_screen(terminal, input, &route, app, agent, theme).await?;
+            if route == ScreenRoute::Agent && terminal.needs_inline_rebuild(size.height) {
+                input.suspend().await;
+                let result = terminal.ensure_inline_height(size.height);
+                input.resume();
+                result?;
+            }
         }
 
-        reconcile_screen(terminal, input, &route, app, agent, theme).await?;
-        if route == ScreenRoute::Agent && terminal.needs_inline_rebuild(size.height) {
-            input.suspend().await;
-            let result = terminal.ensure_inline_height(size.height);
-            input.resume();
-            result?;
-        }
         if app.force_redraw {
             terminal.terminal.clear()?;
             app.force_redraw = false;
         }
+        let screen_mode = terminal.mode;
         terminal
             .terminal
-            .draw(|frame| draw(frame, app, theme, &route))?;
+            .draw(|frame| draw(frame, app, theme, &route, screen_mode, fullscreen_state))?;
 
         let Some(msg) = app_rx.recv().await else {
             break;
         };
-        handle_message(app, msg, terminal, &route)?;
+        handle_message(app, msg, terminal, &route, fullscreen_state)?;
         while let Ok(msg) = app_rx.try_recv() {
-            handle_message(app, msg, terminal, &route)?;
+            handle_message(app, msg, terminal, &route, fullscreen_state)?;
             if app.quit {
                 break;
             }
@@ -282,17 +310,27 @@ fn handle_message(
     msg: AppMsg,
     terminal: &TerminalHost,
     route: &ScreenRoute,
+    fullscreen_state: &mut FullscreenState,
 ) -> Result<()> {
-    // 鼠标在 v2 里由**渲染层**接管：命中测试需要弹窗几何（只有这里知道当前
-    // 屏幕区域），而 v1 那套 `App::handle_mouse`（第 0 行 = tab bar）在 v2 是错的
-    // ——alt screen 的第 0 行不是 tab bar，点一下历史区就切标签页。
+    // 鼠标在 v2 里由**渲染层**接管：命中测试需要弹窗/全屏 shell 几何（只有这里
+    // 知道当前屏幕区域），而 v1 那套 `App::handle_mouse`（第 0 行 = tab bar）
+    // 在 v2 是错的——alt screen 的第 0 行不是 tab bar，点一下历史区就切标签页。
     if let AppMsg::Mouse(mouse) = msg {
-        if let ScreenRoute::Modal(modal) = route {
-            let size = terminal.terminal.size()?;
-            let area = ratatui::layout::Rect::new(0, 0, size.width, size.height);
-            handle_modal_mouse(app, *modal, area, mouse);
+        match (terminal.mode, route) {
+            (ScreenMode::Fullscreen, ScreenRoute::Agent) => {
+                let size = terminal.terminal.size()?;
+                let area = ratatui::layout::Rect::new(0, 0, size.width, size.height);
+                handle_fullscreen_agent_mouse(app, fullscreen_state, area, mouse);
+            }
+            (_, ScreenRoute::Modal(modal)) => {
+                fullscreen_state.clear_pointer();
+                let size = terminal.terminal.size()?;
+                let area = ratatui::layout::Rect::new(0, 0, size.width, size.height);
+                handle_modal_mouse(app, *modal, area, mouse);
+            }
+            _ => fullscreen_state.clear_pointer(),
         }
-        // inline 主界面不捕获鼠标；工作区（alt screen）本轮不接鼠标。
+        // inline 主界面不捕获鼠标；全屏 Workspace 本轮不接鼠标。
         return Ok(());
     }
     if let AppMsg::Key(key) = &msg
@@ -304,6 +342,46 @@ fn handle_message(
     }
     app.handle(msg);
     Ok(())
+}
+
+fn handle_fullscreen_agent_mouse(
+    app: &mut App,
+    state: &mut FullscreenState,
+    area: ratatui::layout::Rect,
+    mouse: ratatui::crossterm::event::MouseEvent,
+) {
+    use ratatui::crossterm::event::{MouseButton, MouseEventKind};
+
+    let show_back_to_latest = app
+        .active_session()
+        .is_some_and(|session| !session.scroll.follow);
+    let hit = || {
+        show_back_to_latest
+            .then(|| fullscreen::hit_test(area, mouse.column, mouse.row))
+            .flatten()
+    };
+
+    match mouse.kind {
+        MouseEventKind::ScrollUp => app.scroll_up(3),
+        MouseEventKind::ScrollDown => app.scroll_down(3),
+        MouseEventKind::Moved => {
+            state.back_to_latest_hover = hit().is_some();
+        }
+        MouseEventKind::Down(MouseButton::Left) => {
+            let target = hit();
+            state.back_to_latest_hover = target.is_some();
+            state.back_to_latest_pressed = target.is_some();
+        }
+        MouseEventKind::Up(MouseButton::Left) => {
+            let released = hit();
+            state.back_to_latest_hover = released.is_some();
+            if state.back_to_latest_pressed && released.is_some() {
+                app.scroll_bottom();
+            }
+            state.back_to_latest_pressed = false;
+        }
+        _ => {}
+    }
 }
 
 /// 弹窗里的鼠标：移动只改悬停；按下记目标；**松开且仍在同一目标上**才提交。
@@ -361,6 +439,7 @@ fn dispatch_modal_hit(app: &mut App, hit: ModalHit) {
 enum ScreenMode {
     Inline,
     Alternate,
+    Fullscreen,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -372,6 +451,7 @@ enum ScreenTransition {
 
 fn screen_transition(mode: ScreenMode, route: &ScreenRoute) -> ScreenTransition {
     match (mode, route) {
+        (ScreenMode::Fullscreen, _) => ScreenTransition::Stay,
         (ScreenMode::Inline, ScreenRoute::Agent)
         | (ScreenMode::Alternate, ScreenRoute::Workspace(_))
         | (ScreenMode::Alternate, ScreenRoute::Modal(_)) => ScreenTransition::Stay,
@@ -402,6 +482,23 @@ impl TerminalHost {
             mode: ScreenMode::Inline,
             requested_inline_height: inline_height,
             desired_inline_height: inline_height,
+            last_terminal_size: terminal_size,
+        }
+    }
+
+    /// alternate-screen 全屏 shell。
+    ///
+    /// `ratatui::init()` 会启用 raw mode、进入 alternate screen 并安装 panic
+    /// restore hook；鼠标捕获由 `run` 在初始化成功后单独打开，确保错误路径也能
+    /// 统一清理。
+    fn init_fullscreen() -> Self {
+        let terminal = ratatui::init();
+        let terminal_size = ratatui::crossterm::terminal::size().unwrap_or((0, 0));
+        Self {
+            terminal,
+            mode: ScreenMode::Fullscreen,
+            requested_inline_height: 0,
+            desired_inline_height: 0,
             last_terminal_size: terminal_size,
         }
     }
@@ -531,6 +628,7 @@ impl TerminalHost {
             return Ok(());
         }
 
+        let was_fullscreen = self.mode == ScreenMode::Fullscreen;
         let was_alternate = self.mode == ScreenMode::Alternate;
         ratatui::restore();
         let command = format!(
@@ -546,16 +644,24 @@ impl TerminalHost {
             let _ = std::process::Command::new("cat").arg(&path).status();
         }
 
-        let inline_height = self.desired_inline_height.max(1);
-        self.terminal = ratatui::init_with_options(TerminalOptions {
-            viewport: Viewport::Inline(inline_height),
-        });
-        self.requested_inline_height = inline_height;
-        self.desired_inline_height = inline_height;
-        self.mode = ScreenMode::Inline;
-        execute!(stdout(), EnableBracketedPaste)?;
-        if was_alternate {
-            self.enter_alternate()?;
+        if was_fullscreen {
+            self.terminal = ratatui::init();
+            self.requested_inline_height = 0;
+            self.desired_inline_height = 0;
+            self.mode = ScreenMode::Fullscreen;
+            execute!(stdout(), EnableMouseCapture, EnableBracketedPaste)?;
+        } else {
+            let inline_height = self.desired_inline_height.max(1);
+            self.terminal = ratatui::init_with_options(TerminalOptions {
+                viewport: Viewport::Inline(inline_height),
+            });
+            self.requested_inline_height = inline_height;
+            self.desired_inline_height = inline_height;
+            self.mode = ScreenMode::Inline;
+            execute!(stdout(), EnableBracketedPaste)?;
+            if was_alternate {
+                self.enter_alternate()?;
+            }
         }
         let _ = self.terminal.clear();
         let _ = std::fs::remove_file(&path);
@@ -571,6 +677,9 @@ async fn reconcile_screen(
     agent: &mut AgentState,
     theme: &Theme,
 ) -> Result<()> {
+    if terminal.mode == ScreenMode::Fullscreen {
+        return Ok(());
+    }
     match screen_transition(terminal.mode, route) {
         ScreenTransition::Stay => {
             if *route == ScreenRoute::Agent {
@@ -947,8 +1056,18 @@ fn clear_wide_trailing_cells(buffer: &mut ratatui::buffer::Buffer) {
     }
 }
 
-fn draw(frame: &mut Frame, app: &App, theme: &Theme, route: &ScreenRoute) {
+fn draw(
+    frame: &mut Frame,
+    app: &App,
+    theme: &Theme,
+    route: &ScreenRoute,
+    screen_mode: ScreenMode,
+    fullscreen_state: &FullscreenState,
+) {
     match route {
+        ScreenRoute::Agent if screen_mode == ScreenMode::Fullscreen => {
+            draw_fullscreen_agent(frame, app, theme, *fullscreen_state);
+        }
         ScreenRoute::Agent => draw_agent(frame, app, theme),
         ScreenRoute::Modal(modal) => {
             clear_screen(frame, theme);
@@ -980,6 +1099,31 @@ fn draw_agent(frame: &mut Frame, app: &App, theme: &Theme) {
             area.x.saturating_add(cursor.x),
             area.y.saturating_add(cursor.y),
         ));
+    }
+}
+
+fn draw_fullscreen_agent(
+    frame: &mut Frame,
+    app: &App,
+    theme: &Theme,
+    fullscreen_state: FullscreenState,
+) {
+    let area = frame.area();
+    let rendered = render_fullscreen_agent(app, area.width, area.height, theme);
+    frame.render_widget(Paragraph::new(rendered.lines), area);
+    if let Some(cursor) = rendered.cursor {
+        frame.set_cursor_position((
+            area.x.saturating_add(cursor.x),
+            area.y.saturating_add(cursor.y),
+        ));
+    }
+
+    let paused = app
+        .active_session()
+        .is_some_and(|session| !session.scroll.follow);
+    if paused {
+        let (body, _) = fullscreen_layout(app, area, theme);
+        fullscreen::draw_back_to_latest(frame, body, fullscreen_state, theme);
     }
 }
 
@@ -1373,6 +1517,188 @@ fn render_agent(app: &App, width: u16, height: u16, theme: &Theme) -> AgentRende
         lines,
         cursor: Some(Position::new(composer.cursor_x, cursor_y)),
     }
+}
+
+/// 全屏 shell：上半屏是 App 自己持有的 transcript 视口，下半屏是 slash 菜单、
+/// 单行思考链、composer、status 与 shortcuts。
+fn render_fullscreen_agent(app: &App, width: u16, height: u16, theme: &Theme) -> AgentRender {
+    if app.active_session().is_none() {
+        return render_brand(app, width, height, theme);
+    }
+
+    let area = Rect::new(0, 0, width, height.max(1));
+    let (body_area, bottom_area) = fullscreen_layout(app, area, theme);
+    let mut lines = render_fullscreen_history(app, body_area.width, body_area.height, theme);
+    while lines.len() < usize::from(body_area.height) {
+        lines.push(Line::default());
+    }
+    lines.truncate(usize::from(body_area.height));
+
+    let bottom = render_fullscreen_chrome(app, width, bottom_area.height, theme);
+    lines.extend(bottom.lines);
+    lines.truncate(usize::from(area.height));
+
+    let cursor = bottom.cursor.map(|cursor| {
+        Position::new(
+            cursor.x,
+            body_area
+                .height
+                .saturating_add(cursor.y)
+                .min(area.height.saturating_sub(1)),
+        )
+    });
+    AgentRender { lines, cursor }
+}
+
+fn fullscreen_layout(app: &App, area: Rect, theme: &Theme) -> (Rect, Rect) {
+    if area.height == 0 {
+        return (area, Rect::new(area.x, area.y, area.width, 0));
+    }
+
+    let reserve_body = u16::from(area.height > 1);
+    let max_bottom = area.height.saturating_sub(reserve_body).max(1);
+    let desired_bottom =
+        u16::try_from(fullscreen_chrome_layout(app, area.width, max_bottom, theme).height())
+            .unwrap_or(u16::MAX);
+    let bottom_height = desired_bottom.clamp(1, max_bottom);
+    let body_height = area.height.saturating_sub(bottom_height);
+
+    (
+        Rect::new(area.x, area.y, area.width, body_height),
+        Rect::new(
+            area.x,
+            area.y.saturating_add(body_height),
+            area.width,
+            bottom_height,
+        ),
+    )
+}
+
+fn fullscreen_chrome_layout(app: &App, width: u16, available: u16, theme: &Theme) -> AgentLayout {
+    let available = usize::from(available.max(1));
+    let Some(session) = app.active_session() else {
+        return AgentLayout {
+            live_rows: 0,
+            slash_rows: 0,
+            stream_rows: 0,
+            thinking_rows: 0,
+            composer_rows: 0,
+            status_rows: 0,
+            shortcuts_rows: 0,
+        };
+    };
+
+    let narrow = width < NARROW_VIEWPORT_WIDTH;
+    let min_composer = if narrow {
+        1
+    } else {
+        usize::from(theme.spacing.composer_min_height.max(1))
+    };
+    let max_composer = usize::from(theme.spacing.composer_max_height.max(1)).max(min_composer);
+    let preferred_composer = composer_visual_rows(session, width, theme)
+        .clamp(min_composer.min(available), max_composer.min(available));
+    let mut layout = AgentLayout {
+        live_rows: 0,
+        slash_rows: slash_menu_rows(app),
+        stream_rows: 0,
+        thinking_rows: usize::from(session_is_working(session)),
+        composer_rows: preferred_composer,
+        status_rows: usize::from(theme.spacing.status_height.max(1)),
+        shortcuts_rows: if narrow {
+            0
+        } else {
+            usize::from(theme.spacing.shortcuts_height.max(1))
+        },
+    };
+
+    while layout.height() > available {
+        if layout.slash_rows > 0 {
+            layout.slash_rows -= 1;
+        } else if layout.shortcuts_rows > 0 {
+            layout.shortcuts_rows = 0;
+        } else if layout.composer_rows > 1 {
+            layout.composer_rows -= 1;
+        } else if layout.status_rows > 0 {
+            layout.status_rows = 0;
+        } else if layout.thinking_rows > 0 {
+            layout.thinking_rows = 0;
+        } else {
+            break;
+        }
+    }
+    layout
+}
+
+fn render_fullscreen_chrome(app: &App, width: u16, height: u16, theme: &Theme) -> AgentRender {
+    let Some(session) = app.active_session() else {
+        return render_brand(app, width, height, theme);
+    };
+    let height = usize::from(height.max(1));
+    let layout =
+        fullscreen_chrome_layout(app, width, u16::try_from(height).unwrap_or(u16::MAX), theme);
+    let mut lines = slash_menu_lines(app, width, theme, layout.slash_rows);
+    if layout.thinking_rows > 0 {
+        lines.push(thinking_line(session, width, theme));
+    }
+    let composer_start = lines.len();
+    let composer = composer_lines(
+        &session.composer.input,
+        session.composer.cursor,
+        width,
+        theme,
+        layout.composer_rows,
+    );
+    lines.extend(composer.lines);
+    while lines.len() < composer_start.saturating_add(layout.composer_rows) {
+        lines.push(Line::default());
+    }
+    if layout.status_rows > 0 {
+        lines.push(status_line(app, width, theme));
+    }
+    if layout.shortcuts_rows > 0 {
+        lines.push(shortcuts_line(app, width, theme));
+    }
+    lines.truncate(height);
+
+    let cursor_y = composer_start
+        .saturating_add(composer.cursor_row)
+        .min(height.saturating_sub(1)) as u16;
+    AgentRender {
+        lines,
+        cursor: Some(Position::new(composer.cursor_x, cursor_y)),
+    }
+}
+
+fn render_fullscreen_history(
+    app: &App,
+    width: u16,
+    height: u16,
+    theme: &Theme,
+) -> Vec<Line<'static>> {
+    let Some(session) = app.active_session() else {
+        return Vec::new();
+    };
+    let height = usize::from(height);
+    if height == 0 {
+        return Vec::new();
+    }
+
+    // Live reasoning 仍在 composer 上方单独显示，避免“单行思考链”在历史区
+    // 重复；其余 live block（尤其流式 assistant）必须进入全屏历史，否则全屏
+    // 模式下只能看到最后一行。
+    let blocks: Vec<_> = adapter::from_turns(&session.timeline.turns)
+        .into_iter()
+        .filter(|block| {
+            block.state.is_visible()
+                && !(block.state == BlockState::Live
+                    && matches!(block.kind, BlockKind::Thinking { .. }))
+        })
+        .collect();
+    let lines = render_transcript(&blocks, width, theme);
+    let total = lines.len();
+    let top = crate::ui::viewport_top(total, height, session.scroll.follow, session.scroll.offset);
+    let end = top.saturating_add(height).min(total);
+    lines[top.min(total)..end].to_vec()
 }
 
 /// 当前 open assistant 的未完成尾行。稳定行已经写进 scrollback，这里只画
@@ -2552,8 +2878,9 @@ mod tests {
         )
         .expect("inline terminal");
         let route = route::resolve(&app);
+        let state = FullscreenState::default();
         terminal
-            .draw(|frame| draw(frame, &app, &theme, &route))
+            .draw(|frame| draw(frame, &app, &theme, &route, ScreenMode::Inline, &state))
             .expect("draw ask modal");
         let text: String = terminal
             .backend()
@@ -2582,14 +2909,69 @@ mod tests {
         )
         .expect("inline terminal");
         let route = route::resolve(&app);
+        let state = FullscreenState::default();
 
         for (width, height) in [(80, 24), (40, 20), (20, 8), (120, 40)] {
             terminal
                 .resize(Rect::new(0, 0, width, height))
                 .expect("resize");
             terminal
-                .draw(|frame| draw(frame, &app, &theme, &route))
+                .draw(|frame| draw(frame, &app, &theme, &route, ScreenMode::Inline, &state))
                 .expect("draw after resize");
+        }
+    }
+
+    #[test]
+    fn fullscreen_agent_draw_uses_full_buffer_and_keeps_composer_visible() {
+        let mut app = app_with_model(model_with_sealed_answer());
+        app.show_workspace = false;
+        app.sessions
+            .get_mut("seed-1")
+            .expect("session")
+            .scroll
+            .follow = false;
+        let theme = test_theme();
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).expect("fullscreen terminal");
+        let route = route::resolve(&app);
+        let state = FullscreenState {
+            back_to_latest_hover: true,
+            back_to_latest_pressed: false,
+        };
+
+        terminal
+            .draw(|frame| draw(frame, &app, &theme, &route, ScreenMode::Fullscreen, &state))
+            .expect("draw fullscreen agent");
+
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        let compact: String = text.chars().filter(|ch| !ch.is_whitespace()).collect();
+        assert!(compact.contains("answer"), "{text}");
+        assert!(compact.contains("回到最新消息"), "{text}");
+    }
+
+    #[test]
+    fn fullscreen_agent_draw_survives_resize() {
+        let mut app = app_with_model(model_with_sealed_answer());
+        app.show_workspace = false;
+        let theme = test_theme();
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).expect("fullscreen terminal");
+        let route = route::resolve(&app);
+        let state = FullscreenState::default();
+
+        for (width, height) in [(80, 24), (40, 20), (20, 8), (120, 40)] {
+            terminal
+                .resize(Rect::new(0, 0, width, height))
+                .expect("resize");
+            terminal
+                .draw(|frame| draw(frame, &app, &theme, &route, ScreenMode::Fullscreen, &state))
+                .expect("draw fullscreen after resize");
         }
     }
 
@@ -2617,6 +2999,15 @@ mod tests {
         assert_eq!(
             screen_transition(ScreenMode::Alternate, &ScreenRoute::Agent),
             ScreenTransition::LeaveAlternate
+        );
+        assert_eq!(
+            screen_transition(ScreenMode::Fullscreen, &ScreenRoute::Agent),
+            ScreenTransition::Stay
+        );
+        assert_eq!(
+            screen_transition(ScreenMode::Fullscreen, &workspace),
+            ScreenTransition::Stay,
+            "全屏 shell 在 Agent/Workspace 之间不应退出 alternate"
         );
     }
 
