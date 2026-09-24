@@ -64,6 +64,7 @@ import os
 import pathlib
 import pty
 import select
+import shlex
 import signal
 import struct
 import subprocess
@@ -300,11 +301,11 @@ token = discovery["token"]
 client_instance_id = str(uuid.uuid4())
 open_payload = {
     "schema": "qaqh.Ringing",
-    "version": 1,
+    "version": 2,
     "client_instance_id": client_instance_id,
 }
 opened = post_json(
-    f"{endpoint}/ringing/v1/clients/open",
+    f"{endpoint}/ringing/v2/clients/open",
     open_payload,
     {"Authorization": f"Bearer {token}"},
 )
@@ -312,7 +313,7 @@ client_session_id = opened["client_session_id"]
 command_id = str(uuid.uuid4())
 command_payload = {
     "schema": "qaqh.Ringing",
-    "version": 1,
+    "version": 2,
     "channel": "control",
     "command_id": command_id,
     "client_instance_id": client_instance_id,
@@ -327,7 +328,7 @@ command_payload = {
     },
 }
 post_json(
-    f"{endpoint}/ringing/v1/commands/control",
+    f"{endpoint}/ringing/v2/commands/control",
     command_payload,
     {
         "Authorization": f"Bearer {token}",
@@ -362,7 +363,11 @@ tui_env["TERM"] = "xterm-256color"
 tui_env["QAQH_DATA_DIR"] = str(DATA)
 tui_env["PAGER"] = "cat"
 tui = subprocess.Popen(
-    [os.environ["TUI"], "--v2-agent", "--no-spawn"],
+    [
+        os.environ["TUI"],
+        *shlex.split(os.environ.get("TUI_ARGS", "--v2-fullscreen")),
+        "--no-spawn",
+    ],
     stdin=slave,
     stdout=slave,
     stderr=slave,
@@ -691,7 +696,7 @@ if is_negative:
     while time.monotonic() < deadline:
         try:
             page = get_json(
-                f"{endpoint}/ringing/v1/sessions/{created_seed}/timeline",
+                f"{endpoint}/ringing/v2/sessions/{created_seed}/timeline",
                 {
                     "Authorization": f"Bearer {token}",
                     "X-QAQH-Client-Session-Id": client_session_id,

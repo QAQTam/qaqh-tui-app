@@ -25,6 +25,9 @@ DAEMON=${DAEMON:-$BACKEND_ROOT/target/debug/qaqh-daemon}
 TUI=${TUI:-$REPO_ROOT/target/debug/qaqh-tui}
 D=${D:-/tmp/qaqh-e2e-modal-mouse}
 RUN_SECS=${RUN_SECS:-30}
+# 鼠标响应属于 fullscreen shell：inline 明确不抓鼠标，保留终端原生选择/复制。
+# 允许覆盖是为了后续在同一个 harness 上跑 `--v1`/其他外壳，但默认必须覆盖本轮验收目标。
+TUI_ARGS=${TUI_ARGS:---v2-fullscreen}
 
 case "$D" in
   /tmp/*|/var/tmp/*) ;;
@@ -42,7 +45,7 @@ WORK=$D/work
 
 echo "跑弹窗鼠标点击回合（隔离 data root + workspace）…"
 DAEMON="$DAEMON" TUI="$TUI" REPO_ROOT="$REPO_ROOT" DATA="$DATA" WORK="$WORK" \
-  RUN_SECS="$RUN_SECS" python3 - <<'PY'
+  RUN_SECS="$RUN_SECS" TUI_ARGS="$TUI_ARGS" python3 - <<'PY'
 import json
 import os
 import pathlib
@@ -287,8 +290,8 @@ wrong_default = any(
 # alternate screen 切换，退出 alt screen 后旧内容还留在它的虚拟屏上（实测会假红）。
 # 直接看字节流里的模式位：进 alt screen / 出 alt screen。
 left_alternate = "\x1b[?1049l" in raw
-# ④ 捕获纪律：鼠标捕获**只在弹窗期间**开（进弹窗开、出弹窗关）。这条是"不破坏
-# 主界面原生选择/复制"的机械保证，比任何 UI 断言都硬。
+# ④ 捕获纪律：fullscreen 进入时开、退出时关。inline 模式不抓鼠标，
+# 因此这个 harness 默认显式启动 `--v2-fullscreen`。
 capture_on = "\x1b[?1000h" in raw and "\x1b[?1003h" in raw and "\x1b[?1006h" in raw
 capture_off = "\x1b[?1000l" in raw and "\x1b[?1003l" in raw and "\x1b[?1006l" in raw
 
@@ -310,7 +313,7 @@ checks = [
     ("① 反例：没有误提交默认第一项（方案甲）", not wrong_default),
     ("② 点击后回合继续到最终正文", FINAL_TEXT in screen),
     ("③ 弹窗关闭（离开 alternate screen）", left_alternate),
-    ("④ 鼠标捕获只在弹窗期间开（开+关都在）", capture_on and capture_off),
+    ("④ fullscreen 鼠标捕获进入/退出成对", capture_on and capture_off),
 ]
 ok = True
 for name, hit in checks:
