@@ -605,7 +605,10 @@ impl RingingV2SessionModel {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use qaqh_client::{ClientV2Cursor, ClientV2CursorToken};
+    use qaqh_client::{
+        ClientV2ControlState, ClientV2ConversationState, ClientV2Cursor, ClientV2CursorToken,
+        ClientV2ToolState,
+    };
 
     fn bootstrap() -> BootstrapSnapshot {
         BootstrapSnapshot {
@@ -800,6 +803,28 @@ mod tests {
     fn client_bootstrap_adapter_maps_pending_driver_and_revision() {
         let token = ClientV2CursorToken::encode_snapshot(&ClientV2Cursor::snapshot("log-1", 42))
             .expect("cursor");
+        // 三个频道快照在 `qaqh-client` 里是手写/领域结构体：非 `Option` 字段在
+        // wire 上都是**必填**（daemon 逐字段发全量，见 `axum_impl/v2.rs` 的
+        // `V2ControlState`），所以 `"state": {}` 会在反序列化时红。
+        // 基线统一用客户端自己的 `Default` 生成，本用例只覆写真正关心的
+        // `interactions` / `driver` —— 后端再往快照里加必填字段时不用回来补
+        // fixture，但整条 `from_value` 反序列化路径仍然被走一遍。
+        let mut control_state =
+            serde_json::to_value(ClientV2ControlState::default()).expect("control baseline");
+        control_state["interactions"] = serde_json::json!([{
+            "interaction_id": "i1",
+            "call_id": "c1",
+            "turn_id": "t1",
+            "kind": "permission"
+        }]);
+        control_state["driver"] = serde_json::json!({
+            "holder": "cs-1",
+            "driver_epoch": 4,
+            "can_claim": false
+        });
+        let conversation_state = serde_json::to_value(ClientV2ConversationState::default())
+            .expect("conversation baseline");
+        let tool_state = serde_json::to_value(ClientV2ToolState::default()).expect("tool baseline");
         let value = serde_json::json!({
             "schema": "qaqh.Ringing",
             "version": 2,
@@ -810,31 +835,19 @@ mod tests {
                 "channel": "control",
                 "state_revision": 7,
                 "snapshot_version": 1,
-                "state": {
-                    "interactions": [{
-                        "interaction_id": "i1",
-                        "call_id": "c1",
-                        "turn_id": "t1",
-                        "kind": "permission"
-                    }],
-                    "driver": {
-                        "holder": "cs-1",
-                        "driver_epoch": 4,
-                        "can_claim": false
-                    }
-                }
+                "state": control_state
             },
             "conversation": {
                 "channel": "conversation",
                 "state_revision": 19,
                 "snapshot_version": 1,
-                "state": {}
+                "state": conversation_state
             },
             "tool": {
                 "channel": "tool",
                 "state_revision": 11,
                 "snapshot_version": 1,
-                "state": {}
+                "state": tool_state
             }
         });
         let bootstrap: ClientV2Bootstrap = serde_json::from_value(value).expect("client bootstrap");

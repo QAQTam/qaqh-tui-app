@@ -16,8 +16,9 @@
 # 前置：qaqh-daemon 与 qaqh-tui 已构建。
 #
 # ⚠ 锚点口径（2026-09-24 更新）：
-#   - 当前 TUI pin / 本机 anchor 已是 `tui-ringing-v2-types-2026-09-24` @
-#     `a43a8bc`，六模式实测全绿；
+#   - 当前 TUI pin / 本机 anchor 已是
+#     `tui-ringing-v2-interaction-causation-2026-09-24` @ `b77c251`；
+#   - 上一版 `tui-ringing-v2-types-2026-09-24` @ `a43a8bc` 六模式实测全绿；
 #   - 旧冻结锚点 `b40ff698` 仍不含后端修复：`none` / `lagged` / `gap` /
 #     `ack-delay` / `ack-hang` 五个模式会红，这是预期；
 #   - 验证记录见
