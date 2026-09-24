@@ -13,6 +13,11 @@ pub enum WorkspaceRoute {
     },
     Settings,
     Help,
+    History {
+        selected: usize,
+        detail: bool,
+        scroll: usize,
+    },
     Todo,
     Subagent {
         seed: String,
@@ -67,6 +72,17 @@ pub fn resolve(app: &App) -> ScreenRoute {
             }
             Overlay::Settings(_) => return ScreenRoute::Workspace(WorkspaceRoute::Settings),
             Overlay::Help => return ScreenRoute::Workspace(WorkspaceRoute::Help),
+            Overlay::History {
+                selected,
+                detail,
+                scroll,
+            } => {
+                return ScreenRoute::Workspace(WorkspaceRoute::History {
+                    selected: *selected,
+                    detail: *detail,
+                    scroll: *scroll,
+                });
+            }
             Overlay::Confirm { .. } => return ScreenRoute::Modal(ModalRoute::Confirm),
             Overlay::AttachPath { .. } => return ScreenRoute::Modal(ModalRoute::AttachPath),
             Overlay::CwdInput { .. } => return ScreenRoute::Modal(ModalRoute::CwdInput),
@@ -187,6 +203,22 @@ mod tests {
         app.overlays.clear();
         app.overlays.push(Overlay::Help);
         assert_eq!(resolve(&app), ScreenRoute::Workspace(WorkspaceRoute::Help));
+
+        // `/history` 也是全屏 Workspace（alternate screen），不是 inline 浮层。
+        app.overlays.clear();
+        app.overlays.push(Overlay::History {
+            selected: 3,
+            detail: true,
+            scroll: 7,
+        });
+        assert_eq!(
+            resolve(&app),
+            ScreenRoute::Workspace(WorkspaceRoute::History {
+                selected: 3,
+                detail: true,
+                scroll: 7,
+            })
+        );
     }
 
     #[test]

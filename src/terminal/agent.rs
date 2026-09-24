@@ -102,7 +102,11 @@ pub async fn run(no_spawn: bool) -> Result<()> {
     .await;
 
     input.suspend().await;
-    let _ = execute!(stdout(), DisableBracketedPaste);
+    // ⚠ 退出清理必须**同时**关掉鼠标捕获：捕获是在 `enter_alternate` 里开的，
+    // 而用户完全可能在全屏面（弹窗 / Workspace）里直接退出——那条路径不经过
+    // `leave_alternate`，只靠它收尾会把终端留在鼠标上报模式，用户的原生选择/
+    // 复制就此失效（实测：`?1000h` 有、`?1000l` 没有）。重复关是幂等的。
+    let _ = execute!(stdout(), DisableMouseCapture, DisableBracketedPaste);
     runtime.shutdown().await;
     ratatui::restore();
     result
@@ -1013,6 +1017,7 @@ fn overlay_hint(overlay: &Overlay, theme: &Theme) -> Line<'static> {
         Overlay::SessionList { .. } => " 会话列表 · M5 Workspace",
         Overlay::Settings(_) => " 设置 · M5 Workspace",
         Overlay::Help => " 帮助 · M5 Workspace",
+        Overlay::History { .. } => " 历史回合 · M5 Workspace",
         Overlay::AttachPath { .. } => " 附件路径 · M5 Modal",
         Overlay::Confirm { .. } => " 确认操作 · M5 Modal",
         Overlay::CwdInput { .. } => " 新会话目录 · M5 Modal",

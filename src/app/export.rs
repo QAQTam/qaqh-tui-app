@@ -36,6 +36,14 @@ pub(crate) fn export_markdown(sess: &SessionState) -> String {
     out
 }
 
+/// 单个回合的 Markdown（`/history` 的详情视图与「导出此回合」共用同一份文本，
+/// 所以详情里看到的就是导出出去的内容）。
+pub(crate) fn export_turn_markdown(turn: &Turn, number: usize) -> String {
+    let mut out = String::new();
+    export_turn(&mut out, number, turn);
+    out
+}
+
 /// 默认导出路径：`./qaqh-export-{seed 前 8 位}-{时间戳}.md`。
 pub(crate) fn default_export_path(seed: &str) -> std::path::PathBuf {
     let short: String = seed.chars().take(8).collect();

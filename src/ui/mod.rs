@@ -261,16 +261,24 @@ mod tests {
             sess.composer.input = "/".chars().collect();
             sess.composer.cursor = sess.composer.input.len();
         }
-        // `/export` 是 SLASH_COMMANDS 的最后一条（索引 6）。
-        assert_eq!(app.slash_candidates().len(), 7, "候选数变了，请同步本锁");
-        app.slash_selected = 6;
+        // 判据是「**最后一条**可达」，不是「恰好 7 条」——所以从命令表推导，
+        // 加命令时不必手改本锁（曾经写死 7/索引 6，加 /history 就会假红）。
+        let candidates = app.slash_candidates();
+        assert_eq!(
+            candidates.len(),
+            crate::app::slash::SLASH_COMMANDS.len(),
+            "候选数应与命令表一致"
+        );
+        let last = candidates.len().saturating_sub(1);
+        let last_name = format!("/{}", candidates[last].name);
+        app.slash_selected = last;
         let text = draw_text(&mut app, 100, 30);
         assert!(
-            text.contains("/export"),
-            "选中第 7 条时菜单必须把它画出来（U-16）\n{text}"
+            text.contains(&last_name),
+            "选中最后一条（{last_name}）时菜单必须把它画出来（U-16）\n{text}"
         );
         assert!(
-            text.contains("▸ /export"),
+            text.contains(&format!("▸ {last_name}")),
             "选中项必须带 ▸ 标记，否则用户不知道回车会执行哪条\n{text}"
         );
     }

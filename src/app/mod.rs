@@ -5,7 +5,7 @@
 
 pub(crate) mod anim;
 mod composer_ops;
-mod export;
+pub(crate) mod export;
 mod interaction;
 pub(crate) mod keymap;
 pub mod markdown;
@@ -430,6 +430,16 @@ pub enum Overlay {
         input: Vec<char>,
         cursor: usize,
     },
+    /// `/history`：按回合浏览当前会话。
+    ///
+    /// 数据源是 **app 自己的 timeline 模型**，不是终端 scrollback —— 后者读不回来
+    /// （没有标准序列），而且会被终端 evict。`detail` 为真时进入该回合的只读
+    /// 详情视图（`selected` 指向 `timeline.turns` 的下标）。
+    History {
+        selected: usize,
+        detail: bool,
+        scroll: usize,
+    },
     /// 思考回放浮层（§4.5）：当前活动回合的 reasoning body（内存零抓取）。
     /// 只读 + 滚动；Esc 关闭。body 在推入时快照（后续 delta 不刷新——回放语义）。
     Thinking {
@@ -471,9 +481,12 @@ impl Overlay {
             Overlay::Confirm { action } => Some(action.seed()),
             Overlay::AttachPath { seed, .. } => Some(seed),
             Overlay::Thinking { seed, .. } => Some(seed),
+            // History 渲染的是**当前活动会话**的 timeline，自己不持有 seed：
+            // 切标签时让它跟着走，不关掉（与 SessionList/Settings 同属全局面）。
             Overlay::SessionList { .. }
             | Overlay::Settings(_)
             | Overlay::Help
+            | Overlay::History { .. }
             | Overlay::CwdInput { .. } => None,
         }
     }

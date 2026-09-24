@@ -1,11 +1,26 @@
 //! Slash 命令解析与二级菜单定义
 //! 一级：/new, /help ...  二级：/new 的 cwd 参数
 
+/// 命令的**落点**：声明它会把界面切到哪。
+///
+/// 为什么要显式声明：Agent View 是 inline + scrollback，而 Workspace 是
+/// alternate screen 全屏。用户按下 `/settings` 会**整屏切换**——这件事应该在
+/// 菜单里就能看见，而不是按下去才知道。后续要做命令面板时，这个字段也是
+/// 分组/过滤的依据（"只显示不换屏的命令"之类）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SlashSurface {
+    /// 就地生效，不换屏（改输入、开 inline 浮层、直接发命令）。
+    Inline,
+    /// 打开全屏 Workspace（alternate screen；Esc 返回 Agent View）。
+    Workspace,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SlashDef {
     pub name: &'static str,
     pub desc: &'static str,
     pub hint: &'static str,
+    pub surface: SlashSurface,
 }
 
 pub const SLASH_COMMANDS: &[SlashDef] = &[
@@ -13,36 +28,49 @@ pub const SLASH_COMMANDS: &[SlashDef] = &[
         name: "new",
         desc: "新建会话",
         hint: "/new [cwd]  在指定目录新建会话（cwd 为绝对路径，留空则按 环境变量>启动目录>当前会话 回退）",
+        surface: SlashSurface::Inline,
     },
     SlashDef {
         name: "help",
         desc: "帮助",
         hint: "/help  打开帮助",
+        surface: SlashSurface::Workspace,
     },
     SlashDef {
         name: "sessions",
         desc: "会话列表",
         hint: "/sessions  打开会话列表 Workspace",
+        surface: SlashSurface::Workspace,
     },
     SlashDef {
         name: "settings",
         desc: "设置",
         hint: "/settings  打开设置 Workspace",
+        surface: SlashSurface::Workspace,
+    },
+    SlashDef {
+        name: "history",
+        desc: "历史回合",
+        hint: "/history  按回合浏览当前会话（可查看/导出单个回合）",
+        surface: SlashSurface::Workspace,
     },
     SlashDef {
         name: "workspace",
         desc: "todo / 工作区",
         hint: "/workspace  打开 todo Workspace",
+        surface: SlashSurface::Workspace,
     },
     SlashDef {
         name: "clear",
         desc: "清空输入",
         hint: "/clear  清空当前输入",
+        surface: SlashSurface::Inline,
     },
     SlashDef {
         name: "export",
         desc: "导出会话",
         hint: "/export [path]  导出当前会话为 Markdown（默认写入当前目录）",
+        surface: SlashSurface::Inline,
     },
 ];
 
@@ -52,6 +80,7 @@ pub enum SlashCmd {
     Help,
     Sessions,
     Settings,
+    History,
     Workspace,
     Clear,
     Export { path: Option<String> },
@@ -92,6 +121,7 @@ pub fn parse(input: &str) -> Option<SlashCmd> {
         "help" => Some(SlashCmd::Help),
         "sessions" => Some(SlashCmd::Sessions),
         "settings" => Some(SlashCmd::Settings),
+        "history" => Some(SlashCmd::History),
         "workspace" => Some(SlashCmd::Workspace),
         "clear" => Some(SlashCmd::Clear),
         "export" => {
@@ -249,10 +279,25 @@ mod tests {
         assert!(completions_for("/ex").iter().any(|d| d.name == "export"));
     }
 
+    /// 命令表里声明的**每一个**名字都必须解析成非 `Unknown` —— 防"菜单里列了
+    /// 但打不出来"（拼写不一致时最容易出的错）。
+    #[test]
+    fn every_declared_command_parses() {
+        for def in SLASH_COMMANDS {
+            let cmd = parse(&format!("/{}", def.name));
+            assert!(
+                !matches!(cmd, Some(SlashCmd::Unknown(_)) | None),
+                "/{} 在菜单里但解析不出来：{cmd:?}",
+                def.name
+            );
+        }
+    }
+
     #[test]
     fn parse_workspace_entrypoints() {
         assert_eq!(parse("/sessions"), Some(SlashCmd::Sessions));
         assert_eq!(parse("/settings"), Some(SlashCmd::Settings));
+        assert_eq!(parse("/history"), Some(SlashCmd::History));
         assert_eq!(parse("/workspace"), Some(SlashCmd::Workspace));
         for command in ["/ses", "/set", "/work"] {
             assert!(

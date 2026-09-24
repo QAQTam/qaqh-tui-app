@@ -132,6 +132,19 @@ impl App {
                 self.toggle_settings();
                 true
             }
+            SlashCmd::History => {
+                if let Some(sess) = self.active_session_mut() {
+                    sess.composer.clear();
+                }
+                self.slash_selected = 0;
+                // 打开即全屏（alternate screen）；数据源是 timeline 模型。
+                self.overlays.push(Overlay::History {
+                    selected: 0,
+                    detail: false,
+                    scroll: 0,
+                });
+                true
+            }
             SlashCmd::Workspace => {
                 if let Some(sess) = self.active_session_mut() {
                     sess.composer.clear();
@@ -187,6 +200,33 @@ impl App {
         };
         match std::fs::write(&target, md) {
             Ok(()) => self.toast(NoticeLevel::Info, format!("已导出：{}", target.display())),
+            Err(e) => self.toast(NoticeLevel::Error, format!("导出失败：{e}")),
+        }
+    }
+
+    /// `/history` 详情里的「导出此回合」。
+    ///
+    /// 与详情视图共用 `export_turn_markdown`，所以导出的就是屏幕上看到的那份；
+    /// 默认落到当前目录 `qaqh-turn-{seed 前 8 位}-{序号}-{时间戳}.md`。
+    pub(super) fn export_history_turn(&mut self, index: usize) {
+        let Some(sess) = self.active_session() else {
+            self.toast(NoticeLevel::Error, "无活动会话，无法导出");
+            return;
+        };
+        let Some(turn) = sess.timeline.turns.get(index) else {
+            self.toast(NoticeLevel::Error, "该回合不在当前窗口内");
+            return;
+        };
+        let number = sess.timeline.turn_number(index);
+        let md = crate::app::export::export_turn_markdown(turn, number as usize);
+        let short: String = sess.seed.chars().take(8).collect();
+        let ts = chrono::Local::now().format("%Y%m%d-%H%M%S");
+        let target = std::path::PathBuf::from(format!("qaqh-turn-{short}-{number}-{ts}.md"));
+        match std::fs::write(&target, md) {
+            Ok(()) => self.toast(
+                NoticeLevel::Info,
+                format!("已导出回合：{}", target.display()),
+            ),
             Err(e) => self.toast(NoticeLevel::Error, format!("导出失败：{e}")),
         }
     }

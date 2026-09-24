@@ -25,7 +25,99 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) {
         Overlay::CwdInput { input, cursor } => draw_cwd(f, input, *cursor, area),
         Overlay::Confirm { action } => draw_confirm(f, action, area),
         Overlay::Thinking { scroll, body, .. } => draw_thinking(f, area, *scroll, body),
+        Overlay::History {
+            selected,
+            detail,
+            scroll,
+        } => draw_history(f, app, area, *selected, *detail, *scroll),
     }
+}
+
+/// `/history`（v1 全屏回退路径）。
+///
+/// v2 那边是 Workspace 路由（`ui/v2/workspace.rs::draw_history`）；这里是 v1 的
+/// 等价面——**同一份 timeline 模型、同一份导出文本**，只是换了套排版。
+fn draw_history(
+    f: &mut Frame,
+    app: &App,
+    area: Rect,
+    selected: usize,
+    detail: bool,
+    scroll: usize,
+) {
+    let Some(session) = app.active_session() else {
+        return;
+    };
+    let turns = &session.timeline.turns;
+    let title = if detail {
+        format!("历史回合 · 第 {} 个", selected + 1)
+    } else {
+        format!("历史回合 · {} 个", turns.len())
+    };
+    let inner = box_frame(f, area, 86, area.height.saturating_sub(6), &title);
+    if turns.is_empty() {
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                " 这个会话还没有回合",
+                theme::dim(),
+            ))),
+            inner,
+        );
+        return;
+    }
+    let selected = selected.min(turns.len() - 1);
+    let height = usize::from(inner.height);
+    let width = usize::from(inner.width).saturating_sub(2);
+
+    if detail {
+        let number = session.timeline.turn_number(selected) as usize;
+        let markdown = crate::app::export::export_turn_markdown(&turns[selected], number);
+        let raw_lines: Vec<&str> = markdown.lines().collect();
+        let start = scroll.min(raw_lines.len().saturating_sub(1));
+        let mut lines: Vec<Line> = Vec::new();
+        'outer: for raw in &raw_lines[start..] {
+            for seg in crate::app::render_line::wrap_text(raw, width) {
+                if lines.len() >= height.saturating_sub(1) {
+                    break 'outer;
+                }
+                lines.push(Line::from(Span::styled(seg, theme::dim())));
+            }
+        }
+        lines.push(Line::from(Span::styled(
+            " ↑↓/PgUp/PgDn 滚动 · e 导出此回合 · Esc 返回列表",
+            theme::dim(),
+        )));
+        f.render_widget(Paragraph::new(lines), inner);
+        return;
+    }
+
+    let mut lines: Vec<Line> = Vec::new();
+    for (index, turn) in turns.iter().enumerate().take(height.saturating_sub(1)) {
+        let is_selected = index == selected;
+        let preview = turn.user_text.lines().next().unwrap_or("").trim();
+        let text = format!(
+            " {} {:>3}  {}",
+            if is_selected { "▶" } else { " " },
+            session.timeline.turn_number(index),
+            preview
+        );
+        // 按显示宽度截断（CJK 占两列），否则长标题会顶破边框。
+        let text = crate::app::render_line::wrap_text(&text, width)
+            .into_iter()
+            .next()
+            .unwrap_or_default();
+        let style = if is_selected {
+            theme::active_tab()
+        } else {
+            theme::dim()
+        };
+        lines.push(Line::from(Span::styled(text, style)));
+    }
+    lines.push(Line::from(Span::styled(
+        " ↑↓ 选择回合 · Enter 查看 · Esc 返回 Agent View",
+        theme::dim(),
+    )));
+    f.render_widget(Paragraph::new(lines), inner);
 }
 
 /// §4.5 思考回放浮层：只读 + 滚动。内容在推入时已快照（`Overlay::Thinking.body`）。

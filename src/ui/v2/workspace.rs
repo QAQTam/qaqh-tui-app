@@ -18,6 +18,7 @@ use crate::theme::Theme;
 use crate::ui::v2::adapter;
 use crate::ui::v2::route::WorkspaceRoute;
 use crate::ui::v2::transcript::render_transcript;
+use qaqh_client::TimelineTurnState;
 
 pub fn draw(f: &mut Frame, app: &App, route: &WorkspaceRoute, theme: &Theme) {
     let area = f.area();
@@ -42,6 +43,11 @@ pub fn draw(f: &mut Frame, app: &App, route: &WorkspaceRoute, theme: &Theme) {
         } => draw_sessions(f, app, body, *selected, *show_archived, theme),
         WorkspaceRoute::Settings => draw_settings(f, app, body, theme),
         WorkspaceRoute::Help => draw_help(f, body, theme),
+        WorkspaceRoute::History {
+            selected,
+            detail,
+            scroll,
+        } => draw_history(f, app, body, *selected, *detail, *scroll, theme),
         WorkspaceRoute::Todo => draw_todo(f, app, body, theme),
         WorkspaceRoute::Subagent { seed } => draw_subagent(f, app, body, seed, theme),
     }
@@ -61,6 +67,20 @@ fn header_line(route: &WorkspaceRoute, app: &App, theme: &Theme) -> Line<'static
         ),
         WorkspaceRoute::Settings => ("Settings", "daemon 配置".to_owned()),
         WorkspaceRoute::Help => ("Help", "按键与斜杠命令".to_owned()),
+        WorkspaceRoute::History {
+            selected, detail, ..
+        } => (
+            "History",
+            if *detail {
+                format!("第 {} 回合详情", selected + 1)
+            } else {
+                let total = app
+                    .active_session()
+                    .map(|s| s.timeline.turns.len())
+                    .unwrap_or(0);
+                format!("{} 个回合（当前窗口）", total)
+            },
+        ),
         WorkspaceRoute::Todo => (
             "Workspace",
             app.active_session()
@@ -96,6 +116,13 @@ fn footer_line(route: &WorkspaceRoute, theme: &Theme) -> Line<'static> {
             " ↑↓ 选择 · Enter 编辑/应用 · ←→ 切换 · s 保存 · r 刷新 · Esc 返回"
         }
         WorkspaceRoute::Help => " Esc 返回 Agent View",
+        WorkspaceRoute::History { detail, .. } => {
+            if *detail {
+                " PgUp/PgDn 滚动 · e 导出此回合 · Esc 返回列表"
+            } else {
+                " ↑↓ 选择回合 · Enter 查看 · PgUp/PgDn 翻页 · Esc 返回 Agent View"
+            }
+        }
         WorkspaceRoute::Todo => " F4/Esc 返回 · PgUp/PgDn 滚动 · F6 详情",
         WorkspaceRoute::Subagent { .. } => {
             " Ctrl+↓/Esc 返回父会话 · PgUp/PgDn 滚动 · Ctrl+Home/End 顶部/底部"
@@ -194,6 +221,115 @@ fn draw_sessions(
                 line
             });
         }
+    }
+    f.render_widget(Paragraph::new(lines), area);
+}
+
+/// `/history`：按回合浏览当前会话。
+///
+/// 数据源是 **timeline 模型**（不是终端 scrollback —— 那个读不回来，也没有
+/// 搜索）。列表回答"有哪些回合"，详情回答"这个回合到底说了什么"；两者都用
+/// **同一份导出文本**，所以「详情里看到的 = 按 `e` 导出的」。
+fn draw_history(
+    f: &mut Frame,
+    app: &App,
+    area: Rect,
+    selected: usize,
+    detail: bool,
+    scroll: usize,
+    theme: &Theme,
+) {
+    let Some(session) = app.active_session() else {
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                " 没有活动会话",
+                Style::new().fg(theme.text.dim),
+            ))),
+            area,
+        );
+        return;
+    };
+    let turns = &session.timeline.turns;
+    if turns.is_empty() {
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                " 这个会话还没有回合",
+                Style::new().fg(theme.text.dim),
+            ))),
+            area,
+        );
+        return;
+    }
+    let selected = selected.min(turns.len().saturating_sub(1));
+
+    if detail {
+        let number = session.timeline.turn_number(selected) as usize;
+        let markdown = crate::app::export::export_turn_markdown(&turns[selected], number);
+        let lines: Vec<Line<'static>> = markdown
+            .lines()
+            .map(|line| {
+                Line::from(Span::styled(
+                    line.to_owned(),
+                    Style::new().fg(theme.text.primary),
+                ))
+            })
+            .collect();
+        f.render_widget(
+            Paragraph::new(visible_lines(&lines, area.height, false, scroll)),
+            area,
+        );
+        return;
+    }
+
+    let height = usize::from(area.height).max(1);
+    let start = selected
+        .saturating_sub(height.saturating_sub(1) / 2)
+        .min(turns.len().saturating_sub(height));
+    let width = usize::from(area.width);
+    let mut lines = Vec::with_capacity(height);
+    for (index, turn) in turns.iter().enumerate().skip(start).take(height) {
+        let is_selected = index == selected;
+        let number = session.timeline.turn_number(index);
+        let state = match turn.state {
+            TimelineTurnState::Running => "…",
+            TimelineTurnState::Failed => "✗",
+            TimelineTurnState::Cancelled => "⊘",
+            TimelineTurnState::Completed => " ",
+        };
+        let tools: usize = turn
+            .rounds
+            .iter()
+            .flat_map(|round| round.blocks.iter())
+            .filter(|block| block.tool.is_some())
+            .count();
+        let preview = turn.user_text.lines().next().unwrap_or("").trim();
+        let preview_width = width.saturating_sub(30).max(10);
+        let marker = if is_selected { "▶" } else { " " };
+        let mut spans = vec![Span::styled(
+            format!(
+                " {marker} {number:>3} {state} {}",
+                fit_width(preview, preview_width)
+            ),
+            Style::new().fg(if is_selected {
+                theme.text.bright
+            } else {
+                theme.text.primary
+            }),
+        )];
+        let mut meta = format!("  {tools} 工具");
+        if turn.offloaded {
+            meta.push_str(" · 已卸载");
+        }
+        if !turn.sealed {
+            meta.push_str(" · 未封口");
+        }
+        spans.push(Span::styled(meta, Style::new().fg(theme.text.dim)));
+        let line = Line::from(spans);
+        lines.push(if is_selected {
+            line.style(Style::new().bg(theme.surface.highlight))
+        } else {
+            line
+        });
     }
     f.render_widget(Paragraph::new(lines), area);
 }
@@ -589,6 +725,146 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect()
+    }
+
+    /// 造一个带两回合的会话（第二回合带一个工具块）。
+    fn app_with_turns() -> App {
+        use crate::app::timeline_model::{Block, Round, ToolCard, Turn};
+        use qaqh_client::{
+            TimelineBlockKind, TimelineBlockState, TimelineToolState, TimelineTurnState,
+        };
+
+        let (mut app, _rx) = App::new_for_test();
+        let seed = "seed-history".to_string();
+        let mut session = SessionState::new(seed.clone());
+        session.timeline.turns = vec![
+            Turn {
+                turn_id: "t1".into(),
+                turn_index: Some(1),
+                user_text: "第一个问题：读一下文件".into(),
+                state: TimelineTurnState::Completed,
+                failure: None,
+                sealed: true,
+                offloaded: false,
+                thinking: Default::default(),
+                rounds: vec![Round {
+                    round_num: 0,
+                    sealed: true,
+                    is_final: true,
+                    blocks: vec![Block {
+                        block_id: "b1".into(),
+                        block_order: 0,
+                        kind: TimelineBlockKind::Text,
+                        state: TimelineBlockState::Sealed,
+                        text: "第一回合的回答".into(),
+                        tool: None,
+                        last_fragment: 0,
+                        rev: 0,
+                    }],
+                }],
+            },
+            Turn {
+                turn_id: "t2".into(),
+                turn_index: Some(2),
+                user_text: "第二个问题：跑一下测试".into(),
+                state: TimelineTurnState::Completed,
+                failure: None,
+                sealed: true,
+                offloaded: false,
+                thinking: Default::default(),
+                rounds: vec![Round {
+                    round_num: 0,
+                    sealed: true,
+                    is_final: true,
+                    blocks: vec![
+                        Block {
+                            block_id: "b2".into(),
+                            block_order: 0,
+                            kind: TimelineBlockKind::Text,
+                            state: TimelineBlockState::Sealed,
+                            text: "第二回合的回答".into(),
+                            tool: None,
+                            last_fragment: 0,
+                            rev: 0,
+                        },
+                        Block {
+                            block_id: "b3".into(),
+                            block_order: 1,
+                            kind: TimelineBlockKind::Tool,
+                            state: TimelineBlockState::Sealed,
+                            text: String::new(),
+                            tool: Some(ToolCard {
+                                tool_call_id: "tc2".into(),
+                                name: "bash".into(),
+                                state: TimelineToolState::Succeeded,
+                                summary: None,
+                                args_json: Some(r#"{"command":"cargo test"}"#.into()),
+                                output: Some("ok".into()),
+                                diff: None,
+                                progress: String::new(),
+                                progress_truncated: false,
+                                progress_bytes_total: 0,
+                                progress_stream: None,
+                                failure: None,
+                                permission: None,
+                                display: None,
+                            }),
+                            last_fragment: 0,
+                            rev: 0,
+                        },
+                    ],
+                }],
+            },
+        ];
+        app.tabs.push(seed.clone());
+        app.sessions.insert(seed, session);
+        app
+    }
+
+    fn draw_history_route(app: &App, selected: usize, detail: bool, scroll: usize) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(100, 24)).expect("terminal");
+        let route = WorkspaceRoute::History {
+            selected,
+            detail,
+            scroll,
+        };
+        terminal
+            .draw(|frame| draw(frame, app, &route, &theme()))
+            .expect("draw history");
+        text(&terminal)
+    }
+
+    /// `/history` 列表：每个回合都要能看见它的**用户问题**（否则用户无法在
+    /// 回合之间做选择），并且带回合号。
+    #[test]
+    fn history_workspace_lists_turn_previews() {
+        let app = app_with_turns();
+        // ⚠ 断言前必须去掉空白：TestBackend 的 buffer 里宽字符占一个续格，
+        // 直接拼出来是「第 一 个 问 题」（续格被当成空格）。
+        let rendered: String = draw_history_route(&app, 1, false, 0)
+            .chars()
+            .filter(|ch| !ch.is_whitespace())
+            .collect();
+        assert!(rendered.contains("第一个问题"), "{rendered}");
+        assert!(rendered.contains("第二个问题"), "{rendered}");
+        assert!(rendered.contains("2个回合"), "头部应给出回合数\n{rendered}");
+    }
+
+    /// 详情：渲染的是**与 `e` 导出同一份** Markdown，所以内容必须真的出现
+    /// （而不是"列表里有个编号、点进去空白"）。
+    #[test]
+    fn history_detail_renders_turn_markdown() {
+        let app = app_with_turns();
+        let rendered: String = draw_history_route(&app, 1, true, 0)
+            .chars()
+            .filter(|ch| !ch.is_whitespace())
+            .collect();
+        assert!(rendered.contains("第二回合的回答"), "{rendered}");
+        assert!(
+            rendered.contains("cargotest"),
+            "工具调用也要在详情里\n{rendered}"
+        );
+        assert!(rendered.contains("e导出此回合"), "底部键位提示\n{rendered}");
     }
 
     #[test]

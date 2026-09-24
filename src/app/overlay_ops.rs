@@ -423,6 +423,86 @@ impl App {
                 self.overlays.pop();
                 true
             }
+            Overlay::History {
+                selected,
+                detail,
+                scroll,
+            } => {
+                let turns = self
+                    .active_session()
+                    .map(|sess| sess.timeline.turns.len())
+                    .unwrap_or(0);
+                let last = turns.saturating_sub(1);
+                let step = 10usize;
+                match key.code {
+                    // 详情里 Esc 退一层回列表，列表里 Esc 才关掉整个 Workspace
+                    // ——与"全屏面必须能逐层退回"的约定一致。
+                    KeyCode::Esc | KeyCode::Char('q') => {
+                        if detail {
+                            self.replace_overlay(Overlay::History {
+                                selected,
+                                detail: false,
+                                scroll: 0,
+                            });
+                        } else {
+                            self.overlays.pop();
+                        }
+                    }
+                    KeyCode::Up | KeyCode::Char('k') if !detail => {
+                        self.replace_overlay(Overlay::History {
+                            selected: selected.saturating_sub(1),
+                            detail: false,
+                            scroll: 0,
+                        });
+                    }
+                    KeyCode::Down | KeyCode::Char('j') if !detail => {
+                        self.replace_overlay(Overlay::History {
+                            selected: (selected + 1).min(last),
+                            detail: false,
+                            scroll: 0,
+                        });
+                    }
+                    KeyCode::PageUp if !detail => {
+                        self.replace_overlay(Overlay::History {
+                            selected: selected.saturating_sub(step),
+                            detail: false,
+                            scroll: 0,
+                        });
+                    }
+                    KeyCode::PageDown if !detail => {
+                        self.replace_overlay(Overlay::History {
+                            selected: (selected + step).min(last),
+                            detail: false,
+                            scroll: 0,
+                        });
+                    }
+                    KeyCode::Enter if !detail => {
+                        self.replace_overlay(Overlay::History {
+                            selected,
+                            detail: true,
+                            scroll: 0,
+                        });
+                    }
+                    // 详情是只读长文，滚动走 offset（与思考回放同一套）。
+                    KeyCode::PageUp | KeyCode::Up if detail => {
+                        self.replace_overlay(Overlay::History {
+                            selected,
+                            detail: true,
+                            scroll: scroll.saturating_add(step),
+                        });
+                    }
+                    KeyCode::PageDown | KeyCode::Down if detail => {
+                        self.replace_overlay(Overlay::History {
+                            selected,
+                            detail: true,
+                            scroll: scroll.saturating_sub(step),
+                        });
+                    }
+                    KeyCode::Char('e') if detail => self.export_history_turn(selected),
+                    _ => {}
+                }
+                true
+            }
             Overlay::SessionList {
                 selected,
                 show_archived,
