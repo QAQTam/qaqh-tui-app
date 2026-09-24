@@ -1,4 +1,4 @@
-//! qaqh-tui：QAQ-Harness 的终端前端（默认 V2 Agent View；Ringing v1）。
+//! qaqh-tui：QAQ-Harness 的终端前端（默认 V2 Fullscreen；Ringing v2）。
 
 mod app;
 mod protocol;
@@ -65,36 +65,19 @@ fn init_logging() {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StartupMode {
     V1,
-    V2Agent,
     V2Fullscreen,
-    V2Inline,
 }
 
-/// 启动模式优先级：`--v1` > `--v2-inline`/env > `--v2-fullscreen`/env > 默认 `V2Agent`。
+/// 启动模式：v2 fullscreen 是唯一默认 UI，`--v2-agent` 作为历史兼容别名。
 ///
-/// alpha1 起 Agent View 是默认 UI；全屏 shell 先以显式开关灰度。协议切换单独
-/// 推进，当前仍使用 Ringing v1。`--v2-agent` 与 `QAQH_V2_AGENT` 保留为显式
-/// 选择/旧脚本兼容，不再是进入 v2 UI 的前置条件。`--v1` 是显式回退闸，必须压过
-/// 环境变量；否则一旦 shell 里残留 v2 env，用户无法在单次启动里回到 v1。
-fn select_startup_mode(
-    args: &[String],
-    _v2_agent_env: bool,
-    v2_fullscreen_env: bool,
-    v2_inline_env: bool,
-) -> StartupMode {
-    let force_v1 = args.iter().any(|arg| arg == "--v1");
-    if !force_v1 && (args.iter().any(|arg| arg == "--v2-inline") || v2_inline_env) {
-        return StartupMode::V2Inline;
+/// `--v1` 是显式回退闸，压过所有 v2 参数。`--v2-inline` 与
+/// `QAQH_V2_INLINE` 属于早期隔离原型，已在 fullscreen 冲刺中退役。
+fn select_startup_mode(args: &[String]) -> StartupMode {
+    if args.iter().any(|arg| arg == "--v1") {
+        StartupMode::V1
+    } else {
+        StartupMode::V2Fullscreen
     }
-    if force_v1 {
-        return StartupMode::V1;
-    }
-    if args.iter().any(|arg| arg == "--v2-fullscreen") || v2_fullscreen_env {
-        return StartupMode::V2Fullscreen;
-    }
-    // `--v2-agent` / `QAQH_V2_AGENT` 仍被接受，但默认值已经相同；参数与 env
-    // 保留是为了不打断既有脚本，并把“显式选择 Agent View”与“默认选择”表达清楚。
-    StartupMode::V2Agent
 }
 
 fn main() -> Result<()> {
@@ -116,54 +99,40 @@ fn main() -> Result<()> {
             );
             println!();
             println!("用法:");
-            println!("  qaqh-tui            连接本地 daemon 并进入 TUI");
+            println!("  qaqh-tui            连接本地 daemon 并进入 V2 全屏 TUI");
             println!("  qaqh-tui resume     直接浏览当前 cwd 下的会话");
             println!("  qaqh-tui --no-spawn 不自动拉起 daemon（仅连接已有实例）");
-            println!("  qaqh-tui --v2-inline 启动 V2 inline 原型（实验，不连接 daemon）");
-            println!("  qaqh-tui --v2-fullscreen 启动 V2 全屏 shell（实验，保留 inline 回退）");
-            println!("  qaqh-tui --v2-agent 显式选择 V2 Agent View（alpha1 起已是默认）");
-            println!("  qaqh-tui --v1       强制 v1 全屏模式（覆盖 QAQH_V2_AGENT）");
+            println!("  qaqh-tui --v2-agent 兼容别名（现在等同 V2 全屏）");
+            println!("  qaqh-tui --v1       强制旧 v1 全屏兼容路径");
             println!("  qaqh-tui doctor     自检：发现/pid 判活/open 握手");
             println!("  qaqh-tui --version  打印版本");
             println!();
             println!(
-                "环境: QAQH_DATA_DIR（数据目录覆盖）、QAQH_BACKEND_ROOT（daemon 拉起候选）、QAQH_DEFAULT_CWD（新建会话默认目录，支持 ~/ 展开）、QAQH_THEME=night|day|terminal|auto、QAQH_V2_FULLSCREEN=1"
+                "环境: QAQH_DATA_DIR（数据目录覆盖）、QAQH_BACKEND_ROOT（daemon 拉起候选）、QAQH_DEFAULT_CWD（新建会话默认目录，支持 ~/ 展开）、QAQH_THEME=night|day|terminal|auto"
             );
             return Ok(());
         }
         _ => {}
     }
 
-    let resume = args.iter().any(|arg| arg == "resume");
-    let mode = select_startup_mode(
-        &args,
-        std::env::var_os("QAQH_V2_AGENT").is_some(),
-        std::env::var_os("QAQH_V2_FULLSCREEN").is_some(),
-        std::env::var_os("QAQH_V2_INLINE").is_some(),
-    );
-
-    if mode == StartupMode::V2Inline {
-        // V2-M1 隔离原型：不连接 daemon、不进入 alternate screen。
-        return terminal::inline::run_prototype();
+    if args.iter().any(|arg| arg == "--v2-inline") || std::env::var_os("QAQH_V2_INLINE").is_some() {
+        bail!("--v2-inline / QAQH_V2_INLINE 已退役；V2 全屏现为默认 UI");
     }
+
+    let resume = args.iter().any(|arg| arg == "resume");
+    let mode = select_startup_mode(&args);
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .context("构建 tokio runtime")?;
     match mode {
-        StartupMode::V2Agent => runtime.block_on(terminal::agent::run(
-            !args.iter().any(|arg| arg == "--no-spawn"),
-            resume,
-            false,
-        )),
         StartupMode::V2Fullscreen => runtime.block_on(terminal::agent::run(
             !args.iter().any(|arg| arg == "--no-spawn"),
             resume,
             true,
         )),
         StartupMode::V1 => runtime.block_on(run_tui(args.iter().any(|a| a == "--no-spawn"))),
-        StartupMode::V2Inline => unreachable!("handled before runtime construction"),
     }
 }
 
@@ -443,67 +412,31 @@ mod tests {
     }
 
     #[test]
-    fn startup_mode_defaults_to_v2_agent() {
-        assert_eq!(
-            select_startup_mode(&args(&[]), false, false, false),
-            StartupMode::V2Agent
-        );
+    fn startup_mode_defaults_to_v2_fullscreen() {
+        assert_eq!(select_startup_mode(&args(&[])), StartupMode::V2Fullscreen);
     }
 
     #[test]
-    fn startup_mode_env_keeps_v2_agent_explicit() {
+    fn v2_agent_is_a_fullscreen_compatibility_alias() {
         assert_eq!(
-            select_startup_mode(&args(&[]), true, false, false),
-            StartupMode::V2Agent
-        );
-    }
-
-    #[test]
-    fn cli_v1_overrides_v2_env_and_flags() {
-        assert_eq!(
-            select_startup_mode(&args(&["--v1", "--v2-agent"]), true, true, true),
-            StartupMode::V1
-        );
-        assert_eq!(
-            select_startup_mode(&args(&["--v1", "--v2-inline"]), true, true, true),
-            StartupMode::V1
-        );
-        assert_eq!(
-            select_startup_mode(&args(&["--v1", "--v2-fullscreen"]), true, true, true),
-            StartupMode::V1
-        );
-    }
-
-    #[test]
-    fn fullscreen_is_opt_in_and_inline_still_wins() {
-        assert_eq!(
-            select_startup_mode(&args(&["--v2-fullscreen"]), true, false, false),
+            select_startup_mode(&args(&["--v2-agent"])),
             StartupMode::V2Fullscreen
         );
         assert_eq!(
-            select_startup_mode(&args(&[]), true, true, false),
+            select_startup_mode(&args(&["--v2-fullscreen"])),
             StartupMode::V2Fullscreen
-        );
-        assert_eq!(
-            select_startup_mode(
-                &args(&["--v2-agent", "--v2-fullscreen", "--v2-inline"]),
-                true,
-                true,
-                false,
-            ),
-            StartupMode::V2Inline
         );
     }
 
     #[test]
-    fn inline_takes_precedence_over_agent() {
+    fn cli_v1_overrides_v2_flags() {
         assert_eq!(
-            select_startup_mode(&args(&["--v2-agent", "--v2-inline"]), true, false, false),
-            StartupMode::V2Inline
+            select_startup_mode(&args(&["--v1", "--v2-agent"])),
+            StartupMode::V1
         );
         assert_eq!(
-            select_startup_mode(&args(&[]), false, false, true),
-            StartupMode::V2Inline
+            select_startup_mode(&args(&["--v1", "--v2-fullscreen"])),
+            StartupMode::V1
         );
     }
 }

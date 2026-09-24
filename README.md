@@ -1,7 +1,7 @@
 # qaqh-tui
 
 QAQ-Harness 的终端前端（ratatui + tokio），基于 `qaqh.Ringing` v2 单流协议直连本地 daemon。
-`v2.0.0-alpha1` 起默认进入 V2 Agent View；`--v1` 可强制回退旧全屏路径。
+当前默认进入 **V2 Fullscreen**；`--v2-agent` 保留为兼容别名，`--v1` 可强制回退旧全屏路径。
 
 ## 运行
 
@@ -13,7 +13,7 @@ cargo build --release
 # 自检：发现 → 存活 → /health → open 握手
 ./target/release/qaqh-tui.exe doctor
 
-# 显式选择 Agent View（默认已启用）；显式回退 v1 全屏
+# 兼容别名；显式回退 v1 全屏
 ./target/release/qaqh-tui.exe --v2-agent
 ./target/release/qaqh-tui.exe --v1
 ```
@@ -38,34 +38,29 @@ TUI 自身默认不落日志。设了 `QAQH_TUI_LOG=<path>` 后才安装一个�
 一句「断开，1000ms 后重连」，具体原因只在日志里（`ReconnectReason` 只覆盖服务端
 主动终止流，普通 HTTP 错误如 401 不带 reason）。
 
-### V2 inline 原型（实验）
-
-```bash
-cargo run -- --v2-inline
-```
-
-不连接 daemon、不进入 alternate screen；用于验证终端 scrollback + inline viewport +
-commit ledger。`Enter` 提交一行，`r` 重放最近一次提交（应被幂等拒绝），`q` 退出。
-它只是原型，不是默认 Agent View，也不影响 `--v1` 回退路径。
-
-### V2 Agent View（alpha1 默认）
+### V2 Fullscreen（当前默认）
 
 ```bash
 cargo run
-# 显式写法仍兼容
+# 兼容旧脚本/显式写法
 cargo run -- --v2-agent
 ```
 
-连接 daemon，复用现有 Runtime/App 状态；已封口 transcript 通过 V2 projector 与
-commit ledger 写入终端 scrollback，live block、composer、status 与 shortcuts 留在
-底部 inline viewport。composer 支持多行与宽字符折行，slash 菜单、model/mode/cwd、
-usage、附件与连接告警均已接入。该模式不启用鼠标捕获，保留终端原生选择/复制；
-`Ctrl+Q` 退出。`--no-spawn` 与 v1 语义一致；`--v1` 强制回退旧全屏路径。
+连接 daemon，复用 Runtime/App 状态。全屏 shell 在 alternate screen 中自持 transcript
+视口、滚动位置与渲染缓存；composer、slash 菜单、thinking、status、shortcuts 固定在底部。
+Workspace/Modal、会话选择器、设置、权限/ask/plan 共用 v2 路由层。
 
-Workspace/Modal、会话选择器、设置、权限/ask/plan 已由 M5 迁移；Ringing v2
-typed bootstrap、命令面、timeline 与 per-seed 单流已切到新锚点。
+鼠标能力已覆盖：
 
-ask_user 在 v2 中采用阻塞式单题分页：`←/→` 切题，`↑/↓` 移动选项，`Enter`
+- 滚轮滚动、回到底部、滚动条
+- 助手消息菜单：复制 Markdown、撤销
+- permission / ask / plan 按钮 hover / 按下 / 点击
+- Settings 行点击
+
+`--no-spawn` 与 v1 语义一致；`--v1` 强制回退旧全屏路径。早期
+`--v2-inline` 隔离原型已退役。
+
+ask_user 采用阻塞式单题分页：`←/→` 切题，`↑/↓` 移动选项，`Enter`
 选择并前进，`Space` 只选择，`1-9/a-f` 直接选择，`e`/`z` 输入自定义答案，
 `Esc` 跳过。快捷键与屏幕编号统一为 1-based。
 

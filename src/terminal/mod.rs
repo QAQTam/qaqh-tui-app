@@ -1,14 +1,12 @@
 //! V2 terminal primitives.
 //!
-//! M1 只提供隔离原型：
 //! - [`commit`]：已提交块的幂等账本；
-//! - [`inline`]：`--v2-inline` 隔离原型；
-//! - [`agent`]：默认的 inline Agent View（`--v2-agent` 仍可显式选择）。
+//! - [`agent`]：生产 Agent shell（默认 fullscreen；v1 是独立兼容路径）。
 //!
-//! alpha1 起 Agent View 是默认 UI；Ringing 协议切换另行推进，当前仍走 v1。
+//! `--v2-inline` 的 M1 隔离原型已退役；inline production shell 仍由
+//! [`agent`] 的兼容分支承载，待 fullscreen parity 完成后再删除。
 
 pub mod agent;
 pub mod clipboard;
 pub mod commit;
-pub mod inline;
 pub mod transcript;
