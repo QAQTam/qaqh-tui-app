@@ -863,6 +863,15 @@ mod tests {
     }
 
     #[test]
+    fn client_plan_review_variant_maps_to_internal_plan_review() {
+        assert_eq!(
+            interaction_kind_from_client(ClientV2InteractionKind::PlanReview).expect("kind"),
+            InteractionKind::PlanReview,
+            "TUI 只依赖 typed variant；wire rename(plan) 由 qaqh-client serde 承担"
+        );
+    }
+
+    #[test]
     fn client_event_adapter_maps_delivery_cursor_and_family() {
         let cursor = ClientV2CursorToken::encode_reliable(&ClientV2Cursor::new("log-1", 8, 1))
             .expect("cursor");

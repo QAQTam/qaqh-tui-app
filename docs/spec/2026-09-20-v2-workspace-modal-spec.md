@@ -16,7 +16,7 @@
 
 1. `permission`
 2. `ask_user`
-3. `plan_review`
+3. `plan`
 4. 顶层 overlay：Sessions / Settings / Help / Confirm / AttachPath / CwdInput / Thinking
 5. 子代理观测
 6. todo Workspace（`show_workspace`）

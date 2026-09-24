@@ -5,6 +5,7 @@ use std::time::{Duration, Instant};
 
 use crate::app::timeline_model::TimelineModel;
 use qaqh_client::ConversationMode;
+use serde::Deserialize;
 // 权威类型与 `qaqh-client` 自身类型重名者带 `Domain` 前缀；在本模块内换回本地惯用名，
 // 这样下文的引用点不必逐个改（映射只此一处）。
 use qaqh_client::ConversationState;
@@ -623,27 +624,6 @@ impl SessionState {
         self.pending_permissions.first()
     }
 
-    /// **实时**权限请求的入队口（`ToolPermissionRequested`）：已解决过的
-    /// tool_call_id 不再入队，同一 id 重复到达时以最新一条替换（详情靠后续
-    /// tool 事件补全）。
-    ///
-    /// bootstrap 快照恢复**不走这里**——快照是旧视图，走
-    /// [`SessionState::restore_permission_from_snapshot`]（只补不换，免得用
-    /// 「（恢复中）」占位符覆盖实时事件带来的详情）。两条路径共用「已解决的 id
-    /// 不再入队」这一条判据（都查 [`RespondedPermissions`]）。
-    ///
-    /// 返回是否入队（`false` = 已解决，被拒）。生产代码不需要这个值，保留是为了
-    /// 让测试能直接断言「补投被丢弃」。
-    pub fn queue_permission(&mut self, panel: PermissionPanel) -> bool {
-        if self.responded_permissions.contains(&panel.tool_call_id) {
-            return false;
-        }
-        self.pending_permissions
-            .retain(|p| p.tool_call_id != panel.tool_call_id);
-        self.pending_permissions.push(panel);
-        true
-    }
-
     /// 权限已解决（用户应答 / 工具已开始 / 已结束）：面板下架并记入历史。
     pub fn resolve_permission(&mut self, tool_call_id: &str) {
         self.pending_permissions
@@ -651,13 +631,11 @@ impl SessionState {
         self.responded_permissions.insert(tool_call_id);
     }
 
-    /// bootstrap 快照恢复挂起权限：**只补不换**。
+    /// bootstrap / 异步正文恢复挂起权限：**只补不换**。
     ///
-    /// 与实时事件入口（[`SessionState::queue_permission`]）的区别在「同 id 已存在」
-    /// 时怎么办：快照可能是**旧**视图（`tool_state` 的 pending 字段只带 id），
-    /// 用它覆盖实时事件带来的面板会把工具名/理由/风险等级换成「（恢复中）」占位符，
-    /// 还会把该面板挪到队尾、改变 `active_permission()` 的优先级。所以这里只在
-    /// 「内存里没有这个 id」时补一条；已解决的 id 同样不再入队。
+    /// bootstrap 与实时流可能在同一窗口各投递一次，正文下载也可能晚到。
+    /// 重复覆盖会把面板挪到队尾、改变 `active_permission()` 的优先级，所以这里
+    /// 只在「内存里没有这个 id」时补一条；已解决的 id 同样不再入队。
     ///
     /// 返回是否真的补了面板。
     pub fn restore_permission_from_snapshot(&mut self, panel: PermissionPanel) -> bool {
@@ -673,46 +651,6 @@ impl SessionState {
         }
         self.pending_permissions.push(panel);
         true
-    }
-
-    /// 从 timeline 工具卡构造 permission 面板（v2 交互正文不含 permission 详情）。
-    /// 找不到卡片时退化为「（恢复中）」占位——详情等 tool 事件补全。
-    pub fn permission_panel_for(&self, call_id: &str) -> PermissionPanel {
-        let card = self.timeline.tool_card(call_id);
-        let tool_name = card
-            .map(|c| c.name.clone())
-            .unwrap_or_else(|| "（恢复中）".into());
-        let perm = card.and_then(|c| c.permission.clone());
-        let (reason, paths, category, level, risk, consequence) = match perm {
-            Some(p) => (
-                p.reason,
-                p.paths,
-                p.category,
-                p.level,
-                p.risk,
-                p.consequence,
-            ),
-            None => (
-                String::new(),
-                Vec::new(),
-                String::new(),
-                0u8,
-                String::new(),
-                String::new(),
-            ),
-        };
-        PermissionPanel {
-            tool_call_id: call_id.to_string(),
-            tool_name,
-            action_summary: None,
-            reason,
-            paths,
-            category: permission_category_from_tag(&category),
-            level,
-            risk: permission_risk_from_tag(&risk),
-            consequence,
-            trust_folder: false,
-        }
     }
 
     pub fn is_waiting_user(&self) -> bool {
@@ -796,7 +734,53 @@ pub fn conversation_cache_from_v2(
     cache
 }
 
-/// timeline 工具卡的 `category` 字符串（snake_case）→ 面板枚举。
+impl PermissionPanel {
+    /// 从 canonical permission interaction body 构造授权面板。
+    ///
+    /// body 由后端 `interaction_body::permission_body` 单点序列化；这里不做
+    /// timeline / tool-card 兜底，缺字段只做展示级降级。
+    pub fn from_interaction_body(tool_call_id: &str, bytes: &[u8]) -> Option<Self> {
+        #[derive(Deserialize)]
+        struct Body {
+            #[serde(default)]
+            tool_name: String,
+            #[serde(default)]
+            action_summary: Option<String>,
+            #[serde(default)]
+            reason: String,
+            #[serde(default)]
+            paths: Vec<String>,
+            #[serde(default)]
+            category: String,
+            #[serde(default)]
+            level: u8,
+            #[serde(default)]
+            risk: String,
+            #[serde(default)]
+            consequence: String,
+        }
+
+        let body: Body = serde_json::from_slice(bytes).ok()?;
+        Some(Self {
+            tool_call_id: tool_call_id.to_owned(),
+            tool_name: if body.tool_name.is_empty() {
+                "（恢复中）".to_owned()
+            } else {
+                body.tool_name
+            },
+            action_summary: body.action_summary,
+            reason: body.reason,
+            paths: body.paths,
+            category: permission_category_from_tag(&body.category),
+            level: body.level,
+            risk: permission_risk_from_tag(&body.risk),
+            consequence: body.consequence,
+            trust_folder: false,
+        })
+    }
+}
+
+/// canonical permission body 的 `category` 字符串（snake_case）→ 面板枚举。
 pub fn permission_category_from_tag(tag: &str) -> PermissionCategory {
     match tag {
         "write" => PermissionCategory::Write,
@@ -806,7 +790,7 @@ pub fn permission_category_from_tag(tag: &str) -> PermissionCategory {
     }
 }
 
-/// timeline 工具卡的 `risk` 字符串（snake_case）→ 面板枚举。
+/// canonical permission body 的 `risk` 字符串（snake_case）→ 面板枚举。
 pub fn permission_risk_from_tag(tag: &str) -> PermissionRisk {
     match tag {
         "high" => PermissionRisk::High,
@@ -1079,27 +1063,52 @@ mod tests {
         }
     }
 
+    #[test]
+    fn permission_panel_from_interaction_body_keeps_approval_details() {
+        let body = serde_json::to_vec(&serde_json::json!({
+            "kind": "permission",
+            "tool_name": "exec",
+            "action_summary": "run cargo test",
+            "reason": "需要执行命令",
+            "paths": ["/tmp/workspace"],
+            "category": "exec",
+            "level": 3,
+            "risk": "high",
+            "consequence": "会运行本地测试",
+        }))
+        .expect("body");
+        let panel = PermissionPanel::from_interaction_body("call_1", &body).expect("panel");
+        assert_eq!(panel.tool_call_id, "call_1");
+        assert_eq!(panel.tool_name, "exec");
+        assert_eq!(panel.action_summary.as_deref(), Some("run cargo test"));
+        assert_eq!(panel.reason, "需要执行命令");
+        assert_eq!(panel.paths, ["/tmp/workspace"]);
+        assert_eq!(panel.category, PermissionCategory::Exec);
+        assert_eq!(panel.level, 3);
+        assert_eq!(panel.risk, PermissionRisk::High);
+        assert_eq!(panel.consequence, "会运行本地测试");
+    }
+
     /// 回归：同一 tool_call_id 在已响应后不得重新入队。
     ///
-    /// 证伪方式：把 `queue_permission` 里的 `responded_permissions.contains` 判断
-    /// 去掉（旧行为：只 retain + push）——`assert!(!...queue_permission(...))` 立刻
-    /// 变红，`active_permission()` 也会重新拿到那个幽灵面板。
+    /// 证伪方式：去掉 `restore_permission_from_snapshot` 里的
+    /// `responded_permissions.contains` 判断——已响应面板会复活。
     #[test]
     fn responded_permission_is_not_requeued() {
         let mut s = SessionState::new("seed".into());
-        assert!(s.queue_permission(perm("c1")));
+        assert!(s.restore_permission_from_snapshot(perm("c1")));
         s.resolve_permission("c1"); // 用户按 a/d 应答
         assert!(s.active_permission().is_none(), "应答后面板必须下架");
 
         assert!(
-            !s.queue_permission(perm("c1")),
+            !s.restore_permission_from_snapshot(perm("c1")),
             "已响应的 tool_call_id 不得重新入队"
         );
         assert!(s.active_permission().is_none(), "幽灵面板不许出现");
         assert_ne!(s.activity_label(), "permission");
 
         // 别的 tool_call 不受影响（集合是按 id 判定的，不是一刀切丢弃）。
-        assert!(s.queue_permission(perm("c2")));
+        assert!(s.restore_permission_from_snapshot(perm("c2")));
         assert_eq!(
             s.active_permission().map(|p| p.tool_call_id.as_str()),
             Some("c2")
@@ -1110,24 +1119,26 @@ mod tests {
     #[test]
     fn late_permission_after_tool_started_does_not_resurrect_panel() {
         let mut s = SessionState::new("seed".into());
-        assert!(s.queue_permission(perm("c1")));
+        assert!(s.restore_permission_from_snapshot(perm("c1")));
         // ToolStarted / ToolFinished 走的就是 resolve_permission。
         s.resolve_permission("c1");
         assert!(
-            !s.queue_permission(perm("c1")),
+            !s.restore_permission_from_snapshot(perm("c1")),
             "补投必须被丢弃，否则它会挤掉真正该处理的 ask"
         );
         assert!(s.active_permission().is_none());
     }
 
-    /// 反方向：没被解决过的同 id 重放仍然只保留一个面板，并刷新为最新一条。
+    /// 反方向：没被解决过的同 id 重放只保留一个面板，且不改变队首优先级。
     #[test]
-    fn same_tool_call_redelivery_still_replaces_panel() {
+    fn same_tool_call_redelivery_keeps_existing_panel() {
         let mut s = SessionState::new("seed".into());
-        assert!(s.queue_permission(perm("c1")));
+        let mut original = perm("c1");
+        original.reason = "原始理由".into();
+        assert!(s.restore_permission_from_snapshot(original));
         let mut updated = perm("c1");
         updated.reason = "新的理由".into();
-        assert!(s.queue_permission(updated));
+        assert!(!s.restore_permission_from_snapshot(updated));
         assert_eq!(
             s.pending_permissions.len(),
             1,
@@ -1135,7 +1146,7 @@ mod tests {
         );
         assert_eq!(
             s.active_permission().map(|p| p.reason.as_str()),
-            Some("新的理由")
+            Some("原始理由")
         );
     }
 
@@ -1170,16 +1181,16 @@ mod tests {
 
     /// 建议项 1（PR #20 二轮）：晚到的 bootstrap 快照「只补不换」。
     ///
-    /// 证伪方式：把 `restore_permission_from_snapshot` 换回 `queue_permission`
-    /// （旧行为）——「已有面板不覆盖」与「详情不得被占位符降级」两条断言同时变红。
+    /// 证伪方式：允许重复 body 覆盖已有面板——「已有面板不覆盖」与
+    /// 「详情不得被降级」两条断言同时变红。
     #[test]
     fn late_snapshot_never_downgrades_live_panels() {
         let mut s = SessionState::new("seed".into());
         let mut live = perm("c1");
         live.reason = "需要写文件".into();
         live.risk = PermissionRisk::High;
-        assert!(s.queue_permission(live));
-        assert!(s.queue_permission(perm("c2")));
+        assert!(s.restore_permission_from_snapshot(live));
+        assert!(s.restore_permission_from_snapshot(perm("c2")));
 
         // 快照晚到：只带 c1，且只有「（恢复中）」占位详情。
         let mut snapshot = perm("c1");

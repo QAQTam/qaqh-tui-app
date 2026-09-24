@@ -46,7 +46,7 @@ use qaqh_client::{
 use qaqh_client::{RingingCommandState as CommandState, RingingCommandStatus};
 use qaqh_client::{SessionActivity, SessionListEntry};
 use session::{
-    AskPanel, Composer, PlanPanel, SessionState, StreamPhase, activity_from_v2,
+    AskPanel, Composer, PermissionPanel, PlanPanel, SessionState, StreamPhase, activity_from_v2,
     conversation_cache_from_v2, streaming_done, sync_streaming_from_timeline,
 };
 
@@ -90,10 +90,12 @@ pub enum ActionResult {
         seed: String,
         result: Result<qaqh_client::ClientV2Bootstrap, String>,
     },
-    /// v2 ask/plan 交互正文（content store 取回后按 body 构造挂起面板）。
+    /// v2 ask / plan / permission 交互正文（content store 取回后按 body 构造挂起面板）。
     InteractionBody {
         seed: String,
         interaction_id: String,
+        /// permission 回复需要 canonical call id；ask / plan 为空。
+        call_id: Option<String>,
         result: Result<Vec<u8>, String>,
     },
     CommandAck {
@@ -319,7 +321,7 @@ impl ApiCtx {
             .map_err(|e| e.to_string())
     }
 
-    /// 取回 content store 里的交互正文（v2 ask/plan）。
+    /// 取回 content store 里的交互正文（v2 ask / plan / permission）。
     pub async fn download_content_by_id(&self, content_id: &str) -> Result<Vec<u8>, String> {
         self.client()?
             .download_content_by_id(content_id)
@@ -1291,9 +1293,9 @@ impl App {
 
     /// v2 `InteractionRequested` → 本仓挂起面板。
     ///
-    /// - permission：正文为 `None`，详情来自 timeline 上同一 `call_id` 的工具卡；
-    /// - ask / plan：正文在 content store（`ContentValue::Ref`），取回后按 body 的
-    ///   `kind` 构造面板（body 由 `qaqh-domain` 的 `interaction_body` 单点序列化）。
+    /// ask / plan / permission 的正文都由 canonical `request` 提供；取回后按
+    /// body 顶层 `kind` 构造面板（body 由 `qaqh-domain` 的 `interaction_body`
+    /// 单点序列化）。permission 需要把 `call_id` 一并带到异步回调，供面板答复。
     fn request_interaction(
         &mut self,
         seed: String,
@@ -1302,26 +1304,31 @@ impl App {
         kind: qaqh_client::ClientV2DeltaInteractionKind,
         request: qaqh_client::ClientV2ContentValue,
     ) {
-        use qaqh_client::ClientV2DeltaInteractionKind as K;
-        match kind {
-            K::Permission => {
-                if let Some(call_id) = call_id {
-                    self.queue_permission_from_timeline(&seed, call_id.as_str());
-                }
+        let call_id = match kind {
+            qaqh_client::ClientV2DeltaInteractionKind::Permission => {
+                call_id.map(|id| id.as_str().to_string())
             }
-            K::Ask | K::Plan => match request {
-                qaqh_client::ClientV2ContentValue::Inline { text } => {
-                    self.apply_interaction_body(&seed, &interaction_id, text.as_bytes());
-                }
-                qaqh_client::ClientV2ContentValue::Ref { content_ref } => {
-                    self.download_interaction_body(
-                        seed,
-                        interaction_id,
-                        content_ref.hash().as_str(),
-                    );
-                }
-                qaqh_client::ClientV2ContentValue::Unavailable(_) => {}
-            },
+            qaqh_client::ClientV2DeltaInteractionKind::Ask
+            | qaqh_client::ClientV2DeltaInteractionKind::Plan => None,
+        };
+        match request {
+            qaqh_client::ClientV2ContentValue::Inline { text } => {
+                self.apply_interaction_body(
+                    &seed,
+                    &interaction_id,
+                    call_id.as_deref(),
+                    text.as_bytes(),
+                );
+            }
+            qaqh_client::ClientV2ContentValue::Ref { content_ref } => {
+                self.download_interaction_body(
+                    seed,
+                    interaction_id,
+                    call_id,
+                    content_ref.hash().as_str(),
+                );
+            }
+            qaqh_client::ClientV2ContentValue::Unavailable(_) => {}
         }
     }
 
@@ -1329,8 +1336,8 @@ impl App {
     ///
     /// 这条路径不是实时事件的重复实现：v2 客户端按 snapshot cursor 起流，
     /// snapshot 与 subscribe 之间的事实不会再从流里 replay，必须由 bootstrap
-    /// 补齐。permission 的详情仍来自 timeline；ask / plan 的正文按 bootstrap
-    /// 携带的 content value 取回。
+    /// 补齐。ask / plan / permission 的正文都按 bootstrap 携带的 content value
+    /// 取回；permission 的 canonical `call_id` 随异步结果一起回传。
     fn restore_pending_interaction(
         &mut self,
         seed: String,
@@ -1345,42 +1352,42 @@ impl App {
         {
             return;
         }
+        let call_id = match interaction.kind {
+            K::Permission if !interaction.call_id.is_empty() => Some(interaction.call_id.clone()),
+            K::Permission | K::Ask | K::PlanReview => None,
+        };
+        if self.has_pending_interaction(&seed, &interaction.interaction_id, call_id.as_deref()) {
+            return;
+        }
         match interaction.kind {
-            K::Permission => {
-                if interaction.call_id.is_empty() {
-                    return;
+            K::Permission | K::Ask | K::PlanReview => match interaction.request {
+                Some(qaqh_client::ClientV2PendingContentValue::Inline { text }) => {
+                    self.apply_interaction_body(
+                        &seed,
+                        &interaction.interaction_id,
+                        call_id.as_deref(),
+                        text.as_bytes(),
+                    );
                 }
-                if let Some(sess) = self.sessions.get_mut(&seed) {
-                    let panel = sess.permission_panel_for(&interaction.call_id);
-                    sess.restore_permission_from_snapshot(panel);
+                Some(qaqh_client::ClientV2PendingContentValue::Ref { content_ref }) => {
+                    self.download_interaction_body(
+                        seed,
+                        interaction.interaction_id,
+                        call_id,
+                        &content_ref,
+                    );
                 }
-            }
-            K::Ask | K::PlanReview => {
-                if self.has_pending_interaction(&seed, &interaction.interaction_id) {
-                    return;
-                }
-                match interaction.request {
-                    Some(qaqh_client::ClientV2PendingContentValue::Inline { text }) => {
-                        self.apply_interaction_body(
-                            &seed,
-                            &interaction.interaction_id,
-                            text.as_bytes(),
-                        );
-                    }
-                    Some(qaqh_client::ClientV2PendingContentValue::Ref { content_ref }) => {
-                        self.download_interaction_body(
-                            seed,
-                            interaction.interaction_id,
-                            &content_ref,
-                        );
-                    }
-                    Some(qaqh_client::ClientV2PendingContentValue::Unavailable(_)) | None => {}
-                }
-            }
+                Some(qaqh_client::ClientV2PendingContentValue::Unavailable(_)) | None => {}
+            },
         }
     }
 
-    fn has_pending_interaction(&self, seed: &str, interaction_id: &str) -> bool {
+    fn has_pending_interaction(
+        &self,
+        seed: &str,
+        interaction_id: &str,
+        call_id: Option<&str>,
+    ) -> bool {
         self.sessions.get(seed).is_some_and(|sess| {
             sess.pending_ask
                 .as_ref()
@@ -1389,6 +1396,11 @@ impl App {
                     .pending_plan
                     .as_ref()
                     .is_some_and(|panel| panel.interaction_id == interaction_id)
+                || call_id.is_some_and(|call_id| {
+                    sess.pending_permissions
+                        .iter()
+                        .any(|panel| panel.tool_call_id == call_id)
+                })
         })
     }
 
@@ -1396,6 +1408,7 @@ impl App {
         &mut self,
         seed: String,
         interaction_id: String,
+        call_id: Option<String>,
         content_id: &str,
     ) {
         let content_id = content_id.to_string();
@@ -1407,22 +1420,20 @@ impl App {
             let _ = tx.send(AppMsg::Action(ActionResult::InteractionBody {
                 seed,
                 interaction_id,
+                call_id,
                 result,
             }));
         });
     }
 
-    /// 从 timeline 工具卡补齐 permission 面板详情（v2 交互正文不含 permission 详情）。
-    fn queue_permission_from_timeline(&mut self, seed: &str, call_id: &str) {
-        let Some(sess) = self.sessions.get_mut(seed) else {
-            return;
-        };
-        let panel = sess.permission_panel_for(call_id);
-        sess.queue_permission(panel);
-    }
-
-    /// ask / plan 交互正文（`qaqh-domain` 的 `interaction_body` JSON）→ 挂起面板。
-    fn apply_interaction_body(&mut self, seed: &str, interaction_id: &str, bytes: &[u8]) {
+    /// 交互正文（`qaqh-domain` 的 `interaction_body` JSON）→ 挂起面板。
+    fn apply_interaction_body(
+        &mut self,
+        seed: &str,
+        interaction_id: &str,
+        call_id: Option<&str>,
+        bytes: &[u8],
+    ) {
         let Ok(body) = serde_json::from_slice::<serde_json::Value>(bytes) else {
             return;
         };
@@ -1430,7 +1441,9 @@ impl App {
             .get("kind")
             .and_then(|k| k.as_str())
             .unwrap_or_default();
-        if self.suppressed_interactions.contains(interaction_id) {
+        if self.suppressed_interactions.contains(interaction_id)
+            || call_id.is_some_and(|call_id| self.suppressed_interactions.contains(call_id))
+        {
             return;
         }
         let Some(sess) = self.sessions.get_mut(seed) else {
@@ -1478,6 +1491,14 @@ impl App {
                     entering_message: false,
                     scroll: 0,
                 });
+            }
+            "permission" => {
+                let Some(call_id) = call_id else {
+                    return;
+                };
+                if let Some(panel) = PermissionPanel::from_interaction_body(call_id, bytes) {
+                    sess.restore_permission_from_snapshot(panel);
+                }
             }
             _ => {}
         }
@@ -1650,9 +1671,12 @@ impl App {
             ActionResult::InteractionBody {
                 seed,
                 interaction_id,
+                call_id,
                 result,
             } => match result {
-                Ok(bytes) => self.apply_interaction_body(&seed, &interaction_id, &bytes),
+                Ok(bytes) => {
+                    self.apply_interaction_body(&seed, &interaction_id, call_id.as_deref(), &bytes)
+                }
                 Err(e) => self.toast(NoticeLevel::Warn, format!("交互正文取回失败[{seed}]: {e}")),
             },
             ActionResult::CommandAck {
@@ -2200,6 +2224,36 @@ mod tests {
             running: false,
             workspace_id: None,
         }
+    }
+
+    #[test]
+    fn permission_interaction_body_restores_panel_without_timeline() {
+        let (mut app, _rx) = App::new_for_test();
+        app.tabs.push("seed".into());
+        app.sessions
+            .insert("seed".into(), SessionState::new("seed".into()));
+        let body = serde_json::to_vec(&serde_json::json!({
+            "kind": "permission",
+            "tool_name": "exec",
+            "action_summary": "cargo test",
+            "reason": "需要执行",
+            "paths": ["/tmp/ws"],
+            "category": "exec",
+            "level": 3,
+            "risk": "high",
+            "consequence": "运行测试"
+        }))
+        .expect("body");
+
+        app.apply_interaction_body("seed", "int_1", Some("call_1"), &body);
+
+        let panel = app.sessions["seed"]
+            .active_permission()
+            .expect("permission panel");
+        assert_eq!(panel.tool_call_id, "call_1");
+        assert_eq!(panel.tool_name, "exec");
+        assert_eq!(panel.action_summary.as_deref(), Some("cargo test"));
+        assert_eq!(panel.risk, PermissionRisk::High);
     }
 
     #[tokio::test]
