@@ -114,7 +114,7 @@ pub async fn run(no_spawn: bool, resume: bool, fullscreen: bool) -> Result<()> {
     spawn_tick(app_tx.clone());
 
     let mut agent = AgentState::default();
-    let mut fullscreen_state = FullscreenState::default();
+    let mut fullscreen_view = FullscreenView::default();
 
     let result = run_loop(
         &mut terminal,
@@ -122,7 +122,7 @@ pub async fn run(no_spawn: bool, resume: bool, fullscreen: bool) -> Result<()> {
         &mut app_rx,
         &mut app,
         &mut agent,
-        &mut fullscreen_state,
+        &mut fullscreen_view,
         theme,
     )
     .await;
@@ -228,7 +228,7 @@ async fn run_loop(
     app_rx: &mut mpsc::UnboundedReceiver<AppMsg>,
     app: &mut App,
     agent: &mut AgentState,
-    fullscreen_state: &mut FullscreenState,
+    fullscreen_view: &mut FullscreenView,
     theme: &'static Theme,
 ) -> Result<()> {
     loop {
@@ -283,14 +283,17 @@ async fn run_loop(
         let screen_mode = terminal.mode;
         terminal
             .terminal
-            .draw(|frame| draw(frame, app, theme, &route, screen_mode, fullscreen_state))?;
+            .draw(|frame| draw(frame, app, theme, &route, screen_mode, fullscreen_view))?;
+        if screen_mode == ScreenMode::Fullscreen && route == ScreenRoute::Agent {
+            fullscreen_view.clamp_scroll(app);
+        }
 
         let Some(msg) = app_rx.recv().await else {
             break;
         };
-        handle_message(app, msg, terminal, &route, fullscreen_state)?;
+        handle_message(app, msg, terminal, &route, fullscreen_view)?;
         while let Ok(msg) = app_rx.try_recv() {
-            handle_message(app, msg, terminal, &route, fullscreen_state)?;
+            handle_message(app, msg, terminal, &route, fullscreen_view)?;
             if app.quit {
                 break;
             }
@@ -310,7 +313,7 @@ fn handle_message(
     msg: AppMsg,
     terminal: &TerminalHost,
     route: &ScreenRoute,
-    fullscreen_state: &mut FullscreenState,
+    fullscreen_view: &mut FullscreenView,
 ) -> Result<()> {
     // 鼠标在 v2 里由**渲染层**接管：命中测试需要弹窗/全屏 shell 几何（只有这里
     // 知道当前屏幕区域），而 v1 那套 `App::handle_mouse`（第 0 行 = tab bar）
@@ -320,18 +323,34 @@ fn handle_message(
             (ScreenMode::Fullscreen, ScreenRoute::Agent) => {
                 let size = terminal.terminal.size()?;
                 let area = ratatui::layout::Rect::new(0, 0, size.width, size.height);
-                handle_fullscreen_agent_mouse(app, fullscreen_state, area, mouse);
+                handle_fullscreen_agent_mouse(app, fullscreen_view, area, mouse);
             }
             (_, ScreenRoute::Modal(modal)) => {
-                fullscreen_state.clear_pointer();
+                fullscreen_view.pointer.clear_pointer();
                 let size = terminal.terminal.size()?;
                 let area = ratatui::layout::Rect::new(0, 0, size.width, size.height);
                 handle_modal_mouse(app, *modal, area, mouse);
             }
-            _ => fullscreen_state.clear_pointer(),
+            _ => fullscreen_view.pointer.clear_pointer(),
         }
         // inline 主界面不捕获鼠标；全屏 Workspace 本轮不接鼠标。
         return Ok(());
+    }
+    if let AppMsg::Key(key) = &msg
+        && terminal.mode == ScreenMode::Fullscreen
+        && *route == ScreenRoute::Agent
+    {
+        match key.code {
+            KeyCode::PageUp => {
+                fullscreen_view.page_up(app);
+                return Ok(());
+            }
+            KeyCode::PageDown => {
+                fullscreen_view.scroll_down(app, 20);
+                return Ok(());
+            }
+            _ => {}
+        }
     }
     if let AppMsg::Key(key) = &msg
         && key.code == KeyCode::Esc
@@ -346,15 +365,14 @@ fn handle_message(
 
 fn handle_fullscreen_agent_mouse(
     app: &mut App,
-    state: &mut FullscreenState,
+    view: &mut FullscreenView,
     area: ratatui::layout::Rect,
     mouse: ratatui::crossterm::event::MouseEvent,
 ) {
     use ratatui::crossterm::event::{MouseButton, MouseEventKind};
 
-    let show_back_to_latest = app
-        .active_session()
-        .is_some_and(|session| !session.scroll.follow);
+    let show_back_to_latest =
+        view.can_scroll() && !app.active_session().is_some_and(|s| s.scroll.follow);
     let hit = || {
         show_back_to_latest
             .then(|| fullscreen::hit_test(area, mouse.column, mouse.row))
@@ -362,23 +380,23 @@ fn handle_fullscreen_agent_mouse(
     };
 
     match mouse.kind {
-        MouseEventKind::ScrollUp => app.scroll_up(3),
-        MouseEventKind::ScrollDown => app.scroll_down(3),
+        MouseEventKind::ScrollUp => view.scroll_up(app, 3),
+        MouseEventKind::ScrollDown => view.scroll_down(app, 3),
         MouseEventKind::Moved => {
-            state.back_to_latest_hover = hit().is_some();
+            view.pointer.back_to_latest_hover = hit().is_some();
         }
         MouseEventKind::Down(MouseButton::Left) => {
             let target = hit();
-            state.back_to_latest_hover = target.is_some();
-            state.back_to_latest_pressed = target.is_some();
+            view.pointer.back_to_latest_hover = target.is_some();
+            view.pointer.back_to_latest_pressed = target.is_some();
         }
         MouseEventKind::Up(MouseButton::Left) => {
             let released = hit();
-            state.back_to_latest_hover = released.is_some();
-            if state.back_to_latest_pressed && released.is_some() {
+            view.pointer.back_to_latest_hover = released.is_some();
+            if view.pointer.back_to_latest_pressed && released.is_some() {
                 app.scroll_bottom();
             }
-            state.back_to_latest_pressed = false;
+            view.pointer.back_to_latest_pressed = false;
         }
         _ => {}
     }
@@ -1062,11 +1080,11 @@ fn draw(
     theme: &Theme,
     route: &ScreenRoute,
     screen_mode: ScreenMode,
-    fullscreen_state: &FullscreenState,
+    fullscreen_view: &mut FullscreenView,
 ) {
     match route {
         ScreenRoute::Agent if screen_mode == ScreenMode::Fullscreen => {
-            draw_fullscreen_agent(frame, app, theme, *fullscreen_state);
+            draw_fullscreen_agent(frame, app, theme, fullscreen_view);
         }
         ScreenRoute::Agent => draw_agent(frame, app, theme),
         ScreenRoute::Modal(modal) => {
@@ -1102,14 +1120,9 @@ fn draw_agent(frame: &mut Frame, app: &App, theme: &Theme) {
     }
 }
 
-fn draw_fullscreen_agent(
-    frame: &mut Frame,
-    app: &App,
-    theme: &Theme,
-    fullscreen_state: FullscreenState,
-) {
+fn draw_fullscreen_agent(frame: &mut Frame, app: &App, theme: &Theme, view: &mut FullscreenView) {
     let area = frame.area();
-    let rendered = render_fullscreen_agent(app, area.width, area.height, theme);
+    let rendered = render_fullscreen_agent(app, area.width, area.height, theme, view);
     frame.render_widget(Paragraph::new(rendered.lines), area);
     if let Some(cursor) = rendered.cursor {
         frame.set_cursor_position((
@@ -1118,12 +1131,24 @@ fn draw_fullscreen_agent(
         ));
     }
 
-    let paused = app
-        .active_session()
-        .is_some_and(|session| !session.scroll.follow);
-    if paused {
-        let (body, _) = fullscreen_layout(app, area, theme);
-        fullscreen::draw_back_to_latest(frame, body, fullscreen_state, theme);
+    let (body, _) = fullscreen_layout(app, area, theme);
+    if let Some(session) = app.active_session() {
+        fullscreen::draw_scrollbar(
+            frame,
+            body,
+            view.transcript.lines.len(),
+            usize::from(view.body_height),
+            session.scroll.follow,
+            session.scroll.offset,
+            theme,
+        );
+    }
+    if view.can_scroll()
+        && app
+            .active_session()
+            .is_some_and(|session| !session.scroll.follow)
+    {
+        fullscreen::draw_back_to_latest(frame, body, view.pointer, theme);
     }
 }
 
@@ -1521,14 +1546,31 @@ fn render_agent(app: &App, width: u16, height: u16, theme: &Theme) -> AgentRende
 
 /// 全屏 shell：上半屏是 App 自己持有的 transcript 视口，下半屏是 slash 菜单、
 /// 单行思考链、composer、status 与 shortcuts。
-fn render_fullscreen_agent(app: &App, width: u16, height: u16, theme: &Theme) -> AgentRender {
+fn render_fullscreen_agent(
+    app: &App,
+    width: u16,
+    height: u16,
+    theme: &Theme,
+    view: &mut FullscreenView,
+) -> AgentRender {
     if app.active_session().is_none() {
+        view.transcript.clear();
+        view.body_height = height;
         return render_brand(app, width, height, theme);
     }
 
     let area = Rect::new(0, 0, width, height.max(1));
     let (body_area, bottom_area) = fullscreen_layout(app, area, theme);
-    let mut lines = render_fullscreen_history(app, body_area.width, body_area.height, theme);
+    view.body_height = body_area.height;
+    // 右侧固定留一列给滚动条，避免内容宽度在“出现/消失滚动条”时抖动。
+    let history_width = body_area.width.saturating_sub(1).max(1);
+    let mut lines = render_fullscreen_history(
+        app,
+        history_width,
+        body_area.height,
+        theme,
+        &mut view.transcript,
+    );
     while lines.len() < usize::from(body_area.height) {
         lines.push(Line::default());
     }
@@ -1669,13 +1711,128 @@ fn render_fullscreen_chrome(app: &App, width: u16, height: u16, theme: &Theme) -
     }
 }
 
+#[derive(Debug, Default)]
+struct FullscreenView {
+    pointer: FullscreenState,
+    transcript: FullscreenTranscriptCache,
+    body_height: u16,
+}
+
+impl FullscreenView {
+    fn can_scroll(&self) -> bool {
+        self.transcript.lines.len() > usize::from(self.body_height)
+    }
+
+    fn max_offset(&self) -> usize {
+        self.transcript
+            .lines
+            .len()
+            .saturating_sub(usize::from(self.body_height))
+    }
+
+    fn scroll_up(&mut self, app: &mut App, lines: usize) {
+        if !self.can_scroll() {
+            app.scroll_bottom();
+            return;
+        }
+        app.scroll_up(lines);
+        self.clamp_scroll(app);
+    }
+
+    fn scroll_down(&mut self, app: &mut App, lines: usize) {
+        app.scroll_down(lines);
+        self.clamp_scroll(app);
+    }
+
+    fn page_up(&mut self, app: &mut App) {
+        let at_limit = app
+            .active_session()
+            .is_some_and(|session| session.scroll.offset >= self.max_offset());
+        let (has_more, loading) = app.active_session().map_or((false, false), |session| {
+            (session.timeline.has_more, session.loading_older)
+        });
+        self.scroll_up(app, 20);
+        if at_limit && has_more && !loading {
+            app.load_older();
+        }
+    }
+
+    fn clamp_scroll(&mut self, app: &mut App) {
+        let max_offset = self.max_offset();
+        let Some(seed) = app.active_seed() else {
+            return;
+        };
+        if let Some(session) = app.sessions.get_mut(&seed) {
+            if max_offset == 0 {
+                session.scroll.follow = true;
+                session.scroll.offset = 0;
+            } else if session.scroll.follow {
+                session.scroll.offset = 0;
+            } else {
+                session.scroll.offset = session.scroll.offset.min(max_offset);
+            }
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct FullscreenTranscriptCache {
+    key: Option<FullscreenTranscriptKey>,
+    lines: Vec<Line<'static>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FullscreenTranscriptKey {
+    seed: String,
+    version: u64,
+    width: u16,
+}
+
+impl FullscreenTranscriptCache {
+    fn clear(&mut self) {
+        self.key = None;
+        self.lines.clear();
+    }
+
+    fn sync(&mut self, app: &App, width: u16, theme: &Theme) {
+        let Some(session) = app.active_session() else {
+            self.clear();
+            return;
+        };
+        let key = FullscreenTranscriptKey {
+            seed: session.seed.clone(),
+            version: session.timeline.version,
+            width,
+        };
+        if self.key.as_ref() == Some(&key) {
+            return;
+        }
+
+        // Live reasoning 仍在 composer 上方单独显示，避免“单行思考链”在历史区
+        // 重复；其余 live block（尤其流式 assistant）必须进入全屏历史，否则全屏
+        // 模式下只能看到最后一行。
+        let blocks: Vec<_> = adapter::from_turns(&session.timeline.turns)
+            .into_iter()
+            .filter(|block| {
+                block.state.is_visible()
+                    && !(block.state == BlockState::Live
+                        && matches!(block.kind, BlockKind::Thinking { .. }))
+            })
+            .collect();
+        self.lines = render_transcript(&blocks, width, theme);
+        self.key = Some(key);
+    }
+}
+
 fn render_fullscreen_history(
     app: &App,
     width: u16,
     height: u16,
     theme: &Theme,
+    cache: &mut FullscreenTranscriptCache,
 ) -> Vec<Line<'static>> {
     let Some(session) = app.active_session() else {
+        cache.clear();
         return Vec::new();
     };
     let height = usize::from(height);
@@ -1683,22 +1840,11 @@ fn render_fullscreen_history(
         return Vec::new();
     }
 
-    // Live reasoning 仍在 composer 上方单独显示，避免“单行思考链”在历史区
-    // 重复；其余 live block（尤其流式 assistant）必须进入全屏历史，否则全屏
-    // 模式下只能看到最后一行。
-    let blocks: Vec<_> = adapter::from_turns(&session.timeline.turns)
-        .into_iter()
-        .filter(|block| {
-            block.state.is_visible()
-                && !(block.state == BlockState::Live
-                    && matches!(block.kind, BlockKind::Thinking { .. }))
-        })
-        .collect();
-    let lines = render_transcript(&blocks, width, theme);
-    let total = lines.len();
+    cache.sync(app, width, theme);
+    let total = cache.lines.len();
     let top = crate::ui::viewport_top(total, height, session.scroll.follow, session.scroll.offset);
     let end = top.saturating_add(height).min(total);
-    lines[top.min(total)..end].to_vec()
+    cache.lines[top.min(total)..end].to_vec()
 }
 
 /// 当前 open assistant 的未完成尾行。稳定行已经写进 scrollback，这里只画
@@ -2878,9 +3024,9 @@ mod tests {
         )
         .expect("inline terminal");
         let route = route::resolve(&app);
-        let state = FullscreenState::default();
+        let mut view = FullscreenView::default();
         terminal
-            .draw(|frame| draw(frame, &app, &theme, &route, ScreenMode::Inline, &state))
+            .draw(|frame| draw(frame, &app, &theme, &route, ScreenMode::Inline, &mut view))
             .expect("draw ask modal");
         let text: String = terminal
             .backend()
@@ -2909,21 +3055,21 @@ mod tests {
         )
         .expect("inline terminal");
         let route = route::resolve(&app);
-        let state = FullscreenState::default();
+        let mut view = FullscreenView::default();
 
         for (width, height) in [(80, 24), (40, 20), (20, 8), (120, 40)] {
             terminal
                 .resize(Rect::new(0, 0, width, height))
                 .expect("resize");
             terminal
-                .draw(|frame| draw(frame, &app, &theme, &route, ScreenMode::Inline, &state))
+                .draw(|frame| draw(frame, &app, &theme, &route, ScreenMode::Inline, &mut view))
                 .expect("draw after resize");
         }
     }
 
     #[test]
     fn fullscreen_agent_draw_uses_full_buffer_and_keeps_composer_visible() {
-        let mut app = app_with_model(model_with_sealed_answer());
+        let mut app = app_with_model(model_with_many_sealed_turns(30));
         app.show_workspace = false;
         app.sessions
             .get_mut("seed-1")
@@ -2934,13 +3080,25 @@ mod tests {
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).expect("fullscreen terminal");
         let route = route::resolve(&app);
-        let state = FullscreenState {
-            back_to_latest_hover: true,
-            back_to_latest_pressed: false,
+        let mut view = FullscreenView {
+            pointer: FullscreenState {
+                back_to_latest_hover: true,
+                back_to_latest_pressed: false,
+            },
+            ..Default::default()
         };
 
         terminal
-            .draw(|frame| draw(frame, &app, &theme, &route, ScreenMode::Fullscreen, &state))
+            .draw(|frame| {
+                draw(
+                    frame,
+                    &app,
+                    &theme,
+                    &route,
+                    ScreenMode::Fullscreen,
+                    &mut view,
+                )
+            })
             .expect("draw fullscreen agent");
 
         let text: String = terminal
@@ -2951,7 +3109,7 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect();
         let compact: String = text.chars().filter(|ch| !ch.is_whitespace()).collect();
-        assert!(compact.contains("answer"), "{text}");
+        assert!(compact.contains("answer-29"), "{text}");
         assert!(compact.contains("回到最新消息"), "{text}");
     }
 
@@ -2963,16 +3121,62 @@ mod tests {
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).expect("fullscreen terminal");
         let route = route::resolve(&app);
-        let state = FullscreenState::default();
+        let mut view = FullscreenView::default();
 
         for (width, height) in [(80, 24), (40, 20), (20, 8), (120, 40)] {
             terminal
                 .resize(Rect::new(0, 0, width, height))
                 .expect("resize");
             terminal
-                .draw(|frame| draw(frame, &app, &theme, &route, ScreenMode::Fullscreen, &state))
+                .draw(|frame| {
+                    draw(
+                        frame,
+                        &app,
+                        &theme,
+                        &route,
+                        ScreenMode::Fullscreen,
+                        &mut view,
+                    )
+                })
                 .expect("draw fullscreen after resize");
         }
+    }
+
+    #[test]
+    fn fullscreen_scroll_clamps_to_rendered_content() {
+        let mut app = app_with_model(model_with_many_sealed_turns(30));
+        app.show_workspace = false;
+        let theme = test_theme();
+        let mut view = FullscreenView::default();
+        view.transcript.sync(&app, 79, &theme);
+        view.body_height = 10;
+
+        view.scroll_up(&mut app, usize::MAX / 2);
+        let session = app.active_session().expect("session");
+        assert!(!session.scroll.follow);
+        assert_eq!(session.scroll.offset, view.max_offset());
+
+        view.scroll_down(&mut app, usize::MAX / 2);
+        assert!(app.active_session().expect("session").scroll.follow);
+    }
+
+    #[tokio::test]
+    async fn fullscreen_page_up_requests_older_at_top() {
+        let mut app = app_with_model(model_with_many_sealed_turns(30));
+        app.show_workspace = false;
+        let theme = test_theme();
+        let mut view = FullscreenView::default();
+        view.transcript.sync(&app, 79, &theme);
+        view.body_height = 10;
+
+        let session = app.sessions.get_mut("seed-1").expect("session");
+        session.timeline.has_more = true;
+        session.timeline.turns[0].turn_index = Some(1);
+        session.scroll.offset = view.max_offset();
+
+        view.page_up(&mut app);
+
+        assert!(app.sessions["seed-1"].loading_older);
     }
 
     #[test]

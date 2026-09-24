@@ -111,6 +111,73 @@ pub fn draw_back_to_latest(frame: &mut Frame, area: Rect, state: FullscreenState
     );
 }
 
+/// 右侧滚动条。无内容可滚时完全隐藏，不占视觉注意力。
+pub fn draw_scrollbar(
+    frame: &mut Frame,
+    area: Rect,
+    total: usize,
+    viewport_height: usize,
+    follow: bool,
+    offset: usize,
+    theme: &Theme,
+) {
+    if area.width == 0 || area.height == 0 || total <= viewport_height {
+        return;
+    }
+
+    let height = usize::from(area.height);
+    let top = crate::ui::viewport_top(total, viewport_height, follow, offset);
+    let (thumb_top, thumb_height) = scrollbar_thumb(total, viewport_height, height, top);
+
+    let track_style = Style::new().fg(theme.chrome.border);
+    let thumb_style = Style::new().fg(theme.text.secondary);
+    let lines: Vec<Line<'static>> = (0..height)
+        .map(|row| {
+            if row >= thumb_top && row < thumb_top.saturating_add(thumb_height) {
+                Line::from(Span::styled("┃", thumb_style))
+            } else {
+                Line::from(Span::styled("│", track_style))
+            }
+        })
+        .collect();
+
+    frame.render_widget(
+        Paragraph::new(lines),
+        Rect::new(
+            area.x.saturating_add(area.width.saturating_sub(1)),
+            area.y,
+            1,
+            area.height,
+        ),
+    );
+}
+
+fn scrollbar_thumb(
+    total: usize,
+    viewport_height: usize,
+    track_height: usize,
+    top: usize,
+) -> (usize, usize) {
+    if track_height == 0 || total == 0 || viewport_height == 0 {
+        return (0, 0);
+    }
+    let thumb_height = track_height
+        .saturating_mul(viewport_height)
+        .checked_div(total)
+        .unwrap_or(1)
+        .clamp(1, track_height);
+    let max_top = total.saturating_sub(viewport_height);
+    let thumb_top = if max_top == 0 {
+        0
+    } else {
+        top.saturating_mul(track_height.saturating_sub(thumb_height))
+            .checked_div(max_top)
+            .unwrap_or(0)
+    }
+    .min(track_height.saturating_sub(thumb_height));
+    (thumb_top, thumb_height)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -144,5 +211,20 @@ mod tests {
     fn tiny_area_has_no_button() {
         assert!(back_to_latest_rect(Rect::new(0, 0, 7, 10)).is_none());
         assert!(back_to_latest_rect(Rect::new(0, 0, 20, 2)).is_none());
+    }
+
+    #[test]
+    fn scrollbar_thumb_stays_inside_track() {
+        let (top, height) = scrollbar_thumb(1_000, 20, 20, 0);
+        assert_eq!(top, 0);
+        assert_eq!(height, 1);
+
+        let (top, height) = scrollbar_thumb(1_000, 20, 20, 980);
+        assert_eq!(top, 19);
+        assert_eq!(height, 1);
+
+        let (top, height) = scrollbar_thumb(100, 50, 20, 25);
+        assert_eq!(height, 10);
+        assert_eq!(top, 5);
     }
 }
