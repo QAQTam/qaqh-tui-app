@@ -78,6 +78,28 @@ impl App {
         }
     }
 
+    /// 创建命令没有进入 daemon，或等待 `SessionCreated` 超时：撤销 creating 状态，
+    /// 并把开屏首条草稿放回可编辑输入框，避免用户输入丢失或状态栏永久卡住。
+    pub(super) fn abort_pending_create(&mut self, message: impl Into<String>) {
+        let had_pending = !self.pending_creates.is_empty();
+        self.pending_creates.clear();
+        if let Some(text) = self.pending_initial_prompt.take() {
+            if self.tabs.is_empty() {
+                self.draft_composer.insert_str(&text);
+            } else if let Some(seed) = self.active_seed()
+                && let Some(session) = self.sessions.get_mut(&seed)
+            {
+                session.composer.input = text.chars().collect();
+                session.composer.cursor = session.composer.input.len();
+            } else {
+                self.pending_initial_prompt = Some(text);
+            }
+        }
+        if had_pending {
+            self.toast(NoticeLevel::Error, message);
+        }
+    }
+
     /// 三档回退：显式 > 环境变量 > 启动目录 > None（让后端迁移）
     pub fn effective_cwd(&self, explicit: Option<String>) -> Option<String> {
         if let Some(p) = explicit {

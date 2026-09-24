@@ -876,8 +876,16 @@ impl App {
                 break;
             }
         }
-        self.pending_creates
-            .retain(|_, at| at.elapsed() < Duration::from_secs(15));
+        let create_timed_out = self
+            .pending_creates
+            .values()
+            .any(|at| at.elapsed() >= Duration::from_secs(15));
+        if create_timed_out {
+            self.abort_pending_create("新会话创建超时，请重试");
+        } else {
+            self.pending_creates
+                .retain(|_, at| at.elapsed() < Duration::from_secs(15));
+        }
         if let Some(armed) = self.quit_armed
             && armed.elapsed() > Duration::from_secs(3)
         {
@@ -1685,6 +1693,7 @@ impl App {
                 result,
             } => match result {
                 Ok(ack) => {
+                    let is_create = seed.is_none();
                     if ack.status == qaqh_client::RingingCommandAckStatus::Rejected {
                         // 缺陷 1（CNB issue #4）：拒绝是终态，不会再有
                         // `causation_id == command_id` 的 `Created` 事件。不撤销
@@ -1695,7 +1704,6 @@ impl App {
                         // `RingingCommandEnvelope::validate` 要求 seed 缺失时命令
                         // 必须是 `SessionCreate`（`qaqh-ringing/src/envelope.rs:177`），
                         // 故这是权威判据，不靠 label 猜。
-                        let is_create = seed.is_none();
                         let msg = session_ops::apply_rejected_ack(
                             &mut self.pending_creates,
                             label,
@@ -1715,6 +1723,10 @@ impl App {
                     }
                 }
                 Err(e) => {
+                    if seed.is_none() {
+                        self.abort_pending_create(format!("{label}: {e}"));
+                        return;
+                    }
                     let lease_dead = e.contains("lease");
                     self.toast(NoticeLevel::Error, format!("{label}: {e}"));
                     if lease_dead {
@@ -2406,6 +2418,52 @@ mod tests {
             app.sessions["new-seed"].composer.value(),
             "hello",
             "首条草稿应原样带入真实会话 composer"
+        );
+    }
+
+    #[test]
+    fn create_transport_error_restores_draft_and_clears_pending() {
+        let (mut app, _rx) = App::new_for_test();
+        app.pending_initial_prompt = Some("hello".into());
+        app.pending_creates
+            .insert("cmd-create".into(), Instant::now());
+
+        app.handle(AppMsg::Action(ActionResult::CommandAck {
+            seed: None,
+            label: "新会话",
+            result: Err("连接 daemon 失败".into()),
+        }));
+
+        assert!(app.pending_creates.is_empty());
+        assert!(app.pending_initial_prompt.is_none());
+        assert_eq!(app.draft_composer.value(), "hello");
+        assert!(
+            app.toasts
+                .back()
+                .is_some_and(|toast| toast.text.contains("连接 daemon 失败")),
+            "创建失败必须给出可见提示"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_timeout_restores_draft_and_clears_pending() {
+        let (mut app, _rx) = App::new_for_test();
+        app.pending_initial_prompt = Some("hello".into());
+        app.pending_creates.insert(
+            "cmd-create".into(),
+            Instant::now() - Duration::from_secs(16),
+        );
+
+        app.handle(AppMsg::Tick);
+
+        assert!(app.pending_creates.is_empty());
+        assert!(app.pending_initial_prompt.is_none());
+        assert_eq!(app.draft_composer.value(), "hello");
+        assert!(
+            app.toasts
+                .back()
+                .is_some_and(|toast| toast.text.contains("创建超时")),
+            "超时必须给出可见提示"
         );
     }
 
