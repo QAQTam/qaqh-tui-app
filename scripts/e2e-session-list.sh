@@ -53,23 +53,30 @@ put cccc3333 ''
 start() { QAQH_DATA_DIR="$D/qaqh" "$DAEMON" run </dev/null >>"$D/daemon.out" 2>&1 & echo $!; }
 wait_pid() { for _ in $(seq 1 40); do grep -q "\"pid\": $1" "$D/qaqh/daemon.json" 2>/dev/null && return 0; sleep 1; done; return 1; }
 
-FIFO=$D/in; mkfifo "$FIFO"
-( exec 3>"$FIFO"; sleep 40 ) & FEED=$!
-
 PID=$(start); wait_pid "$PID" || { echo "daemon 未起来"; cat "$D/daemon.out"; exit 1; }
 echo "daemon pid=$PID"
 
-QAQH_DATA_DIR="$D/qaqh" timeout 55 script -qec "stty rows 40 cols 130; timeout 50 $TUI" /dev/null \
-  <"$FIFO" > "$D/tui.raw" 2>&1 &
-TPID=$!
-wait $TPID 2>/dev/null
-kill "$PID" 2>/dev/null; wait "$FEED" 2>/dev/null
+# 真 PTY 驱动：默认 V2 Agent View 初始化时会发 `ESC[6n` 光标查询，哑驱动
+# （`script(1)`）无人应答 → TUI 初始化即 panic，本脚本会假红。见
+# `scripts/lib/pty-driver.py` 顶部说明。
+#
+# ⚠ 会话列表在 v2 里**不再挂在首屏**：默认 Agent View 首屏是空会话工作区，
+# 列表走 `Ctrl+L`（首屏页脚有该提示）。旧版本脚本假设首屏即列表，默认切到
+# Agent View 后会假红，故这里显式按一次 Ctrl+L（0x0c）。
+QAQH_DATA_DIR="$D/qaqh" python3 "$REPO_ROOT/scripts/lib/pty-driver.py" \
+  --tui "$TUI" --raw "$D/tui.raw" --seconds 20 --key 3:0c --quit
+kill "$PID" 2>/dev/null
 
-python3 - "$D/tui.raw" <<'PY'
-import re, sys, pathlib
-# 去 ANSI 后**整块**搜：TUI 用光标定位重绘，落盘文本不是按行分帧的，
-# 按行切会漏（实测：列表内容与更早的「加载中…」帧粘在同一「行」里）。
-s = re.sub(r"\x1b\[[0-9;?]*[a-zA-Z]", "", pathlib.Path(sys.argv[1]).read_text(errors="replace")).replace("\r", "")
+python3 - "$D/tui.raw" "$REPO_ROOT" <<'PY'
+import sys, pathlib
+
+# ⚠ 必须**重建屏幕**再断言，不能"去 ANSI 后 grep"：TUI 是按光标定位只写变化
+# 单元格的差分流，没变的空格根本不在字节流里，于是 `Bun 引导 daemon` 会被拼成
+# `Bun引导daemon` 而假红（实测过）。详见 scripts/lib/vt_screen.py。
+sys.path.insert(0, str(pathlib.Path(sys.argv[2]) / "scripts" / "lib"))
+from vt_screen import render_text
+
+s = render_text(pathlib.Path(sys.argv[1]).read_text(errors="replace"))
 
 checks = [
     ("A 标题优先（title）",      "Bun 引导 daemon"),

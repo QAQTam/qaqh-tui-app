@@ -52,6 +52,14 @@ case "$D" in
 esac
 TTL_MS=${TTL_MS:-3000}
 RUN_SECS=${RUN_SECS:-70}
+# ⚠ 判据②（"最终停在 `● ready`、全程无 `✗ lost`"）读的是**状态栏相位面**，
+# 那是 v1 的呈现：v2 Agent View 只在**有活动会话**时才画 `status_line`，而本
+# harness 刻意跑空 data root（没有会话），所以默认 Agent View 下这条判据拿不到
+# 任何相位 token（实测：相位序列为空 → 假红）。连接生命周期本身与 UI 无关，
+# 判据①（真 /clients/open 计数）继续覆盖；相位面则显式走 `--v1` 回退路径。
+# 调用方仍可用 `TUI_ARGS=…` 覆盖。
+TUI_ARGS=${TUI_ARGS:---v1}
+export TUI_ARGS
 
 for b in "$DAEMON" "$TUI"; do
   [ -x "$b" ] || { echo "缺少可执行文件：$b"; echo "（本脚本不构建，请先 cargo build）"; exit 1; }
@@ -68,11 +76,10 @@ DATA=$HOME_DIR/$ROOT_NAME
 
 rm -rf "$D"; mkdir -p "$DATA" "$D"
 
-DAEMON_PID=""; PROXY_PID=""; FEED_PID=""
+DAEMON_PID=""; PROXY_PID=""
 cleanup() {
   [ -n "$DAEMON_PID" ] && kill -9 "$DAEMON_PID" 2>/dev/null
   [ -n "$PROXY_PID" ]  && kill -9 "$PROXY_PID"  2>/dev/null
-  [ -n "$FEED_PID" ]   && kill    "$FEED_PID"   2>/dev/null
   return 0
 }
 trap cleanup EXIT
@@ -188,19 +195,14 @@ with open(path, "w", encoding="utf-8") as fh:
     json.dump(d, fh, indent=2, ensure_ascii=False)
 PY
 
-# ── 跑 TUI（pty；stdin 用 FIFO 持住，否则 EventStream 立刻 EOF） ─────────
-FIFO=$D/in
-mkfifo "$FIFO"
-( exec 3>"$FIFO"; sleep "$RUN_SECS" ) & FEED_PID=$!
-
-QAQH_DATA_DIR="$DATA" HOME="$HOME_DIR" USERPROFILE="$HOME_DIR" \
-  timeout $((RUN_SECS + 15)) script -qec "stty rows 40 cols 130; timeout $RUN_SECS $TUI" /dev/null \
-  <"$FIFO" >"$D/tui.raw" 2>&1 &
-TUI_PID=$!
+# ── 跑 TUI（真 PTY 驱动）─────────────────────────────────────────────────
+# 必须答 `ESC[6n`：默认 V2 Agent View 初始化时会查光标位置，哑驱动
+# （`script(1)`）无人应答 → TUI 初始化即 panic，本脚本假红。见
+# `scripts/lib/pty-driver.py` 顶部说明。
 echo "TUI 跑 ${RUN_SECS}s（期间应发生多次租约重新协商）…"
-wait "$TUI_PID" 2>/dev/null
-wait "$FEED_PID" 2>/dev/null
-FEED_PID=""
+QAQH_DATA_DIR="$DATA" HOME="$HOME_DIR" USERPROFILE="$HOME_DIR" \
+  python3 "$REPO_ROOT/scripts/lib/pty-driver.py" \
+  --tui "$TUI" --raw "$D/tui.raw" --seconds "$RUN_SECS" --quit
 
 OPENS=$(cat "$D/opens" 2>/dev/null || echo 0)
 
@@ -213,7 +215,11 @@ raw = pathlib.Path(sys.argv[1]).read_text(errors="replace")
 s = re.sub(r"\x1b\[[0-9;?]*[a-zA-Z]", "", raw).replace("\r", "")
 
 phases = []
-for m in re.finditer(r"(● ready|◌ connecting|✗ lost)(\s*[0-9a-f]{6,12})?", s):
+# 相位 token 两个 UI 都要认：v1 状态栏是 `◌ connecting`，v2 Agent View 的
+# `status_line` 是 `○ opening` / `● ready` / `● degraded` / `✗ lost`。
+for m in re.finditer(
+    r"(● ready|● degraded|○ opening|◌ connecting|✗ lost)(\s*[0-9a-f]{6,12})?", s
+):
     tok = (m.group(1) + (m.group(2) or "")).strip()
     if not phases or phases[-1] != tok:
         phases.append(tok)

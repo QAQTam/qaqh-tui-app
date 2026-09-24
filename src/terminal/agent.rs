@@ -1,12 +1,12 @@
 //! V2 Agent View：真实 Runtime/App 状态驱动的 inline 外壳（M4.1）。
 //!
-//! 运行：`qaqh-tui --v2-agent`
+//! 运行：`qaqh-tui`（alpha1 起默认；`--v2-agent` 仍可显式选择）
 //!
 //! 与 `--v2-inline` 原型的区别：
 //! - 复用生产 `Runtime` / `App`，因此会连接 daemon 并处理真实 timeline 事件；
 //! - 已封口 transcript 经 V2 projector + commit ledger 写入终端 scrollback；
 //! - inline viewport 只绘制 live transcript、composer、status 与 shortcuts；
-//! - 不启用鼠标捕获，保留终端原生选择/复制；v1 默认全屏路径不受影响。
+//! - 不启用鼠标捕获，保留终端原生选择/复制；`--v1` 仍可强制回退全屏路径。
 
 use std::collections::VecDeque;
 use std::io::stdout;
@@ -757,16 +757,21 @@ fn composer_visual_rows(
 fn render_agent(app: &App, width: u16, height: u16, theme: &Theme) -> AgentRender {
     let height = usize::from(height.max(1));
     let Some(session) = app.active_session() else {
+        // 空态也要给「在途 create」一个可见信号：新会话靠列表兜底发现（约一个
+        // 刷新节拍），中间这段如果什么都不显示，用户会以为 Ctrl+N 没生效而
+        // 反复按 —— 每按一次就真的多建一个会话（实测过）。
+        let hint = if app.pending_creates.is_empty() {
+            " Ctrl+N 新建会话 · Ctrl+L 会话列表 · F1 帮助 · Ctrl+Q 退出"
+        } else {
+            " 正在创建会话…"
+        };
         let mut lines = vec![
             Line::from(Span::styled(
                 " QAQH Agent View",
                 Style::new().fg(theme.accent.assistant),
             )),
             Line::default(),
-            Line::from(Span::styled(
-                " Ctrl+N 新建会话 · Ctrl+L 会话列表 · F1 帮助 · Ctrl+Q 退出",
-                Style::new().fg(theme.text.dim),
-            )),
+            Line::from(Span::styled(hint, Style::new().fg(theme.text.dim))),
         ];
         lines.truncate(height);
         return AgentRender {

@@ -3,9 +3,9 @@
 //! M1 只提供隔离原型：
 //! - [`commit`]：已提交块的幂等账本；
 //! - [`inline`]：`--v2-inline` 隔离原型；
-//! - [`agent`]：`--v2-agent` 真实事件循环的 inline Agent 外壳。
+//! - [`agent`]：默认的 inline Agent View（`--v2-agent` 仍可显式选择）。
 //!
-//! 默认 v1 全屏路径不依赖本模块。
+//! alpha1 起 Agent View 是默认 UI；Ringing 协议切换另行推进，当前仍走 v1。
 
 pub mod agent;
 pub mod commit;

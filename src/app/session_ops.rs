@@ -75,6 +75,11 @@ impl App {
         let command_id = uuid::Uuid::new_v4().to_string();
         self.pending_creates
             .insert(command_id.clone(), Instant::now());
+        // 立刻作废列表缓存：新建会话的落地结果由**列表**兜底发现（见
+        // `App::handle_action` 的 `ActionResult::SessionList`）。见下方
+        // `new_session_with_cwd` 的长注释——`Created` 事件在实践中不保证到达，
+        // 不能把「新会话开出来」只押在那一条路径上。
+        self.session_list_at = None;
         self.spawn_api(move |api, tx| async move {
             let result = api
                 .send_command(

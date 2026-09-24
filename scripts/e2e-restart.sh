@@ -24,13 +24,18 @@ DAEMON=${DAEMON:-$BACKEND_ROOT/target/debug/qaqh-daemon}
 TUI=${TUI:-$REPO_ROOT/target/debug/qaqh-tui}
 D=/tmp/qaqh-e2e-restart
 PROBE_DELAY=${PROBE_DELAY:-30}   # 杀 daemon 后等多久按 Ctrl+R（须 > STALL_AFTER=20s）
+# ⚠ 本 harness 断言的是**状态栏相位面**（`● ready` → `✗ lost` → 新 epoch 的
+# `● ready`）与重连文案，那是 v1 的呈现：v2 Agent View 只在有活动会话时才画
+# `status_line`，空 data root 下拿不到相位 token。故默认走 `--v1` 回退路径；
+# 连接/重连行为本身与 UI 无关。调用方可用 `TUI_ARGS=…` 覆盖。
+TUI_ARGS=${TUI_ARGS:---v1}
+export TUI_ARGS
 
 for b in "$DAEMON" "$TUI"; do
   [ -x "$b" ] || { echo "缺少可执行文件：$b（先 cargo build）"; exit 1; }
 done
 
 rm -rf "$D"; mkdir -p "$D/qaqh"
-FIFO=$D/in; mkfifo "$FIFO"
 
 start()      { QAQH_DATA_DIR="$D/qaqh" "$DAEMON" run </dev/null >>"$D/daemon.out" 2>&1 & echo $!; }
 # 必须连 pid 一起核：只判「文件存在」会读到上一轮遗留的 daemon.json。
@@ -40,25 +45,29 @@ epoch()      { grep -o '"server_epoch": "[^"]*"' "$D/qaqh/daemon.json" 2>/dev/nu
 D1=$(start); wait_pid "$D1" || { echo "daemon#1 未起来"; cat "$D/daemon.out"; exit 1; }
 echo "t=0   daemon#1 pid=$D1 epoch=$(epoch)"
 
-# 喂按键：全程持住写端——关掉会让 TUI 的 stdin 立刻 EOF。
-( exec 3>"$FIFO"
-  sleep "$PROBE_DELAY"; printf '\x12' >&3; echo "t=$PROBE_DELAY  Ctrl+R（daemon 仍 dead，相位应已是 lost）"
-  sleep 13;             printf '\x12' >&3; echo "t=$((PROBE_DELAY+13))  Ctrl+R（daemon#2 已起）"
-  sleep 20 ) & FEED=$!
+# 按键由驱动按时间表注入（两次 Ctrl+R），不再用 FIFO：哑驱动收不到 `ESC[6n`
+# 应答，默认 V2 Agent View 会初始化即 panic（假红）。见 `scripts/lib/pty-driver.py`。
+echo "t=$PROBE_DELAY  Ctrl+R（daemon 仍 dead，相位应已是 lost）"
+echo "t=$((PROBE_DELAY+13))  Ctrl+R（daemon#2 已起）"
 
-QAQH_DATA_DIR="$D/qaqh" timeout 75 script -qec "stty rows 40 cols 130; timeout 70 $TUI" /dev/null \
-  <"$FIFO" > "$D/tui.raw" 2>&1 &
+QAQH_DATA_DIR="$D/qaqh" python3 "$REPO_ROOT/scripts/lib/pty-driver.py" \
+  --tui "$TUI" --raw "$D/tui.raw" --seconds 70 \
+  --key "$PROBE_DELAY:12" --key "$((PROBE_DELAY+13)):12" &
 TPID=$!
 sleep 8;  echo "t=8   杀 daemon#1"; kill -9 "$D1" 2>/dev/null; rm -f "$D/qaqh/daemon.json"
 sleep 29; echo "t=37  起 daemon#2"; D2=$(start); wait_pid "$D2" && echo "t=37  daemon#2 pid=$D2 epoch=$(epoch)"
 
-wait $TPID 2>/dev/null; kill "$D2" 2>/dev/null; wait $FEED 2>/dev/null
+wait $TPID 2>/dev/null; kill "$D2" 2>/dev/null
 
 python3 - "$D/tui.raw" <<'PY'
 import re, sys, pathlib
 s = re.sub(r"\x1b\[[0-9;?]*[a-zA-Z]", "", pathlib.Path(sys.argv[1]).read_text(errors="replace")).replace("\r", "")
 seen = []
-for m in re.finditer(r"(● ready|◌ connecting|✗ lost)(\s*[0-9a-f]{6,12})?", s):
+# 相位 token 两个 UI 都要认：v1 状态栏是 `◌ connecting`，v2 Agent View 的
+# `status_line` 是 `○ opening` / `● ready` / `● degraded` / `✗ lost`。
+for m in re.finditer(
+    r"(● ready|● degraded|○ opening|◌ connecting|✗ lost)(\s*[0-9a-f]{6,12})?", s
+):
     tok = (m.group(1) + (m.group(2) or "")).strip()
     if not seen or seen[-1] != tok:
         seen.append(tok)

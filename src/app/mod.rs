@@ -15,6 +15,7 @@ mod paste_guard;
 pub(crate) mod render;
 pub mod render_line;
 pub mod render_transcript;
+pub(crate) mod ringing_v2;
 pub mod session;
 mod session_ops;
 pub mod settings;
@@ -742,8 +743,10 @@ impl App {
         {
             self.quit_armed = None;
         }
-        // 首页自动刷新：无 tab 时保持列表新鲜（对齐 opencode Home 的常驻列表感）
-        if self.tabs.is_empty() {
+        // 首页自动刷新：无 tab 时保持列表新鲜（对齐 opencode Home 的常驻列表感）。
+        // 有在途 create 时**同样**刷新：新会话的落地结果靠列表兜底发现，
+        // 而那时用户可能已经有别的 tab 开着（`tabs` 非空）。
+        if self.tabs.is_empty() || !self.pending_creates.is_empty() {
             let stale = self
                 .session_list_at
                 .map(|t| t.elapsed() > Duration::from_secs(3))
@@ -1582,6 +1585,26 @@ impl App {
                 }
             },
             ActionResult::SessionList(Ok(list)) => {
+                // 新建会话的**兜底发现**：`Ctrl+N` 后不能只等
+                // `SessionStateEvent::Created` 那条可靠事件——实测（真 daemon，
+                // 锚点 b77c251）daemon 侧收据 state=succeeded、journal 里
+                // `session_state_changed/created` 带正确 causation_id，但 TUI 侧
+                // 既不开 tab 也不 toast，v2 Agent View 首屏没有列表面，于是
+                // 「按 Ctrl+N 什么都没发生、再按一次又多建一个会话」。
+                //
+                // 这里用列表兜底：有在途 create 时，把**最新建的那个**会话开出来。
+                // 判据取 `created_at` 最大者，且必须是本地还没有 tab 的 seed ——
+                // 否则会去开一个用户没要求的旧会话。
+                if !self.pending_creates.is_empty()
+                    && let Some(entry) = list.iter().max_by_key(|e| e.meta.created_at)
+                {
+                    let seed = entry.meta.seed.clone();
+                    if !self.tabs.contains(&seed) {
+                        self.open_session_tab(&seed);
+                        self.pending_creates.clear();
+                        self.toast(NoticeLevel::Info, format!("新会话已创建 {seed}"));
+                    }
+                }
                 self.session_list_cache = list;
                 self.session_list_at = Some(Instant::now());
                 // 首页选中越界回绕
@@ -2013,7 +2036,67 @@ pub fn guess_media_type(path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use qaqh_client::{RingingCommandAck, RingingCommandAckStatus};
+    use qaqh_client::{RingingCommandAck, RingingCommandAckStatus, SessionMeta};
+
+    fn list_entry(seed: &str, created_at: u64) -> SessionListEntry {
+        SessionListEntry {
+            meta: SessionMeta {
+                seed: seed.to_string(),
+                created_at,
+                ..SessionMeta::default()
+            },
+            running: false,
+            workspace_id: None,
+        }
+    }
+
+    /// 新建会话的**兜底发现**回归锁。
+    ///
+    /// 为什么不能只锁 `Created` 事件那条路：实测（真 daemon，锚点 b77c251）daemon
+    /// 侧收据 `state=succeeded`、journal 里 `session_state_changed/created` 带**正确**
+    /// 的 `causation_id == command_id`，但 TUI 侧既不开 tab 也不 toast。默认 Agent
+    /// View 首屏又没有列表面，于是表现为「按 Ctrl+N 什么都没发生、再按一次又多建
+    /// 一个会话」。所以「新会话要真的开出来」必须由列表兜底，这条锁的就是它。
+    // 必须跑在 Tokio runtime 里：`open_session_tab` → `attach_and_bootstrap`
+    // → `spawn_api` 走 `tokio::spawn`。
+    #[tokio::test]
+    async fn pending_create_opens_newest_session_from_list() {
+        let (mut app, _rx) = App::new_for_test();
+        app.pending_creates
+            .insert("cmd-create-3".to_string(), Instant::now());
+
+        app.handle(AppMsg::Action(ActionResult::SessionList(Ok(vec![
+            list_entry("old-seed", 100),
+            list_entry("new-seed", 200),
+        ]))));
+
+        assert_eq!(
+            app.tabs,
+            vec!["new-seed".to_string()],
+            "有在途 create 时必须打开**最新建**的那个会话（且不得顺手开旧会话）"
+        );
+        assert!(
+            app.pending_creates.is_empty(),
+            "打开后要消费掉在途 create，否则每次列表刷新都会反复开"
+        );
+    }
+
+    /// 反向闸（同一条分支）：**没有**在途 create 时，列表刷新不得擅自打开任何
+    /// 会话——否则每次首页自动刷新都会把用户弹进某个旧会话。
+    #[test]
+    fn list_refresh_without_pending_create_opens_nothing() {
+        let (mut app, _rx) = App::new_for_test();
+
+        app.handle(AppMsg::Action(ActionResult::SessionList(Ok(vec![
+            list_entry("old-seed", 100),
+        ]))));
+
+        assert!(
+            app.tabs.is_empty(),
+            "无在途 create 时不得自动开会话，实测 tabs={:?}",
+            app.tabs
+        );
+    }
 
     fn create_ack(command_id: &str, status: RingingCommandAckStatus) -> RingingCommandAck {
         RingingCommandAck {
