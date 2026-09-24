@@ -249,6 +249,10 @@ async fn run_loop(
             input.resume();
             result?;
         }
+        if app.force_redraw {
+            terminal.terminal.clear()?;
+            app.force_redraw = false;
+        }
         terminal
             .terminal
             .draw(|frame| draw(frame, app, theme, &route))?;

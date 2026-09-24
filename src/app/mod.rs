@@ -671,6 +671,8 @@ pub struct App {
     pub pending_pager: Option<String>,
     /// 主循环帧统计（`QAQH_TUI_DEBUG=1` 时在状态栏展示）。
     pub frame_stats: FrameStats,
+    /// 后端回合终态到达时置位；主循环下一帧清 viewport 后强制重绘。
+    pub force_redraw: bool,
 }
 
 /// `TimelineLost` 的处置结论。
@@ -770,6 +772,7 @@ impl App {
             subagent_seeds: HashSet::new(),
             pending_pager: None,
             frame_stats: FrameStats::default(),
+            force_redraw: false,
         }
     }
 
@@ -915,6 +918,8 @@ impl App {
                 };
                 // TurnSealed 是 timeline 上的权威终态：立即收口 streaming，不等
                 // 对话频道 TurnCompleted（两条独立 SSE，可能乱序或丢失）。
+                let turn_sealed =
+                    matches!(&entry.event, qaqh_client::TimelineEvent::TurnSealed { .. });
                 if let Some(terminal) = sess.timeline.apply(&entry) {
                     streaming_done(sess, Some(&terminal.turn_id));
                 }
@@ -922,6 +927,9 @@ impl App {
                 if !sess.scroll.follow {
                     // 非跟随模式：内容增长等价于视口上移。
                     sess.scroll.offset = sess.scroll.offset.saturating_add(0);
+                }
+                if turn_sealed {
+                    self.force_redraw = true;
                 }
             }
             RuntimeMsg::TimelineRebaseline { seed, page } => {
@@ -1362,6 +1370,7 @@ impl App {
         let Some(sess) = self.sessions.get_mut(&seed) else {
             return;
         };
+        let mut force_redraw = false;
         match ev {
             ConversationEvent::TurnStarted { turn_id, .. } => {
                 sess.streaming = Some(session::StreamingState {
@@ -1377,6 +1386,7 @@ impl App {
             }
             ConversationEvent::TurnCompleted { usage, turn_id, .. } => {
                 streaming_done(sess, Some(&turn_id));
+                force_redraw = true;
                 if let Some(u) = usage
                     && let Some(conv) = sess.conversation.as_mut()
                 {
@@ -1385,6 +1395,7 @@ impl App {
             }
             ConversationEvent::TurnFailed { turn_id, error } => {
                 streaming_done(sess, Some(&turn_id));
+                force_redraw = true;
                 sess.last_error = Some(error.clone());
                 self.toast(
                     NoticeLevel::Error,
@@ -1476,8 +1487,12 @@ impl App {
             }
             ConversationEvent::ConversationCancelled { turn_id } => {
                 streaming_done(sess, turn_id.as_deref());
+                force_redraw = true;
                 self.toast(NoticeLevel::Info, "回合已取消");
             }
+        }
+        if force_redraw {
+            self.force_redraw = true;
         }
     }
 
@@ -2148,6 +2163,46 @@ mod tests {
             running: false,
             workspace_id: None,
         }
+    }
+
+    #[test]
+    fn turn_completed_requests_forced_redraw() {
+        let (mut app, _rx) = App::new_for_test();
+        app.sessions
+            .insert("seed".into(), SessionState::new("seed".into()));
+
+        app.handle_conversation(
+            "seed".into(),
+            ConversationEvent::TurnCompleted {
+                turn_id: "turn-1".into(),
+                stop_reason: None,
+                usage: None,
+            },
+        );
+
+        assert!(app.force_redraw, "回合终态必须触发下一帧强制重绘");
+    }
+
+    #[test]
+    fn timeline_turn_sealed_requests_forced_redraw() {
+        let (mut app, _rx) = App::new_for_test();
+        app.sessions
+            .insert("seed".into(), SessionState::new("seed".into()));
+
+        app.handle_runtime(RuntimeMsg::Timeline {
+            seed: "seed".into(),
+            entry: Box::new(qaqh_client::TimelineEntry {
+                timeline_seq: 1,
+                turn_id: "turn-1".into(),
+                round_num: Some(0),
+                event: qaqh_client::TimelineEvent::TurnSealed {
+                    state: qaqh_client::TimelineTurnState::Completed,
+                    failure: None,
+                },
+            }),
+        });
+
+        assert!(app.force_redraw, "timeline 终态也必须触发下一帧强制重绘");
     }
 
     #[tokio::test]
