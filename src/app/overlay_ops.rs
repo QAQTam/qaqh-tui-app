@@ -3,6 +3,16 @@
 use super::*;
 use qaqh_client::TimelineBlockKind;
 
+fn move_index(current: usize, count: usize, delta: isize) -> usize {
+    if delta < 0 {
+        current.saturating_sub(delta.unsigned_abs())
+    } else {
+        current
+            .saturating_add(delta as usize)
+            .min(count.saturating_sub(1))
+    }
+}
+
 impl App {
     /// 标签/观测切换后调用：清掉不属于当前标签 seed 的 overlay。
     ///
@@ -78,6 +88,139 @@ impl App {
             .filter(|(_, m)| self.session_matches_cwd_filter(m))
             .map(|(i, _)| i)
             .collect()
+    }
+
+    /// Workspace 会话行点击：索引以过滤后的可见列表为准，动作与 Enter 完全一致。
+    pub fn workspace_open_session(&mut self, filtered_index: usize) {
+        let Some(Overlay::SessionList { show_archived, .. }) = self.overlays.last().cloned() else {
+            return;
+        };
+        let Some(&meta_idx) = self.filtered_sessions(show_archived).get(filtered_index) else {
+            return;
+        };
+        let seed = self.session_list_cache[meta_idx].meta.seed.clone();
+        self.overlays.pop();
+        self.open_session_tab(&seed);
+    }
+
+    /// Workspace 回合行点击：与 History 列表的 Enter 一致，进入只读详情。
+    pub fn workspace_open_history(&mut self, selected: usize) {
+        let turn_count = self
+            .active_session()
+            .map(|session| session.timeline.turns.len())
+            .unwrap_or(0);
+        if selected >= turn_count {
+            return;
+        }
+        self.replace_overlay(Overlay::History {
+            selected,
+            detail: true,
+            scroll: 0,
+        });
+    }
+
+    /// Todo 行点击：当前版本复用 F6 的全局详情开关，先建立鼠标入口。
+    pub fn workspace_toggle_todo_detail(&mut self) {
+        self.show_todo_detail = !self.show_todo_detail;
+    }
+
+    /// Workspace 返回按钮：严格复用各页面 Esc 的层级语义。
+    pub fn workspace_back(&mut self) {
+        match self.overlays.last().cloned() {
+            Some(Overlay::History {
+                selected,
+                detail: true,
+                ..
+            }) => {
+                self.replace_overlay(Overlay::History {
+                    selected,
+                    detail: false,
+                    scroll: 0,
+                });
+            }
+            Some(
+                Overlay::History { .. }
+                | Overlay::SessionList { .. }
+                | Overlay::Settings(_)
+                | Overlay::Help,
+            ) => {
+                self.overlays.pop();
+            }
+            _ if self.inspecting() => self.exit_inspect(),
+            _ => self.show_workspace = false,
+        }
+    }
+
+    /// Workspace 滚轮/方向键移动选择。只处理列表型页面；详情/观测由调用方滚动。
+    pub fn workspace_move_selection(&mut self, delta: isize) {
+        let Some(overlay) = self.overlays.last().cloned() else {
+            return;
+        };
+        match overlay {
+            Overlay::SessionList {
+                selected,
+                show_archived,
+            } => {
+                let count = self.filtered_sessions(show_archived).len();
+                if count == 0 {
+                    return;
+                }
+                let next = move_index(selected, count, delta);
+                self.replace_overlay(Overlay::SessionList {
+                    selected: next,
+                    show_archived,
+                });
+            }
+            Overlay::History {
+                selected,
+                detail: false,
+                ..
+            } => {
+                let count = self
+                    .active_session()
+                    .map(|session| session.timeline.turns.len())
+                    .unwrap_or(0);
+                if count == 0 {
+                    return;
+                }
+                self.replace_overlay(Overlay::History {
+                    selected: move_index(selected, count, delta),
+                    detail: false,
+                    scroll: 0,
+                });
+            }
+            Overlay::Settings(mut state) => {
+                state.move_focus(delta as i32);
+                self.replace_overlay(Overlay::Settings(state));
+            }
+            _ => {}
+        }
+    }
+
+    /// Workspace 滚轮滚动：History 详情有自己的 offset，其它页面走会话视口。
+    pub fn workspace_scroll_view(&mut self, up: bool, lines: usize) {
+        if let Some(Overlay::History {
+            selected,
+            detail: true,
+            scroll,
+        }) = self.overlays.last().cloned()
+        {
+            self.replace_overlay(Overlay::History {
+                selected,
+                detail: true,
+                scroll: if up {
+                    scroll.saturating_add(lines)
+                } else {
+                    scroll.saturating_sub(lines)
+                },
+            });
+            return;
+        }
+        if up {
+            self.scroll_up(lines);
+        } else {
+            self.scroll_down(lines);
+        }
     }
 
     /// `resume` 模式只显示当前 cwd 及其子目录下的会话。

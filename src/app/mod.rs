@@ -597,7 +597,7 @@ pub fn prune_seed_bound_overlays(overlays: &mut Vec<Overlay>, seed: Option<&str>
     });
 }
 
-use self::settings::{FieldKind, SettingsHit, SettingsState};
+use self::settings::{FieldKind, SettingsState};
 
 /// 主循环帧统计（`QAQH_TUI_DEBUG=1` 展示）。
 ///
@@ -646,6 +646,20 @@ pub enum ModalHit {
     PlanReject,
 }
 
+/// Workspace 里一个可点目标。
+///
+/// 与 [`ModalHit`] 一样只保存语义索引，不保存终端坐标；实际坐标由
+/// `ui::v2::workspace` 的共享几何函数在绘制与命中测试时各算一次，但两边
+/// 使用同一份布局/窗口算法。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkspaceHit {
+    SessionRow(usize),
+    HistoryTurn(usize),
+    TodoTask(usize),
+    SettingsRow(usize),
+    Back,
+}
+
 pub struct App {
     pub quit: bool,
     pub runtime: Arc<Runtime>,
@@ -667,9 +681,9 @@ pub struct App {
     /// 鼠标**按下且未松开**的目标。松开时若仍命中同一目标才提交——
     /// 这是按钮的基本语义（按下后拖出去 = 取消）。
     pub modal_pressed: Option<ModalHit>,
-    /// 设置页鼠标悬停/按下目标；只在 Settings Workspace 生效。
-    pub settings_hover: Option<SettingsHit>,
-    pub settings_pressed: Option<SettingsHit>,
+    /// Workspace 鼠标悬停/按下目标；绘制与点击共用语义。
+    pub workspace_hover: Option<WorkspaceHit>,
+    pub workspace_pressed: Option<WorkspaceHit>,
     /// 本进程已提交的交互 id（ask / plan / permission）。提交后不能再被
     /// bootstrap 快照复活成幽灵面板；超时反馈必须能留在可见的 Agent 状态栏。
     suppressed_interactions: HashSet<String>,
@@ -795,8 +809,8 @@ impl App {
             stream_issues: StreamIssues::default(),
             modal_hover: None,
             modal_pressed: None,
-            settings_hover: None,
-            settings_pressed: None,
+            workspace_hover: None,
+            workspace_pressed: None,
             suppressed_interactions: HashSet::new(),
             toasts: VecDeque::new(),
             pending_creates: HashMap::new(),

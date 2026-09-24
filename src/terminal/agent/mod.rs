@@ -35,7 +35,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::app::session::SessionState;
 use crate::app::timeline_model::{Turn, strip_ansi_escapes};
-use crate::app::{App, AppMsg, ConnPhase, ModalHit, Overlay, StartupIntent};
+use crate::app::{App, AppMsg, ConnPhase, ModalHit, Overlay, StartupIntent, WorkspaceHit};
 use crate::runtime::{Runtime, RuntimeMsg};
 use crate::terminal::transcript::PendingCommit;
 use crate::theme::Theme;
@@ -331,11 +331,11 @@ fn handle_message(
                 let area = ratatui::layout::Rect::new(0, 0, size.width, size.height);
                 handle_fullscreen_agent_mouse(app, fullscreen_view, area, mouse);
             }
-            (_, ScreenRoute::Workspace(route::WorkspaceRoute::Settings)) => {
+            (_, ScreenRoute::Workspace(workspace_route)) => {
                 fullscreen_view.pointer.clear_pointer();
                 let size = terminal.terminal.size()?;
                 let area = ratatui::layout::Rect::new(0, 0, size.width, size.height);
-                handle_settings_mouse(app, area, mouse);
+                handle_workspace_mouse(app, workspace_route, area, mouse);
             }
             (_, ScreenRoute::Modal(modal)) => {
                 fullscreen_view.pointer.clear_pointer();
@@ -345,11 +345,11 @@ fn handle_message(
             }
             _ => {
                 fullscreen_view.pointer.clear_pointer();
-                app.settings_hover = None;
-                app.settings_pressed = None;
+                app.workspace_hover = None;
+                app.workspace_pressed = None;
             }
         }
-        // inline 主界面不捕获鼠标；全屏 Workspace 本轮不接鼠标。
+        // inline 主界面不捕获鼠标。
         return Ok(());
     }
     if terminal.mode == ScreenMode::Fullscreen
@@ -387,39 +387,100 @@ fn handle_message(
         && key.code == KeyCode::Esc
         && route::resolve(app) == ScreenRoute::Workspace(route::WorkspaceRoute::Todo)
     {
+        app.workspace_hover = None;
+        app.workspace_pressed = None;
         app.show_workspace = false;
         return Ok(());
+    }
+    if matches!(msg, AppMsg::Key(_)) {
+        app.workspace_hover = None;
+        app.workspace_pressed = None;
     }
     app.handle(msg);
     Ok(())
 }
 
-fn handle_settings_mouse(
+fn handle_workspace_mouse(
     app: &mut App,
+    route: &route::WorkspaceRoute,
     area: ratatui::layout::Rect,
     mouse: ratatui::crossterm::event::MouseEvent,
 ) {
-    use crate::app::settings::SettingsHit;
     use ratatui::crossterm::event::{MouseButton, MouseEventKind};
 
-    let hit = crate::ui::v2::workspace::settings_hit_test(app, area, mouse.column, mouse.row);
+    let hit =
+        crate::ui::v2::workspace::workspace_hit_test(app, route, area, mouse.column, mouse.row);
     match mouse.kind {
-        MouseEventKind::Moved => app.settings_hover = hit,
+        MouseEventKind::Moved => app.workspace_hover = hit,
         MouseEventKind::Down(MouseButton::Left) => {
-            app.settings_hover = hit;
-            app.settings_pressed = hit;
+            app.workspace_hover = hit;
+            app.workspace_pressed = hit;
         }
         MouseEventKind::Up(MouseButton::Left) => {
-            let pressed = app.settings_pressed.take();
-            app.settings_hover = hit;
-            if pressed.is_some()
-                && pressed == hit
-                && let Some(SettingsHit::Row(index)) = hit
+            let pressed = app.workspace_pressed.take();
+            app.workspace_hover = hit;
+            if let (Some(pressed), Some(released)) = (pressed, hit)
+                && pressed == released
             {
-                app.mouse_settings_row(index);
+                dispatch_workspace_hit(app, pressed);
+                app.workspace_hover = None;
+                app.workspace_pressed = None;
             }
         }
+        MouseEventKind::ScrollUp => {
+            handle_workspace_scroll(app, route, true);
+            app.workspace_hover = crate::ui::v2::workspace::workspace_hit_test(
+                app,
+                route,
+                area,
+                mouse.column,
+                mouse.row,
+            );
+            app.workspace_pressed = None;
+        }
+        MouseEventKind::ScrollDown => {
+            handle_workspace_scroll(app, route, false);
+            app.workspace_hover = crate::ui::v2::workspace::workspace_hit_test(
+                app,
+                route,
+                area,
+                mouse.column,
+                mouse.row,
+            );
+            app.workspace_pressed = None;
+        }
         _ => {}
+    }
+}
+
+fn handle_workspace_scroll(app: &mut App, route: &route::WorkspaceRoute, up: bool) {
+    match route {
+        route::WorkspaceRoute::Sessions { .. }
+        | route::WorkspaceRoute::Settings
+        | route::WorkspaceRoute::History { detail: false, .. } => {
+            app.workspace_move_selection(if up { -1 } else { 1 });
+        }
+        route::WorkspaceRoute::History { detail: true, .. } => {
+            app.workspace_scroll_view(up, 3);
+        }
+        route::WorkspaceRoute::Todo | route::WorkspaceRoute::Subagent { .. } => {
+            if up {
+                app.scroll_up(3);
+            } else {
+                app.scroll_down(3);
+            }
+        }
+        route::WorkspaceRoute::Help => {}
+    }
+}
+
+fn dispatch_workspace_hit(app: &mut App, hit: WorkspaceHit) {
+    match hit {
+        WorkspaceHit::SessionRow(index) => app.workspace_open_session(index),
+        WorkspaceHit::HistoryTurn(index) => app.workspace_open_history(index),
+        WorkspaceHit::TodoTask(_) => app.workspace_toggle_todo_detail(),
+        WorkspaceHit::SettingsRow(index) => app.mouse_settings_row(index),
+        WorkspaceHit::Back => app.workspace_back(),
     }
 }
 

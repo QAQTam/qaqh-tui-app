@@ -5,14 +5,15 @@
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::style::{Modifier, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, Paragraph, Wrap};
+use std::ops::Range;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::app::render_line::edit_window;
 use crate::app::settings::{FieldKind, ROWS, SettingsHit, SettingsState};
-use crate::app::{App, Overlay};
+use crate::app::{App, Overlay, WorkspaceHit};
 use crate::protocol::ConfigDto;
 use crate::theme::Theme;
 use crate::ui::v2::adapter;
@@ -28,12 +29,7 @@ pub fn draw(f: &mut Frame, app: &App, route: &WorkspaceRoute, theme: &Theme) {
         area,
     );
 
-    let [header, body, footer] = Layout::vertical([
-        Constraint::Length(1),
-        Constraint::Min(1),
-        Constraint::Length(1),
-    ])
-    .areas(area);
+    let [header, body, footer] = workspace_areas(area);
 
     f.render_widget(Paragraph::new(header_line(route, app, theme)), header);
     match route {
@@ -51,7 +47,8 @@ pub fn draw(f: &mut Frame, app: &App, route: &WorkspaceRoute, theme: &Theme) {
         WorkspaceRoute::Todo => draw_todo(f, app, body, theme),
         WorkspaceRoute::Subagent { seed } => draw_subagent(f, app, body, seed, theme),
     }
-    f.render_widget(Paragraph::new(footer_line(route, theme)), footer);
+    let back = footer_back_visual(app, WorkspaceHit::Back);
+    f.render_widget(Paragraph::new(footer_line(route, theme, back)), footer);
 }
 
 fn header_line(route: &WorkspaceRoute, app: &App, theme: &Theme) -> Line<'static> {
@@ -108,28 +105,112 @@ fn header_line(route: &WorkspaceRoute, app: &App, theme: &Theme) -> Line<'static
     ])
 }
 
-fn footer_line(route: &WorkspaceRoute, theme: &Theme) -> Line<'static> {
-    let text = match route {
+fn footer_line(route: &WorkspaceRoute, theme: &Theme, back: ButtonVisual) -> Line<'static> {
+    let hint = match route {
         WorkspaceRoute::Sessions { .. } => {
-            " ↑↓ 选择 · Enter 打开 · n 新建 · x 归档 · u 恢复 · D 删除 · a 归档显示 · r 刷新 · Esc 返回"
+            "↑↓ 选择 · Enter 打开 · n 新建 · x 归档 · u 恢复 · D 删除 · a 归档显示 · r 刷新"
         }
-        WorkspaceRoute::Settings => {
-            " ↑↓ 选择 · Enter 编辑/应用 · ←→ 切换 · s 保存 · r 刷新 · Esc 返回"
-        }
-        WorkspaceRoute::Help => " Esc 返回 Agent View",
+        WorkspaceRoute::Settings => "↑↓ 选择 · Enter 编辑/应用 · ←→ 切换 · s 保存 · r 刷新",
+        WorkspaceRoute::Help => "返回 Agent View",
         WorkspaceRoute::History { detail, .. } => {
             if *detail {
-                " PgUp/PgDn 滚动 · e 导出此回合 · Esc 返回列表"
+                "PgUp/PgDn 滚动 · e 导出此回合"
             } else {
-                " ↑↓ 选择回合 · Enter 查看 · PgUp/PgDn 翻页 · Esc 返回 Agent View"
+                "↑↓ 选择回合 · Enter 查看 · PgUp/PgDn 翻页"
             }
         }
-        WorkspaceRoute::Todo => " F4/Esc 返回 · PgUp/PgDn 滚动 · F6 详情",
+        WorkspaceRoute::Todo => "PgUp/PgDn 滚动 · F6 详情",
         WorkspaceRoute::Subagent { .. } => {
-            " Ctrl+↓/Esc 返回父会话 · PgUp/PgDn 滚动 · Ctrl+Home/End 顶部/底部"
+            "Ctrl+↓ 返回父会话 · PgUp/PgDn 滚动 · Ctrl+Home/End 顶部/底部"
         }
     };
-    Line::from(Span::styled(text, Style::new().fg(theme.text.dim)))
+    Line::from(vec![
+        Span::styled(BACK_LABEL, button_style(back, theme)),
+        Span::styled(format!(" {hint}"), Style::new().fg(theme.text.dim)),
+    ])
+}
+
+const BACK_LABEL: &str = " [ ← 返回 ] ";
+
+fn workspace_areas(area: Rect) -> [Rect; 3] {
+    Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Min(1),
+        Constraint::Length(1),
+    ])
+    .areas(area)
+}
+
+fn footer_back_area(footer: Rect) -> Rect {
+    Rect {
+        width: (BACK_LABEL.width() as u16).min(footer.width),
+        ..footer
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct ButtonVisual {
+    hovered: bool,
+    pressed: bool,
+}
+
+fn workspace_visual(app: &App, target: WorkspaceHit) -> ButtonVisual {
+    let hovered = app.workspace_hover == Some(target);
+    ButtonVisual {
+        hovered,
+        pressed: hovered && app.workspace_pressed == Some(target),
+    }
+}
+
+fn footer_back_visual(app: &App, target: WorkspaceHit) -> ButtonVisual {
+    workspace_visual(app, target)
+}
+
+fn button_style(visual: ButtonVisual, theme: &Theme) -> Style {
+    let surface = |color| {
+        if color == Color::Reset {
+            Style::new().add_modifier(Modifier::REVERSED)
+        } else {
+            Style::new().bg(color)
+        }
+    };
+    if visual.pressed {
+        surface(theme.surface.highlight).add_modifier(Modifier::BOLD)
+    } else if visual.hovered {
+        surface(theme.surface.hover)
+    } else {
+        Style::new()
+    }
+}
+
+fn interactive_row_style(
+    selected: bool,
+    visual: ButtonVisual,
+    selected_bg: Color,
+    theme: &Theme,
+) -> Style {
+    let bg = if visual.pressed {
+        Some(theme.surface.highlight)
+    } else if visual.hovered {
+        Some(theme.surface.hover)
+    } else if selected {
+        Some(selected_bg)
+    } else {
+        None
+    };
+    let Some(bg) = bg else {
+        return Style::new();
+    };
+    let style = if bg == Color::Reset {
+        Style::new().add_modifier(Modifier::REVERSED)
+    } else {
+        Style::new().bg(bg)
+    };
+    if visual.pressed {
+        style.add_modifier(Modifier::BOLD)
+    } else {
+        style
+    }
 }
 
 fn draw_sessions(
@@ -145,11 +226,8 @@ fn draw_sessions(
         .iter()
         .filter_map(|index| app.session_list_cache.get(*index))
         .collect();
-    let height = usize::from(area.height);
-    let selected = selected.min(entries.len().saturating_sub(1));
-    let start = selected
-        .saturating_sub(height.saturating_sub(1) / 2)
-        .min(entries.len().saturating_sub(height));
+    let height = usize::from(area.height).max(1);
+    let (start, selected) = session_list_window(app, area.height, selected, show_archived);
 
     let mut lines = Vec::with_capacity(height);
     if app.session_list_at.is_none() {
@@ -211,18 +289,44 @@ fn draw_sessions(
                     Style::new().fg(theme.text.dim),
                 ),
             ]);
-            lines.push(if is_selected {
-                line.style(
-                    Style::new()
-                        .bg(theme.chrome.selection)
-                        .fg(theme.text.primary),
-                )
-            } else {
-                line
-            });
+            let visual = workspace_visual(app, WorkspaceHit::SessionRow(index));
+            lines.push(
+                line.patch_style(interactive_row_style(
+                    is_selected,
+                    visual,
+                    theme.chrome.selection,
+                    theme,
+                ))
+                .patch_style(Style::new().fg(theme.text.primary)),
+            );
         }
     }
     f.render_widget(Paragraph::new(lines), area);
+}
+
+fn list_window(count: usize, height: u16, selected: usize) -> (usize, usize) {
+    let height = usize::from(height).max(1);
+    if count == 0 {
+        return (0, 0);
+    }
+    let selected = selected.min(count.saturating_sub(1));
+    let start = selected
+        .saturating_sub(height.saturating_sub(1) / 2)
+        .min(count.saturating_sub(height));
+    (start, selected)
+}
+
+fn session_list_window(
+    app: &App,
+    height: u16,
+    selected: usize,
+    show_archived: bool,
+) -> (usize, usize) {
+    if app.session_list_at.is_none() {
+        return (0, 0);
+    }
+    let count = app.filtered_sessions(show_archived).len();
+    list_window(count, height, selected)
 }
 
 /// `/history`：按回合浏览当前会话。
@@ -282,9 +386,7 @@ fn draw_history(
     }
 
     let height = usize::from(area.height).max(1);
-    let start = selected
-        .saturating_sub(height.saturating_sub(1) / 2)
-        .min(turns.len().saturating_sub(height));
+    let (start, _) = list_window(turns.len(), area.height, selected);
     let width = usize::from(area.width);
     let mut lines = Vec::with_capacity(height);
     for (index, turn) in turns.iter().enumerate().skip(start).take(height) {
@@ -325,11 +427,13 @@ fn draw_history(
         }
         spans.push(Span::styled(meta, Style::new().fg(theme.text.dim)));
         let line = Line::from(spans);
-        lines.push(if is_selected {
-            line.style(Style::new().bg(theme.surface.highlight))
-        } else {
-            line
-        });
+        let visual = workspace_visual(app, WorkspaceHit::HistoryTurn(index));
+        lines.push(line.style(interactive_row_style(
+            is_selected,
+            visual,
+            theme.surface.highlight,
+            theme,
+        )));
     }
     f.render_widget(Paragraph::new(lines), area);
 }
@@ -345,15 +449,11 @@ fn draw_settings(f: &mut Frame, app: &App, area: Rect, theme: &Theme) {
     let focus_line = row_lines.get(focus).copied().unwrap_or(0);
     let scroll = focus_line.saturating_sub(height.saturating_sub(1));
     for (index, line_index) in row_lines.iter().enumerate() {
-        let target = SettingsHit::Row(index);
-        let hovered = app.settings_hover == Some(target);
-        let pressed = app.settings_pressed == Some(target);
-        if (hovered || pressed)
+        let visual = workspace_visual(app, WorkspaceHit::SettingsRow(index));
+        if (visual.hovered || visual.pressed)
             && let Some(line) = lines.get_mut(*line_index)
         {
-            *line = line
-                .clone()
-                .style(settings_row_style(hovered, pressed, theme));
+            *line = line.clone().style(button_style(visual, theme));
         }
     }
     f.render_widget(
@@ -375,23 +475,6 @@ fn draw_settings(f: &mut Frame, app: &App, area: Rect, theme: &Theme) {
                 f.set_cursor_position((x, y));
             }
         }
-    }
-}
-
-fn settings_row_style(hovered: bool, pressed: bool, theme: &Theme) -> Style {
-    let surface = |color| {
-        if color == ratatui::style::Color::Reset {
-            Style::new().add_modifier(Modifier::REVERSED)
-        } else {
-            Style::new().bg(color)
-        }
-    };
-    if pressed {
-        surface(theme.surface.highlight).add_modifier(Modifier::BOLD)
-    } else if hovered {
-        surface(theme.surface.hover)
-    } else {
-        Style::new()
     }
 }
 
@@ -421,6 +504,71 @@ pub fn settings_hit_test(app: &App, area: Rect, column: u16, row: u16) -> Option
         .iter()
         .position(|row_line| *row_line == line)
         .map(SettingsHit::Row)
+}
+
+/// Workspace 的统一命中测试。
+///
+/// 每个页面的可见窗口都调用绘制路径正在使用的同一个 helper；这里不复制
+/// `start/scroll` 公式，避免鼠标 hover 与视觉行错位。
+pub fn workspace_hit_test(
+    app: &App,
+    route: &WorkspaceRoute,
+    area: Rect,
+    column: u16,
+    row: u16,
+) -> Option<WorkspaceHit> {
+    let [_, body, footer] = workspace_areas(area);
+    if rect_contains(footer_back_area(footer), column, row) {
+        return Some(WorkspaceHit::Back);
+    }
+    if !rect_contains(body, column, row) {
+        return None;
+    }
+    let local_row = usize::from(row.saturating_sub(body.y));
+    match route {
+        WorkspaceRoute::Sessions {
+            selected,
+            show_archived,
+        } => {
+            let (start, count) = session_list_window(app, body.height, *selected, *show_archived);
+            (local_row < count.saturating_sub(start))
+                .then_some(WorkspaceHit::SessionRow(start.saturating_add(local_row)))
+        }
+        WorkspaceRoute::History {
+            selected,
+            detail: false,
+            ..
+        } => {
+            let count = app
+                .active_session()
+                .map(|session| session.timeline.turns.len())
+                .unwrap_or(0);
+            let (start, _) = list_window(count, body.height, *selected);
+            (local_row < count.saturating_sub(start))
+                .then_some(WorkspaceHit::HistoryTurn(start.saturating_add(local_row)))
+        }
+        WorkspaceRoute::Todo => {
+            let layout = todo_layout(app, body, Theme::current());
+            let line = layout.top.saturating_add(local_row);
+            layout
+                .task_ranges
+                .iter()
+                .position(|range| range.contains(&line))
+                .map(WorkspaceHit::TodoTask)
+        }
+        WorkspaceRoute::Settings => settings_hit_test(app, body, column, row)
+            .map(|SettingsHit::Row(index)| WorkspaceHit::SettingsRow(index)),
+        WorkspaceRoute::Help
+        | WorkspaceRoute::History { detail: true, .. }
+        | WorkspaceRoute::Subagent { .. } => None,
+    }
+}
+
+fn rect_contains(area: Rect, column: u16, row: u16) -> bool {
+    column >= area.x
+        && column < area.x.saturating_add(area.width)
+        && row >= area.y
+        && row < area.y.saturating_add(area.height)
 }
 
 fn settings_lines(
@@ -556,18 +704,37 @@ fn draw_help(f: &mut Frame, area: Rect, theme: &Theme) {
     f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
 }
 
-fn draw_todo(f: &mut Frame, app: &App, area: Rect, theme: &Theme) {
+struct TodoLayout {
+    lines: Vec<Line<'static>>,
+    task_ranges: Vec<Range<usize>>,
+    top: usize,
+}
+
+fn todo_layout(app: &App, area: Rect, theme: &Theme) -> TodoLayout {
     let Some(session) = app.active_session() else {
-        return;
+        return TodoLayout {
+            lines: Vec::new(),
+            task_ranges: Vec::new(),
+            top: 0,
+        };
     };
     let mut lines = Vec::new();
+    let mut task_ranges = Vec::new();
     let Some(dashboard) = session.dashboard.as_ref() else {
         lines.push(Line::from(Span::styled(
             " 尚无 todo · agent 使用 todo 工具后在这里实时更新",
             Style::new().fg(theme.text.dim),
         )));
-        f.render_widget(Paragraph::new(lines), area);
-        return;
+        return TodoLayout {
+            top: viewport_top(
+                lines.len(),
+                area.height,
+                session.scroll.follow,
+                session.scroll.offset,
+            ),
+            lines,
+            task_ranges,
+        };
     };
 
     let total = dashboard.tasks.len();
@@ -595,7 +762,8 @@ fn draw_todo(f: &mut Frame, app: &App, area: Rect, theme: &Theme) {
         ),
     ]));
     lines.push(Line::default());
-    for task in &dashboard.tasks {
+    for (task_index, task) in dashboard.tasks.iter().enumerate() {
+        let start = lines.len();
         let (glyph, style) = match task.status.as_str() {
             "in_progress" => ("◐", Style::new().fg(theme.accent.running)),
             "completed" => ("●", Style::new().fg(theme.accent.success)),
@@ -629,6 +797,15 @@ fn draw_todo(f: &mut Frame, app: &App, area: Rect, theme: &Theme) {
                 );
             }
         }
+        let range = start..lines.len();
+        let visual = workspace_visual(app, WorkspaceHit::TodoTask(task_index));
+        if visual.hovered || visual.pressed {
+            let style = interactive_row_style(false, visual, Color::Reset, theme);
+            for line in &mut lines[range.clone()] {
+                *line = line.clone().style(style);
+            }
+        }
+        task_ranges.push(range);
     }
     if !dashboard.documents.is_empty() {
         lines.push(Line::default());
@@ -652,12 +829,28 @@ fn draw_todo(f: &mut Frame, app: &App, area: Rect, theme: &Theme) {
             ]));
         }
     }
-    let visible = visible_lines(
-        &lines,
+    let top = viewport_top(
+        lines.len(),
         area.height,
         session.scroll.follow,
         session.scroll.offset,
     );
+    TodoLayout {
+        lines,
+        task_ranges,
+        top,
+    }
+}
+
+fn draw_todo(f: &mut Frame, app: &App, area: Rect, theme: &Theme) {
+    let layout = todo_layout(app, area, theme);
+    let visible = layout
+        .lines
+        .iter()
+        .skip(layout.top)
+        .take(usize::from(area.height).max(1))
+        .cloned()
+        .collect::<Vec<_>>();
     f.render_widget(Paragraph::new(visible), area);
 }
 
@@ -695,16 +888,24 @@ fn visible_lines(
     follow: bool,
     offset: usize,
 ) -> Vec<Line<'static>> {
+    let top = viewport_top(lines.len(), height, follow, offset);
+    lines
+        .iter()
+        .skip(top)
+        .take(usize::from(height).max(1))
+        .cloned()
+        .collect()
+}
+
+fn viewport_top(total: usize, height: u16, follow: bool, offset: usize) -> usize {
     let height = usize::from(height).max(1);
-    let total = lines.len();
-    let top = if follow {
+    if follow {
         total.saturating_sub(height)
     } else {
         total
             .saturating_sub(height)
             .saturating_sub(offset.min(total))
-    };
-    lines.iter().skip(top).take(height).cloned().collect()
+    }
 }
 
 fn push_wrapped(
@@ -952,6 +1153,111 @@ mod tests {
             settings_hit_test(&app, body, 5, body.y),
             None,
             "section header is not clickable"
+        );
+    }
+
+    fn app_with_session_list() -> App {
+        use qaqh_client::{SessionListEntry, SessionMeta};
+
+        let (mut app, _rx) = App::new_for_test();
+        app.session_list_cache = (0..6)
+            .map(|index| SessionListEntry {
+                meta: SessionMeta {
+                    seed: format!("seed-{index}"),
+                    created_at: index,
+                    ..SessionMeta::default()
+                },
+                running: false,
+                workspace_id: None,
+            })
+            .collect();
+        app.session_list_at = Some(std::time::Instant::now());
+        app
+    }
+
+    #[test]
+    fn workspace_hit_test_matches_session_window() {
+        let app = app_with_session_list();
+        let area = Rect::new(0, 0, 100, 5);
+        let route = WorkspaceRoute::Sessions {
+            selected: 5,
+            show_archived: false,
+        };
+
+        assert_eq!(
+            workspace_hit_test(&app, &route, area, 5, 1),
+            Some(WorkspaceHit::SessionRow(3)),
+            "可视窗口从 selected 居中后的第 3 行开始"
+        );
+        assert_eq!(
+            workspace_hit_test(&app, &route, area, 5, 2),
+            Some(WorkspaceHit::SessionRow(4))
+        );
+        assert_eq!(
+            workspace_hit_test(&app, &route, area, 5, area.height - 1),
+            Some(WorkspaceHit::Back)
+        );
+    }
+
+    #[test]
+    fn workspace_hit_test_maps_history_and_todo_rows() {
+        let history_app = app_with_turns();
+        let history = WorkspaceRoute::History {
+            selected: 1,
+            detail: false,
+            scroll: 0,
+        };
+        let area = Rect::new(0, 0, 100, 8);
+        assert_eq!(
+            workspace_hit_test(&history_app, &history, area, 5, 1),
+            Some(WorkspaceHit::HistoryTurn(0))
+        );
+        assert_eq!(
+            workspace_hit_test(&history_app, &history, area, 5, 2),
+            Some(WorkspaceHit::HistoryTurn(1))
+        );
+
+        let (mut todo_app, _rx) = App::new_for_test();
+        todo_app.tabs.push("seed".into());
+        let mut session = SessionState::new("seed".into());
+        session.dashboard = Some(qaqh_client::DomainDashboardSnapshot {
+            seed: "seed".into(),
+            documents: Vec::new(),
+            recent_edits: Vec::new(),
+            tasks: vec![qaqh_client::DashboardTask {
+                id: "t1".into(),
+                subject: "完成鼠标交互".into(),
+                description: "点击任务行应命中".into(),
+                status: "in_progress".into(),
+                evidence: None,
+            }],
+            current_todo_id: Some("t1".into()),
+        });
+        todo_app.sessions.insert("seed".into(), session);
+        assert_eq!(
+            workspace_hit_test(&todo_app, &WorkspaceRoute::Todo, area, 5, 3),
+            Some(WorkspaceHit::TodoTask(0)),
+            "todo 第 3 行是任务主体（前两行是摘要和空行）"
+        );
+    }
+
+    #[test]
+    fn workspace_hover_paints_session_row_background() {
+        let mut app = app_with_session_list();
+        app.workspace_hover = Some(WorkspaceHit::SessionRow(0));
+        let route = WorkspaceRoute::Sessions {
+            selected: 0,
+            show_archived: false,
+        };
+        let theme = theme();
+        let mut terminal = Terminal::new(TestBackend::new(100, 8)).expect("terminal");
+        terminal
+            .draw(|frame| draw(frame, &app, &route, &theme))
+            .expect("draw sessions");
+        assert_eq!(
+            terminal.backend().buffer()[(1, 1)].bg,
+            theme.surface.hover,
+            "悬停行应有 surface.hover 底色"
         );
     }
 
