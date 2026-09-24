@@ -151,6 +151,9 @@ impl App {
                 }
                 self.slash_selected = 0;
                 self.show_workspace = true;
+                if let Some(seed) = self.active_seed() {
+                    self.fetch_dashboard(seed);
+                }
                 true
             }
             SlashCmd::Clear => {

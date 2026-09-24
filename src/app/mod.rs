@@ -964,6 +964,11 @@ impl App {
             }
             RuntimeMsg::Timeline { seed, entry } => {
                 // 子代理发现：spawn_subagent 工具卡（增量，先于 apply 检查）。
+                let todo_tool_touched = matches!(
+                    &entry.event,
+                    qaqh_client::TimelineEvent::ToolUpdated { tool, .. }
+                        if tool.name.starts_with("todo")
+                );
                 if let qaqh_client::TimelineEvent::ToolUpdated { tool, .. } = &entry.event {
                     self.discover_spawn_tool(&seed, tool);
                 }
@@ -984,6 +989,11 @@ impl App {
                 }
                 if turn_sealed {
                     self.force_redraw = true;
+                }
+                if todo_tool_touched {
+                    // v2 投影没有 dashboard 增量；todo 工具的 timeline 更新是
+                    // 前端可依赖的刷新触发点。
+                    self.fetch_dashboard(seed);
                 }
             }
             RuntimeMsg::TimelineRebaseline { seed, page } => {
@@ -1952,7 +1962,11 @@ impl App {
                 return;
             }
             Some(GlobalKey::ToggleWorkspace) => {
+                let opening = !self.show_workspace;
                 self.show_workspace = !self.show_workspace;
+                if opening && let Some(seed) = self.active_seed() {
+                    self.fetch_dashboard(seed);
+                }
                 return;
             }
             Some(GlobalKey::ToggleTodoDetail) => {
@@ -2942,6 +2956,53 @@ mod tests {
             SubagentState::Closed,
             "会话已消失 → 挂在 root 名下的父条目收口为 Closed"
         );
+    }
+
+    #[tokio::test]
+    async fn opening_todo_workspace_refreshes_dashboard() {
+        let (mut app, _rx) = App::new_for_test();
+        app.tabs.push("seed".into());
+        app.sessions
+            .insert("seed".into(), SessionState::new("seed".into()));
+        app.show_workspace = false;
+
+        app.handle(AppMsg::Key(ratatui::crossterm::event::KeyEvent::new(
+            ratatui::crossterm::event::KeyCode::F(4),
+            ratatui::crossterm::event::KeyModifiers::NONE,
+        )));
+
+        assert!(app.show_workspace);
+        assert!(app.dashboard_fetching.contains("seed"));
+    }
+
+    #[tokio::test]
+    async fn todo_tool_update_refreshes_dashboard() {
+        let (mut app, _rx) = App::new_for_test();
+        app.tabs.push("seed".into());
+        app.sessions
+            .insert("seed".into(), SessionState::new("seed".into()));
+        let tool: qaqh_client::TimelineTool = serde_json::from_value(serde_json::json!({
+            "tool_call_id": "call-todo-1",
+            "name": "todo_write",
+            "state": "running"
+        }))
+        .expect("tool");
+        let entry = qaqh_client::TimelineEntry {
+            timeline_seq: 1,
+            turn_id: "turn-1".into(),
+            round_num: Some(0),
+            event: qaqh_client::TimelineEvent::ToolUpdated {
+                block_id: "todo-1".into(),
+                tool,
+            },
+        };
+
+        app.handle(AppMsg::Runtime(RuntimeMsg::Timeline {
+            seed: "seed".into(),
+            entry: Box::new(entry),
+        }));
+
+        assert!(app.dashboard_fetching.contains("seed"));
     }
 
     /// **渲染缓存纪律回归**（机主实测 ⟂ 峰值 466 的根因）：
