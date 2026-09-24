@@ -16,7 +16,7 @@ use std::time::Duration;
 
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use unicode_width::UnicodeWidthStr;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::app::render_line::wrap_text;
 use crate::app::timeline_model::strip_ansi_escapes;
@@ -387,12 +387,30 @@ fn render_thinking(
 
 fn render_tool(tool: &ToolBlock, width: usize, theme: &Theme) -> Vec<Line<'static>> {
     let name = sanitize_text(&tool.name);
-    let summary = tool.summary.as_deref().map(sanitize_text);
-    let mut header = format!("{} {name}", theme.glyph.tool);
-    if let Some(summary) = summary.as_deref().filter(|summary| !summary.is_empty()) {
-        header.push(' ');
-        header.push_str(summary);
-    }
+    let summary = tool
+        .summary
+        .as_deref()
+        .map(sanitize_text)
+        .filter(|summary| !summary.is_empty());
+
+    // 头统一成 `⚙ {工具名} [{标记}] {正文}`：后端的 display summary 有两种风格
+    // （`[OK] edit /p` 与 `edit /p`），这里先拆再拼，避免出现 "edit [OK] edit /p"
+    // 这种工具名说两遍、成功说两遍的样子。
+    let (marker, rest) = split_summary_marker(summary.as_deref().unwrap_or_default());
+    let (rest, _had_name) = strip_tool_prefix(rest, &name);
+    let marker_text = marker
+        .map(|marker| format!(" [{marker}]"))
+        .unwrap_or_default();
+    // 缩短的预算要扣掉前面已经占掉的列（`⚙ name [OK]`），否则头部仍会折行。
+    let budget = width
+        .saturating_sub(theme.glyph.tool.width() + name.width() + marker_text.width() + 3)
+        .max(24);
+    let rest = shorten_header_paths(rest, budget);
+    let header = if rest.is_empty() {
+        format!("{} {name}{marker_text}", theme.glyph.tool)
+    } else {
+        format!("{} {name}{marker_text} {rest}", theme.glyph.tool)
+    };
     let mut lines = render_prefixed_text(
         &header,
         width,
@@ -401,12 +419,109 @@ fn render_tool(tool: &ToolBlock, width: usize, theme: &Theme) -> Vec<Line<'stati
         fg(theme.accent.tool),
         fg(theme.accent.tool),
     );
-    lines.extend(render_tool_state(tool, theme));
-    lines.extend(render_tool_body(tool, width, theme));
+    lines.extend(render_tool_state(tool, marker, theme));
+    lines.extend(render_tool_body(tool, width, theme, summary.as_deref()));
     lines
 }
 
-fn render_tool_state(tool: &ToolBlock, theme: &Theme) -> Vec<Line<'static>> {
+/// 把后端 summary 拆成 `(终态标记, 正文)`：`[OK] edit /p` → `(Some("OK"), "edit /p")`。
+///
+/// 标记是后端 display 投影给的（`[OK]` / `[ERR]` / `[FAIL]`），拆出来是为了：
+/// ① 头里能重新排成"名字在前、标记居中"；② 状态行据此判断"成功是不是已经说过了"。
+fn split_summary_marker(summary: &str) -> (Option<&str>, &str) {
+    let trimmed = summary.trim();
+    if let Some(rest) = trimmed.strip_prefix('[')
+        && let Some((marker, tail)) = rest.split_once(']')
+    {
+        return (Some(marker), tail.trim_start());
+    }
+    (None, trimmed)
+}
+
+/// 去掉正文开头的工具名（`edit /p` → `/p`），返回 `(剩余, 是否真的去掉过)`。
+fn strip_tool_prefix<'a>(text: &'a str, name: &str) -> (&'a str, bool) {
+    if name.is_empty() {
+        return (text, false);
+    }
+    match text.get(..name.len()) {
+        Some(head)
+            if head.eq_ignore_ascii_case(name)
+                && text[name.len()..]
+                    .chars()
+                    .next()
+                    .is_none_or(|ch| ch == ' ' || ch == ':' || ch == '/') =>
+        {
+            (text[name.len()..].trim_start(), true)
+        }
+        _ => (text, false),
+    }
+}
+
+/// summary 的标记是否已经说明了成功。
+fn marker_states_success(marker: Option<&str>) -> bool {
+    marker.is_some_and(|marker| {
+        let upper = marker.to_ascii_uppercase();
+        upper == "OK" || upper == "DONE"
+    })
+}
+
+/// 头部里的长路径缩短：home 前缀换 `~`，仍然过长的路径中段省略。
+///
+/// **只作用于头部摘要**，不动正文——正文是工具的真实输出，改了就不再是证据。
+fn shorten_header_paths(text: &str, budget: usize) -> String {
+    let home = std::env::var("HOME").ok().filter(|home| !home.is_empty());
+    let mut out = String::new();
+    for (idx, token) in text.split(' ').enumerate() {
+        if idx > 0 {
+            out.push(' ');
+        }
+        let mut token = token.to_owned();
+        if let Some(home) = home.as_deref()
+            && let Some(rest) = token.strip_prefix(home)
+            && (rest.is_empty() || rest.starts_with('/'))
+        {
+            token = format!("~{rest}");
+        }
+        if token.width() > budget && token.contains('/') {
+            token = elide_middle(&token, budget);
+        }
+        out.push_str(&token);
+    }
+    out
+}
+
+/// 中段省略：保留开头（能看出是哪棵树）与结尾（文件名/行号），中间换 `…`。
+fn elide_middle(text: &str, max: usize) -> String {
+    if text.width() <= max || max < 6 {
+        return text.to_owned();
+    }
+    let head_budget = max / 3;
+    let tail_budget = max.saturating_sub(head_budget).saturating_sub(1);
+    let mut head = String::new();
+    let mut used = 0usize;
+    for ch in text.chars() {
+        let width = ch.width().unwrap_or(0);
+        if used + width > head_budget {
+            break;
+        }
+        head.push(ch);
+        used += width;
+    }
+    let mut tail_chars: Vec<char> = Vec::new();
+    let mut tail_used = 0usize;
+    for ch in text.chars().rev() {
+        let width = ch.width().unwrap_or(0);
+        if tail_used + width > tail_budget {
+            break;
+        }
+        tail_chars.push(ch);
+        tail_used += width;
+    }
+    tail_chars.reverse();
+    format!("{head}…{}", tail_chars.into_iter().collect::<String>())
+}
+
+fn render_tool_state(tool: &ToolBlock, marker: Option<&str>, theme: &Theme) -> Vec<Line<'static>> {
     let (glyph, label, style) = match tool.state {
         ToolState::Prepared => (
             theme.glyph.running,
@@ -445,26 +560,45 @@ fn render_tool_state(tool: &ToolBlock, theme: &Theme) -> Vec<Line<'static>> {
     };
     let mut metrics = Vec::new();
     if let Some(duration) = tool.duration {
-        metrics.push(format_duration(duration));
+        // 亚 100ms 打印成 `0.0s` 是纯噪声（实测每个快工具都带一行 0.0s）。
+        if duration >= Duration::from_millis(100) {
+            metrics.push(format_duration(duration));
+        }
     }
     if let Some(bytes) = tool.bytes {
         metrics.push(format_bytes(bytes));
     }
-    let mut spans = vec![
-        Span::styled("  ".to_string(), fg(theme.text.dim)),
-        Span::styled(format!("{glyph} "), style),
-        Span::styled(label, style),
-    ];
+
+    // 分工：**summary 说"做了什么"，状态行说"结果如何"**。summary 已经自带终态
+    // 时（后端给的 `[OK]`），成功态就不再重复一遍 `✓ done`；失败/取消**保留**
+    // 标签——那里的 label 是原因（`exit 1`），不是重复的结论。
+    let label_is_redundant =
+        matches!(tool.state, ToolState::Success) && marker_states_success(marker);
+    let mut spans = vec![Span::styled("  ".to_string(), fg(theme.text.dim))];
+    if !label_is_redundant {
+        spans.push(Span::styled(format!("{glyph} "), style));
+        spans.push(Span::styled(label, style));
+    }
     if !metrics.is_empty() {
+        let sep = if label_is_redundant { "" } else { " · " };
         spans.push(Span::styled(
-            format!(" · {}", metrics.join(" · ")),
+            format!("{sep}{}", metrics.join(" · ")),
             fg(theme.text.dim),
         ));
+    }
+    // 结论与度量都没有 → 整行不画（空行也是噪声）。
+    if label_is_redundant && metrics.is_empty() {
+        return Vec::new();
     }
     vec![Line::from(spans)]
 }
 
-fn render_tool_body(tool: &ToolBlock, width: usize, theme: &Theme) -> Vec<Line<'static>> {
+fn render_tool_body(
+    tool: &ToolBlock,
+    width: usize,
+    theme: &Theme,
+    summary: Option<&str>,
+) -> Vec<Line<'static>> {
     let (text, diff) = if let Some(diff) = tool.diff.as_deref() {
         (diff, true)
     } else if let Some(output) = tool.output.as_deref() {
@@ -475,9 +609,25 @@ fn render_tool_body(tool: &ToolBlock, width: usize, theme: &Theme) -> Vec<Line<'
         return Vec::new();
     };
     let text = sanitize_text(text);
-    let source: Vec<&str> = text.lines().collect();
+    let mut source: Vec<&str> = text.lines().collect();
     if source.is_empty() {
         return Vec::new();
+    }
+    // 正文开头与 summary 逐字相同时不再重复：实测 `read` 的头部摘要与正文首行
+    // 是同一句（`L1: timeout = 30`），上下各印一遍纯属噪声。
+    let skip = summary
+        .map(|summary| {
+            source
+                .iter()
+                .take_while(|line| line.trim() == summary.trim())
+                .count()
+        })
+        .unwrap_or(0);
+    if skip > 0 {
+        source.drain(..skip);
+        if source.is_empty() {
+            return Vec::new();
+        }
     }
 
     let running = tool.state.is_running();
@@ -864,6 +1014,126 @@ mod tests {
         assert!(text.contains("Thinking…"));
         assert!(text.contains("latest thought"));
         assert!(!text.contains("first"));
+    }
+
+    /// 工具卡的**去冗余**回归锁。四条都来自真机实拍：
+    /// `⚙ edit [OK] edit /path`（工具名两次）、`✓ done`（成功两次说）、
+    /// `read` 摘要与正文逐字重复、`0.0s`（亚 100ms 的无信息量度量）。
+    #[test]
+    fn tool_card_does_not_repeat_what_summary_already_says() {
+        let theme = theme();
+
+        // ① 后端 summary 自带工具名 + `[OK]`：头不重复名字，状态行不再说 done。
+        let tool = ToolBlock {
+            name: "edit".into(),
+            summary: Some("[OK] edit /tmp/a.txt".into()),
+            state: ToolState::Success,
+            output: None,
+            diff: None,
+            progress: None,
+            failure: None,
+            duration: Some(Duration::from_millis(40)),
+            bytes: Some(96),
+        };
+        let text = text_of(&render_block(
+            &TranscriptBlock::new("t1", BlockKind::Tool(tool)),
+            100,
+            &theme,
+        ));
+        assert_eq!(
+            text.matches("edit").count(),
+            1,
+            "工具名只能说一次：\n{text}"
+        );
+        assert!(
+            !text.contains("done"),
+            "summary 已有 [OK]，不该再说 done：\n{text}"
+        );
+        assert!(text.contains("96 B"), "度量要保留：\n{text}");
+        assert!(!text.contains("0.0s"), "亚 100ms 不显示耗时：\n{text}");
+
+        // ② summary 与正文逐字相同时不重复正文。
+        let tool = ToolBlock {
+            name: "read".into(),
+            summary: Some("L1: timeout = 30".into()),
+            state: ToolState::Success,
+            output: Some("L1: timeout = 30".into()),
+            diff: None,
+            progress: None,
+            failure: None,
+            duration: Some(Duration::from_millis(500)),
+            bytes: None,
+        };
+        let text = text_of(&render_block(
+            &TranscriptBlock::new("t2", BlockKind::Tool(tool)),
+            100,
+            &theme,
+        ));
+        assert_eq!(
+            text.matches("L1: timeout = 30").count(),
+            1,
+            "摘要与正文重复时应只留一处：\n{text}"
+        );
+
+        // ③ 失败态**保留**原因（`exit 1` 不是重复的结论，是信息）。
+        let tool = ToolBlock {
+            name: "bash".into(),
+            summary: Some("cargo clippy".into()),
+            state: ToolState::Failed,
+            output: Some("error: unused import".into()),
+            diff: None,
+            progress: None,
+            failure: Some("exit 1".into()),
+            duration: Some(Duration::from_millis(900)),
+            bytes: None,
+        };
+        let text = text_of(&render_block(
+            &TranscriptBlock::new("t3", BlockKind::Tool(tool)),
+            100,
+            &theme,
+        ));
+        assert!(text.contains("exit 1"), "失败原因不能被去重吃掉：\n{text}");
+    }
+
+    /// 头部路径缩短：home 前缀换 `~`，过长中段省略；**正文不动**（正文是证据）。
+    #[test]
+    fn tool_header_shortens_paths_but_body_keeps_them() {
+        let theme = theme();
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/home/u".into());
+        let long = format!("{home}/projects/very/deep/tree/with/many/segments/file.txt");
+        let tool = ToolBlock {
+            name: "write".into(),
+            summary: Some(format!("[OK] {long}")),
+            state: ToolState::Success,
+            output: Some(long.clone()),
+            diff: None,
+            progress: None,
+            failure: None,
+            duration: None,
+            bytes: None,
+        };
+        let text = text_of(&render_block(
+            &TranscriptBlock::new("t1", BlockKind::Tool(tool)),
+            60,
+            &theme,
+        ));
+        let header = text.lines().next().unwrap_or_default();
+        assert!(header.starts_with("⚙ "), "{text}");
+        assert!(
+            !header.contains(&format!("{home}/projects")),
+            "头部应把 home 换成 ~：{header}"
+        );
+        assert!(header.contains('…'), "头部过长路径应中段省略：{header}");
+        // 正文照旧完整（它是对齐/复制的依据，不能被缩写出错）。正文按宽度折行，
+        // 所以分头尾两段判，而不是整串比对。
+        assert!(
+            text.contains(&format!("{home}/projects/very")),
+            "正文不得被缩短（home 前缀应原样保留）：\n{text}"
+        );
+        assert!(
+            text.contains("file.txt"),
+            "正文不得被缩短（尾部应原样保留）：\n{text}"
+        );
     }
 
     #[test]
