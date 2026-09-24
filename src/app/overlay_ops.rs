@@ -437,6 +437,9 @@ impl App {
                             let seed = seed.clone();
                             self.close_tab_by_seed(&seed);
                         }
+                        ConfirmAction::UndoTurn { seed, turn_id } => {
+                            self.undo_turn_from(seed.clone(), turn_id.clone());
+                        }
                     },
                     _ => {}
                 }

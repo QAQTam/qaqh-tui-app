@@ -43,7 +43,7 @@ use crate::runtime::{Runtime, RuntimeMsg};
 use crate::terminal::transcript::PendingCommit;
 use crate::theme::Theme;
 use crate::ui::v2::adapter;
-use crate::ui::v2::fullscreen::{self, FullscreenState, MessageAction, MessageMenu};
+use crate::ui::v2::fullscreen::{self, FullscreenState, MessageAction, MessageMenu, MessageRole};
 use crate::ui::v2::route::{self, ScreenRoute};
 use crate::ui::v2::runtime::V2TranscriptRuntime;
 use crate::ui::v2::transcript::{BlockKind, BlockState, TranscriptBlock, render_transcript};
@@ -448,7 +448,7 @@ fn handle_fullscreen_agent_mouse(
             view.pointer.back_to_latest_hover = target.is_some();
             view.pointer.back_to_latest_pressed = target.is_some();
             if target.is_none()
-                && let Some(hit) = view.assistant_at(mouse.column, mouse.row)
+                && let Some(hit) = view.message_at(mouse.column, mouse.row)
             {
                 view.open_menu(hit, mouse.column, mouse.row);
             }
@@ -518,6 +518,12 @@ fn activate_message_action(app: &mut App, view: &mut FullscreenView, action: Mes
                     view.close_menu();
                 }
             }
+        }
+        MessageAction::UndoFromHere => {
+            if let Some(turn_id) = view.menu.as_ref().map(|menu| menu.turn_id.clone()) {
+                app.confirm_undo_turn(turn_id);
+            }
+            view.close_menu();
         }
         MessageAction::Retry | MessageAction::Fork => {}
     }
@@ -876,6 +882,7 @@ struct AgentState {
     replay_active: bool,
     replay_cursor: usize,
     replay_version: Option<u64>,
+    rebaseline_epoch: Option<u64>,
 }
 
 #[derive(Debug, Default)]
@@ -916,6 +923,7 @@ impl AgentState {
             self.replay_active = false;
             self.replay_cursor = 0;
             self.replay_version = None;
+            self.rebaseline_epoch = None;
             return AgentSync {
                 pending: Vec::new(),
                 reset_scrollback,
@@ -930,6 +938,7 @@ impl AgentState {
             self.replay_active = false;
             self.replay_cursor = 0;
             self.replay_version = None;
+            self.rebaseline_epoch = None;
             return AgentSync {
                 pending: Vec::new(),
                 reset_scrollback,
@@ -944,6 +953,25 @@ impl AgentState {
             self.replay_active = true;
             self.replay_cursor = 0;
             self.replay_version = Some(session.timeline.version);
+            self.rebaseline_epoch = Some(session.timeline.rebaseline_epoch);
+            return AgentSync {
+                pending: self.replay_chunk(
+                    &seed,
+                    &session.timeline.turns,
+                    session.timeline.version,
+                ),
+                reset_scrollback: true,
+            };
+        }
+
+        if self.rebaseline_epoch != Some(session.timeline.rebaseline_epoch) {
+            self.pending_commits.clear();
+            self.reset_streaming();
+            self.transcript.begin_replay(&seed);
+            self.replay_active = true;
+            self.replay_cursor = 0;
+            self.replay_version = Some(session.timeline.version);
+            self.rebaseline_epoch = Some(session.timeline.rebaseline_epoch);
             return AgentSync {
                 pending: self.replay_chunk(
                     &seed,
@@ -998,6 +1026,7 @@ impl AgentState {
             self.replay_active = false;
             self.replay_cursor = 0;
             self.replay_version = None;
+            self.rebaseline_epoch = None;
             return;
         };
         let Some(session) = app.sessions.get(&seed) else {
@@ -1006,6 +1035,7 @@ impl AgentState {
             self.replay_active = false;
             self.replay_cursor = 0;
             self.replay_version = None;
+            self.rebaseline_epoch = None;
             return;
         };
         self.seed = Some(seed.clone());
@@ -1013,6 +1043,7 @@ impl AgentState {
         self.replay_active = true;
         self.replay_cursor = 0;
         self.replay_version = Some(session.timeline.version);
+        self.rebaseline_epoch = Some(session.timeline.rebaseline_epoch);
     }
 
     fn was_streamed(&self, block: &TranscriptBlock) -> bool {
@@ -1872,13 +1903,14 @@ struct FullscreenView {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct AssistantHit {
+struct MessageHit {
     turn_id: String,
     block_id: String,
+    role: MessageRole,
 }
 
 impl FullscreenView {
-    fn assistant_at(&self, column: u16, row: u16) -> Option<AssistantHit> {
+    fn message_at(&self, column: u16, row: u16) -> Option<MessageHit> {
         if column < self.body_area.x
             || column >= self.body_area.x.saturating_add(self.body_area.width)
             || row < self.body_area.y
@@ -1892,17 +1924,19 @@ impl FullscreenView {
         self.transcript
             .spans
             .iter()
-            .find(|span| span.assistant && line >= span.start && line < span.end)
-            .map(|span| AssistantHit {
+            .find(|span| line >= span.start && line < span.end)
+            .map(|span| MessageHit {
                 turn_id: span.turn_id.clone(),
                 block_id: span.block_id.clone(),
+                role: span.role,
             })
     }
 
-    fn open_menu(&mut self, hit: AssistantHit, column: u16, row: u16) {
+    fn open_menu(&mut self, hit: MessageHit, column: u16, row: u16) {
         self.menu = Some(MessageMenu::new(
             hit.turn_id,
             hit.block_id,
+            hit.role,
             Position::new(column, row),
         ));
     }
@@ -1983,7 +2017,7 @@ struct FullscreenTranscriptCache {
 struct FullscreenBlockSpan {
     turn_id: String,
     block_id: String,
-    assistant: bool,
+    role: MessageRole,
     start: usize,
     end: usize,
 }
@@ -2060,7 +2094,11 @@ impl FullscreenTranscriptCache {
             spans.push(FullscreenBlockSpan {
                 turn_id: block.turn_id.clone(),
                 block_id: block.id.to_string(),
-                assistant: matches!(block.kind, BlockKind::Assistant { .. }),
+                role: match block.kind {
+                    BlockKind::User { .. } => MessageRole::User,
+                    BlockKind::Assistant { .. } => MessageRole::Assistant,
+                    _ => continue,
+                },
                 start,
                 end: lines.len(),
             });
@@ -2785,6 +2823,22 @@ mod tests {
     }
 
     #[test]
+    fn rebaseline_epoch_forces_scrollback_replay() {
+        let mut app = app_with_model(model_with_sealed_answer());
+        let mut state = AgentState::default();
+        let first = state.sync(&app);
+        assert_eq!(first.pending.len(), 2);
+
+        let session = app.sessions.get_mut("seed-1").expect("session");
+        session.timeline.rebaseline_epoch = session.timeline.rebaseline_epoch.saturating_add(1);
+        session.timeline.version = session.timeline.version.saturating_add(1);
+
+        let replayed = state.sync(&app);
+        assert!(replayed.reset_scrollback);
+        assert_eq!(replayed.pending.len(), 2);
+    }
+
+    #[test]
     fn forced_replay_resets_and_replays_after_scrollback_purge() {
         let app = app_with_model(model_with_sealed_answer());
         let mut state = AgentState::default();
@@ -3417,6 +3471,7 @@ mod tests {
             menu: Some(MessageMenu::new(
                 "turn-1".into(),
                 "b1".into(),
+                MessageRole::Assistant,
                 Position::new(20, 5),
             )),
             ..Default::default()
@@ -3447,6 +3502,18 @@ mod tests {
         assert!(compact.contains("复制成Markdown"), "{text}");
         assert!(compact.contains("重新回答"), "{text}");
         assert!(compact.contains("从这里继续"), "{text}");
+    }
+
+    #[test]
+    fn user_undo_opens_second_confirmation() {
+        let mut app = app_with_model(model_with_sealed_answer());
+        app.confirm_undo_turn("turn-1".into());
+        assert!(matches!(
+            app.overlays.last(),
+            Some(Overlay::Confirm {
+                action: crate::app::ConfirmAction::UndoTurn { seed, turn_id }
+            }) if seed == "seed-1" && turn_id == "turn-1"
+        ));
     }
 
     #[test]
@@ -3527,12 +3594,20 @@ mod tests {
         view.body_area = Rect::new(0, 0, 80, 10);
         view.visible_start = 0;
 
-        assert_eq!(view.assistant_at(2, 0), None, "row 0 is the user block");
         assert_eq!(
-            view.assistant_at(2, 2),
-            Some(AssistantHit {
+            view.message_at(2, 0),
+            Some(MessageHit {
+                turn_id: "turn-0".into(),
+                block_id: "turn-0:user".into(),
+                role: MessageRole::User,
+            })
+        );
+        assert_eq!(
+            view.message_at(2, 2),
+            Some(MessageHit {
                 turn_id: "turn-0".into(),
                 block_id: "block-0".into(),
+                role: MessageRole::Assistant,
             })
         );
     }

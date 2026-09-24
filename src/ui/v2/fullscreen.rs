@@ -41,16 +41,16 @@ pub enum MessageAction {
     CopyMarkdown,
     Retry,
     Fork,
+    UndoFromHere,
 }
 
 impl MessageAction {
-    pub const ALL: [Self; 3] = [Self::CopyMarkdown, Self::Retry, Self::Fork];
-
     pub const fn label(self) -> &'static str {
         match self {
             Self::CopyMarkdown => "复制成 Markdown",
             Self::Retry => "重新回答",
             Self::Fork => "从这里继续",
+            Self::UndoFromHere => "撤销此对话",
         }
     }
 
@@ -59,12 +59,34 @@ impl MessageAction {
             Self::CopyMarkdown => "⧉",
             Self::Retry => "↻",
             Self::Fork => "⑂",
+            Self::UndoFromHere => "↶",
         }
     }
 
-    /// Retry/Fork 要等后端原子语义，先以禁用项固定菜单形状。
+    /// Retry/Fork 要等后端原子语义；当前复制与 undo 已可用。
     pub const fn enabled(self) -> bool {
-        matches!(self, Self::CopyMarkdown)
+        matches!(self, Self::CopyMarkdown | Self::UndoFromHere)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MessageRole {
+    User,
+    Assistant,
+}
+
+impl MessageRole {
+    const fn actions(self) -> &'static [MessageAction] {
+        const ASSISTANT: &[MessageAction] = &[
+            MessageAction::CopyMarkdown,
+            MessageAction::Retry,
+            MessageAction::Fork,
+        ];
+        const USER: &[MessageAction] = &[MessageAction::UndoFromHere];
+        match self {
+            Self::Assistant => ASSISTANT,
+            Self::User => USER,
+        }
     }
 }
 
@@ -72,6 +94,7 @@ impl MessageAction {
 pub struct MessageMenu {
     pub turn_id: String,
     pub block_id: String,
+    pub role: MessageRole,
     pub selected: usize,
     pub hover: Option<usize>,
     pub pressed: Option<usize>,
@@ -79,10 +102,11 @@ pub struct MessageMenu {
 }
 
 impl MessageMenu {
-    pub fn new(turn_id: String, block_id: String, anchor: Position) -> Self {
+    pub fn new(turn_id: String, block_id: String, role: MessageRole, anchor: Position) -> Self {
         Self {
             turn_id,
             block_id,
+            role,
             selected: 0,
             hover: None,
             pressed: None,
@@ -90,12 +114,17 @@ impl MessageMenu {
         }
     }
 
+    pub fn actions(&self) -> &'static [MessageAction] {
+        self.role.actions()
+    }
+
     pub fn selected_action(&self) -> MessageAction {
-        MessageAction::ALL[self.selected.min(MessageAction::ALL.len() - 1)]
+        self.actions()[self.selected.min(self.actions().len() - 1)]
     }
 
     pub fn move_selection(&mut self, delta: isize) {
-        let count = MessageAction::ALL.len();
+        let actions = self.actions();
+        let count = actions.len();
         let mut index = self.selected;
         for _ in 0..count {
             index = if delta < 0 {
@@ -103,7 +132,7 @@ impl MessageMenu {
             } else {
                 (index + 1) % count
             };
-            if MessageAction::ALL[index].enabled() {
+            if actions[index].enabled() {
                 self.selected = index;
                 return;
             }
@@ -194,15 +223,15 @@ pub fn draw_back_to_latest(frame: &mut Frame, area: Rect, state: FullscreenState
 
 const MENU_WIDTH: u16 = 34;
 
-fn message_menu_rect(area: Rect, anchor: Position) -> Rect {
-    let height = MessageAction::ALL.len() as u16 + 2;
+fn message_menu_rect(area: Rect, menu: &MessageMenu) -> Rect {
+    let height = menu.actions().len() as u16 + 2;
     let width = MENU_WIDTH.min(area.width.max(1)).max(8);
     let max_x = area.x.saturating_add(area.width.saturating_sub(width));
     let max_y = area
         .y
         .saturating_add(area.height.saturating_sub(height.min(area.height)));
-    let x = anchor.x.saturating_add(1).min(max_x).max(area.x);
-    let y = anchor.y.saturating_add(1).min(max_y).max(area.y);
+    let x = menu.anchor.x.saturating_add(1).min(max_x).max(area.x);
+    let y = menu.anchor.y.saturating_add(1).min(max_y).max(area.y);
     Rect::new(x, y, width, height.min(area.height))
 }
 
@@ -212,7 +241,7 @@ pub fn message_menu_hit_test(
     column: u16,
     row: u16,
 ) -> Option<usize> {
-    let rect = message_menu_rect(area, menu.anchor);
+    let rect = message_menu_rect(area, menu);
     let inner_x = rect.x.saturating_add(1);
     let inner_y = rect.y.saturating_add(1);
     let inner_width = rect.width.saturating_sub(2);
@@ -224,14 +253,14 @@ pub fn message_menu_hit_test(
         return None;
     }
     let index = usize::from(row.saturating_sub(inner_y));
-    MessageAction::ALL
+    menu.actions()
         .get(index)
         .filter(|action| action.enabled())
         .map(|_| index)
 }
 
 pub fn draw_message_menu(frame: &mut Frame, area: Rect, menu: &MessageMenu, theme: &Theme) {
-    let rect = message_menu_rect(area, menu.anchor);
+    let rect = message_menu_rect(area, menu);
     frame.render_widget(Clear, rect);
     frame.render_widget(
         Block::default()
@@ -251,7 +280,7 @@ pub fn draw_message_menu(frame: &mut Frame, area: Rect, menu: &MessageMenu, them
         rect.width.saturating_sub(2),
         rect.height.saturating_sub(2),
     );
-    for (index, action) in MessageAction::ALL.iter().enumerate() {
+    for (index, action) in menu.actions().iter().enumerate() {
         let hovered = menu.hover == Some(index);
         let pressed = menu.pressed == Some(index);
         let selected = menu.selected == index;
@@ -411,8 +440,13 @@ mod tests {
     #[test]
     fn message_menu_hit_only_returns_enabled_rows() {
         let area = Rect::new(0, 0, 80, 24);
-        let menu = MessageMenu::new("turn".into(), "block".into(), Position::new(10, 5));
-        let rect = message_menu_rect(area, menu.anchor);
+        let menu = MessageMenu::new(
+            "turn".into(),
+            "block".into(),
+            MessageRole::Assistant,
+            Position::new(10, 5),
+        );
+        let rect = message_menu_rect(area, &menu);
 
         assert_eq!(
             message_menu_hit_test(area, &menu, rect.x + 2, rect.y + 1),
@@ -432,11 +466,28 @@ mod tests {
 
     #[test]
     fn message_menu_selection_skips_disabled_actions() {
-        let mut menu = MessageMenu::new("turn".into(), "block".into(), Position::new(0, 0));
+        let mut menu = MessageMenu::new(
+            "turn".into(),
+            "block".into(),
+            MessageRole::Assistant,
+            Position::new(0, 0),
+        );
         assert_eq!(menu.selected_action(), MessageAction::CopyMarkdown);
         menu.move_selection(1);
         assert_eq!(menu.selected_action(), MessageAction::CopyMarkdown);
         menu.move_selection(-1);
         assert_eq!(menu.selected_action(), MessageAction::CopyMarkdown);
+    }
+
+    #[test]
+    fn user_menu_only_exposes_undo() {
+        let menu = MessageMenu::new(
+            "turn".into(),
+            "turn:user".into(),
+            MessageRole::User,
+            Position::new(0, 0),
+        );
+        assert_eq!(menu.actions(), &[MessageAction::UndoFromHere]);
+        assert_eq!(menu.selected_action(), MessageAction::UndoFromHere);
     }
 }

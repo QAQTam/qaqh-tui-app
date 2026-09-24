@@ -609,6 +609,10 @@ fn draw_confirm(f: &mut Frame, action: &ConfirmAction, area: Rect, theme: &Theme
         ConfirmAction::CloseTab(seed) => {
             ("确认关闭", format!("关闭标签 {seed}？会话仍保留在列表中。"))
         }
+        ConfirmAction::UndoTurn { turn_id, .. } => (
+            "确认撤销",
+            format!("撤销回合 {turn_id} 及其后的全部对话？工具副作用不会回滚。"),
+        ),
     };
     let rect = centered_rect(64u16.min(area.width.saturating_sub(4)), 8, area);
     if rect.width < 8 || rect.height < 5 {

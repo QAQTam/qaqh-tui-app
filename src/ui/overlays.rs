@@ -369,6 +369,10 @@ fn draw_confirm(f: &mut Frame, action: &ConfirmAction, area: Rect) {
         ConfirmAction::CloseTab(seed) => {
             ("确认关闭", format!("关闭标签 {seed}？（会话保留在列表中）"))
         }
+        ConfirmAction::UndoTurn { turn_id, .. } => (
+            "确认撤销",
+            format!("撤销回合 {turn_id} 及其后的全部对话？工具副作用不会回滚。"),
+        ),
     };
     let inner = box_frame(f, area, 60, 7, title);
     let mut lines: Vec<Line> = Vec::new();

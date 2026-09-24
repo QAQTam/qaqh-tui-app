@@ -415,6 +415,7 @@ pub enum ConfirmAction {
     DeleteSession(String),
     ArchiveSession(String),
     CloseTab(String),
+    UndoTurn { seed: String, turn_id: String },
 }
 
 // Settings 变体内嵌完整编辑态，尺寸差较大；Box 化推迟到独立性能任务。
@@ -466,6 +467,7 @@ impl ConfirmAction {
             ConfirmAction::DeleteSession(seed)
             | ConfirmAction::ArchiveSession(seed)
             | ConfirmAction::CloseTab(seed) => seed,
+            ConfirmAction::UndoTurn { seed, .. } => seed,
         }
     }
 }
@@ -896,7 +898,7 @@ impl App {
     fn handle_runtime(&mut self, msg: RuntimeMsg) {
         match msg {
             RuntimeMsg::Conn(ev) => self.handle_conn(ev),
-            RuntimeMsg::Ringing { env } => self.handle_envelope(*env),
+            RuntimeMsg::V2Event { seed, event } => self.handle_v2_event(seed, *event),
             RuntimeMsg::ResetRequired { seed } => {
                 // 频道级 reset → 重新 bootstrap 该会话（timeline 流自会 re-baseline）。
                 let seed2 = seed.clone();

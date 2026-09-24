@@ -413,6 +413,9 @@ pub struct TimelineModel {
     /// 但历史并不止于此」。二者可以同时为真（窗口内还能翻，翻到头仍够不到开头）。
     pub truncated_before: bool,
     pub version: u64,
+    /// 权威快照整体替换的代际；undo/compact/rebaseline 用它触发 terminal
+    /// scrollback purge 与 projector/ledger 重建。
+    pub rebaseline_epoch: u64,
     /// B1 可观测：事件引用的 block/tool 卡缺失被丢弃的次数（契约异常信号）。
     /// 设计内幂等丢弃不计入：旧 fragment_seq 重放、快照窗口外迟到条目。
     pub dropped_missing_block: u64,
@@ -704,6 +707,8 @@ impl TimelineModel {
         self.has_more = page.has_more;
         self.total_turns = page.total_turns;
         self.truncated_before = page.truncated_before;
+        self.dropped_turns = page.total_turns.saturating_sub(self.turns.len());
+        self.rebaseline_epoch = self.rebaseline_epoch.saturating_add(1);
         self.bump();
     }
 
@@ -823,6 +828,29 @@ mod tests {
             round_num: Some(0),
             event,
         }
+    }
+
+    #[test]
+    fn replace_from_page_advances_rebaseline_epoch() {
+        let page = TimelinePage {
+            schema: "qaqh.Ringing".into(),
+            version: 1,
+            server_epoch: "ep".into(),
+            seed: "s".into(),
+            has_more: false,
+            total_turns: 0,
+            truncated_before: false,
+            snapshot: qaqh_client::TimelineSnapshot {
+                watermark: 0,
+                turns: vec![],
+            },
+        };
+        let mut model = TimelineModel::default();
+        let version = model.version;
+        model.replace_from_page(&page);
+        assert_eq!(model.rebaseline_epoch, 1);
+        assert_eq!(model.dropped_turns, 0);
+        assert_eq!(model.version, version + 1);
     }
 
     /// 权威语义：`BlockCheckpoint.arg` 是**增量**，必须**追加**而不是覆盖。

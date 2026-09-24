@@ -141,6 +141,31 @@ impl App {
         else {
             return;
         };
+        self.undo_turn_from(seed, turn_id);
+    }
+
+    /// 用户消息 context menu 的二次确认入口。
+    pub fn confirm_undo_turn(&mut self, turn_id: String) {
+        let Some(seed) = self.active_seed() else {
+            return;
+        };
+        let exists = self.sessions.get(&seed).is_some_and(|session| {
+            session
+                .timeline
+                .turns
+                .iter()
+                .any(|turn| turn.turn_id == turn_id)
+        });
+        if !exists {
+            self.toast(NoticeLevel::Warn, "该回合已不在当前 timeline 窗口中");
+            return;
+        }
+        self.overlays.push(Overlay::Confirm {
+            action: ConfirmAction::UndoTurn { seed, turn_id },
+        });
+    }
+
+    pub fn undo_turn_from(&mut self, seed: String, turn_id: String) {
         self.spawn_api(move |api, tx| async move {
             // command_id 由本侧生成：ack 之后要拿它轮询 receipt。
             let command_id = uuid::Uuid::new_v4().to_string();
