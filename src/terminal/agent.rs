@@ -32,6 +32,7 @@ use ratatui::{DefaultTerminal, Frame, Terminal, TerminalOptions, Viewport};
 use tokio::sync::mpsc;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
+use crate::app::session::SessionState;
 use crate::app::timeline_model::Turn;
 use crate::app::{App, AppMsg, ConnPhase, ModalHit, Overlay};
 use crate::runtime::{Runtime, RuntimeMsg};
@@ -40,10 +41,9 @@ use crate::theme::Theme;
 use crate::ui::v2::adapter;
 use crate::ui::v2::route::{self, ScreenRoute};
 use crate::ui::v2::runtime::V2TranscriptRuntime;
-use crate::ui::v2::transcript::{BlockState, render_transcript};
+use crate::ui::v2::transcript::{BlockKind, BlockState, render_transcript};
 use crate::ui::v2::workspace;
-use qaqh_client::ConversationMode;
-use qaqh_client::NoticeLevel;
+use qaqh_client::{ConversationMode, NoticeLevel, TimelineBlockKind, TimelineBlockState};
 
 const TICK_INTERVAL: Duration = Duration::from_millis(200);
 const COMMIT_CHUNK_BLOCKS: usize = 32;
@@ -670,8 +670,43 @@ async fn commit_pending(
     let height = u16::try_from(lines.len()).unwrap_or(u16::MAX);
     host.terminal.insert_before(height, |buffer| {
         Paragraph::new(lines).render(buffer.area, buffer);
+        clear_wide_trailing_cells(buffer);
     })?;
     Ok(())
+}
+
+/// `Terminal::insert_before` 直接逐 cell 调 backend.draw，不会像普通 diff draw 一样
+/// 跳过宽字符的尾格。Buffer 中宽字符尾格通常是 `" "`，Kitty 等终端收到
+/// `你 + MoveTo(尾格) + 空格` 后会把整个宽字形擦成空白。
+///
+/// 这里把尾格 symbol 清成空串：backend 仍会移动光标，但不会打印覆盖空格，
+/// 宽字符因此能保留下来。普通 diff draw 路径不受影响。
+fn clear_wide_trailing_cells(buffer: &mut ratatui::buffer::Buffer) {
+    let width = usize::from(buffer.area.width);
+    let height = usize::from(buffer.area.height);
+    if width == 0 || height == 0 {
+        return;
+    }
+
+    for row in 0..height {
+        let row_start = row * width;
+        let mut col = 0;
+        while col < width {
+            let cell = &buffer.content[row_start + col];
+            let cell_width = cell.symbol().width();
+            if cell_width > 1 {
+                for trailing in 1..cell_width {
+                    let trailing_col = col + trailing;
+                    if trailing_col < width {
+                        buffer.content[row_start + trailing_col].set_symbol("");
+                    }
+                }
+                col += cell_width;
+            } else {
+                col += 1;
+            }
+        }
+    }
 }
 
 fn draw(frame: &mut Frame, app: &App, theme: &Theme, route: &ScreenRoute) {
@@ -719,6 +754,7 @@ struct AgentRender {
 struct AgentLayout {
     live_rows: usize,
     slash_rows: usize,
+    thinking_rows: usize,
     composer_rows: usize,
     status_rows: usize,
     shortcuts_rows: usize,
@@ -728,6 +764,7 @@ impl AgentLayout {
     fn height(self) -> usize {
         self.live_rows
             .saturating_add(self.slash_rows)
+            .saturating_add(self.thinking_rows)
             .saturating_add(self.composer_rows)
             .saturating_add(self.status_rows)
             .saturating_add(self.shortcuts_rows)
@@ -762,12 +799,42 @@ fn inline_viewport_height(app: &App, width: u16, terminal_height: u16, theme: &T
         .max(1)
 }
 
+fn session_is_working(session: &SessionState) -> bool {
+    session.streaming.is_some() || session.timeline.running_turn_id().is_some()
+}
+
+/// live transcript 是否需要占位。
+///
+/// 当前只有**运行中的工具**真正需要实时可变正文：进度、输出、状态会持续变化。
+/// reasoning 走 composer 上方的 thinking 行；assistant/system notice 都在封口后
+/// 一次性提交 scrollback，避免“小窗先渲染、随后完全展开”的二次渲染。
+fn has_live_transcript(session: &SessionState) -> bool {
+    let Some(turn_id) = session.timeline.running_turn_id() else {
+        return false;
+    };
+    let Some(turn) = session
+        .timeline
+        .turns
+        .iter()
+        .find(|turn| turn.turn_id == turn_id)
+    else {
+        return false;
+    };
+    turn.rounds
+        .iter()
+        .flat_map(|round| &round.blocks)
+        .any(|block| {
+            block.kind == TimelineBlockKind::Tool && block.state == TimelineBlockState::Open
+        })
+}
+
 fn agent_layout(app: &App, width: u16, available: u16, theme: &Theme) -> AgentLayout {
     let available = usize::from(available.max(1));
     let Some(session) = app.active_session() else {
         return AgentLayout {
             live_rows: 0,
             slash_rows: 0,
+            thinking_rows: 0,
             composer_rows: 0,
             status_rows: 0,
             shortcuts_rows: 0,
@@ -775,6 +842,7 @@ fn agent_layout(app: &App, width: u16, available: u16, theme: &Theme) -> AgentLa
     };
 
     let narrow = width < NARROW_VIEWPORT_WIDTH;
+    let working = session_is_working(session);
     let min_composer = if narrow {
         1
     } else {
@@ -784,11 +852,14 @@ fn agent_layout(app: &App, width: u16, available: u16, theme: &Theme) -> AgentLa
     let preferred_composer = composer_visual_rows(session, width, theme)
         .clamp(min_composer.min(available), max_composer.min(available));
     let preferred_slash = slash_menu_rows(app);
-    let preferred_live = if narrow {
+    let preferred_live = if !has_live_transcript(session) {
+        0
+    } else if narrow {
         NARROW_LIVE_VIEWPORT_ROWS
     } else {
         LIVE_VIEWPORT_ROWS
     };
+    let preferred_thinking = usize::from(working);
     let preferred_status = usize::from(theme.spacing.status_height.max(1));
     let preferred_shortcuts = if narrow {
         0
@@ -799,6 +870,7 @@ fn agent_layout(app: &App, width: u16, available: u16, theme: &Theme) -> AgentLa
     let mut layout = AgentLayout {
         live_rows: preferred_live,
         slash_rows: preferred_slash,
+        thinking_rows: preferred_thinking,
         composer_rows: preferred_composer,
         status_rows: if available >= 2 { preferred_status } else { 0 },
         shortcuts_rows: preferred_shortcuts,
@@ -817,6 +889,8 @@ fn agent_layout(app: &App, width: u16, available: u16, theme: &Theme) -> AgentLa
             layout.composer_rows -= 1;
         } else if layout.status_rows > 0 {
             layout.status_rows = 0;
+        } else if layout.thinking_rows > 0 {
+            layout.thinking_rows = 0;
         } else {
             break;
         }
@@ -864,10 +938,13 @@ fn render_agent(app: &App, width: u16, height: u16, theme: &Theme) -> AgentRende
 
     let layout = agent_layout(app, width, u16::try_from(height).unwrap_or(u16::MAX), theme);
 
-    let blocks: Vec<_> = adapter::from_turns(&session.timeline.turns)
+    let mut blocks: Vec<_> = adapter::from_turns(&session.timeline.turns)
         .into_iter()
         .filter(|block| block.state == BlockState::Live)
         .collect();
+    // live transcript 只保留运行中的工具。assistant / system notice 都只在
+    // 封口后由 commit pump 一次性写入 scrollback，避免二次渲染。
+    blocks.retain(|block| matches!(block.kind, BlockKind::Tool(_)));
     let live = render_transcript(&blocks, width, theme);
     let live_start = live.len().saturating_sub(layout.live_rows);
     let mut lines: Vec<Line<'static>> = live[live_start..].to_vec();
@@ -882,6 +959,9 @@ fn render_agent(app: &App, width: u16, height: u16, theme: &Theme) -> AgentRende
     }
 
     lines.extend(slash_menu_lines(app, width, theme, layout.slash_rows));
+    if layout.thinking_rows > 0 {
+        lines.push(thinking_line(session, width, theme));
+    }
     let composer_start = lines.len();
     let composer = composer_lines(
         &session.composer.input,
@@ -909,6 +989,102 @@ fn render_agent(app: &App, width: u16, height: u16, theme: &Theme) -> AgentRende
         lines,
         cursor: Some(Position::new(composer.cursor_x, cursor_y)),
     }
+}
+
+/// composer 上方的单行 thinking 状态。
+///
+/// - 始终保留 spinner：只要 turn/stream 仍在工作，即使当前没有 reasoning
+///   正文，也不能把“正在工作”信号关掉。
+/// - 文本只取 reasoning 当前行的尾部窗口；换行后只显示新行。
+/// - 正文按字符做 shimmer，保证移动高光与字符边界一致。
+fn thinking_line(session: &SessionState, width: u16, theme: &Theme) -> Line<'static> {
+    let frame = crate::app::anim::frame_now();
+    let spinner = crate::app::anim::claude_spinner_glyph(frame);
+    let prefix = format!("{spinner} ");
+    let prefix_width = spinner.width() + 1;
+    let budget = usize::from(width).saturating_sub(prefix_width).max(1);
+
+    let text = latest_reasoning_line(session).unwrap_or_else(|| {
+        session
+            .streaming
+            .as_ref()
+            .map(|state| format!("{}…", state.phase.label()))
+            .unwrap_or_else(|| "working…".to_string())
+    });
+    let shown = tail_cols(&text, budget);
+
+    let mut spans = vec![Span::styled(prefix, Style::new().fg(theme.accent.thinking))];
+    spans.extend(shimmer_spans(&shown, frame, theme));
+    Line::from(spans)
+}
+
+/// 当前 running turn 中最后一个 reasoning block 的当前行。
+///
+/// 使用 `rsplit('\n')` 而不是 `lines().last()`：如果模型刚输出换行，
+/// 新行即使暂时为空也必须立刻替换旧行，不能继续显示旧内容。
+fn latest_reasoning_line(session: &SessionState) -> Option<String> {
+    let turn_id = session.timeline.running_turn_id()?;
+    let turn = session
+        .timeline
+        .turns
+        .iter()
+        .find(|turn| turn.turn_id == turn_id)?;
+    for round in turn.rounds.iter().rev() {
+        for block in round.blocks.iter().rev() {
+            if block.kind == TimelineBlockKind::Reasoning {
+                return Some(
+                    block
+                        .text
+                        .rsplit('\n')
+                        .next()
+                        .unwrap_or_default()
+                        .to_string(),
+                );
+            }
+        }
+    }
+    None
+}
+
+/// 取文本尾部、保证最右侧（最新字符）可见；宽字符要么完整保留、要么整体舍弃。
+fn tail_cols(line: &str, max_width: usize) -> String {
+    let max_width = max_width.max(1);
+    let mut used = 0usize;
+    let mut chars = Vec::new();
+    for ch in line.chars().rev() {
+        let width = ch.width().unwrap_or(0);
+        if used + width > max_width {
+            break;
+        }
+        used += width;
+        chars.push(ch);
+    }
+    chars.reverse();
+    chars.into_iter().collect()
+}
+
+/// 字符级 shimmer：每个字符独立取色，形成一条从左向右移动的窄光带。
+fn shimmer_spans(text: &str, frame: u64, theme: &Theme) -> Vec<Span<'static>> {
+    let chars: Vec<char> = text.chars().collect();
+    if chars.is_empty() {
+        return Vec::new();
+    }
+    let period = chars.len().max(8) + 8;
+    let center = (frame % period as u64) as isize - 4;
+    chars
+        .into_iter()
+        .enumerate()
+        .map(|(index, ch)| {
+            let distance = (index as isize - center).unsigned_abs();
+            let style = match distance {
+                0 => Style::new().fg(theme.text.bright),
+                1 => Style::new().fg(theme.accent.thinking),
+                2 => Style::new().fg(theme.text.muted),
+                _ => Style::new().fg(theme.text.dim),
+            };
+            Span::styled(ch.to_string(), style)
+        })
+        .collect()
 }
 
 struct ComposerRender {
@@ -1224,7 +1400,7 @@ fn shortcuts_line(app: &App, width: u16, theme: &Theme) -> Line<'static> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::session::{AskPanel, SessionState};
+    use crate::app::session::{AskPanel, SessionState, StreamPhase, StreamingState};
     use crate::app::timeline_model::TimelineModel;
     use crate::theme::{ColorSupport, ThemeKind};
     use qaqh_client::{
@@ -1363,6 +1539,72 @@ mod tests {
                         failure: None,
                         permission: None,
                     }),
+                },
+            },
+        ));
+        model
+    }
+
+    fn model_with_live_answer_after_thinking() -> TimelineModel {
+        let mut model = TimelineModel::default();
+        model.apply(&entry(
+            1,
+            "turn-1",
+            TimelineEvent::TurnOpened {
+                user_text: "question".to_string(),
+            },
+        ));
+        model.apply(&entry(
+            2,
+            "turn-1",
+            TimelineEvent::BlockOpened {
+                block: TimelineBlock {
+                    block_id: "thinking-1".to_string(),
+                    block_order: 0,
+                    kind: TimelineBlockKind::Reasoning,
+                    state: TimelineBlockState::Open,
+                    text: "internal reasoning".to_string(),
+                    tool: None,
+                },
+            },
+        ));
+        model.apply(&entry(
+            3,
+            "turn-1",
+            TimelineEvent::BlockOpened {
+                block: TimelineBlock {
+                    block_id: "answer-1".to_string(),
+                    block_order: 1,
+                    kind: TimelineBlockKind::Text,
+                    state: TimelineBlockState::Open,
+                    text: "assistant answer".to_string(),
+                    tool: None,
+                },
+            },
+        ));
+        model
+    }
+
+    fn model_with_live_reasoning(text: &str) -> TimelineModel {
+        let mut model = TimelineModel::default();
+        model.apply(&entry(
+            1,
+            "turn-1",
+            TimelineEvent::TurnOpened {
+                user_text: "question".to_string(),
+            },
+        ));
+        model.apply(&entry(
+            2,
+            "turn-1",
+            TimelineEvent::BlockOpened {
+                block: TimelineBlock {
+                    block_id: "thinking-1".to_string(),
+                    block_order: 0,
+                    kind: TimelineBlockKind::Reasoning,
+                    state: TimelineBlockState::Open,
+                    text: text.to_string(),
+                    tool: None,
                 },
             },
         ));
@@ -1662,6 +1904,100 @@ mod tests {
         assert!(text.contains("src/main.rs"), "{text}");
     }
 
+    #[test]
+    fn thinking_row_uses_latest_line_and_tail_window() {
+        let app = app_with_model(model_with_live_reasoning(
+            "first line\nsecond line is intentionally long",
+        ));
+        let rendered = render_agent(&app, 24, 8, &test_theme());
+        let text: String = rendered
+            .lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert!(text.contains("long"), "{text}");
+        assert!(!text.contains("first line"), "{text}");
+    }
+
+    #[test]
+    fn thinking_row_keeps_spinner_without_reasoning() {
+        let mut app = app_with_model(TimelineModel::default());
+        let session = app.sessions.get_mut("seed-1").expect("session");
+        session.streaming = Some(StreamingState {
+            turn_id: "turn-1".to_string(),
+            phase: StreamPhase::ToolCalling,
+            round_num: 0,
+            tool_name: Some("read".to_string()),
+            armed_at: std::time::Instant::now(),
+        });
+
+        let rendered = render_agent(&app, 40, 8, &test_theme());
+        let text: String = rendered
+            .lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert!(text.contains("tool…"), "{text}");
+        let thinking = rendered
+            .lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .find(|line| line.contains("tool…"))
+            .expect("thinking row");
+        let first = thinking.chars().next().expect("spinner");
+        assert!(
+            matches!(first, '·' | '✢' | '✳' | '✶' | '✻' | '✽'),
+            "thinking row must keep the working spinner: {thinking:?}"
+        );
+    }
+
+    #[test]
+    fn thinking_tail_keeps_latest_characters_and_wide_chars_intact() {
+        assert_eq!(tail_cols("abcdef", 3), "def");
+        assert_eq!(tail_cols("你好世界", 4), "世界");
+    }
+
+    #[test]
+    fn live_answer_waits_for_commit_and_keeps_thinking_in_dedicated_row() {
+        let app = app_with_model(model_with_live_answer_after_thinking());
+        let rendered = render_agent(&app, 60, 10, &test_theme());
+        let text: String = rendered
+            .lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert!(
+            !text.contains("assistant answer"),
+            "assistant 不应在 live viewport 二次渲染：{text}"
+        );
+        assert!(!text.contains("Thinking…"), "{text}");
+
+        let thinking = rendered
+            .lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .find(|line| line.contains("internal reasoning"))
+            .expect("thinking row");
+        let first = thinking.chars().next().expect("spinner");
+        assert!(
+            matches!(first, '·' | '✢' | '✳' | '✶' | '✻' | '✽'),
+            "thinking row must lead with a working spinner: {thinking:?}"
+        );
+    }
+
     #[tokio::test]
     async fn agent_delegates_enter_to_existing_composer_send_path() {
         let mut app = app_with_model(TimelineModel::default());
@@ -1768,5 +2104,20 @@ mod tests {
             screen_transition(ScreenMode::Alternate, &ScreenRoute::Agent),
             ScreenTransition::LeaveAlternate
         );
+    }
+
+    #[test]
+    fn insert_before_clears_wide_trailing_cells_without_touching_glyph() {
+        let mut buffer = ratatui::buffer::Buffer::empty(Rect::new(0, 0, 8, 1));
+        buffer.set_string(0, 0, "你a", Style::default());
+        assert_eq!(buffer.content[0].symbol(), "你");
+        assert_eq!(buffer.content[1].symbol(), " ");
+        assert_eq!(buffer.content[2].symbol(), "a");
+
+        clear_wide_trailing_cells(&mut buffer);
+
+        assert_eq!(buffer.content[0].symbol(), "你");
+        assert_eq!(buffer.content[1].symbol(), "");
+        assert_eq!(buffer.content[2].symbol(), "a");
     }
 }

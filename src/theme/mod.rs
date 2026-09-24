@@ -243,7 +243,7 @@ impl Default for SpacingTokens {
             block_pad_left: 2,
             block_pad_right: 2,
             outer_pad: 2,
-            composer_min_height: 3,
+            composer_min_height: 1,
             composer_max_height: 8,
             status_height: 1,
             shortcuts_height: 1,

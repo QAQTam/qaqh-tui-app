@@ -61,6 +61,15 @@ pub(crate) fn thinking_glyph(frame: u64) -> &'static str {
     FRAMES[(frame % FRAMES.len() as u64) as usize]
 }
 
+/// Claude 风格六帧星芒（thinking 行专用）。
+///
+/// 与 braille spinner 的区别是低帧率、单 cell、无方向旋转感；它只表达
+/// “agent 正在工作”，不承载进度语义。
+pub(crate) fn claude_spinner_glyph(frame: u64) -> &'static str {
+    const FRAMES: [&str; 6] = ["·", "✢", "✳", "✶", "✻", "✽"];
+    FRAMES[(frame % FRAMES.len() as u64) as usize]
+}
+
 /// 跑马灯：`text`（附加两个空格分隔）按列环形滚动，取宽 `width` 的窗口。
 /// 实现：cell → 字符映射表逐格取值。宽字符跨界（左切/右切）时该字符本帧
 /// 整体不显示、以其 cell 占位填空格——保证输出显示宽度恒等于 `width`。
@@ -175,6 +184,17 @@ mod tests {
         // 与旧内联实现的帧序逐帧一致（收编不改行为）。
         assert_eq!(thinking_glyph(0), "◐");
         assert_eq!(thinking_glyph(3), "◓");
+    }
+
+    #[test]
+    fn claude_spinner_cycles_six_single_width_frames() {
+        let glyphs: Vec<&str> = (0..6).map(claude_spinner_glyph).collect();
+        let unique: std::collections::HashSet<_> = glyphs.iter().collect();
+        assert_eq!(unique.len(), 6);
+        assert_eq!(claude_spinner_glyph(6), claude_spinner_glyph(0));
+        for glyph in glyphs {
+            assert_eq!(display_width(glyph), 1, "glyph={glyph:?}");
+        }
     }
 
     #[test]

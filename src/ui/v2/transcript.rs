@@ -14,7 +14,7 @@ use std::fmt;
 use std::fmt::Write as _;
 use std::time::Duration;
 
-use ratatui::style::{Modifier, Style};
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
@@ -341,7 +341,7 @@ fn render_assistant(text: &str, width: usize, theme: &Theme) -> Vec<Line<'static
     let prefix = format!("{} ", theme.glyph.assistant);
     let continuation = " ".repeat(prefix.width());
     let body_width = width.saturating_sub(prefix.width()).max(1);
-    let body = render_markdown(&text, body_width, theme);
+    let body = super::markdown::render(&text, body_width, theme);
     prefix_lines(body, &prefix, &continuation, fg(theme.accent.assistant))
 }
 
@@ -699,78 +699,6 @@ fn render_system(
     render_prefixed_text(&text, width, &prefix, &continuation, style, style)
 }
 
-fn render_markdown(text: &str, width: usize, theme: &Theme) -> Vec<Line<'static>> {
-    let mut lines = Vec::new();
-    let mut in_code = false;
-    for raw in text.lines() {
-        let trimmed = raw.trim_start();
-        if trimmed.starts_with("```") {
-            in_code = !in_code;
-            continue;
-        }
-        if in_code {
-            let code_style = fg(theme.markdown.code);
-            for seg in wrap_text(raw, width.saturating_sub(2).max(1)) {
-                lines.push(Line::from(vec![
-                    Span::styled("  ".to_string(), Style::default()),
-                    Span::styled(seg, code_style),
-                ]));
-            }
-            continue;
-        }
-        if let Some((level, rest)) = heading(raw) {
-            let style = heading_style(level, theme);
-            for seg in wrap_text(rest, width) {
-                lines.push(Line::from(Span::styled(seg, style)));
-            }
-            continue;
-        }
-        if is_rule(trimmed) {
-            lines.push(Line::from(Span::styled(
-                "─".repeat(width.min(40)),
-                fg(theme.markdown.rule),
-            )));
-            continue;
-        }
-        if let Some(rest) = trimmed.strip_prefix('>') {
-            let rest = rest.trim_start();
-            for seg in wrap_text(rest, width.saturating_sub(2).max(1)) {
-                lines.push(Line::from(vec![
-                    Span::styled(format!("{} ", theme.glyph.quote), fg(theme.markdown.quote)),
-                    Span::styled(seg, fg(theme.markdown.quote)),
-                ]));
-            }
-            continue;
-        }
-        if let Some((prefix, rest)) = list_item(trimmed) {
-            let (prefix, rest, style) = task_item(prefix, rest, theme);
-            let body_width = width.saturating_sub(prefix.width()).max(1);
-            for (idx, seg) in wrap_text(rest, body_width).into_iter().enumerate() {
-                let shown_prefix = if idx == 0 {
-                    prefix.clone()
-                } else {
-                    " ".repeat(prefix.width())
-                };
-                let mut spans = vec![Span::styled(shown_prefix, style)];
-                spans.extend(inline_spans(&seg, style, theme));
-                lines.push(Line::from(spans));
-            }
-            continue;
-        }
-        for seg in wrap_text(raw, width) {
-            lines.push(Line::from(inline_spans(
-                &seg,
-                fg(theme.markdown.text),
-                theme,
-            )));
-        }
-    }
-    if lines.is_empty() {
-        lines.push(Line::default());
-    }
-    lines
-}
-
 fn prefix_lines(
     lines: Vec<Line<'static>>,
     first_prefix: &str,
@@ -813,94 +741,6 @@ fn render_prefixed_text(
             Line::from(spans)
         })
         .collect()
-}
-
-fn heading(raw: &str) -> Option<(usize, &str)> {
-    let trimmed = raw.trim_start();
-    let level = trimmed.chars().take_while(|ch| *ch == '#').count();
-    if !(1..=6).contains(&level) || trimmed.chars().nth(level) != Some(' ') {
-        return None;
-    }
-    trimmed.get(level + 1..).map(|rest| (level, rest))
-}
-
-fn heading_style(level: usize, theme: &Theme) -> Style {
-    let color = match level {
-        1 => theme.markdown.h1,
-        2 => theme.markdown.h2,
-        3 => theme.markdown.h3,
-        4 => theme.markdown.h4,
-        5 => theme.markdown.h5,
-        _ => theme.markdown.h6,
-    };
-    fg(color).add_modifier(Modifier::BOLD)
-}
-
-fn is_rule(value: &str) -> bool {
-    let value = value.trim();
-    value.len() >= 3
-        && (value.chars().all(|ch| ch == '-')
-            || value.chars().all(|ch| ch == '*')
-            || value.chars().all(|ch| ch == '_'))
-}
-
-fn list_item(value: &str) -> Option<(String, &str)> {
-    for marker in ["- ", "* ", "+ "] {
-        if let Some(rest) = value.strip_prefix(marker) {
-            return Some(("• ".to_string(), rest));
-        }
-    }
-    let digits = value.chars().take_while(char::is_ascii_digit).count();
-    if digits > 0
-        && value.chars().nth(digits) == Some('.')
-        && value.chars().nth(digits + 1) == Some(' ')
-    {
-        return value
-            .get(digits + 2..)
-            .map(|rest| (value[..=digits].to_string(), rest));
-    }
-    None
-}
-
-fn task_item<'a>(prefix: String, rest: &'a str, theme: &Theme) -> (String, &'a str, Style) {
-    if let Some(value) = rest.strip_prefix("[x] ") {
-        return (
-            format!("{} ", theme.glyph.success),
-            value,
-            fg(theme.markdown.task_done),
-        );
-    }
-    if let Some(value) = rest.strip_prefix("[ ] ") {
-        return ("○ ".to_string(), value, fg(theme.markdown.task_todo));
-    }
-    (prefix, rest, fg(theme.markdown.text))
-}
-
-fn inline_spans(text: &str, base: Style, theme: &Theme) -> Vec<Span<'static>> {
-    let mut spans = Vec::new();
-    let mut rest = text;
-    while let Some(start) = rest.find('`') {
-        if start > 0 {
-            spans.push(Span::styled(rest[..start].to_string(), base));
-        }
-        let after = &rest[start + 1..];
-        let Some(end) = after.find('`') else {
-            spans.push(Span::styled(rest[start..].to_string(), base));
-            return spans;
-        };
-        spans.push(Span::styled(
-            after[..end].to_string(),
-            fg(theme.markdown.code),
-        ));
-        rest = &after[end + 1..];
-    }
-    if !rest.is_empty() {
-        spans.push(Span::styled(rest.to_string(), base));
-    }
-    if spans.is_empty() {
-        spans.push(Span::styled(String::new(), base));
-    }
-    spans
 }
 
 fn fg(color: ratatui::style::Color) -> Style {
@@ -1300,7 +1140,7 @@ mod tests {
         ];
         assert_eq!(
             text_of(&render_transcript(&blocks, 40, &theme())),
-            "  ❯ hello 世界\n\n◆ Title\n  body\n\n◇ Thought for 1.2s\n\n\
+            "  ❯ hello 世界\n\n◆ Title\n  \n  body\n\n◇ Thought for 1.2s\n\n\
              ⚙ read plan.md\n  ✓ done · 0.8s · 1.0 KB\n    line one\n    line two\n\n· note"
         );
     }
