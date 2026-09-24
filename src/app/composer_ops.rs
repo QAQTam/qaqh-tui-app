@@ -247,7 +247,8 @@ impl App {
     }
 
     /// 品牌首屏输入框按键：复用 [`Composer`] 的编辑语义，但发送动作先走
-    /// [`Self::start_draft_conversation`]，由 `SessionCreate` 落成后再发消息。
+    /// [`Self::start_draft_conversation`]，由 `SessionCreate` 落成后把草稿带进
+    /// 真实会话 composer，用户确认后再发送。
     pub(super) fn draft_key(&mut self, key: KeyEvent) {
         use ratatui::crossterm::event::{KeyCode, KeyModifiers};
         if !self.pending_creates.is_empty() {

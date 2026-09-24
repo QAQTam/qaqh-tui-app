@@ -998,7 +998,7 @@ fn render_brand(app: &App, width: u16, height: u16, theme: &Theme) -> AgentRende
     let hint = if !app.pending_creates.is_empty() {
         " 正在创建会话…"
     } else {
-        " Enter 开始 · Alt+Enter 换行 · Ctrl+L 会话 · F1 帮助 · Ctrl+Q 退出"
+        " Enter 创建会话并带入输入框 · Alt+Enter 换行 · Ctrl+L 会话 · F1 帮助 · Ctrl+Q 退出"
     };
     lines.push(Line::from(Span::styled(
         hint,

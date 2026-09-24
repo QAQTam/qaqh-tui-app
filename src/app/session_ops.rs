@@ -45,10 +45,11 @@ impl App {
         self.new_session_with_cwd(None);
     }
 
-    /// 品牌首屏提交：首条消息先暂存，等新会话 seed 落成后再发送。
+    /// 品牌首屏提交：先把输入暂存，等新会话 seed 落成后带进真实 composer。
     ///
     /// 空输入仍创建一个空会话，行为对齐原来的 Ctrl+N；有输入时不在前端预造
-    /// timeline，避免出现“本地临时消息 + 后端回放”双份正文。
+    /// timeline，避免出现“本地临时消息 + 后端回放”双份正文。首条消息不自动发送，
+    /// 用户能在会话 composer 里继续编辑后再按 Enter。
     pub(super) fn start_draft_conversation(&mut self) {
         let text = self.draft_composer.value();
         self.draft_composer.clear();
@@ -60,8 +61,8 @@ impl App {
         self.new_session_with_cwd(None);
     }
 
-    /// `SessionCreate` 已确认后调用：把首条消息放进真实会话 composer 并发送。
-    pub(super) fn consume_pending_initial_prompt(&mut self) {
+    /// `SessionCreate` 已确认后调用：把首条草稿带进真实会话 composer。
+    pub(super) fn transfer_pending_initial_prompt(&mut self) {
         let Some(text) = self.pending_initial_prompt.take() else {
             return;
         };
@@ -74,9 +75,7 @@ impl App {
             session.composer.cursor = session.composer.input.len();
         } else {
             self.pending_initial_prompt = Some(text);
-            return;
         }
-        self.send_message();
     }
 
     /// 三档回退：显式 > 环境变量 > 启动目录 > None（让后端迁移）

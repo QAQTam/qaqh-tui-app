@@ -1116,7 +1116,7 @@ impl App {
                             && self.pending_creates.remove(&cid).is_some()
                         {
                             self.open_session_tab(&seed);
-                            self.consume_pending_initial_prompt();
+                            self.transfer_pending_initial_prompt();
                             self.toast(NoticeLevel::Info, format!("新会话已创建 {seed}"));
                         }
                     }
@@ -1676,7 +1676,7 @@ impl App {
                     if !self.tabs.contains(&seed) {
                         self.open_session_tab(&seed);
                         self.pending_creates.clear();
-                        self.consume_pending_initial_prompt();
+                        self.transfer_pending_initial_prompt();
                         self.toast(NoticeLevel::Info, format!("新会话已创建 {seed}"));
                     }
                 }
@@ -2165,7 +2165,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pending_initial_prompt_is_consumed_when_create_lands() {
+    async fn pending_initial_prompt_is_transferred_when_create_lands() {
         let (mut app, _rx) = App::new_for_test();
         app.pending_initial_prompt = Some("hello".into());
         app.pending_creates
@@ -2177,9 +2177,10 @@ mod tests {
 
         assert_eq!(app.tabs, vec!["new-seed".to_string()]);
         assert!(app.pending_initial_prompt.is_none());
-        assert!(
-            app.sessions["new-seed"].composer.is_empty(),
-            "首条消息应已交给发送路径，不再滞留在 composer"
+        assert_eq!(
+            app.sessions["new-seed"].composer.value(),
+            "hello",
+            "首条草稿应原样带入真实会话 composer"
         );
     }
 
