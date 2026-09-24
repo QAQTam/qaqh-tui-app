@@ -345,6 +345,37 @@ fn render_assistant(text: &str, width: usize, theme: &Theme) -> Vec<Line<'static
     prefix_lines(body, &prefix, &continuation, fg(theme.accent.assistant))
 }
 
+/// 流式路径的单行渲染：稳定行已确认不会再变，才允许进入 scrollback。
+///
+/// `first_line` 决定首行用 assistant glyph、后续行用同宽缩进；`code` 由流式
+/// 状态机根据 fenced code 上下文传入，避免把代码行当普通 Markdown 再解析一次。
+pub(crate) fn render_stream_line(
+    text: &str,
+    width: usize,
+    theme: &Theme,
+    first_line: bool,
+    code: bool,
+    lang: Option<&str>,
+) -> Vec<Line<'static>> {
+    let text = sanitize_text(text);
+    if text.is_empty() {
+        return vec![Line::default()];
+    }
+    let prefix = if first_line {
+        format!("{} ", theme.glyph.assistant)
+    } else {
+        "  ".to_string()
+    };
+    let continuation = " ".repeat(prefix.width());
+    let body_width = width.saturating_sub(prefix.width()).max(1);
+    let body = if code {
+        super::markdown::render_code_line(&text, lang, body_width, theme)
+    } else {
+        super::markdown::render(&text, body_width, theme)
+    };
+    prefix_lines(body, &prefix, &continuation, fg(theme.accent.assistant))
+}
+
 fn render_thinking(
     text: &str,
     duration: Option<Duration>,

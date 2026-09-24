@@ -140,12 +140,41 @@ class FakeProvider(BaseHTTPRequestHandler):
                 {"choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]},
             ]
         else:
+            # 最后正文分多个 SSE delta 下发：既验收 chat 正文存在，也覆盖
+            # V2 的稳定行流式提交路径（不是只在 turn sealed 时一次性蹦出）。
             chunks = [
                 {
                     "choices": [
                         {
                             "index": 0,
-                            "delta": {"role": "assistant", "content": FINAL_TEXT},
+                            "delta": {"role": "assistant", "content": "alpha1 "},
+                            "finish_reason": None,
+                        }
+                    ]
+                },
+                {
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": {"content": "基本可用："},
+                            "finish_reason": None,
+                        }
+                    ]
+                },
+                {
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": {"content": "write/read/edit/exec "},
+                            "finish_reason": None,
+                        }
+                    ]
+                },
+                {
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": {"content": "全通"},
                             "finish_reason": None,
                         }
                     ]
@@ -248,6 +277,7 @@ echo "== 判据 =="
 python3 - "$D" "$REPO_ROOT" "$WORK" <<'PY'
 import json
 import pathlib
+import re
 import sys
 
 D = pathlib.Path(sys.argv[1])
@@ -260,6 +290,11 @@ from vt_screen import render_text
 
 raw = (D / "tui.raw").read_text(errors="replace")
 screen = render_text(raw)
+# 流式提交后，已稳定行可能已经滚出最终可见 viewport；验收要看终端原始
+# 写入流里的 chat 正文，而不是只盯最终一屏（后者会漏掉 scrollback）。
+raw_clean = re.sub(r"\x1b\[[0-9;?]*[a-zA-Z]", "", raw)
+raw_clean = re.sub(r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)", "", raw_clean)
+frontend_chat = all(part in raw_clean for part in ("alpha1", "write/read/edit/exec", "全通"))
 requests = json.loads((D / "provider-requests.json").read_text(encoding="utf-8"))
 
 on_disk = TARGET.read_text() if TARGET.exists() else ""
@@ -270,7 +305,7 @@ tool_fed_back = any(
 )
 
 checks = [
-    ("① 前端显示 chat 正文", "alpha1 基本可用" in screen),
+    ("① 前端显示 chat 正文", frontend_chat),
     ("② 前端显示四个工具名",
      all(name in screen for name in ("write", "read", "edit", "exec"))),
     ("③ 后端 write→edit 落盘为 v2", on_disk == "alpha1-basic-v2\n"),

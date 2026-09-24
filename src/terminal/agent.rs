@@ -8,7 +8,7 @@
 //! - inline viewport 只绘制 live transcript、composer、status 与 shortcuts；
 //! - 不启用鼠标捕获，保留终端原生选择/复制；`--v1` 仍可强制回退全屏路径。
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::io::stdout;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -33,7 +33,7 @@ use tokio::sync::mpsc;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::app::session::SessionState;
-use crate::app::timeline_model::Turn;
+use crate::app::timeline_model::{Turn, strip_ansi_escapes};
 use crate::app::{App, AppMsg, ConnPhase, ModalHit, Overlay, StartupIntent};
 use crate::runtime::{Runtime, RuntimeMsg};
 use crate::terminal::transcript::PendingCommit;
@@ -41,7 +41,7 @@ use crate::theme::Theme;
 use crate::ui::v2::adapter;
 use crate::ui::v2::route::{self, ScreenRoute};
 use crate::ui::v2::runtime::V2TranscriptRuntime;
-use crate::ui::v2::transcript::{BlockKind, BlockState, render_transcript};
+use crate::ui::v2::transcript::{BlockKind, BlockState, TranscriptBlock, render_transcript};
 use crate::ui::v2::workspace;
 use qaqh_client::{ConversationMode, NoticeLevel, TimelineBlockKind, TimelineBlockState};
 
@@ -540,9 +540,30 @@ struct AgentState {
     transcript: V2TranscriptRuntime,
     seed: Option<String>,
     pending_commits: VecDeque<PendingCommit>,
+    /// 已稳定、但必须等更早的 pending block 提交完后才能写 scrollback 的流式行。
+    pending_stream_lines: VecDeque<Line<'static>>,
+    streaming: StreamingCommitState,
+    streamed_blocks: HashSet<(String, String)>,
     replay_active: bool,
     replay_cursor: usize,
     replay_version: Option<u64>,
+}
+
+#[derive(Debug, Default)]
+struct StreamingCommitState {
+    turn_id: Option<String>,
+    block_id: Option<String>,
+    text: String,
+    processed_lines: usize,
+    emitted_lines: usize,
+    in_code: bool,
+    code_lang: Option<String>,
+}
+
+impl StreamingCommitState {
+    fn reset(&mut self) {
+        *self = Self::default();
+    }
 }
 
 #[derive(Debug, Default)]
@@ -562,6 +583,7 @@ impl AgentState {
             self.seed = None;
             self.transcript.clear();
             self.pending_commits.clear();
+            self.reset_streaming();
             self.replay_active = false;
             self.replay_cursor = 0;
             self.replay_version = None;
@@ -575,6 +597,7 @@ impl AgentState {
             self.seed = None;
             self.transcript.clear();
             self.pending_commits.clear();
+            self.reset_streaming();
             self.replay_active = false;
             self.replay_cursor = 0;
             self.replay_version = None;
@@ -587,6 +610,7 @@ impl AgentState {
         if self.seed.as_deref() != Some(seed.as_str()) {
             self.seed = Some(seed.clone());
             self.pending_commits.clear();
+            self.reset_streaming();
             self.transcript.begin_replay(&seed);
             self.replay_active = true;
             self.replay_cursor = 0;
@@ -604,6 +628,7 @@ impl AgentState {
         if self.replay_active {
             if self.replay_version != Some(session.timeline.version) {
                 self.transcript.begin_replay(&seed);
+                self.reset_streaming();
                 self.replay_cursor = 0;
                 self.replay_version = Some(session.timeline.version);
             }
@@ -625,6 +650,101 @@ impl AgentState {
             ),
             reset_scrollback: false,
         }
+    }
+
+    fn reset_streaming(&mut self) {
+        self.pending_stream_lines.clear();
+        self.streaming.reset();
+        self.streamed_blocks.clear();
+    }
+
+    fn was_streamed(&self, block: &TranscriptBlock) -> bool {
+        self.streamed_blocks
+            .contains(&(block.turn_id.clone(), block.id.to_string()))
+    }
+
+    /// 把当前 open assistant 的**完整行**变成可提交行；最后一行留在 live tail。
+    fn sync_streaming(&mut self, app: &App, width: usize, theme: &Theme) -> Vec<Line<'static>> {
+        let current = app.active_session().and_then(open_assistant_block);
+        let mut out = Vec::new();
+        match current {
+            Some((turn_id, block_id, text)) => {
+                let same_block = self.streaming.turn_id.as_deref() == Some(turn_id)
+                    && self.streaming.block_id.as_deref() == Some(block_id);
+                if !same_block {
+                    out.extend(self.finish_streaming(width, theme));
+                    self.streaming.turn_id = Some(turn_id.to_string());
+                    self.streaming.block_id = Some(block_id.to_string());
+                }
+                self.streaming.text.clear();
+                self.streaming.text.push_str(text);
+                let stable = stable_line_count(text, false);
+                out.extend(self.render_streaming_lines(stable, width, theme));
+            }
+            None => out.extend(self.finish_streaming(width, theme)),
+        }
+        out
+    }
+
+    /// block 已封口/切换：把最后一行也提交，并标记该 block 不再走 sealed 整体渲染。
+    fn finish_streaming(&mut self, width: usize, theme: &Theme) -> Vec<Line<'static>> {
+        if self.streaming.block_id.is_none() {
+            return Vec::new();
+        }
+        let total = stable_line_count(&self.streaming.text, true);
+        let out = self.render_streaming_lines(total, width, theme);
+        if self.streaming.emitted_lines > 0
+            && let (Some(turn_id), Some(block_id)) = (
+                self.streaming.turn_id.take(),
+                self.streaming.block_id.take(),
+            )
+        {
+            self.streamed_blocks.insert((turn_id, block_id));
+        }
+        self.streaming.reset();
+        out
+    }
+
+    fn render_streaming_lines(
+        &mut self,
+        target: usize,
+        width: usize,
+        theme: &Theme,
+    ) -> Vec<Line<'static>> {
+        let text = self.streaming.text.clone();
+        let source: Vec<&str> = text.split('\n').collect();
+        let mut out = Vec::new();
+        while self.streaming.processed_lines < target {
+            let Some(line) = source.get(self.streaming.processed_lines).copied() else {
+                break;
+            };
+            self.streaming.processed_lines += 1;
+
+            if let Some(lang) = fence_language(line) {
+                if self.streaming.in_code {
+                    self.streaming.in_code = false;
+                    self.streaming.code_lang = None;
+                } else {
+                    self.streaming.in_code = true;
+                    self.streaming.code_lang = lang;
+                }
+                continue;
+            }
+
+            let first_line = self.streaming.emitted_lines == 0;
+            let rendered = crate::ui::v2::transcript::render_stream_line(
+                line,
+                width,
+                theme,
+                first_line,
+                self.streaming.in_code,
+                self.streaming.code_lang.as_deref(),
+            );
+            self.streaming.emitted_lines =
+                self.streaming.emitted_lines.saturating_add(rendered.len());
+            out.extend(rendered);
+        }
+        out
     }
 
     fn replay_chunk(&mut self, seed: &str, turns: &[Turn], version: u64) -> Vec<PendingCommit> {
@@ -658,6 +778,7 @@ async fn commit_pending(
     agent: &mut AgentState,
     theme: &Theme,
 ) -> Result<()> {
+    let width = host.terminal.get_frame().area().width;
     let sync = agent.sync(app);
     if sync.reset_scrollback {
         input.suspend().await;
@@ -665,17 +786,36 @@ async fn commit_pending(
         input.resume();
         result?;
     }
-    agent.pending_commits.extend(sync.pending);
+
+    let stream_lines = agent.sync_streaming(app, usize::from(width), theme);
+    agent.pending_stream_lines.extend(stream_lines);
+
+    let mut pending = sync.pending;
+    pending.retain(|item| !agent.was_streamed(&item.block));
+    agent.pending_commits.extend(pending);
+
     let chunk = agent.take_commit_chunk(COMMIT_CHUNK_BLOCKS);
-    if chunk.is_empty() {
-        return Ok(());
+    if !chunk.is_empty() {
+        let blocks: Vec<_> = chunk.into_iter().map(|item| item.block).collect();
+        let mut lines = render_transcript(&blocks, width, theme);
+        if lines.is_empty() {
+            lines.push(Line::default());
+        }
+        commit_lines(host, lines)?;
     }
 
-    let width = host.terminal.get_frame().area().width;
-    let blocks: Vec<_> = chunk.into_iter().map(|item| item.block).collect();
-    let mut lines = render_transcript(&blocks, width, theme);
+    // 流式行必须排在所有更早的 sealed block 后面；有积压时先留在队列，
+    // 下一帧 pending 清空后再写，避免工具/回答顺序倒置。
+    if agent.pending_commits.is_empty() && !agent.pending_stream_lines.is_empty() {
+        let lines = agent.pending_stream_lines.drain(..).collect();
+        commit_lines(host, lines)?;
+    }
+    Ok(())
+}
+
+fn commit_lines(host: &mut TerminalHost, lines: Vec<Line<'static>>) -> Result<()> {
     if lines.is_empty() {
-        lines.push(Line::default());
+        return Ok(());
     }
     let height = u16::try_from(lines.len()).unwrap_or(u16::MAX);
     host.terminal.insert_before(height, |buffer| {
@@ -764,6 +904,7 @@ struct AgentRender {
 struct AgentLayout {
     live_rows: usize,
     slash_rows: usize,
+    stream_rows: usize,
     thinking_rows: usize,
     composer_rows: usize,
     status_rows: usize,
@@ -774,6 +915,7 @@ impl AgentLayout {
     fn height(self) -> usize {
         self.live_rows
             .saturating_add(self.slash_rows)
+            .saturating_add(self.stream_rows)
             .saturating_add(self.thinking_rows)
             .saturating_add(self.composer_rows)
             .saturating_add(self.status_rows)
@@ -915,15 +1057,65 @@ fn centered_line(text: &str, width: usize, style: Style) -> Line<'static> {
     ))
 }
 
+fn open_assistant_block(session: &SessionState) -> Option<(&str, &str, &str)> {
+    let turn_id = session.timeline.running_turn_id()?;
+    let turn = session
+        .timeline
+        .turns
+        .iter()
+        .find(|turn| turn.turn_id == turn_id)?;
+    for round in turn.rounds.iter().rev() {
+        for block in round.blocks.iter().rev() {
+            if block.kind == TimelineBlockKind::Text && block.state == TimelineBlockState::Open {
+                return Some((
+                    turn.turn_id.as_str(),
+                    block.block_id.as_str(),
+                    block.text.as_str(),
+                ));
+            }
+        }
+    }
+    None
+}
+
+/// 稳定行数：未封口时最后一行始终留在 live tail；封口时才允许提交最后一行。
+fn stable_line_count(text: &str, sealed: bool) -> usize {
+    if text.is_empty() {
+        return 0;
+    }
+    let lines = text.split('\n').count();
+    if text.ends_with('\n') {
+        lines.saturating_sub(1)
+    } else if sealed {
+        lines
+    } else {
+        lines.saturating_sub(1)
+    }
+}
+
+/// `Some(lang)` = 围栏行；外层 `None` = 普通行。`lang=None` 表示无语言标记。
+fn fence_language(line: &str) -> Option<Option<String>> {
+    let trimmed = line.trim_start();
+    let marker = if trimmed.starts_with("```") {
+        "```"
+    } else if trimmed.starts_with("~~~") {
+        "~~~"
+    } else {
+        return None;
+    };
+    let rest = trimmed[marker.len()..].trim();
+    Some((!rest.is_empty()).then(|| rest.to_string()))
+}
+
 fn session_is_working(session: &SessionState) -> bool {
     session.streaming.is_some() || session.timeline.running_turn_id().is_some()
 }
 
 /// live transcript 是否需要占位。
 ///
-/// 当前只有**运行中的工具**真正需要实时可变正文：进度、输出、状态会持续变化。
-/// reasoning 走 composer 上方的 thinking 行；assistant/system notice 都在封口后
-/// 一次性提交 scrollback，避免“小窗先渲染、随后完全展开”的二次渲染。
+/// 当前只有**运行中的工具**需要多行可变正文：进度、输出、状态会持续变化。
+/// reasoning 走 thinking 行；assistant open block 的稳定行走流式提交，未完成
+/// 尾行走单独的 stream 行，不再把整段 assistant 塞进 live transcript。
 fn has_live_transcript(session: &SessionState) -> bool {
     let Some(turn_id) = session.timeline.running_turn_id() else {
         return false;
@@ -950,6 +1142,7 @@ fn agent_layout(app: &App, width: u16, available: u16, theme: &Theme) -> AgentLa
         return AgentLayout {
             live_rows: 0,
             slash_rows: 0,
+            stream_rows: 0,
             thinking_rows: 0,
             composer_rows: 0,
             status_rows: 0,
@@ -975,6 +1168,7 @@ fn agent_layout(app: &App, width: u16, available: u16, theme: &Theme) -> AgentLa
     } else {
         LIVE_VIEWPORT_ROWS
     };
+    let preferred_stream = usize::from(open_assistant_block(session).is_some());
     let preferred_thinking = usize::from(working);
     let preferred_status = usize::from(theme.spacing.status_height.max(1));
     let preferred_shortcuts = if narrow {
@@ -986,6 +1180,7 @@ fn agent_layout(app: &App, width: u16, available: u16, theme: &Theme) -> AgentLa
     let mut layout = AgentLayout {
         live_rows: preferred_live,
         slash_rows: preferred_slash,
+        stream_rows: preferred_stream,
         thinking_rows: preferred_thinking,
         composer_rows: preferred_composer,
         status_rows: if available >= 2 { preferred_status } else { 0 },
@@ -999,6 +1194,8 @@ fn agent_layout(app: &App, width: u16, available: u16, theme: &Theme) -> AgentLa
             layout.live_rows -= 1;
         } else if layout.slash_rows > 0 {
             layout.slash_rows -= 1;
+        } else if layout.stream_rows > 0 {
+            layout.stream_rows = 0;
         } else if layout.shortcuts_rows > 0 {
             layout.shortcuts_rows = 0;
         } else if layout.composer_rows > 1 {
@@ -1038,8 +1235,8 @@ fn render_agent(app: &App, width: u16, height: u16, theme: &Theme) -> AgentRende
         .into_iter()
         .filter(|block| block.state == BlockState::Live)
         .collect();
-    // live transcript 只保留运行中的工具。assistant / system notice 都只在
-    // 封口后由 commit pump 一次性写入 scrollback，避免二次渲染。
+    // live transcript 只保留运行中的工具；assistant open block 的稳定行由
+    // `sync_streaming` 逐行提交，未完成尾行单独走 stream_rows。
     blocks.retain(|block| matches!(block.kind, BlockKind::Tool(_)));
     let live = render_transcript(&blocks, width, theme);
     let live_start = live.len().saturating_sub(layout.live_rows);
@@ -1055,6 +1252,9 @@ fn render_agent(app: &App, width: u16, height: u16, theme: &Theme) -> AgentRende
     }
 
     lines.extend(slash_menu_lines(app, width, theme, layout.slash_rows));
+    if layout.stream_rows > 0 {
+        lines.push(stream_tail_line(session, width, theme));
+    }
     if layout.thinking_rows > 0 {
         lines.push(thinking_line(session, width, theme));
     }
@@ -1085,6 +1285,33 @@ fn render_agent(app: &App, width: u16, height: u16, theme: &Theme) -> AgentRende
         lines,
         cursor: Some(Position::new(composer.cursor_x, cursor_y)),
     }
+}
+
+/// 当前 open assistant 的未完成尾行。稳定行已经写进 scrollback，这里只画
+/// 最后一行；它每帧可变，因此绝不能再走 `insert_before`。
+fn stream_tail_line(session: &SessionState, width: u16, theme: &Theme) -> Line<'static> {
+    let Some((_, _, text)) = open_assistant_block(session) else {
+        return Line::default();
+    };
+    let prefix = format!("{} ", theme.glyph.assistant);
+    let body_width = usize::from(width)
+        .saturating_sub(prefix.width())
+        .saturating_sub(1)
+        .max(1);
+    let tail = strip_ansi_escapes(text.rsplit('\n').next().unwrap_or_default());
+    let shown = tail_cols(&tail, body_width);
+    let mut spans = vec![Span::styled(
+        prefix,
+        Style::new().fg(theme.accent.assistant),
+    )];
+    if let Some(line) = crate::ui::v2::markdown::render(&shown, body_width, theme).last() {
+        spans.extend(line.spans.clone());
+    }
+    spans.push(Span::styled(
+        theme.glyph.cursor.to_string(),
+        Style::new().fg(theme.accent.assistant),
+    ));
+    Line::from(spans)
 }
 
 /// composer 上方的单行 thinking 状态。
@@ -1531,6 +1758,19 @@ mod tests {
         app
     }
 
+    fn text_of(lines: &[Line<'static>]) -> String {
+        lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
     fn model_with_sealed_answer() -> TimelineModel {
         let mut model = TimelineModel::default();
         model.apply(&entry(
@@ -1719,6 +1959,46 @@ mod tests {
         let second = state.sync(&app);
         assert!(!second.reset_scrollback);
         assert!(second.pending.is_empty());
+    }
+
+    #[test]
+    fn streaming_commits_complete_lines_and_flushes_tail_on_seal() {
+        let mut model = model_with_live_answer_after_thinking();
+        model.apply(&entry(
+            4,
+            "turn-1",
+            TimelineEvent::TextDelta {
+                block_id: "answer-1".to_string(),
+                fragment_seq: 1,
+                delta: "\nsecond".to_string(),
+            },
+        ));
+        let app = app_with_model(model.clone());
+        let mut state = AgentState::default();
+
+        let first = state.sync_streaming(&app, 60, &test_theme());
+        let first_text = text_of(&first);
+        assert!(first_text.contains("assistant answer"), "{first_text}");
+        assert!(!first_text.contains("second"), "{first_text}");
+        assert!(state.streamed_blocks.is_empty());
+
+        model.apply(&entry(
+            5,
+            "turn-1",
+            TimelineEvent::BlockSealed {
+                block_id: "answer-1".to_string(),
+            },
+        ));
+        let sealed_app = app_with_model(model);
+        let second = state.sync_streaming(&sealed_app, 60, &test_theme());
+        let second_text = text_of(&second);
+        assert!(second_text.contains("second"), "{second_text}");
+        assert!(
+            state
+                .streamed_blocks
+                .contains(&("turn-1".to_string(), "answer-1".to_string())),
+            "已流式提交的 block 必须在 sealed 整体渲染时被抑制"
+        );
     }
 
     #[test]
@@ -2094,7 +2374,7 @@ mod tests {
     }
 
     #[test]
-    fn live_answer_waits_for_commit_and_keeps_thinking_in_dedicated_row() {
+    fn live_answer_tail_and_thinking_use_dedicated_rows() {
         let app = app_with_model(model_with_live_answer_after_thinking());
         let rendered = render_agent(&app, 60, 10, &test_theme());
         let text: String = rendered
@@ -2104,9 +2384,10 @@ mod tests {
             .map(|span| span.content.as_ref())
             .collect();
         assert!(
-            !text.contains("assistant answer"),
-            "assistant 不应在 live viewport 二次渲染：{text}"
+            text.contains("assistant answer"),
+            "open assistant 的未完成尾行应在 live viewport 显示：{text}"
         );
+        assert!(text.contains('▌'), "流式尾行应带光标：{text}");
         assert!(!text.contains("Thinking…"), "{text}");
 
         let thinking = rendered
