@@ -1,6 +1,6 @@
 # qaqh-tui
 
-QAQ-Harness 的终端前端（ratatui + tokio），基于 `qaqh.Ringing` v1 协议直连本地 daemon。
+QAQ-Harness 的终端前端（ratatui + tokio），基于 `qaqh.Ringing` v2 单流协议直连本地 daemon。
 `v2.0.0-alpha1` 起默认进入 V2 Agent View；`--v1` 可强制回退旧全屏路径。
 
 ## 运行
@@ -62,8 +62,8 @@ commit ledger 写入终端 scrollback，live block、composer、status 与 short
 usage、附件与连接告警均已接入。该模式不启用鼠标捕获，保留终端原生选择/复制；
 `Ctrl+Q` 退出。`--no-spawn` 与 v1 语义一致；`--v1` 强制回退旧全屏路径。
 
-Workspace/Modal、会话选择器、设置、权限/ask/plan 已由 M5 迁移；协议切换仍按
-Ringing v2 冻结语义单独推进，alpha1 当前继续使用 v1 协议。
+Workspace/Modal、会话选择器、设置、权限/ask/plan 已由 M5 迁移；Ringing v2
+typed bootstrap、命令面、timeline 与 per-seed 单流已切到新锚点。
 
 ask_user 在 v2 中采用阻塞式单题分页：`←/→` 切题，`↑/↓` 移动选项，`Enter`
 选择并前进，`Space` 只选择，`1-9/a-f` 直接选择，`e`/`z` 输入自定义答案，

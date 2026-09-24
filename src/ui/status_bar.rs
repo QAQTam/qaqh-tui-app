@@ -286,7 +286,7 @@ mod tests {
     #[test]
     fn ready_phase_stream_issue_is_visible_and_clears_on_recovery() {
         let msg = "连接断开，3000ms 后重连".to_string();
-        let stream = StreamKey::Channel(qaqh_client::Channel::Conversation);
+        let stream = StreamKey::V2("seed".into());
         let mut issues = StreamIssues::default();
 
         // 旧行为：StreamIssue 只写 conn_error、相位停在 Ready → 状态栏什么都不显示。

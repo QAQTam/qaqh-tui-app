@@ -10,7 +10,7 @@ use qaqh_client::ConversationMode;
 use qaqh_client::ConversationState;
 use qaqh_client::{
     AskMode, ContentRef, DomainActivityState as ActivityState, DomainAskQuestion as AskQuestion,
-    DomainError, PermissionCategory, PermissionRisk, SkillsStatus, UsageInfo,
+    DomainError, PermissionCategory, PermissionRisk, UsageInfo,
 };
 
 // ───────────────────────── 流式相位 ─────────────────────────
@@ -538,7 +538,6 @@ pub struct SessionState {
     pub pending_permissions: Vec<PermissionPanel>,
     /// 已解决的权限请求 id（防「幽灵面板」补投，见 [`RespondedPermissions`]）。
     pub responded_permissions: RespondedPermissions,
-    pub skills: Option<SkillsStatus>,
     /// workspace 面板数据（bootstrap control state + DashboardSnapshot 推送）。
     pub dashboard: Option<qaqh_client::DomainDashboardSnapshot>,
     /// 压缩进度动画（Some = 压缩进行中）。
@@ -582,7 +581,6 @@ impl SessionState {
             pending_plan: None,
             pending_permissions: Vec::new(),
             responded_permissions: RespondedPermissions::default(),
-            skills: None,
             dashboard: None,
             compact_anim: None,
             code_added: 0,
@@ -675,6 +673,46 @@ impl SessionState {
         true
     }
 
+    /// 从 timeline 工具卡构造 permission 面板（v2 交互正文不含 permission 详情）。
+    /// 找不到卡片时退化为「（恢复中）」占位——详情等 tool 事件补全。
+    pub fn permission_panel_for(&self, call_id: &str) -> PermissionPanel {
+        let card = self.timeline.tool_card(call_id);
+        let tool_name = card
+            .map(|c| c.name.clone())
+            .unwrap_or_else(|| "（恢复中）".into());
+        let perm = card.and_then(|c| c.permission.clone());
+        let (reason, paths, category, level, risk, consequence) = match perm {
+            Some(p) => (
+                p.reason,
+                p.paths,
+                p.category,
+                p.level,
+                p.risk,
+                p.consequence,
+            ),
+            None => (
+                String::new(),
+                Vec::new(),
+                String::new(),
+                0u8,
+                String::new(),
+                String::new(),
+            ),
+        };
+        PermissionPanel {
+            tool_call_id: call_id.to_string(),
+            tool_name,
+            action_summary: None,
+            reason,
+            paths,
+            category: permission_category_from_tag(&category),
+            level,
+            risk: permission_risk_from_tag(&risk),
+            consequence,
+            trust_folder: false,
+        }
+    }
+
     pub fn is_waiting_user(&self) -> bool {
         self.activity == Some(ActivityState::WaitingUser)
             || !self.pending_permissions.is_empty()
@@ -704,15 +742,6 @@ impl SessionState {
             _ => "idle".into(),
         }
     }
-
-    pub fn apply_usage(&mut self, usage: UsageInfo, context_limit: u32, model: String) {
-        self.usage = Some(usage);
-        self.context_limit = Some(context_limit);
-        if let Some(conv) = self.conversation.as_mut() {
-            conv.model = Some(model);
-            conv.context_limit = Some(context_limit as u64);
-        }
-    }
 }
 
 /// 会话退出流式的统一收口。
@@ -733,6 +762,56 @@ pub fn streaming_done(session: &mut SessionState, turn_id: Option<&str>) {
 ///（`agent/engine_input.rs`），但两条 SSE 通道独立投递仍可能反转；宽限期确保
 /// "timeline 暂时还没出现这个 turn" 不被误判成 "turn 已终结"。
 pub const STREAM_GHOST_GRACE: Duration = Duration::from_secs(2);
+
+/// v2 control 投影的 activity 词汇（idle / running / interrupted）→ 领域
+/// `ActivityState`（本仓状态栏仍用领域词汇）。
+///
+/// `waiting_user` 不由 activity 表达，而由挂起交互面板（permission / ask /
+/// plan）判定，见 [`SessionState::is_waiting_user`]。
+pub fn activity_from_v2(activity: qaqh_client::ClientV2ActivityState) -> ActivityState {
+    match activity {
+        qaqh_client::ClientV2ActivityState::Idle => ActivityState::Idle,
+        qaqh_client::ClientV2ActivityState::Running => ActivityState::Working,
+        qaqh_client::ClientV2ActivityState::Interrupted => ActivityState::Disconnected,
+    }
+}
+
+/// 从 v2 conversation 投影抽出本仓 `conversation` 缓存（只保留 model/usage）。
+///
+/// v2 投影没有聚合的 `usage_totals` / `context_limit`：model/usage 取**最新**
+/// assistant block 的字段，其余留给实时 `UsageUpdated` 事件补全。
+pub fn conversation_cache_from_v2(
+    snapshot: &qaqh_client::ClientV2ConversationState,
+) -> ConversationState {
+    let mut cache = ConversationState::default();
+    for entry in snapshot.context.iter().rev() {
+        if let qaqh_client::ClientV2ConversationContextKind::AssistantBlock(block) = &entry.kind {
+            cache.model = Some(block.model.clone());
+            cache.usage = block.usage.clone();
+            break;
+        }
+    }
+    cache
+}
+
+/// timeline 工具卡的 `category` 字符串（snake_case）→ 面板枚举。
+pub fn permission_category_from_tag(tag: &str) -> PermissionCategory {
+    match tag {
+        "write" => PermissionCategory::Write,
+        "exec" => PermissionCategory::Exec,
+        "net" => PermissionCategory::Net,
+        _ => PermissionCategory::Read,
+    }
+}
+
+/// timeline 工具卡的 `risk` 字符串（snake_case）→ 面板枚举。
+pub fn permission_risk_from_tag(tag: &str) -> PermissionRisk {
+    match tag {
+        "high" => PermissionRisk::High,
+        "medium" => PermissionRisk::Medium,
+        _ => PermissionRisk::Medium,
+    }
+}
 
 /// timeline（transcript 与 turn 生命周期权威）→ streaming 状态收敛。
 ///

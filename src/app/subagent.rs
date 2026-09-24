@@ -211,32 +211,40 @@ pub fn rescan(sess: &mut SessionState) -> Vec<String> {
     discovered
 }
 
-/// `SubagentStatus.state` 标签 → 状态（容忍大小写与尾部附加信息，
-/// 如 "ERROR exit=1" / "TIMEOUT after 120s"）。
-pub fn state_from_tag(tag: &str) -> Option<SubagentState> {
-    let upper = tag.to_ascii_uppercase();
-    if upper.starts_with("COMPLETED") {
-        Some(SubagentState::Completed)
-    } else if upper.starts_with("ERROR") {
-        Some(SubagentState::Error)
-    } else if upper.starts_with("TIMEOUT") {
-        Some(SubagentState::Timeout)
-    } else if upper.starts_with("CANCELLED") {
-        Some(SubagentState::Cancelled)
-    } else {
-        None
+/// v2 `SubagentTerminalStatus` → 本仓子代理终态。
+pub fn state_from_v2(status: qaqh_client::ClientV2SubagentTerminalStatus) -> SubagentState {
+    use qaqh_client::ClientV2SubagentTerminalStatus as S;
+    match status {
+        S::Completed => SubagentState::Completed,
+        S::Failed => SubagentState::Error,
+        S::Cancelled => SubagentState::Cancelled,
+        S::TimedOut => SubagentState::Timeout,
     }
 }
 
-/// 应用终态标签到（父会话中）同名且未终态的首个条目。
-/// Closed 是 TUI 侧猜测（会话消失），权威终态标签可覆盖它。
+/// v2 `SubagentSpawned` → 把 `child_session_id` 绑到 `parent_call_id` 对应的条目。
+pub fn bind_seed(sess: &mut SessionState, parent_call_id: &str, child_session_id: &str) {
+    if let Some(entry) = sess
+        .subagents
+        .iter_mut()
+        .find(|e| e.tool_call_id == parent_call_id)
+    {
+        entry.seed = Some(child_session_id.to_string());
+    }
+}
+
+/// v2 `SubagentFinished` → 按 `child_session_id` 落终态。
 /// 返回该条目的 seed（供调用方停止 timeline 跟踪）。
-pub fn apply_status(sess: &mut SessionState, name: &str, tag: &str) -> Option<String> {
-    let state = state_from_tag(tag)?;
+pub fn apply_terminal(
+    sess: &mut SessionState,
+    child_session_id: &str,
+    status: qaqh_client::ClientV2SubagentTerminalStatus,
+) -> Option<String> {
+    let state = state_from_v2(status);
     let entry = sess
         .subagents
         .iter_mut()
-        .find(|e| e.name == name && (!e.state.is_terminal() || e.state == SubagentState::Closed))?;
+        .find(|e| e.seed.as_deref() == Some(child_session_id) && !e.state.is_terminal())?;
     entry.state = state;
     entry.seed.clone()
 }
@@ -621,7 +629,8 @@ mod tests {
     }
 
     #[test]
-    fn apply_status_matches_by_name_and_skips_terminal() {
+    fn apply_terminal_matches_by_seed_and_skips_terminal() {
+        use qaqh_client::ClientV2SubagentTerminalStatus as S;
         let mut sess = SessionState::new("parent".into());
         sess.subagents.push(SubagentEntry {
             tool_call_id: "c1".into(),
@@ -630,24 +639,34 @@ mod tests {
             state: SubagentState::Running,
         });
         assert_eq!(
-            apply_status(&mut sess, "explore", "ERROR exit=1").as_deref(),
+            apply_terminal(&mut sess, "s1", S::Failed).as_deref(),
             Some("s1")
         );
         assert_eq!(sess.subagents[0].state, SubagentState::Error);
-        // 已终态：不再匹配（找不到非终态同名条目）。
-        assert_eq!(apply_status(&mut sess, "explore", "COMPLETED"), None);
+        // 已终态：不再匹配（找不到非终态条目）。
+        assert_eq!(apply_terminal(&mut sess, "s1", S::Completed), None);
     }
 
     #[test]
-    fn state_from_tag_variants() {
-        assert_eq!(state_from_tag("COMPLETED"), Some(SubagentState::Completed));
-        assert_eq!(state_from_tag("ERROR exit=1"), Some(SubagentState::Error));
-        assert_eq!(
-            state_from_tag("TIMEOUT after 120s"),
-            Some(SubagentState::Timeout)
-        );
-        assert_eq!(state_from_tag("CANCELLED"), Some(SubagentState::Cancelled));
-        assert_eq!(state_from_tag("RUNNING"), None);
+    fn bind_seed_sets_child_session_on_parent_call() {
+        let mut sess = SessionState::new("parent".into());
+        sess.subagents.push(SubagentEntry {
+            tool_call_id: "c1".into(),
+            seed: None,
+            name: "explore".into(),
+            state: SubagentState::Starting,
+        });
+        bind_seed(&mut sess, "c1", "s1");
+        assert_eq!(sess.subagents[0].seed.as_deref(), Some("s1"));
+    }
+
+    #[test]
+    fn state_from_v2_variants() {
+        use qaqh_client::ClientV2SubagentTerminalStatus as S;
+        assert_eq!(state_from_v2(S::Completed), SubagentState::Completed);
+        assert_eq!(state_from_v2(S::Failed), SubagentState::Error);
+        assert_eq!(state_from_v2(S::TimedOut), SubagentState::Timeout);
+        assert_eq!(state_from_v2(S::Cancelled), SubagentState::Cancelled);
     }
 
     #[test]
