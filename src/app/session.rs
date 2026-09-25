@@ -237,7 +237,7 @@ pub struct PlanPanel {
 pub struct PermissionPanel {
     pub tool_call_id: String,
     pub tool_name: String,
-    /// 有界动作摘要（目前 daemon 对 exec 下发 command/argv/args/shell/cwd）。
+    /// 有界动作摘要（目前 daemon 对 exec 下发 command/args/shell/cwd）。
     pub action_summary: Option<String>,
     pub reason: String,
     pub paths: Vec<String>,

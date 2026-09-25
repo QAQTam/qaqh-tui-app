@@ -569,6 +569,7 @@ pub(crate) fn test_display(
         header: None,
         body,
         metrics: None,
+        outcome: None,
     }
 }
 
@@ -791,6 +792,18 @@ fn extract_shell_output_text(raw: &str) -> Option<String> {
     None
 }
 
+/// v2 exec display: keep stdout/stderr distinguishable when both are present.
+fn render_streams_body(stdout: &str, stderr: &str) -> Option<String> {
+    let stdout = stdout.trim_end();
+    let stderr = stderr.trim_end();
+    match (stdout.is_empty(), stderr.is_empty()) {
+        (true, true) => None,
+        (false, true) => Some(stdout.to_string()),
+        (true, false) => Some(format!("stderr:\n{stderr}")),
+        (false, false) => Some(format!("stdout:\n{stdout}\nstderr:\n{stderr}")),
+    }
+}
+
 /// 工具进度被截断时的可见标注（B1「丢弃必须可见」）。
 ///
 /// `ToolCard::progress_truncated` 为真 = **进度缓冲的前段已被丢弃**（wire 语义见
@@ -920,6 +933,7 @@ fn push_tool_card_anim(
         || matches!(
             display_body,
             Some(TimelineToolBody::Shell { .. })
+                | Some(TimelineToolBody::Streams { .. })
                 | Some(TimelineToolBody::Diff { .. })
                 | Some(TimelineToolBody::Text { .. })
         );
@@ -1486,6 +1500,11 @@ fn push_tool_card_anim(
                 exit_code,
                 truncated,
                 ..
+            }
+            | TimelineToolBody::Streams {
+                exit_code,
+                truncated,
+                ..
             } => Some((*exit_code, *truncated, String::new())),
             _ => None,
         });
@@ -1497,6 +1516,7 @@ fn push_tool_card_anim(
         // progress 只是被取代的中间态，此时标注它「前段已丢弃」是噪音。
         let display_shell_output = display_body.and_then(|b| match b {
             TimelineToolBody::Shell { output, .. } => Some(output.clone()),
+            TimelineToolBody::Streams { stdout, stderr, .. } => render_streams_body(stdout, stderr),
             _ => None,
         });
         let (src, src_from_progress) =
@@ -1609,6 +1629,9 @@ fn push_tool_card_anim(
                     truncated: true,
                     ..
                 } | TimelineToolBody::Shell {
+                    truncated: true,
+                    ..
+                } | TimelineToolBody::Streams {
                     truncated: true,
                     ..
                 }
@@ -2144,7 +2167,7 @@ mod tests {
             summary: Some(
                 r#"{"status":"completed","command":"cargo ...","exit_code":0,"output":""}"#.into(),
             ),
-            args_json: Some(r#"{"argv":["cargo","build"]}"#.into()),
+            args_json: Some(r#"{"command":"cargo build"}"#.into()),
             output: Some(r#"{"status":"completed","exit_code":0,"output":"l1"}"#.into()),
             diff: None,
             progress: String::new(),
@@ -2173,6 +2196,7 @@ mod tests {
                 effective_tool_name: None,
                 user_initiated: false,
             }),
+            outcome: None,
         };
         let mut lines = Vec::new();
         push_tool_card(&mut lines, &mk(Some(d)), 80);
@@ -2192,9 +2216,11 @@ mod tests {
             "Shell body 输出必须直接上屏（无需 JSON 剥壳）：{flat}"
         );
 
-        // H16 回退：display 缺失 → 旧字段渲染，标题不臆造命令行。
+        // H16 回退：display 与参数都缺失 → 只显示工具名，不臆造命令行。
+        let mut fallback = mk(None);
+        fallback.args_json = None;
         let mut lines = Vec::new();
-        push_tool_card(&mut lines, &mk(None), 80);
+        push_tool_card(&mut lines, &fallback, 80);
         let flat = flatten(&lines);
         // flatten 以 span 为界 join，"# exec" 是两个 span——按语义断言。
         assert!(flat.contains("\nexec\n"), "回退标题仍是工具名：{flat}");
@@ -2224,6 +2250,7 @@ mod tests {
                 header: Some(TimelineToolHeader::Other { label: name.into() }),
                 body: Some(body),
                 metrics: None,
+                outcome: None,
             }),
         };
         // ask：Body::None + 投影摘要。
@@ -2294,6 +2321,7 @@ mod tests {
                     truncated: true,
                 }),
                 metrics: None,
+                outcome: None,
             }),
         };
         let mut lines = Vec::new();
@@ -2767,6 +2795,50 @@ mod tests {
         assert!(flat.contains("err line"));
         assert!(!flat.contains("[stderr]"));
         assert!(!flat.contains("\"status\""));
+    }
+
+    #[test]
+    fn streams_body_keeps_stdout_and_stderr_distinguishable() {
+        let tool = ToolCard {
+            tool_call_id: "c-streams".into(),
+            name: "bash".into(),
+            state: TimelineToolState::Failed,
+            summary: None,
+            args_json: None,
+            output: None,
+            diff: None,
+            progress: String::new(),
+            progress_truncated: false,
+            progress_bytes_total: 0,
+            progress_stream: None,
+            failure: None,
+            permission: None,
+            display: Some(test_display(
+                None,
+                Some(TimelineToolBody::Streams {
+                    stdout: "out line".into(),
+                    stderr: "err line".into(),
+                    exit_code: Some(1),
+                    truncated: false,
+                    interleaved: false,
+                }),
+            )),
+        };
+        let mut lines = Vec::new();
+        push_tool_card(&mut lines, &tool, 80);
+        let flat: String = lines
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.text.clone()))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let stdout_at = flat.find("stdout:").expect("stdout label");
+        let stderr_at = flat.find("stderr:").expect("stderr label");
+        assert!(stdout_at < flat.find("out line").expect("stdout body"));
+        assert!(stderr_at < flat.find("err line").expect("stderr body"));
+        assert!(
+            flat.contains("exit 1"),
+            "exit code must remain visible: {flat}"
+        );
     }
 
     /// W-02 裁决（2026-09-20）：**卡片正文不展开**，正文高度恒 ≤ 7 行。
