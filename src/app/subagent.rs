@@ -569,6 +569,7 @@ mod tests {
                     seed: seed.into(),
                 }),
                 metrics: None,
+                outcome: None,
             }),
             ..t
         }

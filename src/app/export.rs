@@ -179,6 +179,16 @@ fn export_tool(out: &mut String, tool: &ToolCard) {
     let body = d.and_then(|d| d.body.as_ref());
     match body {
         Some(TimelineToolBody::Shell { output, .. }) => push_fenced(out, "sh", output),
+        Some(TimelineToolBody::Streams { stdout, stderr, .. }) => {
+            if !stdout.trim().is_empty() {
+                out.push_str("stdout:\n");
+                push_fenced(out, "", stdout);
+            }
+            if !stderr.trim().is_empty() {
+                out.push_str("stderr:\n");
+                push_fenced(out, "", stderr);
+            }
+        }
         Some(TimelineToolBody::Diff { unified, .. }) => push_fenced(out, "diff", unified),
         Some(TimelineToolBody::Text { text, .. }) => push_fenced(out, "", text),
         Some(TimelineToolBody::Subagent { name, .. }) => {
@@ -349,6 +359,7 @@ mod tests {
                                 truncated: false,
                             }),
                             metrics: None,
+                            outcome: None,
                         });
                         block_tool("b2", 1, c)
                     },
