@@ -4,6 +4,9 @@ use super::*;
 
 impl App {
     pub fn send_message(&mut self) {
+        if self.reject_if_v2_read_only("发送") {
+            return;
+        }
         let Some(seed) = self.active_seed() else {
             return;
         };
@@ -47,6 +50,9 @@ impl App {
     }
 
     pub fn cancel_turn(&mut self) {
+        if self.reject_if_v2_read_only("中止") {
+            return;
+        }
         let Some(seed) = self.active_seed() else {
             return;
         };
@@ -77,6 +83,9 @@ impl App {
     }
 
     pub fn toggle_mode(&mut self) {
+        if self.reject_if_v2_read_only("切换模式") {
+            return;
+        }
         let Some(seed) = self.active_seed() else {
             return;
         };
@@ -108,6 +117,9 @@ impl App {
     }
 
     pub fn compact(&mut self) {
+        if self.reject_if_v2_read_only("压缩") {
+            return;
+        }
         let Some(seed) = self.active_seed() else {
             return;
         };
@@ -131,6 +143,9 @@ impl App {
     }
 
     pub fn undo_turn(&mut self) {
+        if self.reject_if_v2_read_only("撤销") {
+            return;
+        }
         let Some(seed) = self.active_seed() else {
             return;
         };
@@ -146,6 +161,9 @@ impl App {
 
     /// 用户消息 context menu 的二次确认入口。
     pub fn confirm_undo_turn(&mut self, turn_id: String) {
+        if self.reject_if_v2_read_only("撤销") {
+            return;
+        }
         let Some(seed) = self.active_seed() else {
             return;
         };

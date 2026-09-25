@@ -3,6 +3,7 @@
 use std::collections::{HashSet, VecDeque};
 use std::time::{Duration, Instant};
 
+use crate::app::ringing_v2::RingingV2SessionModel;
 use crate::app::timeline_model::TimelineModel;
 use qaqh_client::ConversationMode;
 use serde::Deserialize;
@@ -531,6 +532,8 @@ pub struct SessionState {
     /// 仅作 `model` / `context_limit` / `usage` 的缓存——快照里其余字段由
     /// `TimelineModel` 与实时事件承担。
     pub conversation: Option<ConversationState>,
+    /// canonical v2 会话状态机：epoch/log/cursor、reset、interaction、driver。
+    pub ringing_v2: RingingV2SessionModel,
     pub activity: Option<ActivityState>,
     pub usage: Option<UsageInfo>,
     pub usage_totals: Option<UsageInfo>,
@@ -569,12 +572,14 @@ pub struct SessionState {
 
 impl SessionState {
     pub fn new(seed: String) -> Self {
+        let ringing_v2 = RingingV2SessionModel::new(seed.clone());
         Self {
             seed,
             title: None,
             mode: ConversationMode::Code,
             timeline: TimelineModel::default(),
             conversation: None,
+            ringing_v2,
             activity: None,
             usage: None,
             usage_totals: None,
@@ -658,6 +663,25 @@ impl SessionState {
             || !self.pending_permissions.is_empty()
             || self.pending_ask.is_some()
             || self.pending_plan.is_some()
+    }
+
+    /// 当前客户端是否持有 v2 driver seat。
+    pub fn v2_is_driver(&self, client_session_id: Option<&str>) -> bool {
+        client_session_id.is_some_and(|id| self.ringing_v2.is_driver(id))
+    }
+
+    /// 非 driver 的写控制只读；交互应答仍可继续。
+    pub fn v2_is_read_only(&self, client_session_id: Option<&str>) -> bool {
+        self.ringing_v2.is_read_only()
+            || client_session_id.is_some_and(|id| !self.ringing_v2.is_driver(id))
+    }
+
+    /// 无活跃 holder 时允许发起 canonical driver claim。
+    pub fn v2_can_claim(&self) -> bool {
+        self.ringing_v2
+            .driver()
+            .map(|driver| driver.can_claim)
+            .unwrap_or_else(|| self.ringing_v2.server_epoch().is_some())
     }
 
     /// 状态栏标签（working / waiting / idle…）。

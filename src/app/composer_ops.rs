@@ -312,6 +312,15 @@ impl App {
     /// Composer 按键。
     pub(super) fn composer_key(&mut self, key: KeyEvent) {
         use ratatui::crossterm::event::{KeyCode, KeyModifiers};
+        if self.active_v2_read_only() && matches!(key.code, KeyCode::Enter | KeyCode::Esc) {
+            let action = if key.code == KeyCode::Enter {
+                "发送"
+            } else {
+                "中止"
+            };
+            self.reject_if_v2_read_only(action);
+            return;
+        }
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         // 粘贴护栏：洪流期的 Enter 一律降级为空格（终端不支持括号粘贴时，
         // 粘贴文本以按键流到达，回车会误触发送）。支持括号粘贴的终端不走这里。
