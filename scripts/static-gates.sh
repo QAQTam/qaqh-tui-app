@@ -40,21 +40,14 @@ fi
 # spec §11 / issue #46 task 6：展示层消费 typed 投影，不自己解 JSON。
 #
 # **白名单（带理由）**：
-#   src/app/render_transcript.rs — M3/T12 已记录的**展示豁免**：仅
-#     `format_args_preview` 一处，服务于两个有界入口
-#       ① display=None 的老会话（H16 回退）
-#       ② 无结构化 body 的 display 卡的参数补充
-#     两处调用点已人工核对（render_transcript.rs:550 / :1060，后者受
-#     `skip_args_preview` 约束）。
 #   src/app/mod.rs — API **直通**（`query` / `action` / `ConfigLoaded` 的
 #     `Value`），不做展示解析。
 #   src/app/settings_ops.rs — 把 typed draft **序列化**成 wire 值，不解析。
-G2_ALLOWED_FILES='src/app/render_transcript\.rs|src/app/mod\.rs|src/app/settings_ops\.rs'
+G2_ALLOWED_FILES='src/app/mod\.rs|src/app/settings_ops\.rs'
 g2_files=$(grep -rl "serde_json::Value" --include=*.rs src/ | sort)
 g2_bad=$(printf '%s\n' "$g2_files" | grep -vE "^($G2_ALLOWED_FILES)$" || true)
-# 解析（from_str::<…Value…>）比类型出现更严格：只允许 render_transcript.rs 的豁免函数
-g2_parse=$(grep -rn "serde_json::from_str::<[^>]*Value" --include=*.rs src/ \
-    | grep -v '^src/app/render_transcript\.rs:' || true)
+# 解析（from_str::<…Value…>）比类型出现更严格：展示层不允许手解 JSON。
+g2_parse=$(grep -rn "serde_json::from_str::<[^>]*Value" --include=*.rs src/ || true)
 if [ -n "$g2_bad" ] || [ -n "$g2_parse" ]; then
     [ -n "$g2_bad" ] && {
         note ✗ "G2 展示层：白名单外的 serde_json::Value 出现"
@@ -66,7 +59,7 @@ if [ -n "$g2_bad" ] || [ -n "$g2_parse" ]; then
     }
     fail=1
 else
-    note ✓ "G2 展示层：手解 JSON 仅存在于已记录的展示豁免（render_transcript.rs）"
+    note ✓ "G2 展示层：serde_json::Value 仅存在于 API 直通/序列化豁免"
 fi
 
 # ── G3：不读取服务端存储布局 ───────────────────────────────────────
@@ -89,7 +82,7 @@ fi
 # ── G4：renderer 状态不进 wire / reducer ───────────────────────────
 # spec §11：SessionModel / reducer 不得携带渲染层状态。
 g4_hits=$(grep -nE '^\s*use .*(Theme|text::Line|style::Style)|ratatui::' \
-    src/ui/v2/runtime.rs src/app/timeline_model.rs 2>/dev/null || true)
+    src/app/ringing_v2.rs src/app/timeline_model.rs 2>/dev/null || true)
 if [ -n "$g4_hits" ]; then
     note ✗ "G4 分层：reducer / wire model 里出现渲染层类型"
     printf '%s\n' "$g4_hits" | sed 's/^/      /'

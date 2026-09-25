@@ -1,4 +1,4 @@
-//! 对话动作（发送/取消/压缩/撤销）、滚动与工具卡展开（自 app/mod.rs 拆分，行为不变）。
+//! 对话动作（发送/取消/压缩/撤销）与滚动（自 app/mod.rs 拆分）。
 
 use super::*;
 
@@ -36,6 +36,10 @@ impl App {
                         message_id: None,
                         input_purpose: ConversationInputPurpose::TriggerTurn,
                         as_system: false,
+                        // Subagent V2 additions; regular UI messages are neither
+                        // inter-agent deliveries nor terminal notifications.
+                        inter_agent: None,
+                        subagent_terminal: None,
                     }),
                     Default::default(),
                 )
@@ -95,7 +99,6 @@ impl App {
         };
         if let Some(sess) = self.sessions.get_mut(&seed) {
             sess.mode = next; // 乐观更新
-            sess.block_cache = None;
         }
         self.spawn_api(move |api, tx| async move {
             let result = api
@@ -375,64 +378,6 @@ impl App {
         if let Some(sess) = self.sessions.get_mut(&seed) {
             sess.scroll.follow = true;
             sess.scroll.offset = 0;
-        }
-    }
-
-    // ───────────────────────── 按键路由 ─────────────────────────
-
-    /// PageUp：滚动；到顶且还有更早回合 → 触发分页加载。
-    pub(super) fn page_up(&mut self) {
-        let (total, at_limit, has_more, loading) = {
-            let Some(sess) = self.view_session() else {
-                return;
-            };
-            let total = sess
-                .block_cache
-                .as_ref()
-                .map(|c| c.total_lines())
-                .unwrap_or(0);
-            (
-                total,
-                sess.scroll.offset >= total.saturating_sub(1),
-                sess.timeline.has_more,
-                sess.loading_older,
-            )
-        };
-        self.scroll_up(20);
-        if at_limit && has_more && !loading {
-            self.load_older();
-        }
-        let _ = total;
-    }
-
-    pub(super) fn toggle_tool_expand(&mut self) {
-        // §4.7（M2）：F7 作用于**最近一个 T2 运行组**（逆序首个含 T2 工具的
-        // round），切换其 expanded_groups 位。组展开 = 卡片列表；收起 = 一行
-        // 组行（组内最后 Failed 卡例外内联，错误不许藏）。
-        let Some(seed) = self.view_seed() else {
-            return;
-        };
-        let Some(sess) = self.sessions.get_mut(&seed) else {
-            return;
-        };
-        for turn in sess.timeline.turns.iter().rev() {
-            for round in turn.rounds.iter().rev() {
-                let has_t2 = round.blocks.iter().any(|b| {
-                    b.kind == qaqh_client::TimelineBlockKind::Tool
-                        && b.tool
-                            .as_ref()
-                            .is_some_and(|t| !render_transcript::is_t1_tool(&t.name))
-                });
-                if !has_t2 {
-                    continue;
-                }
-                let key = (turn.turn_id.clone(), round.round_num);
-                if !sess.expanded_groups.remove(&key) {
-                    sess.expanded_groups.insert(key);
-                }
-                sess.block_cache = None;
-                return;
-            }
         }
     }
 }

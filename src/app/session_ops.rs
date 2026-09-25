@@ -173,10 +173,6 @@ impl App {
             self.tabs.remove(pos);
             self.sessions.remove(seed);
             self.tracked_seeds.remove(seed);
-            self.focus_order.retain(|s| s != seed);
-            if self.last_focused.as_deref() == Some(seed) {
-                self.last_focused = None;
-            }
             if self.active >= self.tabs.len() && self.active > 0 {
                 self.active = self.tabs.len() - 1;
             }
@@ -190,10 +186,6 @@ impl App {
         // **保留**——终态子代理仍要能被查看。
         self.mark_subagent_closed(seed);
         self.tracked_seeds.remove(seed);
-        self.focus_order.retain(|s| s != seed);
-        if self.last_focused.as_deref() == Some(seed) {
-            self.last_focused = None;
-        }
         self.sync_tracked();
     }
 
@@ -430,84 +422,6 @@ impl App {
             }));
         });
     }
-
-    pub(super) fn click_tab(&mut self, column: u16) {
-        // 与 ui::tab_bar 的布局约定一致：品牌段 10 列，其后每 tab 占
-        // " [n] title " 的宽度；仅处理前 9 个。
-        let mut col: u16 = 10;
-        for (idx, seed) in self.tabs.iter().enumerate().take(9) {
-            let title = self
-                .sessions
-                .get(seed)
-                .map(|s| s.title())
-                .unwrap_or_default();
-            let label_w = format!(" {} {} ", idx + 1, truncate_str(&title, 18))
-                .chars()
-                .count() as u16;
-            if column >= col && column < col + label_w {
-                self.active = idx;
-                // 切标签即退出子代理观测（观测作用域属于原标签）。
-                if self.inspecting() {
-                    self.exit_inspect();
-                }
-                self.prune_overlays_for_active_seed();
-                return;
-            }
-            col += label_w;
-        }
-    }
-    /// 焦点切换的内存回收（会话隔离的最后一环）：
-    /// 1) 非 active 标签全部丢弃渲染缓存（聚焦时按需重建）；
-    /// 2) 超出 LRU 窗口的标签丢弃 timeline 模型（轻状态/挂起交互/用量保留），
-    ///    标记 needs_rebaseline；
-    /// 3) 回到被逐出的标签时自动 re-baseline（服务端是权威历史）。
-    pub(super) fn touch_focus(&mut self, active: &str) {
-        // 活动标签与被观测的子代理同等保护（实时视图不能被 LRU 逐出）。
-        let mut focus_seeds: Vec<String> = vec![active.to_owned()];
-        if let Some(inspect) = self.inspect.clone()
-            && self.sessions.contains_key(&inspect)
-            && inspect != active
-        {
-            focus_seeds.push(inspect);
-        }
-        for seed in &focus_seeds {
-            self.focus_order.retain(|s| s != seed);
-        }
-        for seed in focus_seeds.iter().rev() {
-            self.focus_order.insert(0, seed.clone());
-        }
-
-        for (seed, s) in self.sessions.iter_mut() {
-            if seed != active {
-                s.block_cache = None;
-            }
-        }
-
-        let keep: HashSet<String> = self
-            .focus_order
-            .iter()
-            .take(ACTIVE_MODELS)
-            .cloned()
-            .collect();
-        for (seed, s) in self.sessions.iter_mut() {
-            if !keep.contains(seed) && s.ready && !s.needs_rebaseline {
-                s.timeline = timeline_model::TimelineModel::default();
-                s.block_cache = None;
-                s.ready = false;
-                s.needs_rebaseline = true;
-                s.scroll.follow = true;
-                s.scroll.offset = 0;
-            }
-        }
-
-        if self
-            .sessions
-            .get(active)
-            .is_some_and(|s| s.needs_rebaseline && !s.loading_older)
-        {
-            self.request_rebaseline(active);
-        }
-    }
 }
 
 /// 被拒 ack 的本地效果：**立即**撤销对应的 pending create，并给出失败文案。
@@ -517,7 +431,7 @@ impl App {
 /// 的可靠事件返回）。被拒的 `SessionCreate` 因此**永远等不到**
 /// `SessionStateEvent::Created`，`pending_creates` 里那条只能等 `handle_tick`
 /// 的 15s `retain` 过期——这 15s 里状态栏一直显示 `· creating…`
-/// （`ui/status_bar.rs:40`），用户以为还在创建，实际早已失败。
+/// 用户以为还在创建，实际早已失败。
 ///
 /// 判据是**精确关联**，不是猜：`ack.command_id` 就是本侧为 `SessionCreate`
 /// 生成并透传的那个 id（见 `App::new_session_with_cwd`），且 `qaqh-client` 的

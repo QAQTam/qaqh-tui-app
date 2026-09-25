@@ -3,7 +3,7 @@
 //! 数据源 = **timeline 模型**（非渲染缓存）：输出与终端宽度无关、可跨端复用；
 //! 展示投影（display）优先、H16 旧字段回退，与渲染层同一口径。
 //!
-//! v1 范围：仅当前窗口内的回合（`timeline.turns`）；更早回合的折叠/归档
+//! 范围：仅当前窗口内的回合（`timeline.turns`）；更早回合的折叠/归档
 //! 状态如实标注在头部（B1「丢弃必须可见」）。reasoning body 不驻留
 //! （D1 有损客户端纪律）——思考信息以回合头的聚合计数呈现。
 
@@ -262,8 +262,18 @@ fn tool_state_label(s: TimelineToolState) -> &'static str {
     }
 }
 
-// human_bytes：与渲染层共用（契约 P2 展示口径）
-use crate::app::render_transcript::human_bytes;
+/// 人类可读字节（契约 P2 展示口径）。
+fn human_bytes(bytes: u64) -> String {
+    const KB: u64 = 1024;
+    const MB: u64 = 1024 * KB;
+    if bytes >= MB {
+        format!("{:.1} MB", bytes as f64 / MB as f64)
+    } else if bytes >= KB {
+        format!("{:.1} KB", bytes as f64 / KB as f64)
+    } else {
+        format!("{bytes} B")
+    }
+}
 
 #[cfg(test)]
 mod tests {

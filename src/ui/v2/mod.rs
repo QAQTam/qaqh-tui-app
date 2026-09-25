@@ -7,8 +7,6 @@ pub mod adapter;
 pub mod fullscreen;
 pub mod markdown;
 pub mod modal;
-pub mod projector;
 pub mod route;
-pub mod runtime;
 pub mod transcript;
 pub mod workspace;

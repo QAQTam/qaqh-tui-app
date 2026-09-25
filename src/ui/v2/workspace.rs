@@ -1,7 +1,7 @@
 //! V2 alternate-screen Workspace。
 //!
-//! Workspace 只负责管理面与只读观测；正文历史仍由 Agent View 的 inline
-//! viewport 与终端 scrollback 承担，因此这里不会调用 `insert_before`。
+//! Workspace 只负责管理面与只读观测；正文历史由 V2 fullscreen Agent View
+//! 自己持有，因此这里不维护终端 scrollback。
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -331,9 +331,9 @@ fn session_list_window(
 
 /// `/history`：按回合浏览当前会话。
 ///
-/// 数据源是 **timeline 模型**（不是终端 scrollback —— 那个读不回来，也没有
-/// 搜索）。列表回答"有哪些回合"，详情回答"这个回合到底说了什么"；两者都用
-/// **同一份导出文本**，所以「详情里看到的 = 按 `e` 导出的」。
+/// 数据源是 **timeline 模型**。列表回答"有哪些回合"，详情回答"这个回合到底
+/// 说了什么"；两者都用 **同一份导出文本**，所以「详情里看到的 = 按 `e`
+/// 导出的」。
 fn draw_history(
     f: &mut Frame,
     app: &App,
@@ -686,7 +686,7 @@ fn draw_help(f: &mut Frame, area: Rect, theme: &Theme) {
     ];
     let mut lines = Vec::with_capacity(entries.len() + 3);
     lines.push(Line::from(Span::styled(
-        " 默认 Agent View 使用 inline viewport；Workspace 与 Modal 使用 alternate screen。",
+        " Agent View、Workspace 与 Modal 都在 fullscreen shell 内。",
         Style::new().fg(theme.text.secondary),
     )));
     lines.push(Line::default());

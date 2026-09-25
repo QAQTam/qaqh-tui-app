@@ -23,7 +23,7 @@ set -u
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 REPO_ROOT=$(cd -- "$SCRIPT_DIR/.." && pwd)
-BACKEND_ROOT=${QAQH_BACKEND_ROOT:-$REPO_ROOT/../qaqh-backend-anchor}
+BACKEND_ROOT=${QAQH_BACKEND_ROOT:-$REPO_ROOT/../qaqh-backend}
 DAEMON=${DAEMON:-$BACKEND_ROOT/target/debug/qaqh-daemon}
 TUI=${TUI:-$REPO_ROOT/target/debug/qaqh-tui}
 D=${D:-/tmp/qaqh-e2e-v2-tmux}
@@ -206,7 +206,7 @@ wrapper.write_text(
     f'export QAQH_DATA_DIR="{DATA}"\n'
     f'echo "{BANNER}"\n'
     'for i in $(seq 1 40); do echo "filler-$i"; done\n'
-    f'"{TUI}" --v2-agent --no-spawn\n'
+    f'"{TUI}" --no-spawn\n'
     'echo "TUI_EXIT=$?"\n'
     "sleep 120\n"
 )

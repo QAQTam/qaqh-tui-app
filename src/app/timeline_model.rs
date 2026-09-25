@@ -255,27 +255,9 @@ impl Block {
         }
     }
 
-    pub fn is_streaming(&self) -> bool {
-        self.state == TimelineBlockState::Open
-    }
-
     /// 标记内容已变（任何可能影响渲染的写入之后调用）。
     fn touch(&mut self) {
         self.rev = self.rev.wrapping_add(1);
-    }
-
-    /// 该块是否含“随时间变化的字形”（spinner / ▌ 光标 / 进度条）。
-    ///
-    /// T8 后动画已出带（AnimSlot），缓存不再依赖它；保留供 §3.5 帧调度
-    /// （dirty 判定）在 M2 接线。
-    #[allow(dead_code)]
-    pub fn is_animating(&self) -> bool {
-        if self.state == TimelineBlockState::Open {
-            return true;
-        }
-        self.tool
-            .as_ref()
-            .is_some_and(|t| t.state == TimelineToolState::Running)
     }
 }
 
@@ -414,7 +396,7 @@ pub struct TimelineModel {
     pub truncated_before: bool,
     pub version: u64,
     /// 权威快照整体替换的代际；undo/compact/rebaseline 用它触发 terminal
-    /// scrollback purge 与 projector/ledger 重建。
+    /// fullscreen transcript cache 的重建。
     pub rebaseline_epoch: u64,
     /// B1 可观测：事件引用的 block/tool 卡缺失被丢弃的次数（契约异常信号）。
     /// 设计内幂等丢弃不计入：旧 fragment_seq 重放、快照窗口外迟到条目。
@@ -427,18 +409,6 @@ pub struct TimelineModel {
 impl TimelineModel {
     fn bump(&mut self) {
         self.version += 1;
-    }
-
-    /// B1 可观测：非零丢弃时返回紧凑摘要（status_bar 展示），恒零返回
-    /// None——正常会话该信号必须完全不可见（零噪声设计）。
-    pub fn dropped_summary(&self) -> Option<String> {
-        if self.dropped_missing_block == 0 && self.dropped_missing_turn == 0 {
-            return None;
-        }
-        Some(format!(
-            "⚠ dropped b={} t={}",
-            self.dropped_missing_block, self.dropped_missing_turn
-        ))
     }
 
     fn find_turn_mut(&mut self, turn_id: &str) -> Option<&mut Turn> {
@@ -781,11 +751,6 @@ impl TimelineModel {
             Some(gi) => gi + 1,
             None => (self.dropped_turns + idx + 1) as u64,
         }
-    }
-
-    /// 会话总回合数（含已从窗口丢弃的）。
-    pub fn turn_total(&self) -> u64 {
-        self.total_turns.max(self.dropped_turns + self.turns.len()) as u64
     }
 
     pub fn last_turn_id(&self) -> Option<&str> {
@@ -2039,8 +2004,6 @@ mod tests {
     #[test]
     fn dropped_counters_signal_contract_anomalies_only() {
         let mut m = TimelineModel::default();
-        assert_eq!(m.dropped_summary(), None, "恒零必须零噪声");
-
         // 引用缺失 turn 的事件：计入 missing_turn，不 bump version。
         m.apply(&entry(
             1,
@@ -2054,7 +2017,6 @@ mod tests {
         assert_eq!(m.dropped_missing_turn, 1);
         assert_eq!(m.dropped_missing_block, 0);
         assert_eq!(m.version, 0, "丢弃不触发渲染缓存失效");
-        assert!(m.dropped_summary().is_some());
 
         // 引用缺失 block 的事件：计入 missing_block。
         m.apply(&entry(
@@ -2351,26 +2313,6 @@ mod tests {
                 ..
             })
         ));
-        // 渲染断言：标题含完整命令 + metrics 尾注（既有锁的 fixture 形状对齐）。
-        let block = Block {
-            block_id: "b1".into(),
-            block_order: 0,
-            kind: TimelineBlockKind::Tool,
-            state: TimelineBlockState::Sealed,
-            text: String::new(),
-            tool: Some(card),
-            last_fragment: 0,
-            rev: 1,
-        };
-        let mut sink = crate::app::render_transcript::AnimSink::Bake;
-        let lines = crate::app::render_transcript::render_block_lines(&block, 80, &mut sink);
-        let flat: String = lines
-            .iter()
-            .flat_map(|l| l.spans.iter().map(|s| s.text.as_str()))
-            .collect::<Vec<_>>()
-            .join("|");
-        assert!(flat.contains("cargo test"), "exec 标题：{flat}");
-        assert!(flat.contains("2.3s"), "metrics 尾注：{flat}");
     }
 
     #[test]

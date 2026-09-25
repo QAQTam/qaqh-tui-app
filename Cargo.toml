@@ -2,7 +2,7 @@
 name = "qaqh-tui"
 version = "2.0.0-alpha2"
 edition = "2024"
-description = "Terminal UI client for the QAQ-Harness daemon (Ringing protocol v1)"
+description = "Terminal UI client for the QAQ-Harness daemon (Ringing v2)"
 license = "MIT"
 
 [[bin]]
@@ -10,8 +10,8 @@ name = "qaqh-tui"
 path = "src/main.rs"
 
 [dependencies]
-# 传输层权威实现（Ringing V1 客户端）。T-01 阶段一后，连接生命周期、三频道
-# SSE 流与 per-seed timeline 流全部由它承担，本仓不再自建。
+# 传输层权威实现（Ringing V2 客户端）。连接生命周期、单流与
+# per-seed timeline 流全部由它承担，本仓不再自建。
 #
 # 路径依赖跨 workspace 正常工作（qaqh-client 经 path 依赖 qaqh-domain/
 # qaqh-ringing/qaqh-types，并用 version/lints workspace = true）；代价是后端

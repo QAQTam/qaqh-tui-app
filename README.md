@@ -1,7 +1,7 @@
 # qaqh-tui
 
 QAQ-Harness 的终端前端（ratatui + tokio），基于 `qaqh.Ringing` v2 单流协议直连本地 daemon。
-当前默认进入 **V2 Fullscreen**；`--v2-agent` 保留为兼容别名，`--v1` 可强制回退旧全屏路径。
+当前唯一 UI 是 **V2 Fullscreen**；旧 TUI v1 全屏与 V2 inline 设计已删除。
 
 ## 运行
 
@@ -13,9 +13,8 @@ cargo build --release
 # 自检：发现 → 存活 → /health → open 握手
 ./target/release/qaqh-tui.exe doctor
 
-# 兼容别名；显式回退 v1 全屏
-./target/release/qaqh-tui.exe --v2-agent
-./target/release/qaqh-tui.exe --v1
+# 浏览当前 cwd 下的会话
+./target/release/qaqh-tui.exe resume
 ```
 
 环境变量：`QAQH_DATA_DIR`（数据目录覆盖，默认 `%USERPROFILE%\.qaqh`）、
@@ -38,12 +37,10 @@ TUI 自身默认不落日志。设了 `QAQH_TUI_LOG=<path>` 后才安装一个�
 一句「断开，1000ms 后重连」，具体原因只在日志里（`ReconnectReason` 只覆盖服务端
 主动终止流，普通 HTTP 错误如 401 不带 reason）。
 
-### V2 Fullscreen（当前默认）
+### V2 Fullscreen
 
 ```bash
 cargo run
-# 兼容旧脚本/显式写法
-cargo run -- --v2-agent
 ```
 
 连接 daemon，复用 Runtime/App 状态。全屏 shell 在 alternate screen 中自持 transcript
@@ -57,8 +54,8 @@ Workspace/Modal、会话选择器、设置、权限/ask/plan 共用 v2 路由层
 - permission / ask / plan 按钮 hover / 按下 / 点击
 - Settings 行点击
 
-`--no-spawn` 与 v1 语义一致；`--v1` 强制回退旧全屏路径。早期
-`--v2-inline` 隔离原型已退役。
+`--no-spawn` 只连接已有 daemon，不自动拉起。旧的 `--v1` 与
+`--v2-inline` 入口会明确报错退出。
 
 ask_user 采用阻塞式单题分页：`←/→` 切题，`↑/↓` 移动选项，`Enter`
 选择并前进，`Space` 只选择，`1-9/a-f` 直接选择，`e`/`z` 输入自定义答案，
@@ -68,16 +65,14 @@ ask_user 采用阻塞式单题分页：`←/→` 切题，`↑/↓` 移动选项
 
 | 区域 | 说明 |
 |---|---|
-| 标签栏 | 多会话 tab；`!`＝挂起交互、`…`＝流式中；Alt+1..9 / Alt+←→ 切换 |
-| 会话信息 | model / plan·code 模式 / 代码增删 / seed |
 | transcript | timeline 权威投影：回合 → 块（text / reasoning 折叠 / 工具卡） |
-| workspace 侧栏 | todo 列表 + 最近改动（DashboardSnapshot 活状态；F4 开关，<100 列自动隐藏） |
+| Workspace | F4 打开 todo / 最近改动 / 会话 / 设置 / 帮助工作区 |
 | composer | Enter 发送 · Ctrl+P 模式 · Ctrl+A 附件 · Ctrl+Y 撤销回合 · Ctrl+E 压缩 |
 | 状态栏 | 连接相位 + epoch · toast · token 用量与上下文占比 · 活动 · 时钟 |
 
-全局：Ctrl+T 思考回放（当前回合）· Ctrl+N 新建会话 · Ctrl+W 关闭标签（会话保留）·
+全局：Ctrl+T 思考回放（当前回合）· Ctrl+N 新建会话 · Alt+W 关闭标签（会话保留）·
 Ctrl+L 会话列表（恢复/归档/删除，D 删除需确认）· Ctrl+, 配置面板 · F1 帮助 ·
-F3 活动区显隐 · Ctrl+C×2 / Ctrl+Q 退出。
+Ctrl+C×2 / Ctrl+Q 退出。
 思考回放浮层：↑↓/PgUp/PgDn 滚动 · `e` 交给 `$PAGER` 全文浏览（默认 `less -R`）· Esc 关闭。
 
 Slash：`/new [cwd]` 新建 · `/help` 帮助 · `/clear` 清空输入 ·

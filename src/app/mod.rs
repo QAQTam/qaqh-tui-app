@@ -8,13 +8,10 @@ mod composer_ops;
 pub(crate) mod export;
 mod interaction;
 pub(crate) mod keymap;
-pub mod markdown;
 mod overlay_ops;
 pub(crate) mod pager;
 mod paste_guard;
-pub(crate) mod render;
 pub mod render_line;
-pub mod render_transcript;
 pub(crate) mod ringing_v2;
 pub mod session;
 mod session_ops;
@@ -50,22 +47,6 @@ use session::{
     conversation_cache_from_v2, streaming_done, sync_streaming_from_timeline,
 };
 
-/// `ensure_render_caches` 里「refresh → 用刷新后的总行数重算视口顶端」的迭代上限。
-///
-/// ⚠ 与 `render::MAX_LAYOUT_PASSES` **数值相同但语义不同**（那个是「布局不动点」的轨数，
-/// 本值是「视口不动点」的轨数），分居两文件：**改一个不必改另一个**，也不要当成同一个参数一起调。
-///
-/// 为什么要迭代：`refresh` 会把估算高度换成精确高度 ⇒ **总行数会在 refresh 中改变**，
-/// 用刷新前的 total 算出的 `top` 与 `draw` 用刷新后的 total 算出的 `top` 不一致，
-/// 窗口就会落到未渲染块上（issue #33）。实测首帧 2~3 趟收敛；上限只是防呆，
-/// 即使超出，`TranscriptCache::viewport` 仍保证 `draw` 取到**同一份**几何——
-/// 不变量不会破，最多滚动位置晚一帧收敛。
-const VIEWPORT_FIXPOINT_PASSES: usize = 4;
-
-/// 保留 timeline 模型的最近焦点标签数（LRU；超出者仅存轻状态，
-/// 重新聚焦时 re-baseline 重建 transcript）。对照 opencode sync 的
-/// "进入会话全量重取 + 滑动窗口" 策略。
-const ACTIVE_MODELS: usize = 4;
 // 单会话内存回合**不设硬上限**。
 //
 // 历史上这里有个 `TURNS_CAP = 400` 的计数切片。删除它的理由：
@@ -505,14 +486,14 @@ pub enum Overlay {
     Confirm {
         action: ConfirmAction,
     },
-    /// 二级：/new 的 cwd 输入（/ 本身的一级菜单为 inline 浮层，非 overlay）
+    /// 二级：/new 的 cwd 输入（/ 本身的一级菜单为就地浮层，非 overlay）
     CwdInput {
         input: Vec<char>,
         cursor: usize,
     },
     /// `/history`：按回合浏览当前会话。
     ///
-    /// 数据源是 **app 自己的 timeline 模型**，不是终端 scrollback —— 后者读不回来
+    /// 数据源是 **app 自己的 timeline 模型**，不依赖终端回滚缓冲。
     /// （没有标准序列），而且会被终端 evict。`detail` 为真时进入该回合的只读
     /// 详情视图（`selected` 指向 `timeline.turns` 的下标）。
     History {
@@ -624,29 +605,6 @@ pub fn prune_seed_bound_overlays(overlays: &mut Vec<Overlay>, seed: Option<&str>
 
 use self::settings::{FieldKind, SettingsState};
 
-/// 主循环帧统计（`QAQH_TUI_DEBUG=1` 展示）。
-///
-/// 由 `main.rs` 主循环每秒结算一次：把「wire 事件率」与「终端实际刷新率」
-/// 两个数字分开，再把整帧耗时拆成三段——渲染管线 / 终端写入 / 事件处理，
-/// 用于定位观感瓶颈到底在应用侧还是终端侧。
-#[derive(Debug, Clone, Copy, Default)]
-pub struct FrameStats {
-    /// 最近一秒完成的帧数（每帧 = 一次 `terminal.draw`）。
-    pub fps: u32,
-    /// 最近一秒消费的运行时消息数（`AppMsg::Runtime`；≈ timeline 事件率）。
-    pub events_per_s: u32,
-    /// 最近一秒的平均整帧耗时（`ref_us + term_us`）。
-    pub draw_us: u64,
-    /// 其中：`ensure_render_caches`（渲染管线：段对齐 + 物化 + 淘汰）。
-    pub ref_us: u64,
-    /// 其中：`terminal.draw`（`ui::draw` + ratatui diff + 终端写入/刷新）。
-    pub term_us: u64,
-    /// 其中：`app.handle`（每帧平均；批量事件合计摊到帧）。
-    pub handle_us: u64,
-    /// 最近一秒内单次 refresh 的最大重渲块数（⟂ 峰值）。
-    pub peak_rebuilt: u32,
-}
-
 /// 弹窗里一个**可点目标**。
 ///
 /// 这是"语义目标"，不是坐标：坐标由渲染层按同一套布局算（见
@@ -733,14 +691,9 @@ pub struct App {
     pub config: Option<ConfigDto>,
     /// settings 保存请求在途标记（防 config.save 双发——事故 R4）。
     pub settings_saving: bool,
-    /// F3（M2 重定义）：ActivityBar 显隐（§4.4）。旧「思考链全局展开」语义废止。
-    pub show_activity: bool,
     /// 右侧 workspace 面板开关（F4；窄终端自动隐藏）。
     pub show_workspace: bool,
     pub tracked_seeds: HashSet<String>,
-    /// 最近焦点顺序（MRU，头 = 最近）。
-    pub focus_order: Vec<String>,
-    pub last_focused: Option<String>,
     /// todo 详情折叠（F6）。
     pub show_todo_detail: bool,
     pub last_tick: Instant,
@@ -762,8 +715,6 @@ pub struct App {
     /// M4（T15）：待交给 `$PAGER` 的文本——Ctrl+T 浮层按 `e` 置位；
     /// main.rs 主循环在帧间消费（挂起终端 → 分页器 → 恢复）。
     pub pending_pager: Option<String>,
-    /// 主循环帧统计（`QAQH_TUI_DEBUG=1` 时在状态栏展示）。
-    pub frame_stats: FrameStats,
     /// 后端回合终态到达时置位；主循环下一帧清 viewport 后强制重绘。
     pub force_redraw: bool,
 }
@@ -852,11 +803,8 @@ impl App {
             dashboard_fetching: HashSet::new(),
             config: None,
             settings_saving: false,
-            show_activity: true,
             show_workspace: true,
             tracked_seeds: HashSet::new(),
-            focus_order: Vec::new(),
-            last_focused: None,
             show_todo_detail: true,
             last_tick: Instant::now(),
             paste_guard: PasteGuard::default(),
@@ -868,7 +816,6 @@ impl App {
             inspect: None,
             subagent_seeds: HashSet::new(),
             pending_pager: None,
-            frame_stats: FrameStats::default(),
             force_redraw: false,
         }
     }
@@ -880,14 +827,9 @@ impl App {
             AppMsg::Runtime(m) => self.handle_runtime(m),
             AppMsg::Action(a) => self.handle_action(a),
             AppMsg::Key(k) => self.handle_key(k),
-            AppMsg::Mouse(m) => self.handle_mouse(m),
+            AppMsg::Mouse(_) => {}
             AppMsg::Paste(text) => self.handle_paste(text),
-            AppMsg::Resize => {
-                // 宽度变化 → 渲染缓存全部失效。
-                for s in self.sessions.values_mut() {
-                    s.block_cache = None;
-                }
-            }
+            AppMsg::Resize => {}
             AppMsg::Tick => self.handle_tick(),
         }
     }
@@ -933,20 +875,6 @@ impl App {
             if count > 0 && self.home_selected >= count {
                 self.home_selected = count - 1;
             }
-        }
-    }
-
-    fn handle_mouse(&mut self, m: MouseEvent) {
-        use ratatui::crossterm::event::MouseEventKind;
-        match m.kind {
-            MouseEventKind::ScrollUp => self.scroll_up(3),
-            MouseEventKind::ScrollDown => self.scroll_down(3),
-            MouseEventKind::Down(kind)
-                if kind == ratatui::crossterm::event::MouseButton::Left && m.row == 0 =>
-            {
-                self.click_tab(m.column);
-            }
-            _ => {}
         }
     }
 
@@ -1055,11 +983,8 @@ impl App {
                 let Some(sess) = self.sessions.get_mut(&seed) else {
                     return;
                 };
-                // 重基线 = 权威时间线已就绪：压缩动画兜底清除。
-                sess.compact_anim = None;
                 let was_follow = sess.scroll.follow;
                 let first_load = !sess.ready;
-                sess.needs_rebaseline = false;
                 sess.timeline.replace_from_page(&page);
                 sess.ready = true;
                 sync_streaming_from_timeline(sess);
@@ -1067,7 +992,6 @@ impl App {
                     sess.scroll.follow = true;
                     sess.scroll.offset = 0;
                 }
-                sess.block_cache = None;
                 // 子代理：重扫工具卡 + 终态兑底推导。
                 self.handle_subagent_rebaseline(&seed);
             }
@@ -1267,7 +1191,9 @@ impl App {
             qaqh_client::ClientV2Payload::ResourceDelta(delta) => {
                 self.handle_resource_delta(seed, delta)
             }
-            qaqh_client::ClientV2Payload::TimelineDelta(_)
+            qaqh_client::ClientV2Payload::MailboxDelta(_)
+            | qaqh_client::ClientV2Payload::TeamDelta(_)
+            | qaqh_client::ClientV2Payload::TimelineDelta(_)
             | qaqh_client::ClientV2Payload::AuditRef(_)
             | qaqh_client::ClientV2Payload::Unknown(_) => {}
         }
@@ -1408,7 +1334,6 @@ impl App {
                 });
                 match outcome {
                     ringing_v2::DriverOutcome::Applied => {
-                        sess.block_cache = None;
                         self.force_redraw = true;
                     }
                     ringing_v2::DriverOutcome::Duplicate => {}
@@ -1715,9 +1640,7 @@ impl App {
                 streaming_done(sess, Some(turn_id.as_str()));
                 force_redraw = true;
             }
-            D::CompactionApplied { .. } => {
-                sess.compact_anim = None;
-            }
+            D::CompactionApplied { .. } => {}
             D::InputAccepted { .. } => {}
         }
         if force_redraw {
@@ -1820,7 +1743,6 @@ impl App {
                         // 不能只恢复 permission：v2 流的 snapshot cursor 会跳过
                         // “快照中已经挂起”的事实，ask / plan 也必须从这里补面板。
                         let pending_interactions = ctl.interactions.clone();
-                        sess.block_cache = None;
 
                         for interaction in pending_interactions {
                             self.restore_pending_interaction(bootstrap_seed.clone(), interaction);
@@ -1981,14 +1903,9 @@ impl App {
             ActionResult::Uploaded { seed, path, result } => match result {
                 Ok(content) => {
                     if let Some(sess) = self.sessions.get_mut(&seed) {
-                        let name = std::path::Path::new(&path)
-                            .file_name()
-                            .map(|s| s.to_string_lossy().to_string())
-                            .unwrap_or_else(|| path.clone());
-                        sess.composer.attachments.push(session::Attachment {
-                            path: name,
-                            content,
-                        });
+                        sess.composer
+                            .attachments
+                            .push(session::Attachment { content });
                         self.toast(NoticeLevel::Info, "附件已上传".to_string());
                     } else {
                         // 上传途中目标会话被关闭（异步竞态）：上传成功也无处可挂，
@@ -2009,7 +1926,6 @@ impl App {
                     sess.timeline.replace_from_page(&page);
                     sess.scroll.follow = true;
                     sess.scroll.offset = 0;
-                    sess.block_cache = None;
                 }
             }
             ActionResult::LoadOlder { seed, result } => {
@@ -2018,7 +1934,6 @@ impl App {
                     // prepend 而非 replace：已加载的窗口内容保留；
                     // offset（距底行数）不变，视口内容相对稳定。
                     sess.timeline.prepend_older(&page);
-                    sess.block_cache = None;
                 } else if let Some(sess) = self.sessions.get_mut(&seed) {
                     sess.loading_older = false;
                 }
@@ -2221,13 +2136,6 @@ impl App {
                 self.toggle_overlay(Overlay::Help);
                 return;
             }
-            Some(GlobalKey::ToggleReasoning) => {
-                self.show_activity = !self.show_activity;
-                for s in self.sessions.values_mut() {
-                    s.block_cache = None;
-                }
-                return;
-            }
             Some(GlobalKey::ToggleWorkspace) => {
                 let opening = !self.show_workspace;
                 self.show_workspace = !self.show_workspace;
@@ -2238,10 +2146,6 @@ impl App {
             }
             Some(GlobalKey::ToggleTodoDetail) => {
                 self.show_todo_detail = !self.show_todo_detail;
-                return;
-            }
-            Some(GlobalKey::ToggleToolExpand) => {
-                self.toggle_tool_expand();
                 return;
             }
             Some(GlobalKey::Reconnect) => {
@@ -2317,82 +2221,6 @@ impl App {
         } else {
             self.overlays.push(overlay);
         }
-    }
-
-    /// 每帧前维护：焦点变化时执行 LRU 内存回收；只为 active 会话维护渲染缓存。
-    ///
-    /// 四个关键点（对应 A1/A2/A3 + 虚拟化）：
-    ///
-    /// - **A1 宽度对齐**：内容宽取自 `ui::transcript_viewport`（与
-    ///   `transcript::draw` 同一事实源），而不是终端全宽。历史缺陷就是两者
-    ///   永不相等 → 缓存 100% 失效 → 每帧两次全量渲染。
-    /// - **A2 无变化不重渲**：只在内容键变化（或存在动画段）时才动；空闲
-    ///   帧不重建任何段。
-    /// - **A3 分段缓存**：按回合分段，只重渲键变了的段，其余复用 `Arc`。
-    ///   流式只重渲正在增长的那一段，不再扫全量历史。
-    /// - **虚拟化**：只保留视口附近段的渲染结果，离屏段退化为估算高度；
-    ///   滚动几何由高度之和给出，无需渲染全量历史。
-    pub fn ensure_render_caches(&mut self, area: ratatui::layout::Rect) {
-        let Some(active) = self.view_seed() else {
-            return;
-        };
-        if self.last_focused.as_deref() != Some(active.as_str()) {
-            self.touch_focus(&active);
-            self.last_focused = Some(active.clone());
-        }
-        let show_workspace = self.show_workspace;
-        let composer_height = crate::ui::composer::height(self);
-        let activity_height = crate::ui::activity_bar::height(self);
-        let (width, height) =
-            crate::ui::transcript_viewport(area, composer_height, activity_height, show_workspace);
-        let Some(sess) = self.sessions.get_mut(&active) else {
-            return;
-        };
-        // 缓存内嵌于 SessionState：take 出来以满足 refresh 的 &SessionState 借用
-        // （结构体 move 是指针搬运，O(1)）。
-        let mut cache = sess
-            .block_cache
-            .take()
-            .unwrap_or_else(|| render::TranscriptCache::new(width));
-        refresh_at_viewport(sess, width, height, &mut cache);
-        sess.block_cache = Some(cache);
-    }
-}
-
-/// 视口不动点：在 `cache` 上把视口覆盖到的块渲染齐，供本帧 `draw` 取窗口。
-///
-/// 为什么要迭代：`refresh` 会把估算高度换成精确高度 ⇒ **总行数会在 refresh 中改变**，
-/// 用刷新前的 total 算出的 `top` 与 `draw` 用刷新后的 total 算出的 `top` 不一致，
-/// 窗口就会落到未渲染块上（issue #33：debug 直接 panic，release 静默空屏）。
-/// 所以迭代到「用刷新后的 total 算出的 top 与上一趟相同」为止；实测首帧 2~3 趟收敛，
-/// 第 2 趟起几乎全是复用（O(keep)）。上限只是防呆——即使超出，
-/// `TranscriptCache::viewport` 仍保证 `draw` 取到**同一份**几何，不变量不会破。
-///
-/// 抽成自由函数是为了**可测**：`app::render` 的回归锁直接调它，不必复刻这套循环。
-pub(crate) fn refresh_at_viewport(
-    sess: &SessionState,
-    width: u16,
-    height: usize,
-    cache: &mut render::TranscriptCache,
-) {
-    let mut top = crate::ui::viewport_top(
-        cache.total_lines(),
-        height,
-        sess.scroll.follow,
-        sess.scroll.offset,
-    );
-    for _ in 0..VIEWPORT_FIXPOINT_PASSES {
-        render::refresh(sess, width, Some((top, height)), cache);
-        let next = crate::ui::viewport_top(
-            cache.total_lines(),
-            height,
-            sess.scroll.follow,
-            sess.scroll.offset,
-        );
-        if next == top {
-            break;
-        }
-        top = next;
     }
 }
 
@@ -2983,7 +2811,7 @@ mod tests {
     /// 此前只测了 `session_ops::apply_rejected_ack` 本身，把本文件 handler 里那行
     /// 调用换回旧行为（只 toast、不撤销）时**全绿**——本次主修复唯一生效的那层
     /// 没有网。本测试打穿 `App::handle` → `handle_action`，锁的是**状态栏
-    /// `· creating…` 的消失**（`ui/status_bar.rs:40` 读的就是 `pending_creates`），
+    /// `· creating…` 的消失**（`pending_creates` 驱动状态展示），
     /// 不是函数返回值。
     ///
     /// 变异验证（实测）：把 `handle_action` 里的 `apply_rejected_ack` 调用换回
@@ -3062,7 +2890,7 @@ mod tests {
     }
 
     fn channel(c: qaqh_client::Channel) -> StreamKey {
-        // v1 三频道已并入每 seed 一条的 v2 单流；测试里仍用频道名当不同的流身份。
+        // v2 使用每 seed 一条单流；测试里仍用频道名当不同的流身份。
         StreamKey::V2(c.as_str().to_string())
     }
 
@@ -3667,40 +3495,5 @@ mod tests {
         }));
 
         assert!(app.dashboard_fetching.contains("seed"));
-    }
-
-    /// **渲染缓存纪律回归**（机主实测 ⟂ 峰值 466 的根因）：
-    /// dashboard（todo / 最近改动）只被 workspace 侧栏消费
-    /// （`ui/sidebar.rs` 直读 `sess.dashboard`），与 transcript 渲染缓存无关；
-    /// 而它在工具调用期高频更新——清缓存 = 每次工具调用整缓存重建
-    /// （实测 ⟂ 峰值 466 ≈ 全量重渲）。
-    ///
-    /// 证伪方式：把任一处 `sess.block_cache = None` 加回 dashboard 路径 → 本测试红。
-    #[test]
-    fn dashboard_updates_must_not_clear_transcript_cache() {
-        let (mut app, _rx) = app_with_tabs(&["seed"], 0);
-        app.sessions.get_mut("seed").unwrap().block_cache =
-            Some(crate::app::render::TranscriptCache::new(80));
-
-        let snapshot = || qaqh_client::DomainDashboardSnapshot {
-            seed: "seed".into(),
-            documents: Vec::new(),
-            recent_edits: vec!["src/lib.rs".into()],
-            tasks: Vec::new(),
-            current_todo_id: None,
-        };
-
-        // ① v2 投影没有 dashboard 增量（v1 的 control DashboardSnapshot 已随
-        //    三频道流删除）——workspace 面板只走下面的 service 拉取路径。
-
-        // ② service 拉取兜底路径（DashboardUpdated → fetch_dashboard 的结果）。
-        app.handle(AppMsg::Action(ActionResult::Dashboard {
-            seed: "seed".into(),
-            result: Ok(snapshot()),
-        }));
-        assert!(
-            app.sessions["seed"].block_cache.is_some(),
-            "Dashboard 结果不得清空 transcript 渲染缓存"
-        );
     }
 }

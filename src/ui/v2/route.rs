@@ -1,9 +1,7 @@
 //! V2 屏幕路由。
 //!
-//! Agent View 在 inline 模式使用动态 viewport；在 fullscreen 模式常驻
-//! alternate screen。Workspace 与 Modal 在 inline 模式下临时进入 alternate，
-//! fullscreen 模式下与 Agent 共用同一张屏幕。路由是纯函数，只读取 App 状态，
-//! 供终端生命周期与绘制共用同一事实源。
+//! Agent View、Workspace 与 Modal 共用同一张 fullscreen alternate screen。
+//! 路由是纯函数，只读取 App 状态，供终端生命周期与绘制共用同一事实源。
 
 use crate::app::{App, Overlay};
 
@@ -206,7 +204,7 @@ mod tests {
         app.overlays.push(Overlay::Help);
         assert_eq!(resolve(&app), ScreenRoute::Workspace(WorkspaceRoute::Help));
 
-        // `/history` 也是全屏 Workspace（alternate screen），不是 inline 浮层。
+        // `/history` 也是全屏 Workspace（alternate screen）。
         app.overlays.clear();
         app.overlays.push(Overlay::History {
             selected: 3,

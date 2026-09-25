@@ -200,15 +200,6 @@ main() {
     cargo test --all-targets
 
     echo
-    echo "== 性能门禁（M6.4）=="
-    # 必须单线程（内存判据走全局分配器计数，并行测试会污染读数）。
-    # 钉的是结构性性质，不是绝对耗时——判据表见 src/app/render/bench.rs。
-    if ! "$root/scripts/perf-gate.sh"; then
-        echo "✗ 性能门禁未通过。" >&2
-        exit 1
-    fi
-
-    echo
     echo "== 静态门禁（跨仓契约，Ringing v2 冻结语义）=="
     # 把「TUI 不碰后端内部」变成可执行检查；白名单显式带理由。
     # 出处：后端冻结 spec §0/§11/§12、TUI issue #46 task 6。

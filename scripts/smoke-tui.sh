@@ -1,10 +1,8 @@
 #!/bin/bash
 # 构建后自检：TUI 二进制能不能起来、首帧有没有渲染、有没有 panic。
 #
-# 为什么需要它：issue #33（P0）就是**首帧**问题——`top` 被算两遍（refresh 前后 total 不同），
-# 窗口落在未渲染块上：debug 直接 panic，release 整个视口静默变空。这类问题
-# **单测锁能抓**（见 `render/mod.rs` 的两条 P0 锁），但「构建出来的那个二进制能不能跑」
-# 只有真跑一次才知道。本脚本比 `e2e-lease-expiry.sh` 轻得多，适合每次构建后顺手跑。
+# 为什么需要它：首帧空屏、初始化 panic 这类问题，单测未必覆盖真实终端路径；
+# 「构建出来的那个二进制能不能跑」只有真跑一次才知道。
 #
 # 判据（缺一即红）：
 #   ① 输出里**没有 panic**；
@@ -19,26 +17,22 @@
 # ⚠ Linux 下 data root 的 basename 必须是 `qaqh`（Windows 才是 `.qaqh`）。
 # ⚠ 不要用 `pkill -f <模式>` 清理：脚本自身的命令行就含那些模式。全程按显式 PID 操作。
 #
-# **它不覆盖什么**（如实标注）：本脚本跑的是**空会话**（隔离 daemon 里没有历史），
-# 所以走不到「长会话 → 视口落在未渲染块」那条路径。那条路径由 `render/mod.rs` 里的
-# 夹具锁（`sweep_fixture(120)`）覆盖；本脚本只回答「这个二进制起得来吗」。
+# **它不覆盖什么**（如实标注）：本脚本跑的是**空会话**，只回答
+# 「这个二进制起得来吗」，不覆盖长会话滚动与交互路径。
 
 set -u
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 REPO_ROOT=$(cd -- "$SCRIPT_DIR/.." && pwd)
-# 默认吃**锚点 worktree**（TUI 钉的 rev，见 scripts/ci-linux.sh 的 QAQH_BACKEND_REV），
-# 而不是开发者正在用的 ../qaqh-backend 工作树——否则 e2e 会跑到别人分支构建的
-# daemon 上，与本仓门禁的锚点不是同一个东西。
-BACKEND_ROOT=${QAQH_BACKEND_ROOT:-$REPO_ROOT/../qaqh-backend-anchor}
+# 默认吃兄弟仓 ../qaqh-backend；调用方仍可用 QAQH_BACKEND_ROOT 覆盖。
+BACKEND_ROOT=${QAQH_BACKEND_ROOT:-$REPO_ROOT/../qaqh-backend}
 DAEMON=${DAEMON:-$BACKEND_ROOT/target/debug/qaqh-daemon}
 TUI=${TUI:-$REPO_ROOT/target/debug/qaqh-tui}
 D=${D:-/tmp/qaqh-smoke-tui}
 RUN_SECS=${RUN_SECS:-8}
 
-# ⚠ 守卫（评审阻断 2）：`D` 可被环境覆盖，而下面要 `rm -rf "$D"`。误设 `D=/`、`D=/tmp`
-# 或指向工作目录都会变成一次破坏性删除。同仓 `e2e-lease-expiry.sh:46-49` 已为同类问题
-# 加了同样守卫，本脚本不能漏。
+# ⚠ 守卫：`D` 可被环境覆盖，而下面要清理它。误设 `D=/`、`D=/tmp`
+# 或指向工作目录都会变成一次破坏性删除。
 case "$D" in
   /tmp/*|/var/tmp/*) ;;
   *) echo "拒绝：D 必须落在 /tmp 或 /var/tmp 下（当前：$D）——本脚本会对它 rm -rf" >&2; exit 1 ;;
@@ -77,8 +71,8 @@ if [ "$ok" != 1 ]; then
 fi
 echo "daemon pid=$DAEMON_PID 就绪；跑 TUI ${RUN_SECS}s…"
 
-# 真 PTY 驱动：v2 Agent View 初始化 inline viewport 时会发 `ESC[6n` 查询光标，
-# 旧版 `script` 驱动无人应答，默认切到 v2 后会把合法的终端能力探测误判成 panic。
+# 真 PTY 驱动：V2 fullscreen 初始化时会发 `ESC[6n` 查询光标，
+# 旧版 `script` 驱动无人应答，会把合法的终端能力探测误判成 panic。
 # 这里复用 e2e 的做法，显式回 `ESC[1;1R`，跑满窗口后 Ctrl+Q 干净退出。
 python3 - "$TUI" "$DATA" "$D/tui.raw" "$RUN_SECS" <<'PY'
 import fcntl
@@ -157,8 +151,7 @@ s = re.sub(r"\x1b\[[0-9;?]*[a-zA-Z]", "", raw).replace("\r", "")
 panic = "panicked" in s
 text = [line for line in s.split("\n") if line.strip()]
 first = text[0] if text else ""
-# 真 TUI 标识：默认 V2 Agent View 首帧画 `AgentView`；`--v1` 回退路径保留
-# 含二进制名的 tab bar；`--v2-fullscreen` 空会话首帧画 QAQH 品牌页。
+# 真 TUI 标识：V2 fullscreen 首帧画 `AgentView`，空会话首帧画 QAQH 品牌页。
 marker = "qaqh-tui" in s or "AgentView" in s or "QAQ-HARNESS" in s
 startup_error = bool(re.match(r"\s*(Error|error|thread .*panicked)", first))
 print(f"  去 ANSI 后非空行: {len(text)}")

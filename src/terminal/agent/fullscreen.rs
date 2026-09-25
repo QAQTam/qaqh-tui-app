@@ -4,10 +4,11 @@
 //! fullscreen rendering. Shared composer/status helpers remain in the parent
 //! `agent` module.
 
-use super::inline::{NARROW_VIEWPORT_WIDTH, render_brand};
 use super::*;
 use crate::ui::v2::fullscreen as ui_fullscreen;
 use crate::ui::v2::fullscreen::{FullscreenState, MessageAction, MessageMenu, MessageRole};
+
+const NARROW_VIEWPORT_WIDTH: u16 = 40;
 
 pub(super) fn handle_fullscreen_agent_mouse(
     app: &mut App,
@@ -566,9 +567,8 @@ impl FullscreenTranscriptCache {
         let blocks: Vec<_> = adapter::from_turns(&session.timeline.turns)
             .into_iter()
             .filter(|block| {
-                block.state.is_visible()
-                    && !(block.state == BlockState::Live
-                        && matches!(block.kind, BlockKind::Thinking { .. }))
+                !(block.state == BlockState::Live
+                    && matches!(block.kind, BlockKind::Thinking { .. }))
             })
             .collect();
 
@@ -645,4 +645,103 @@ fn render_fullscreen_history(
     let top = crate::ui::viewport_top(total, height, session.scroll.follow, session.scroll.offset);
     let end = top.saturating_add(height).min(total);
     (cache.lines[top.min(total)..end].to_vec(), top)
+}
+
+/// 普通启动的品牌首屏：品牌标识 + 输入框 + 一行状态提示。
+///
+/// 这里不预造 session；`Enter` 由 app 层转成 `SessionCreate`，首条消息在 seed
+/// 确认后补发。
+fn render_brand(app: &App, width: u16, height: u16, theme: &Theme) -> AgentRender {
+    let height = usize::from(height.max(1));
+    let width = usize::from(width.max(1));
+    let mut lines = brand_lines(width, theme);
+
+    let box_width = width;
+    let inner_width = box_width.saturating_sub(4).max(1);
+    let composer = composer_lines(
+        &app.draft_composer.input,
+        app.draft_composer.cursor,
+        u16::try_from(inner_width).unwrap_or(u16::MAX),
+        theme,
+        3,
+    );
+    let border_style = Style::new().fg(theme.chrome.border);
+    let composer_start = lines.len();
+    lines.push(Line::from(Span::styled(
+        format!("╭{}╮", "─".repeat(box_width.saturating_sub(2))),
+        border_style,
+    )));
+    for line in composer.lines {
+        let mut spans = Vec::with_capacity(line.spans.len() + 2);
+        spans.push(Span::styled("│ ".to_string(), border_style));
+        spans.extend(line.spans);
+        spans.push(Span::styled(" │".to_string(), border_style));
+        lines.push(Line::from(spans));
+    }
+    lines.push(Line::from(Span::styled(
+        format!("╰{}╯", "─".repeat(box_width.saturating_sub(2))),
+        border_style,
+    )));
+    lines.push(Line::default());
+
+    let hint = if !app.pending_creates.is_empty() {
+        " 正在创建会话…"
+    } else {
+        " Enter 创建会话并带入输入框 · Alt+Enter 换行 · Ctrl+L 会话 · F1 帮助 · Ctrl+Q 退出"
+    };
+    lines.push(Line::from(Span::styled(
+        hint,
+        Style::new().fg(theme.text.dim),
+    )));
+    lines.truncate(height);
+
+    let cursor_y = composer_start
+        .saturating_add(1)
+        .saturating_add(composer.cursor_row);
+    let cursor_x = 2u16.saturating_add(composer.cursor_x);
+    let cursor = (cursor_y < height && usize::from(cursor_x) < width)
+        .then_some(Position::new(cursor_x, cursor_y as u16));
+    AgentRender { lines, cursor }
+}
+
+fn brand_lines(width: usize, theme: &Theme) -> Vec<Line<'static>> {
+    let accent = Style::new()
+        .fg(theme.accent.assistant)
+        .add_modifier(ratatui::style::Modifier::BOLD);
+    let muted = Style::new().fg(theme.text.dim);
+    if width < usize::from(NARROW_VIEWPORT_WIDTH) {
+        return vec![
+            Line::from(Span::styled("  QAQH", accent)),
+            Line::from(Span::styled("  QAQ-Harness Terminal", muted)),
+            Line::default(),
+        ];
+    }
+
+    const ART: [&str; 6] = [
+        "  ██████╗  █████╗  ██████╗ ██╗  ██╗",
+        " ██╔═══██╗██╔══██╗██╔═══██╗██║  ██║",
+        " ██║   ██║███████║██║   ██║███████║",
+        " ██║   ██║██╔══██║██║   ██║██╔══██║",
+        " ╚██████╔╝██║  ██║╚██████╔╝██║  ██║",
+        "  ╚═════╝ ╚═╝  ╚═╝ ╚═════╝ ╚═╝  ╚═╝",
+    ];
+    let mut lines: Vec<Line<'static>> = ART
+        .into_iter()
+        .map(|text| centered_line(text, width, accent))
+        .collect();
+    lines.push(centered_line(
+        "Q A Q - H A R N E S S   ·   T E R M I N A L",
+        width,
+        muted,
+    ));
+    lines.push(Line::default());
+    lines
+}
+
+fn centered_line(text: &str, width: usize, style: Style) -> Line<'static> {
+    let padding = width.saturating_sub(text.width()) / 2;
+    Line::from(Span::styled(
+        format!("{}{}", " ".repeat(padding), text),
+        style,
+    ))
 }

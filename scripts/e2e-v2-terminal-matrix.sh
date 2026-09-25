@@ -16,7 +16,7 @@ REPO_ROOT=$(cd -- "$SCRIPT_DIR/.." && pwd)
 # 默认吃**锚点 worktree**（TUI 钉的 rev，见 scripts/ci-linux.sh 的 QAQH_BACKEND_REV），
 # 而不是开发者正在用的 ../qaqh-backend 工作树——否则 e2e 会跑到别人分支构建的
 # daemon 上，与本仓门禁的锚点不是同一个东西。
-BACKEND_ROOT=${QAQH_BACKEND_ROOT:-$REPO_ROOT/../qaqh-backend-anchor}
+BACKEND_ROOT=${QAQH_BACKEND_ROOT:-$REPO_ROOT/../qaqh-backend}
 DAEMON=${DAEMON:-$BACKEND_ROOT/target/debug/qaqh-daemon}
 TUI=${TUI:-$REPO_ROOT/target/debug/qaqh-tui}
 D=${D:-/tmp/qaqh-e2e-v2-terminal-matrix}
@@ -112,7 +112,7 @@ def run_profile(name, extra_env):
     master, slave = pty.openpty()
     fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 36, 120, 0, 0))
     proc = subprocess.Popen(
-        [os.environ["TUI"], "--v2-agent", "--no-spawn"],
+        [os.environ["TUI"], "--no-spawn"],
         stdin=slave,
         stdout=slave,
         stderr=slave,

@@ -24,7 +24,7 @@ set -u
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 REPO_ROOT=$(cd -- "$SCRIPT_DIR/.." && pwd)
-BACKEND_ROOT=${QAQH_BACKEND_ROOT:-$REPO_ROOT/../qaqh-backend-anchor}
+BACKEND_ROOT=${QAQH_BACKEND_ROOT:-$REPO_ROOT/../qaqh-backend}
 DAEMON=${DAEMON:-$BACKEND_ROOT/target/debug/qaqh-daemon}
 TUI=${TUI:-$REPO_ROOT/target/debug/qaqh-tui}
 D=${D:-/tmp/qaqh-e2e-v2-alacritty}
@@ -189,7 +189,7 @@ wrapper.write_text(
     f'"{TUI}" doctor > "{DOCTOR}" 2>&1\n'
     'echo "DOCTOR_EXIT=$?" >> "$LOG"\n'
     # ② 真跑 TUI
-    f'"{TUI}" --v2-agent --no-spawn\n'
+    f'"{TUI}" --no-spawn\n'
     'echo "TUI_EXIT=$?" >> "$LOG"\n'
     "sleep 120\n"
 )
@@ -250,7 +250,7 @@ check(
 # TUI 活着的证据：进程还在 + 日志已开始写 + 日志里无 panic。
 def tui_alive():
     out = subprocess.run(
-        ["pgrep", "-f", f"{TUI} --v2-agent --no-spawn"],
+        ["pgrep", "-f", f"{TUI} --no-spawn"],
         capture_output=True,
         text=True,
     )

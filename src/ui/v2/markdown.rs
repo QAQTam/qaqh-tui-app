@@ -1,12 +1,12 @@
 //! V2 Markdown → ratatui 渲染。
 //!
 //! 这一层只负责把 `pulldown-cmark` 事件投影成 V2 主题下的 [`Line`]：
-//! - 颜色全部来自 [`Theme`]，不依赖 V1 的 `RenderLine/SpanStyle`；
+//! - 颜色全部来自 [`Theme`]；
 //! - 代码高亮只取 syntect 前景与字形，不搬背景，保持终端底色；
 //! - 输出仍然是可逐行提交的普通 `Line`，方便流式稳定边界接管。
 //!
 //! 完整块用于 sealed/history 渲染；流式路径只把已经稳定的源码行交给
-//! [`render_code_line`] 或 [`render`] 单行渲染，未完成尾行留在 inline viewport。
+//! [`render`] 输出主题化 Markdown 行。
 
 use std::sync::OnceLock;
 
@@ -553,33 +553,6 @@ fn heading_style(level: u8, theme: &Theme) -> Style {
         _ => theme.markdown.h6,
     };
     fg(color).add_modifier(Modifier::BOLD)
-}
-
-pub(crate) fn render_code_line(
-    text: &str,
-    lang: Option<&str>,
-    width: usize,
-    theme: &Theme,
-) -> Vec<Line<'static>> {
-    let content_width = width.saturating_sub(CODE_INDENT.width()).max(1);
-    let spans = if text.is_empty() {
-        Vec::new()
-    } else {
-        highlighted_spans(text, lang, theme)
-    };
-    let rows = if spans.is_empty() {
-        vec![Vec::new()]
-    } else {
-        wrap_styled(&spans, content_width)
-    };
-    rows.into_iter()
-        .map(|row| {
-            let mut line = Vec::with_capacity(row.len() + 1);
-            line.push(Span::styled(CODE_INDENT.to_string(), Style::default()));
-            line.extend(row.into_iter().map(StyledSpan::into_span));
-            Line::from(line)
-        })
-        .collect()
 }
 
 fn render_code_block(

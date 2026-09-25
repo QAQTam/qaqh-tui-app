@@ -3,11 +3,9 @@
 //! 适配层是唯一允许同时看到 `timeline_model` 与 V2 block 类型的地方；
 //! renderer 保持纯输入，便于快照和主题矩阵测试。
 
-#![allow(dead_code)] // M3 先冻结适配口径；M3.2 inline/commit 接线后消费。
-
 use crate::app::timeline_model::{Block, ToolCard, Turn};
 use crate::ui::v2::transcript::{
-    BlockId, BlockKind, BlockState, SystemLevel, ToolBlock, ToolState, TranscriptBlock,
+    BlockId, BlockKind, BlockState, ToolBlock, ToolState, TranscriptBlock,
 };
 use qaqh_client::{TimelineBlockKind, TimelineBlockState, TimelineToolState};
 
@@ -80,7 +78,6 @@ fn from_block(turn_id: &str, turn_sealed: bool, block: &Block) -> Option<Transcr
         }
         TimelineBlockKind::Notice => BlockKind::System {
             text: block.text.clone(),
-            level: SystemLevel::Info,
         },
     };
     Some(TranscriptBlock {

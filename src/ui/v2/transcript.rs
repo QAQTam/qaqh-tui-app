@@ -1,17 +1,10 @@
 //! V2 Transcript block 模型与主题化渲染。
 //!
-//! M3 的第一层刻意与 V1 `render_transcript` 解耦：
-//! - V1 的 `RenderLine/SpanStyle` 继续服务旧全屏路径；
-//! - V2 直接输出 ratatui `Line`，颜色只从 [`Theme`] token 取；
-//! - block 状态先冻结，后续由 commit ledger 接管 `Sealed -> Committed`。
-//!
-//! 该模块暂不读取 wire 类型；M3 后续 adapter 负责把 `Turn/Block/ToolCard`
-//! 投影到这里的 view model，避免在渲染层混入后端契约。
-
-#![allow(dead_code)] // M3 逐层接线；先冻结模型和渲染口径。
+//! 直接输出 ratatui `Line`，颜色只从 [`Theme`] token 取。
+//! adapter 负责把 `Turn/Block/ToolCard` 投影到 view model，避免在渲染层混入
+//! 后端契约。
 
 use std::fmt;
-use std::fmt::Write as _;
 use std::time::Duration;
 
 use ratatui::style::Style;
@@ -26,17 +19,13 @@ const MIN_WIDTH: usize = 20;
 const TOOL_BODY_EDGE: usize = 3;
 const TOOL_BODY_RUNNING_TAIL: usize = 6;
 
-/// 稳定块身份。后续映射到 `CommitId.block_id`。
+/// 稳定块身份。
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct BlockId(String);
 
 impl BlockId {
     pub fn new(value: impl Into<String>) -> Self {
         Self(value.into())
-    }
-
-    pub fn as_str(&self) -> &str {
-        &self.0
     }
 }
 
@@ -58,23 +47,11 @@ impl From<String> for BlockId {
     }
 }
 
-/// 块在终端提交协议中的生命周期。
+/// 块的渲染生命周期。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum BlockState {
     Live,
     Sealed,
-    Committed,
-    Discarded,
-}
-
-impl BlockState {
-    pub const fn is_mutable(self) -> bool {
-        matches!(self, Self::Live)
-    }
-
-    pub const fn is_visible(self) -> bool {
-        !matches!(self, Self::Discarded)
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -93,13 +70,6 @@ impl ToolState {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum SystemLevel {
-    Info,
-    Warning,
-    Error,
-}
-
 /// ToolBlock 的 V2 view model。
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ToolBlock {
@@ -112,22 +82,6 @@ pub struct ToolBlock {
     pub failure: Option<String>,
     pub duration: Option<Duration>,
     pub bytes: Option<u64>,
-}
-
-impl ToolBlock {
-    pub fn new(name: impl Into<String>, state: ToolState) -> Self {
-        Self {
-            name: name.into(),
-            summary: None,
-            state,
-            output: None,
-            diff: None,
-            progress: None,
-            failure: None,
-            duration: None,
-            bytes: None,
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -145,7 +99,6 @@ pub enum BlockKind {
     Tool(ToolBlock),
     System {
         text: String,
-        level: SystemLevel,
     },
 }
 
@@ -159,6 +112,7 @@ pub struct TranscriptBlock {
 }
 
 impl TranscriptBlock {
+    #[cfg(test)]
     pub fn new(id: impl Into<BlockId>, kind: BlockKind) -> Self {
         Self {
             id: id.into(),
@@ -169,16 +123,13 @@ impl TranscriptBlock {
         }
     }
 
-    pub fn with_turn_id(mut self, turn_id: impl Into<String>) -> Self {
-        self.turn_id = turn_id.into();
-        self
-    }
-
+    #[cfg(test)]
     pub fn with_state(mut self, state: BlockState) -> Self {
         self.state = state;
         self
     }
 
+    #[cfg(test)]
     pub fn seal(&mut self) -> bool {
         if self.state != BlockState::Live {
             return false;
@@ -187,27 +138,12 @@ impl TranscriptBlock {
         true
     }
 
-    pub fn commit(&mut self) -> bool {
-        if self.state != BlockState::Sealed {
-            return false;
-        }
-        self.state = BlockState::Committed;
-        true
-    }
-
-    pub fn discard(&mut self) -> bool {
-        if self.state == BlockState::Discarded {
-            return false;
-        }
-        self.state = BlockState::Discarded;
-        true
-    }
-
     /// 替换纯文本块内容；工具块不走此入口。
     ///
     /// 封口后拒绝修改，防止 `Sealed` 内容在重放时发生静默变化。
+    #[cfg(test)]
     pub fn replace_text(&mut self, value: impl Into<String>) -> bool {
-        if !self.state.is_mutable() {
+        if self.state != BlockState::Live {
             return false;
         }
         let value = value.into();
@@ -215,7 +151,7 @@ impl TranscriptBlock {
             BlockKind::User { text }
             | BlockKind::Assistant { text }
             | BlockKind::Thinking { text, .. }
-            | BlockKind::System { text, .. } => {
+            | BlockKind::System { text } => {
                 if *text == value {
                     return false;
                 }
@@ -226,54 +162,6 @@ impl TranscriptBlock {
             BlockKind::Tool(_) => false,
         }
     }
-
-    /// 生成不含 ANSI 的稳定内容指纹，供 commit ledger 冲突检测使用。
-    pub fn content_fingerprint(&self) -> String {
-        let mut out = String::new();
-        push_field(&mut out, self.id.as_str());
-        push_field(&mut out, &self.turn_id);
-        push_field(&mut out, &self.revision.to_string());
-        push_field(&mut out, &format!("{:?}", self.state));
-        match &self.kind {
-            BlockKind::User { text } => {
-                push_field(&mut out, "user");
-                push_field(&mut out, text);
-            }
-            BlockKind::Assistant { text } => {
-                push_field(&mut out, "assistant");
-                push_field(&mut out, text);
-            }
-            BlockKind::Thinking { text, duration } => {
-                push_field(&mut out, "thinking");
-                push_field(&mut out, text);
-                push_field(&mut out, &format!("{duration:?}"));
-            }
-            BlockKind::Tool(tool) => {
-                push_field(&mut out, "tool");
-                push_field(&mut out, &tool.name);
-                push_field(&mut out, tool.summary.as_deref().unwrap_or(""));
-                push_field(&mut out, &format!("{:?}", tool.state));
-                push_field(&mut out, tool.output.as_deref().unwrap_or(""));
-                push_field(&mut out, tool.diff.as_deref().unwrap_or(""));
-                push_field(&mut out, tool.progress.as_deref().unwrap_or(""));
-                push_field(&mut out, tool.failure.as_deref().unwrap_or(""));
-                push_field(&mut out, &format!("{:?}", tool.duration));
-                push_field(&mut out, &format!("{:?}", tool.bytes));
-            }
-            BlockKind::System { text, level } => {
-                push_field(&mut out, "system");
-                push_field(&mut out, text);
-                push_field(&mut out, &format!("{level:?}"));
-            }
-        }
-        out
-    }
-}
-
-fn push_field(out: &mut String, value: &str) {
-    let _ = write!(out, "{}:", value.len());
-    out.push_str(value);
-    out.push('|');
 }
 
 /// 渲染整个 transcript。
@@ -284,7 +172,7 @@ pub fn render_transcript(
 ) -> Vec<Line<'static>> {
     let width = usize::from(width.max(MIN_WIDTH as u16));
     let mut lines = Vec::new();
-    for block in blocks.iter().filter(|block| block.state.is_visible()) {
+    for block in blocks {
         if !lines.is_empty() {
             lines.push(Line::default());
         }
@@ -293,7 +181,7 @@ pub fn render_transcript(
     lines
 }
 
-/// 渲染单个 block；输出可继续交给 `Paragraph` 或 scrollback commit。
+/// 渲染单个 block。
 pub fn render_block(block: &TranscriptBlock, width: usize, theme: &Theme) -> Vec<Line<'static>> {
     let width = width.max(MIN_WIDTH);
     let mut lines = match &block.kind {
@@ -307,7 +195,7 @@ pub fn render_block(block: &TranscriptBlock, width: usize, theme: &Theme) -> Vec
             theme,
         ),
         BlockKind::Tool(tool) => render_tool(tool, width, theme),
-        BlockKind::System { text, level } => render_system(text, *level, width, theme),
+        BlockKind::System { text } => render_system(text, width, theme),
     };
     if block.state == BlockState::Live
         && matches!(block.kind, BlockKind::Assistant { .. })
@@ -342,37 +230,6 @@ fn render_assistant(text: &str, width: usize, theme: &Theme) -> Vec<Line<'static
     let continuation = " ".repeat(prefix.width());
     let body_width = width.saturating_sub(prefix.width()).max(1);
     let body = super::markdown::render(&text, body_width, theme);
-    prefix_lines(body, &prefix, &continuation, fg(theme.accent.assistant))
-}
-
-/// 流式路径的单行渲染：稳定行已确认不会再变，才允许进入 scrollback。
-///
-/// `first_line` 决定首行用 assistant glyph、后续行用同宽缩进；`code` 由流式
-/// 状态机根据 fenced code 上下文传入，避免把代码行当普通 Markdown 再解析一次。
-pub(crate) fn render_stream_line(
-    text: &str,
-    width: usize,
-    theme: &Theme,
-    first_line: bool,
-    code: bool,
-    lang: Option<&str>,
-) -> Vec<Line<'static>> {
-    let text = sanitize_text(text);
-    if text.is_empty() {
-        return vec![Line::default()];
-    }
-    let prefix = if first_line {
-        format!("{} ", theme.glyph.assistant)
-    } else {
-        "  ".to_string()
-    };
-    let continuation = " ".repeat(prefix.width());
-    let body_width = width.saturating_sub(prefix.width()).max(1);
-    let body = if code {
-        super::markdown::render_code_line(&text, lang, body_width, theme)
-    } else {
-        super::markdown::render(&text, body_width, theme)
-    };
     prefix_lines(body, &prefix, &continuation, fg(theme.accent.assistant))
 }
 
@@ -713,18 +570,10 @@ fn tool_body_style(line: &str, diff: bool, theme: &Theme) -> Style {
     }
 }
 
-fn render_system(
-    text: &str,
-    level: SystemLevel,
-    width: usize,
-    theme: &Theme,
-) -> Vec<Line<'static>> {
+fn render_system(text: &str, width: usize, theme: &Theme) -> Vec<Line<'static>> {
     let text = sanitize_text(text);
-    let (glyph, style) = match level {
-        SystemLevel::Info => (theme.glyph.system, fg(theme.text.dim)),
-        SystemLevel::Warning => (theme.glyph.failure, fg(theme.semantic.warning)),
-        SystemLevel::Error => (theme.glyph.failure, fg(theme.accent.error)),
-    };
+    let glyph = theme.glyph.system;
+    let style = fg(theme.text.dim);
     let prefix = format!("{glyph} ");
     let continuation = " ".repeat(prefix.width());
     render_prefixed_text(&text, width, &prefix, &continuation, style, style)
@@ -1028,19 +877,6 @@ mod tests {
     }
 
     #[test]
-    fn system_error_uses_failure_glyph() {
-        let block = TranscriptBlock::new(
-            "s1",
-            BlockKind::System {
-                text: "connection lost".to_string(),
-                level: SystemLevel::Error,
-            },
-        );
-        let text = text_of(&render_block(&block, 40, &theme()));
-        assert!(text.starts_with('✗'), "{text}");
-    }
-
-    #[test]
     fn render_sanitizes_terminal_control_sequences() {
         let block = TranscriptBlock::new(
             "u2",
@@ -1053,19 +889,6 @@ mod tests {
         assert!(!rendered.contains('\x07'));
         assert!(rendered.contains("red"));
         assert!(rendered.contains("ok"));
-    }
-
-    #[test]
-    fn discarded_blocks_are_not_rendered() {
-        let mut block = TranscriptBlock::new(
-            "x",
-            BlockKind::System {
-                text: "hidden".to_string(),
-                level: SystemLevel::Info,
-            },
-        );
-        block.discard();
-        assert!(render_transcript(&[block], 40, &theme()).is_empty());
     }
 
     #[test]
@@ -1165,7 +988,6 @@ mod tests {
                 "s",
                 BlockKind::System {
                     text: "note".to_string(),
-                    level: SystemLevel::Info,
                 },
             ),
         ];

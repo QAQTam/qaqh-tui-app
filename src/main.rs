@@ -1,4 +1,4 @@
-//! qaqh-tui：QAQ-Harness 的终端前端（默认 V2 Fullscreen；Ringing v2）。
+//! qaqh-tui：QAQ-Harness 的终端前端（V2 Fullscreen；Ringing v2）。
 
 mod app;
 mod protocol;
@@ -8,15 +8,6 @@ mod theme;
 mod ui;
 
 use anyhow::{Context, Result, bail};
-use futures::StreamExt;
-use ratatui::crossterm::event::{
-    EnableBracketedPaste, EnableMouseCapture, Event, EventStream, KeyEventKind,
-};
-use ratatui::crossterm::execute;
-use tokio::sync::mpsc;
-
-use app::{App, AppMsg, FrameStats};
-use runtime::{Runtime, RuntimeMsg};
 
 /// 极简文件 logger：设了 `QAQH_TUI_LOG=<path>` 才安装。
 ///
@@ -62,32 +53,12 @@ fn init_logging() {
     log::set_max_level(log::LevelFilter::Debug);
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum StartupMode {
-    V1,
-    V2Fullscreen,
-}
-
-/// 启动模式：v2 fullscreen 是唯一默认 UI，`--v2-agent` 作为历史兼容别名。
-///
-/// `--v1` 是显式回退闸，压过所有 v2 参数。`--v2-inline` 与
-/// `QAQH_V2_INLINE` 属于早期隔离原型，已在 fullscreen 冲刺中退役。
-fn select_startup_mode(args: &[String]) -> StartupMode {
-    if args.iter().any(|arg| arg == "--v1") {
-        StartupMode::V1
-    } else {
-        StartupMode::V2Fullscreen
-    }
-}
-
 fn main() -> Result<()> {
     init_logging();
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         Some("doctor") => return doctor(),
         Some("--version") | Some("-V") | Some("version") => {
-            // 版本号此前只存在于 Cargo metadata 里，运行时没有任何观测面——
-            // 升到 2.0.0-alpha1 时补上，让「装的到底是哪个版本」可直接问二进制。
             println!("qaqh-tui {}", env!("CARGO_PKG_VERSION"));
             return Ok(());
         }
@@ -102,8 +73,6 @@ fn main() -> Result<()> {
             println!("  qaqh-tui            连接本地 daemon 并进入 V2 全屏 TUI");
             println!("  qaqh-tui resume     直接浏览当前 cwd 下的会话");
             println!("  qaqh-tui --no-spawn 不自动拉起 daemon（仅连接已有实例）");
-            println!("  qaqh-tui --v2-agent 兼容别名（现在等同 V2 全屏）");
-            println!("  qaqh-tui --v1       强制旧 v1 全屏兼容路径");
             println!("  qaqh-tui doctor     自检：发现/pid 判活/open 握手");
             println!("  qaqh-tui --version  打印版本");
             println!();
@@ -115,229 +84,20 @@ fn main() -> Result<()> {
         _ => {}
     }
 
+    if args.iter().any(|arg| arg == "--v1") {
+        bail!("v1 全屏兼容路径已删除；当前仅支持 V2 fullscreen");
+    }
     if args.iter().any(|arg| arg == "--v2-inline") || std::env::var_os("QAQH_V2_INLINE").is_some() {
-        bail!("--v2-inline / QAQH_V2_INLINE 已退役；V2 全屏现为默认 UI");
+        bail!("v2 inline 旧版设计已删除；当前仅支持 V2 fullscreen");
     }
 
     let resume = args.iter().any(|arg| arg == "resume");
-    let mode = select_startup_mode(&args);
-
+    let no_spawn = args.iter().any(|arg| arg == "--no-spawn");
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .context("构建 tokio runtime")?;
-    match mode {
-        StartupMode::V2Fullscreen => runtime.block_on(terminal::agent::run(
-            !args.iter().any(|arg| arg == "--no-spawn"),
-            resume,
-            true,
-        )),
-        StartupMode::V1 => runtime.block_on(run_tui(args.iter().any(|a| a == "--no-spawn"))),
-    }
-}
-
-async fn run_tui(no_spawn: bool) -> Result<()> {
-    // 先建通道再连接：连接期间 `ClientHandlers` 回调发来的消息先入队，等 App
-    // 构造好后一并排空（否则首个 Ready/事件会丢）。
-    let (app_tx, mut app_rx) = mpsc::unbounded_channel::<AppMsg>();
-    let (rt_tx, mut rt_rx) = mpsc::unbounded_channel::<RuntimeMsg>();
-    {
-        let bridge_tx = app_tx.clone();
-        tokio::spawn(async move {
-            while let Some(msg) = rt_rx.recv().await {
-                if bridge_tx.send(AppMsg::Runtime(msg)).is_err() {
-                    break;
-                }
-            }
-        });
-    }
-
-    // 连接生命周期（含「daemon 不在则拉起」）全部交给 qaqh-client。
-    let runtime = Runtime::start(rt_tx, !no_spawn)
-        .await
-        .context("连接 daemon 失败")?;
-
-    // 终端初始化（ratatui 0.30：init/restore + panic hook）。
-    let mut terminal = ratatui::init();
-    execute!(std::io::stdout(), EnableMouseCapture, EnableBracketedPaste)
-        .context("启用鼠标/粘贴")?;
-
-    // 输入任务。
-    {
-        let input_tx = app_tx.clone();
-        tokio::spawn(async move {
-            let mut reader = EventStream::new();
-            while let Some(ev) = reader.next().await {
-                match ev {
-                    Ok(Event::Key(k)) if k.kind == KeyEventKind::Press => {
-                        if input_tx.send(AppMsg::Key(k)).is_err() {
-                            break;
-                        }
-                    }
-                    Ok(Event::Mouse(m)) => {
-                        if input_tx.send(AppMsg::Mouse(m)).is_err() {
-                            break;
-                        }
-                    }
-                    Ok(Event::Paste(s)) => {
-                        if input_tx.send(AppMsg::Paste(s)).is_err() {
-                            break;
-                        }
-                    }
-                    Ok(Event::Resize(_w, _h)) => {
-                        if input_tx.send(AppMsg::Resize).is_err() {
-                            break;
-                        }
-                    }
-                    Ok(_) => {}
-                    Err(_) => break,
-                }
-            }
-        });
-    }
-
-    // 心跳任务（toast 过期 / Ctrl+C 双击窗口 / 时钟 / 动画 200ms）。
-    {
-        let tick_tx = app_tx.clone();
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_millis(200));
-            loop {
-                interval.tick().await;
-                if tick_tx.send(AppMsg::Tick).is_err() {
-                    break;
-                }
-            }
-        });
-    }
-
-    let mut app = App::new(runtime.clone(), app_tx.clone());
-    // 首页：无 tab 时直接展示会话列表，立即拉取一次避免首帧空白
-    app.fetch_session_list();
-
-    // 主循环：事件驱动，批量消费后单帧重绘。
-    //
-    // 帧统计（QAQH_TUI_DEBUG=1 展示）：帧数 / 消费的运行时消息数 / 整帧耗时，
-    // 每秒结算一次写回 `app.frame_stats`——把「wire 事件率」与「终端实际刷新率」
-    // 分开测量（前者来自 SSE，后者才是观感上限）。
-    let mut frames: u32 = 0;
-    let mut events: u32 = 0;
-    let mut draw_us: u64 = 0;
-    let mut ref_us_sum: u64 = 0;
-    let mut term_us_sum: u64 = 0;
-    let mut handle_us_sum: u64 = 0;
-    let mut peak_rebuilt: u32 = 0;
-    let mut stats_at = std::time::Instant::now();
-    let loop_result: Result<()> = async {
-        loop {
-            if app.quit {
-                break;
-            }
-            // 渲染缓存键必须与 ui::draw 实际使用的 transcript 内容宽一致
-            // （ui::mod 的 transcript_content_width 是唯一事实源）。
-            let area =
-                ratatui::layout::Rect::new(0, 0, terminal.size()?.width, terminal.size()?.height);
-            let ref_t0 = std::time::Instant::now();
-            app.ensure_render_caches(area);
-            let ref_us = ref_t0.elapsed().as_micros() as u64;
-            let term_t0 = std::time::Instant::now();
-            terminal.draw(|f| ui::draw(f, &app))?;
-            let term_us = term_t0.elapsed().as_micros() as u64;
-            ref_us_sum += ref_us;
-            term_us_sum += term_us;
-            draw_us += ref_us + term_us;
-            frames += 1;
-            if let Some(n) = app
-                .active_session()
-                .and_then(|s| s.block_cache.as_ref())
-                .map(|c| c.stats.rebuilt_blocks)
-            {
-                peak_rebuilt = peak_rebuilt.max(n as u32);
-            }
-
-            // M4（T15）：Ctrl+T 浮层按 `e` 置位 → 帧间挂起终端交给 $PAGER。
-            if let Some(text) = app.pending_pager.take() {
-                run_pager(&mut terminal, &text);
-            }
-
-            let Some(msg) = app_rx.recv().await else {
-                break;
-            };
-            if matches!(&msg, AppMsg::Runtime(_)) {
-                events += 1;
-            }
-            let handle_t0 = std::time::Instant::now();
-            app.handle(msg);
-            handle_us_sum += handle_t0.elapsed().as_micros() as u64;
-            // 排空积压（一帧内合并多个事件）。
-            while let Ok(msg) = app_rx.try_recv() {
-                if matches!(&msg, AppMsg::Runtime(_)) {
-                    events += 1;
-                }
-                let handle_t0 = std::time::Instant::now();
-                app.handle(msg);
-                handle_us_sum += handle_t0.elapsed().as_micros() as u64;
-                if app.quit {
-                    break;
-                }
-            }
-            if stats_at.elapsed() >= std::time::Duration::from_secs(1) {
-                let f = u64::from(frames.max(1));
-                app.frame_stats = FrameStats {
-                    fps: frames,
-                    events_per_s: events,
-                    draw_us: draw_us / f,
-                    ref_us: ref_us_sum / f,
-                    term_us: term_us_sum / f,
-                    handle_us: handle_us_sum / f,
-                    peak_rebuilt,
-                };
-                frames = 0;
-                events = 0;
-                draw_us = 0;
-                ref_us_sum = 0;
-                term_us_sum = 0;
-                handle_us_sum = 0;
-                peak_rebuilt = 0;
-                stats_at = std::time::Instant::now();
-            }
-        }
-        Ok(())
-    }
-    .await;
-
-    runtime.shutdown().await;
-    ratatui::restore();
-    loop_result
-}
-
-// ───────────────────────── $PAGER（M4 / T15）─────────────────────────
-
-/// 挂起终端 → 外部分页器全文浏览 → 恢复（重建 + 全量重绘）。
-///
-/// `$PAGER` 未设置 → `less -R`；`less` 不存在（exit 127）→ 退化为 `cat`。
-/// 写临时文件失败则静默放弃（浮层本身仍可滚动，不是功能阻塞）。
-fn run_pager(terminal: &mut ratatui::DefaultTerminal, text: &str) {
-    let tmp = std::env::temp_dir().join(format!("qaqh-pager-{}.md", std::process::id()));
-    if std::fs::write(&tmp, text).is_err() {
-        return;
-    }
-    ratatui::restore();
-    let cmd = format!(
-        "{} {}",
-        app::pager::pager_cmd(std::env::var("PAGER").ok().as_deref()),
-        app::pager::shell_quote(&tmp.to_string_lossy()),
-    );
-    let status = std::process::Command::new("sh")
-        .arg("-c")
-        .arg(&cmd)
-        .status();
-    if matches!(status.map(|s| s.code()), Ok(Some(127))) {
-        let _ = std::process::Command::new("cat").arg(&tmp).status();
-    }
-    *terminal = ratatui::init();
-    let _ = execute!(std::io::stdout(), EnableMouseCapture, EnableBracketedPaste);
-    let _ = terminal.clear();
-    let _ = std::fs::remove_file(&tmp);
+    runtime.block_on(terminal::agent::run(no_spawn, resume))
 }
 
 // ───────────────────────── doctor 自检 ─────────────────────────
@@ -400,43 +160,5 @@ async fn doctor_async() -> Result<()> {
             bail!("[3] open 被拒（协议代差）: {m} —— 请更新客户端或 daemon")
         }
         Err(e) => bail!("[3] open 失败: {e}"),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{StartupMode, select_startup_mode};
-
-    fn args(values: &[&str]) -> Vec<String> {
-        values.iter().map(|value| (*value).to_string()).collect()
-    }
-
-    #[test]
-    fn startup_mode_defaults_to_v2_fullscreen() {
-        assert_eq!(select_startup_mode(&args(&[])), StartupMode::V2Fullscreen);
-    }
-
-    #[test]
-    fn v2_agent_is_a_fullscreen_compatibility_alias() {
-        assert_eq!(
-            select_startup_mode(&args(&["--v2-agent"])),
-            StartupMode::V2Fullscreen
-        );
-        assert_eq!(
-            select_startup_mode(&args(&["--v2-fullscreen"])),
-            StartupMode::V2Fullscreen
-        );
-    }
-
-    #[test]
-    fn cli_v1_overrides_v2_flags() {
-        assert_eq!(
-            select_startup_mode(&args(&["--v1", "--v2-agent"])),
-            StartupMode::V1
-        );
-        assert_eq!(
-            select_startup_mode(&args(&["--v1", "--v2-fullscreen"])),
-            StartupMode::V1
-        );
     }
 }

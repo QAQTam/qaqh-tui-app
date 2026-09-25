@@ -2,7 +2,7 @@
 # 真机端到端：V2 Agent View 高频 resize 压力（M6.3）。
 #
 # 判据：
-#   ① 连续高度变化触发多次 inline viewport 重建；
+#   ① 连续高度变化触发 fullscreen 重排；
 #   ② 无 cursor-position timeout / panic；
 #   ③ TUI 正常退出。
 #
@@ -18,7 +18,7 @@ REPO_ROOT=$(cd -- "$SCRIPT_DIR/.." && pwd)
 # 默认吃**锚点 worktree**（TUI 钉的 rev，见 scripts/ci-linux.sh 的 QAQH_BACKEND_REV），
 # 而不是开发者正在用的 ../qaqh-backend 工作树——否则 e2e 会跑到别人分支构建的
 # daemon 上，与本仓门禁的锚点不是同一个东西。
-BACKEND_ROOT=${QAQH_BACKEND_ROOT:-$REPO_ROOT/../qaqh-backend-anchor}
+BACKEND_ROOT=${QAQH_BACKEND_ROOT:-$REPO_ROOT/../qaqh-backend}
 DAEMON=${DAEMON:-$BACKEND_ROOT/target/debug/qaqh-daemon}
 TUI=${TUI:-$REPO_ROOT/target/debug/qaqh-tui}
 D=${D:-/tmp/qaqh-e2e-v2-resize-stress}
@@ -88,7 +88,7 @@ fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 40, 130, 0, 0))
 env = os.environ.copy()
 env["TERM"] = "xterm-256color"
 proc = subprocess.Popen(
-    [os.environ["TUI"], "--v2-agent", "--no-spawn"],
+    [os.environ["TUI"], "--no-spawn"],
     stdin=slave,
     stdout=slave,
     stderr=slave,

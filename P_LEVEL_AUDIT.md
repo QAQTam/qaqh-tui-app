@@ -15,7 +15,7 @@
 
 ### 1. unsafe（P0 排查）
 
-- 仅 `src/app/render/bench.rs:34-46`：测试基准计数分配器，直透 `System`，仅做 `LIVE/PEAK` 计数，无 UB。
+- 旧 `src/app/render/bench.rs` 已随 v1/inline 清理删除；当前 `src/` 无 unsafe。
 - 缺 `// SAFETY:` 注释，按 unsafe-checker 记 P3，不构成漏洞。
 
 ### 2. 并发/锁（m07）
@@ -38,22 +38,22 @@
 - `src/app/interaction.rs:282,291`：经 `questions.get(focus)` 校验后才索引 `selections[focus]/customs[focus]`。
 - `src/app/interaction.rs:312-316` `EditCommit` 仅当 `editing_custom.is_some()` 可达，而 `editing_custom` 仅由校验过的 `StartEdit` 置位；空 `questions` 时无法进入编辑态。
 - `src/app/session.rs:79-80`：`AskPanel::new` 保证三者同长原子构造；`src/app/mod.rs:1032` 整体替换，不存在半更新。
-- `src/ui/modal.rs:208,225` 渲染侧同不变量。
+- `src/ui/v2/modal.rs` 渲染侧同不变量。
 - 结论：无生产可达越界。
 
 ### 5. render panic（已排除）
 
-- `src/app/render/mod.rs:822,827,892,908` 等 `panic/expect` 全在 `src/app/render/mod.rs:657 #[cfg(test)] mod tests` 内，非生产路径。
+- 旧 `src/app/render/mod.rs` 已随 v1/inline 清理删除；当前渲染路径无生产可达 panic。
 
 ### 6. pager 命令执行（注入排查，已排除）
 
-- `src/main.rs:172-194` + `src/app/pager.rs:10-30`：`sh -c` 执行 `$PAGER`，`tmp` 路径经 `shell_quote` 单引号转义。
+- `src/terminal/agent/mod.rs` + `src/app/pager.rs`：`sh -c` 执行 `$PAGER`，`tmp` 路径经 `shell_quote` 单引号转义。
 - `$PAGER` 仅取本地 env，属用户自控，非远端输入。`tmp` 名含 `pid`，本地 TOCTOU 风险低。
 - 结论：非 P 级注入。
 
 ### 7. 静默丢弃（m06 排查，已排除）
 
-- `src/app/session_ops.rs:193,209`：`.ok()` 逐项跳过畸形条目，但顶层非数组仍经 `ok_or_else` 回传 `Err`，注释写明 G2 宽松契约。
+- `src/app/session_ops.rs`：`.ok()` 逐项跳过畸形条目，但顶层非数组仍经 `ok_or_else` 回传 `Err`，注释写明 G2 宽松契约。
 - `src/app/mod.rs:1667` `spawn_api` 用 `client_opt()` 非 `client()`，断连时任务照起、结果走 `Err`，无 panic。
 - 结论：设计如此，非 P 级。
 

@@ -6,7 +6,7 @@
 #
 #   - daemon 侧完全正常：命令收据 `state=succeeded`，journal 里
 #     `session_state_changed/created` 带**正确**的 `causation_id == command_id`；
-#   - TUI 侧什么都没发生：不开 tab、不 toast（`--v1` 也一样，只是首屏列表 3s
+#   - TUI 侧什么都没发生：不开 tab、不 toast（首屏会话列表 3s
 #     自动刷新把「最近会话 — 1 个」显示出来，遮住了故障）；
 #   - 默认 Agent View 首屏**没有列表面**，于是表现为「按了没反应」——
 #     再按一次就**又建一个**（实测连按两次 = 磁盘上 2 个会话，界面全程不变）。
@@ -31,7 +31,7 @@ REPO_ROOT=$(cd -- "$SCRIPT_DIR/.." && pwd)
 # 默认吃**锚点 worktree**（TUI 钉的 rev，见 scripts/ci-linux.sh 的 QAQH_BACKEND_REV），
 # 而不是开发者正在用的 ../qaqh-backend 工作树——否则 e2e 会跑到别人分支构建的
 # daemon 上，与本仓门禁的锚点不是同一个东西。
-BACKEND_ROOT=${QAQH_BACKEND_ROOT:-$REPO_ROOT/../qaqh-backend-anchor}
+BACKEND_ROOT=${QAQH_BACKEND_ROOT:-$REPO_ROOT/../qaqh-backend}
 DAEMON=${DAEMON:-$BACKEND_ROOT/target/debug/qaqh-daemon}
 TUI=${TUI:-$REPO_ROOT/target/debug/qaqh-tui}
 D=${D:-/tmp/qaqh-e2e-new-session}

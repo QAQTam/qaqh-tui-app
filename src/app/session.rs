@@ -292,7 +292,6 @@ impl RespondedPermissions {
 
 #[derive(Debug, Clone)]
 pub struct Attachment {
-    pub path: String,
     pub content: ContentRef,
 }
 
@@ -337,50 +336,6 @@ impl Composer {
                 _ => self.insert(ch),
             }
         }
-    }
-
-    /// 行数（含光标所在行的尾部空行）。
-    pub fn rows(&self) -> usize {
-        self.input.iter().filter(|c| **c == '\n').count() + 1
-    }
-
-    /// 光标的 (行号 0-based, 行内 char 偏移)。
-    pub fn line_col(&self) -> (usize, usize) {
-        let line = self.input[..self.cursor.min(self.input.len())]
-            .iter()
-            .filter(|c| **c == '\n')
-            .count();
-        let col = match self.input[..self.cursor.min(self.input.len())]
-            .iter()
-            .rposition(|c| *c == '\n')
-        {
-            Some(pos) => self.cursor - pos - 1,
-            None => self.cursor,
-        };
-        (line, col)
-    }
-
-    /// 第 `line` 行（0-based）的 char 切片范围 `[start, end)`；越界行返回空行。
-    pub fn line_bounds(&self, line: usize) -> (usize, usize) {
-        let mut idx = 0usize;
-        let mut cur = 0usize;
-        let mut start = 0usize;
-        while cur < line && idx < self.input.len() {
-            if self.input[idx] == '\n' {
-                cur += 1;
-                start = idx + 1;
-            }
-            idx += 1;
-        }
-        if cur < line {
-            return (self.input.len(), self.input.len());
-        }
-        let end = self.input[idx..]
-            .iter()
-            .position(|c| *c == '\n')
-            .map(|p| idx + p)
-            .unwrap_or(self.input.len());
-        (start, end)
     }
 
     pub fn backspace(&mut self) {
@@ -499,26 +454,7 @@ pub struct ScrollState {
     pub offset: usize,
 }
 
-// ───────────────────────── 渲染缓存 ─────────────────────────
-
-/// 视口外仍保留精确渲染结果的段数余量。
-///
-/// 权衡：够顺滑滚动（快速上翻不用重渲），又不至于把整段历史留在内存。
-/// Grok 用 128 是因为它的 entry 粒度是**块**（400+ 个）；本仓粒度是**回合**，
-/// 单个回合可达上千行，所以取小值。
-pub(crate) const KEEP_MARGIN_SEGMENTS: usize = 8;
-
 // ───────────────────────── 会话状态 ─────────────────────────
-
-/// 压缩过程动画状态（由 Conversation 事件驱动；结束/重基线时清除）。
-#[derive(Debug, Clone)]
-pub struct CompactionAnim {
-    pub started_at: std::time::Instant,
-    pub turns_total: u32,
-    pub turns_keeping: u32,
-    /// CompactProgress 的 delta 文本（协议真实信息，随条展示）。
-    pub last_delta: Option<String>,
-}
 
 #[derive(Debug, Clone)]
 pub struct SessionState {
@@ -546,26 +482,13 @@ pub struct SessionState {
     pub responded_permissions: RespondedPermissions,
     /// workspace 面板数据（bootstrap control state + DashboardSnapshot 推送）。
     pub dashboard: Option<qaqh_client::DomainDashboardSnapshot>,
-    /// 压缩进度动画（Some = 压缩进行中）。
-    pub compact_anim: Option<CompactionAnim>,
-    /// 代码变更聚合（+行 / −行）。
-    pub code_added: usize,
-    pub code_removed: usize,
     pub last_error: Option<DomainError>,
     pub composer: Composer,
     pub scroll: ScrollState,
-    /// 块级渲染缓存（M1 `render::refresh`，T8 起为生产唯一来源；
-    /// 锁 8 动画出带的宿主）。
-    pub block_cache: Option<crate::app::render::TranscriptCache>,
     /// bootstrap / re-baseline 是否已就绪。
     pub ready: bool,
-    /// 被 LRU 逐出 transcript 后，重新聚焦时需要 re-baseline。
-    pub needs_rebaseline: bool,
     /// 加载更早：in-flight 去重。
     pub loading_older: bool,
-    /// §4.2 运行组展开态：(turn_id, round_num)。展开 = 组内卡片列表可见；
-    /// 收起 = 一行组行（失败例外：组内最后一张 Failed 卡始终内联）。
-    pub expanded_groups: std::collections::HashSet<(String, u32)>,
     /// 本会话拉起的子代理（spawn 顺序；身份锚点 = timeline 工具卡 id）。
     pub subagents: Vec<super::subagent::SubagentEntry>,
 }
@@ -590,34 +513,16 @@ impl SessionState {
             pending_permissions: Vec::new(),
             responded_permissions: RespondedPermissions::default(),
             dashboard: None,
-            compact_anim: None,
-            code_added: 0,
-            code_removed: 0,
             last_error: None,
             composer: Composer::default(),
             scroll: ScrollState {
                 follow: true,
                 offset: 0,
             },
-            block_cache: None,
             ready: false,
-            needs_rebaseline: false,
             loading_older: false,
-            expanded_groups: std::collections::HashSet::new(),
             subagents: Vec::new(),
         }
-    }
-
-    /// 标签标题：控制频道 `SessionMetaChanged` 推来的 title → `session <seed>`。
-    ///
-    /// 这里曾有第三级回退 `meta.display_title()`——**那段代码从未执行过**：
-    /// `SessionState::meta` 自首版起就没被赋过值（`git log -S'meta = Some'` 全史
-    /// 零命中），恒为 `None`。G2 类型化时一并删除，语义不变（它本来就走不到）。
-    pub fn title(&self) -> String {
-        if let Some(t) = self.title.as_deref().filter(|s| !s.is_empty()) {
-            return t.to_owned();
-        }
-        format!("session {}", self.seed)
     }
 
     pub fn display_model(&self) -> Option<String> {
@@ -901,48 +806,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn rows_and_line_col_track_newlines() {
-        let mut c = Composer::default();
-        assert_eq!(c.rows(), 1);
-        assert_eq!(c.line_col(), (0, 0));
-        for ch in "ab".chars() {
-            c.insert(ch);
-        }
-        c.insert('\n');
-        for ch in "cd".chars() {
-            c.insert(ch);
-        }
-        assert_eq!(c.value(), "ab\ncd");
-        assert_eq!(c.rows(), 2);
-        assert_eq!(c.line_col(), (1, 2));
-        c.left();
-        c.left();
-        assert_eq!(c.line_col(), (1, 0));
-    }
-
-    #[test]
-    fn line_bounds_split_multiline() {
-        let mut c = Composer::default();
-        for ch in "ab\ncd\n\n".chars() {
-            c.insert(ch);
-        }
-        let (s0, e0) = c.line_bounds(0);
-        assert_eq!(c.input[s0..e0], ['a', 'b']);
-        let (s1, e1) = c.line_bounds(1);
-        assert_eq!(c.input[s1..e1], ['c', 'd']);
-        let (s2, e2) = c.line_bounds(2);
-        assert_eq!(c.input[s2..e2], Vec::<char>::new());
-        // 越界行：空窗口。
-        let (s3, e3) = c.line_bounds(9);
-        assert_eq!(s3, e3);
-        assert_eq!(c.line_col(), (3, 0));
-    }
-
-    #[test]
     fn insert_str_keeps_paste_newlines() {
         let mut c = Composer::default();
         c.insert_str("第一行\n第二行\r\n第三行");
-        assert_eq!(c.rows(), 3);
+        assert_eq!(c.value().lines().count(), 3);
         assert!(c.value().starts_with("第一行\n第二行\n第三行"));
     }
 

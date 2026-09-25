@@ -509,7 +509,7 @@ impl App {
                     s.composer.history_down();
                 }
             }
-            KeyCode::PageUp => self.page_up(),
+            KeyCode::PageUp => self.scroll_up(20),
             KeyCode::PageDown => self.scroll_down(20),
             KeyCode::Char('a') if ctrl => {
                 if let Some(seed) = self.active_seed() {

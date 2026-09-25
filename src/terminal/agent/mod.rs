@@ -1,14 +1,9 @@
-//! V2 Agent shell：共享事件循环、终端生命周期与输入分发。
+//! V2 fullscreen Agent shell：事件循环、终端生命周期与输入分发。
 //!
-//! 当前生产默认是 fullscreen（[`fullscreen`]）；inline/scrollback 作为冻结的
-//! 兼容分支保留在 [`inline`]，`--v1` 仍走独立旧 UI 路径。
-//!
-//! 两个 v2 shell 共用 Runtime/App 状态：
-//! - inline 把已封口 transcript 经 projector + commit ledger 写入 scrollback；
-//! - fullscreen 由 App 自己持有 transcript 视口、滚动和鼠标命中状态。
+//! 当前只有一套生产 shell；App 自己持有 transcript 视口、滚动和鼠标命中状态。
 
 use std::collections::hash_map::DefaultHasher;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::io::stdout;
 use std::sync::Arc;
@@ -17,53 +12,40 @@ use std::thread;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use ratatui::backend::CrosstermBackend;
-use ratatui::crossterm::cursor::MoveTo;
 use ratatui::crossterm::event::{
     DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, Event,
     KeyEventKind, poll, read,
 };
-use ratatui::crossterm::terminal::{Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen};
 use ratatui::crossterm::{event::KeyCode, execute};
 use ratatui::layout::{Position, Rect};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Paragraph, Widget};
-use ratatui::{DefaultTerminal, Frame, Terminal, TerminalOptions, Viewport};
+use ratatui::widgets::Paragraph;
+use ratatui::{DefaultTerminal, Frame};
 use tokio::sync::mpsc;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::app::session::SessionState;
-use crate::app::timeline_model::{Turn, strip_ansi_escapes};
-use crate::app::{App, AppMsg, ConnPhase, ModalHit, Overlay, StartupIntent, WorkspaceHit};
+use crate::app::{App, AppMsg, ConnPhase, ModalHit, StartupIntent, WorkspaceHit};
 use crate::runtime::{Runtime, RuntimeMsg};
-use crate::terminal::transcript::PendingCommit;
 use crate::theme::Theme;
 use crate::ui::v2::adapter;
 use crate::ui::v2::route::{self, ScreenRoute};
-use crate::ui::v2::runtime::V2TranscriptRuntime;
-use crate::ui::v2::transcript::{BlockKind, BlockState, TranscriptBlock, render_transcript};
+use crate::ui::v2::transcript::{BlockKind, BlockState, TranscriptBlock};
 use crate::ui::v2::workspace;
-use qaqh_client::{ConversationMode, NoticeLevel, TimelineBlockKind, TimelineBlockState};
+use qaqh_client::{ConversationMode, NoticeLevel, TimelineBlockKind};
 
 mod fullscreen;
-mod inline;
 use fullscreen::{
     FullscreenView, draw_fullscreen_agent, handle_fullscreen_agent_mouse,
     handle_fullscreen_menu_key,
-};
-use inline::{
-    AgentState, commit_pending, draw_agent, initial_inline_height, inline_viewport_height,
 };
 
 const TICK_INTERVAL: Duration = Duration::from_millis(200);
 const MAX_SLASH_ROWS: usize = 4;
 
-/// 启动真实 V2 Agent shell。
-///
-/// 当前 CLI 只从 fullscreen 入口调用；`fullscreen=false` 保留给冻结的 inline
-/// 兼容分支与回归测试，不再作为默认启动路径。
-pub async fn run(no_spawn: bool, resume: bool, fullscreen: bool) -> Result<()> {
+/// 启动真实 V2 fullscreen Agent shell。
+pub async fn run(no_spawn: bool, resume: bool) -> Result<()> {
     let (app_tx, mut app_rx) = mpsc::unbounded_channel::<AppMsg>();
     let (rt_tx, mut rt_rx) = mpsc::unbounded_channel::<RuntimeMsg>();
     {
@@ -82,7 +64,6 @@ pub async fn run(no_spawn: bool, resume: bool, fullscreen: bool) -> Result<()> {
         .context("连接 daemon 失败")?;
 
     let mut app = App::new(runtime.clone(), app_tx.clone());
-    // V2 的 F4/Workspace 是 alternate-screen 工作区，不再复用 v1 常驻 sidebar。
     app.show_workspace = false;
     app.fetch_session_list();
     if resume {
@@ -96,17 +77,8 @@ pub async fn run(no_spawn: bool, resume: bool, fullscreen: bool) -> Result<()> {
         app.open_session_list();
     }
     let theme = Theme::current();
-    let mut terminal = if fullscreen {
-        TerminalHost::init_fullscreen()
-    } else {
-        TerminalHost::init(initial_inline_height(&app, theme))
-    };
-    let input_setup = if fullscreen {
-        execute!(stdout(), EnableMouseCapture, EnableBracketedPaste)
-    } else {
-        execute!(stdout(), EnableBracketedPaste)
-    };
-    if let Err(error) = input_setup {
+    let mut terminal = TerminalHost::init();
+    if let Err(error) = execute!(stdout(), EnableMouseCapture, EnableBracketedPaste) {
         ratatui::restore();
         runtime.shutdown().await;
         return Err(error).context("启用终端输入");
@@ -115,25 +87,18 @@ pub async fn run(no_spawn: bool, resume: bool, fullscreen: bool) -> Result<()> {
     let mut input = InputPump::new(app_tx.clone());
     spawn_tick(app_tx.clone());
 
-    let mut agent = AgentState::default();
     let mut fullscreen_view = FullscreenView::default();
-
     let result = run_loop(
         &mut terminal,
         &mut input,
         &mut app_rx,
         &mut app,
-        &mut agent,
         &mut fullscreen_view,
         theme,
     )
     .await;
 
     input.suspend().await;
-    // ⚠ 退出清理必须**同时**关掉鼠标捕获：捕获是在 `enter_alternate` 里开的，
-    // 而用户完全可能在全屏面（弹窗 / Workspace）里直接退出——那条路径不经过
-    // `leave_alternate`，只靠它收尾会把终端留在鼠标上报模式，用户的原生选择/
-    // 复制就此失效（实测：`?1000h` 有、`?1000l` 没有）。重复关是幂等的。
     let _ = execute!(stdout(), DisableMouseCapture, DisableBracketedPaste);
     runtime.shutdown().await;
     ratatui::restore();
@@ -176,8 +141,7 @@ impl InputPump {
                                 }
                                 Event::Paste(text) => AppMsg::Paste(text),
                                 Event::Resize(_, _) => AppMsg::Resize,
-                                // 鼠标只在弹窗（alternate screen）期间被捕获，
-                                // 见 `TerminalHost::enter_alternate`。
+                                // Fullscreen shell captures mouse input globally.
                                 Event::Mouse(mouse) => AppMsg::Mouse(mouse),
                                 _ => continue,
                             };
@@ -197,7 +161,7 @@ impl InputPump {
     /// 暂停 crossterm 输入读取。
     ///
     /// 读取线程每次只 poll 10ms 后主动释放 crossterm 内部 event reader 锁；
-    /// `Terminal::with_options(Viewport::Inline)` 重建 viewport 时要读取 cursor
+    /// 终端重建时要读取 cursor
     /// position，若输入线程正阻塞在 `read/poll` 会等锁到超时（实测 2s 后 Agent
     /// View 直接退出）。因此所有可能重建终端对象的路径都必须先停止并 join 输入
     /// 线程，确保锁已经释放。
@@ -229,7 +193,6 @@ async fn run_loop(
     input: &mut InputPump,
     app_rx: &mut mpsc::UnboundedReceiver<AppMsg>,
     app: &mut App,
-    agent: &mut AgentState,
     fullscreen_view: &mut FullscreenView,
     theme: &'static Theme,
 ) -> Result<()> {
@@ -238,59 +201,23 @@ async fn run_loop(
             break;
         }
         let route = route::resolve(app);
-        if terminal.mode == ScreenMode::Fullscreen && route != ScreenRoute::Agent {
+        if route != ScreenRoute::Agent {
             fullscreen_view.close_menu();
         }
         let size = terminal.terminal.size()?;
-        let previous_size = terminal.last_terminal_size;
-        let terminal_resized = terminal.note_terminal_size(size.width, size.height);
-
-        if terminal.mode == ScreenMode::Fullscreen {
-            // 全屏 shell 自己渲染整张 transcript；resize 只交给 ratatui
-            // autoresize，不再重建 inline viewport，也不 purge scrollback。
-            if terminal_resized {
-                fullscreen_view.close_menu();
-                terminal.terminal.autoresize()?;
-            }
-        } else {
-            let desired_height = inline_viewport_height(app, size.width, size.height, theme);
-            terminal.set_inline_height(desired_height);
-
-            if terminal_resized
-                && size.height < previous_size.1
-                && route == ScreenRoute::Agent
-                && terminal.mode == ScreenMode::Inline
-            {
-                // 缩小会把旧 viewport 的可见行留在新 origin 上方。清掉 scrollback 后
-                // 用 timeline 重放，避免旧 logo / 工具卡 / 状态栏残留成重影。
-                input.suspend().await;
-                let result = terminal.purge_scrollback_for_replay();
-                input.resume();
-                result?;
-                agent.force_replay(app);
-            } else if terminal_resized {
-                // 其他尺寸变化交给 ratatui autoresize；不要手工重建 inline viewport。
-                terminal.terminal.autoresize()?;
-            }
-
-            reconcile_screen(terminal, input, &route, app, agent, theme).await?;
-            if route == ScreenRoute::Agent && terminal.needs_inline_rebuild(size.height) {
-                input.suspend().await;
-                let result = terminal.ensure_inline_height(size.height);
-                input.resume();
-                result?;
-            }
+        if terminal.note_terminal_size(size.width, size.height) {
+            fullscreen_view.close_menu();
+            terminal.terminal.autoresize()?;
         }
 
         if app.force_redraw {
             terminal.terminal.clear()?;
             app.force_redraw = false;
         }
-        let screen_mode = terminal.mode;
         terminal
             .terminal
-            .draw(|frame| draw(frame, app, theme, &route, screen_mode, fullscreen_view))?;
-        if screen_mode == ScreenMode::Fullscreen && route == ScreenRoute::Agent {
+            .draw(|frame| draw(frame, app, theme, &route, fullscreen_view))?;
+        if route == ScreenRoute::Agent {
             fullscreen_view.clamp_scroll(app);
         }
 
@@ -321,46 +248,36 @@ fn handle_message(
     route: &ScreenRoute,
     fullscreen_view: &mut FullscreenView,
 ) -> Result<()> {
-    // 鼠标在 v2 里由**渲染层**接管：命中测试需要弹窗/全屏 shell 几何（只有这里
-    // 知道当前屏幕区域），而 v1 那套 `App::handle_mouse`（第 0 行 = tab bar）
-    // 在 v2 是错的——alt screen 的第 0 行不是 tab bar，点一下历史区就切标签页。
+    // 鼠标由渲染层接管：命中测试需要当前 shell/弹窗几何。
     if let AppMsg::Mouse(mouse) = msg {
-        match (terminal.mode, route) {
-            (ScreenMode::Fullscreen, ScreenRoute::Agent) => {
+        match route {
+            ScreenRoute::Agent => {
                 let size = terminal.terminal.size()?;
                 let area = ratatui::layout::Rect::new(0, 0, size.width, size.height);
                 handle_fullscreen_agent_mouse(app, fullscreen_view, area, mouse);
             }
-            (_, ScreenRoute::Workspace(workspace_route)) => {
+            ScreenRoute::Workspace(workspace_route) => {
                 fullscreen_view.pointer.clear_pointer();
                 let size = terminal.terminal.size()?;
                 let area = ratatui::layout::Rect::new(0, 0, size.width, size.height);
                 handle_workspace_mouse(app, workspace_route, area, mouse);
             }
-            (_, ScreenRoute::Modal(modal)) => {
+            ScreenRoute::Modal(modal) => {
                 fullscreen_view.pointer.clear_pointer();
                 let size = terminal.terminal.size()?;
                 let area = ratatui::layout::Rect::new(0, 0, size.width, size.height);
                 handle_modal_mouse(app, *modal, area, mouse);
             }
-            _ => {
-                fullscreen_view.pointer.clear_pointer();
-                app.workspace_hover = None;
-                app.workspace_pressed = None;
-            }
         }
-        // inline 主界面不捕获鼠标。
         return Ok(());
     }
-    if terminal.mode == ScreenMode::Fullscreen
-        && *route == ScreenRoute::Agent
+    if *route == ScreenRoute::Agent
         && fullscreen_view.menu.is_some()
         && matches!(&msg, AppMsg::Paste(_))
     {
         return Ok(());
     }
-    if terminal.mode == ScreenMode::Fullscreen
-        && *route == ScreenRoute::Agent
+    if *route == ScreenRoute::Agent
         && fullscreen_view.menu.is_some()
         && let AppMsg::Key(key) = &msg
     {
@@ -368,7 +285,6 @@ fn handle_message(
         return Ok(());
     }
     if let AppMsg::Key(key) = &msg
-        && terminal.mode == ScreenMode::Fullscreen
         && *route == ScreenRoute::Agent
     {
         match key.code {
@@ -530,70 +446,22 @@ fn dispatch_modal_hit(app: &mut App, hit: ModalHit) {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ScreenMode {
-    Inline,
-    Alternate,
-    Fullscreen,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ScreenTransition {
-    Stay,
-    EnterAlternate,
-    LeaveAlternate,
-}
-
-fn screen_transition(mode: ScreenMode, route: &ScreenRoute) -> ScreenTransition {
-    match (mode, route) {
-        (ScreenMode::Fullscreen, _) => ScreenTransition::Stay,
-        (ScreenMode::Inline, ScreenRoute::Agent)
-        | (ScreenMode::Alternate, ScreenRoute::Workspace(_))
-        | (ScreenMode::Alternate, ScreenRoute::Modal(_)) => ScreenTransition::Stay,
-        (ScreenMode::Inline, ScreenRoute::Workspace(_) | ScreenRoute::Modal(_)) => {
-            ScreenTransition::EnterAlternate
-        }
-        (ScreenMode::Alternate, ScreenRoute::Agent) => ScreenTransition::LeaveAlternate,
-    }
-}
-
 struct TerminalHost {
     terminal: DefaultTerminal,
-    mode: ScreenMode,
-    requested_inline_height: u16,
-    desired_inline_height: u16,
     last_terminal_size: (u16, u16),
 }
 
 impl TerminalHost {
-    fn init(inline_height: u16) -> Self {
-        let inline_height = inline_height.max(1);
-        let terminal = ratatui::init_with_options(TerminalOptions {
-            viewport: Viewport::Inline(inline_height),
-        });
-        let terminal_size = ratatui::crossterm::terminal::size().unwrap_or((0, 0));
-        Self {
-            terminal,
-            mode: ScreenMode::Inline,
-            requested_inline_height: inline_height,
-            desired_inline_height: inline_height,
-            last_terminal_size: terminal_size,
-        }
-    }
-
-    /// alternate-screen 全屏 shell。
+    /// alternate-screen fullscreen shell.
     ///
-    /// `ratatui::init()` 会启用 raw mode、进入 alternate screen 并安装 panic
-    /// restore hook；鼠标捕获由 `run` 在初始化成功后单独打开，确保错误路径也能
-    /// 统一清理。
-    fn init_fullscreen() -> Self {
+    /// `ratatui::init()` enables raw mode, enters the alternate screen and installs
+    /// the panic restore hook. Mouse capture is enabled separately after init so
+    /// initialization failures still restore the terminal.
+    fn init() -> Self {
         let terminal = ratatui::init();
         let terminal_size = ratatui::crossterm::terminal::size().unwrap_or((0, 0));
         Self {
             terminal,
-            mode: ScreenMode::Fullscreen,
-            requested_inline_height: 0,
-            desired_inline_height: 0,
             last_terminal_size: terminal_size,
         }
     }
@@ -605,126 +473,13 @@ impl TerminalHost {
         changed
     }
 
-    fn set_inline_height(&mut self, height: u16) {
-        self.desired_inline_height = height.max(1);
-    }
-
-    fn needs_inline_rebuild(&self, terminal_height: u16) -> bool {
-        if self.mode != ScreenMode::Inline
-            || self.requested_inline_height == self.desired_inline_height
-        {
-            return false;
-        }
-        // 终端高度把目标 viewport 夹住了：这是 ratatui 的 autoresize 职责，
-        // 不要在这里重建一个更矮的 inline viewport，否则放大再缩小会留下旧行。
-        let terminal_height = terminal_height.max(1);
-        if self.desired_inline_height >= terminal_height
-            && self.requested_inline_height > self.desired_inline_height
-        {
-            return false;
-        }
-        true
-    }
-
-    /// 在当前 inline viewport 高度与布局需求不一致时重建 viewport。
-    ///
-    /// 只清理旧 viewport 区域：增高锚定顶部，缩高锚定底边；不会重放 transcript。
-    fn ensure_inline_height(&mut self, terminal_height: u16) -> Result<()> {
-        if !self.needs_inline_rebuild(terminal_height) {
-            return Ok(());
-        }
-        self.rebuild_inline(self.desired_inline_height)
-    }
-
-    fn rebuild_inline(&mut self, height: u16) -> Result<()> {
-        let height = height.max(1);
-        let old_area = self.terminal.get_frame().area();
-        // 缩高时保持 viewport 底边不动，否则旧底部行会留在新 viewport 下面，
-        // 表现为状态栏/输入框重影；增高仍锚定顶部，避免侵入上方 scrollback。
-        let anchor_y = if height < old_area.height {
-            old_area
-                .y
-                .saturating_add(old_area.height)
-                .saturating_sub(height)
-        } else {
-            old_area.y
-        };
-        self.terminal.clear()?;
-        self.terminal
-            .set_cursor_position(Position::new(0, anchor_y))?;
-        self.terminal = Terminal::with_options(
-            CrosstermBackend::new(stdout()),
-            TerminalOptions {
-                viewport: Viewport::Inline(height),
-            },
-        )?;
-        self.requested_inline_height = height;
-        self.desired_inline_height = height;
-        self.mode = ScreenMode::Inline;
-        Ok(())
-    }
-
-    /// 进 alternate screen（弹窗 / 工作区）。
-    ///
-    /// **鼠标捕获只在这里开**：alt screen 里没有 scrollback，终端原生滚轮/选择
-    /// 本来也用不上，所以"吃掉原生鼠标"在这里代价最小；回到 inline 必须立刻
-    /// 关掉（见 `leave_alternate`），否则主界面的原生选择/复制就废了。
-    fn enter_alternate(&mut self) -> Result<()> {
-        execute!(stdout(), EnterAlternateScreen, EnableMouseCapture)?;
-        self.terminal = Terminal::new(CrosstermBackend::new(stdout()))?;
-        self.mode = ScreenMode::Alternate;
-        Ok(())
-    }
-
-    fn leave_alternate(&mut self) -> Result<()> {
-        let inline_height = self.desired_inline_height.max(1);
-        execute!(stdout(), DisableMouseCapture, LeaveAlternateScreen)?;
-        self.terminal = Terminal::with_options(
-            CrosstermBackend::new(stdout()),
-            TerminalOptions {
-                viewport: Viewport::Inline(inline_height),
-            },
-        )?;
-        self.requested_inline_height = inline_height;
-        self.desired_inline_height = inline_height;
-        self.mode = ScreenMode::Inline;
-        Ok(())
-    }
-
-    /// 清空屏幕与终端 scrollback，并把 inline viewport 重新锚定到顶部。
-    ///
-    /// 只用于会话切换与终端缩屏重建：旧会话/旧 viewport 的历史必须从终端历史里
-    /// 移除，否则新内容只能被追加到旧历史后面，无法满足“清屏 + 按 ledger 顺序重放”。
-    /// 调用后由 `commit_pending` 写入新 seed 的完整已封口快照。
-    fn purge_scrollback_for_replay(&mut self) -> Result<()> {
-        let inline_height = self.desired_inline_height.max(1);
-        execute!(
-            stdout(),
-            Clear(ClearType::All),
-            Clear(ClearType::Purge),
-            MoveTo(0, 0)
-        )?;
-        self.terminal = Terminal::with_options(
-            CrosstermBackend::new(stdout()),
-            TerminalOptions {
-                viewport: Viewport::Inline(inline_height),
-            },
-        )?;
-        self.requested_inline_height = inline_height;
-        self.desired_inline_height = inline_height;
-        self.mode = ScreenMode::Inline;
-        Ok(())
-    }
-
-    /// 挂起 TUI → 外部分页器 → 按原屏幕模式恢复。
+    /// Suspend TUI for `$PAGER`, then restore the fullscreen shell.
     fn run_pager(&mut self, text: &str) -> Result<()> {
         let path = std::env::temp_dir().join(format!("qaqh-pager-{}.md", std::process::id()));
         if std::fs::write(&path, text).is_err() {
             return Ok(());
         }
 
-        let was_fullscreen = self.mode == ScreenMode::Fullscreen;
-        let was_alternate = self.mode == ScreenMode::Alternate;
         ratatui::restore();
         let command = format!(
             "{} {}",
@@ -739,64 +494,12 @@ impl TerminalHost {
             let _ = std::process::Command::new("cat").arg(&path).status();
         }
 
-        if was_fullscreen {
-            self.terminal = ratatui::init();
-            self.requested_inline_height = 0;
-            self.desired_inline_height = 0;
-            self.mode = ScreenMode::Fullscreen;
-            execute!(stdout(), EnableMouseCapture, EnableBracketedPaste)?;
-        } else {
-            let inline_height = self.desired_inline_height.max(1);
-            self.terminal = ratatui::init_with_options(TerminalOptions {
-                viewport: Viewport::Inline(inline_height),
-            });
-            self.requested_inline_height = inline_height;
-            self.desired_inline_height = inline_height;
-            self.mode = ScreenMode::Inline;
-            execute!(stdout(), EnableBracketedPaste)?;
-            if was_alternate {
-                self.enter_alternate()?;
-            }
-        }
+        self.terminal = ratatui::init();
+        execute!(stdout(), EnableMouseCapture, EnableBracketedPaste)?;
         let _ = self.terminal.clear();
         let _ = std::fs::remove_file(&path);
         Ok(())
     }
-}
-
-async fn reconcile_screen(
-    terminal: &mut TerminalHost,
-    input: &mut InputPump,
-    route: &ScreenRoute,
-    app: &App,
-    agent: &mut AgentState,
-    theme: &Theme,
-) -> Result<()> {
-    if terminal.mode == ScreenMode::Fullscreen {
-        return Ok(());
-    }
-    match screen_transition(terminal.mode, route) {
-        ScreenTransition::Stay => {
-            if *route == ScreenRoute::Agent {
-                commit_pending(terminal, input, app, agent, theme).await?;
-            }
-        }
-        ScreenTransition::EnterAlternate => {
-            commit_pending(terminal, input, app, agent, theme).await?;
-            input.suspend().await;
-            let result = terminal.enter_alternate();
-            input.resume();
-            result?;
-        }
-        ScreenTransition::LeaveAlternate => {
-            input.suspend().await;
-            let result = terminal.leave_alternate();
-            input.resume();
-            result?;
-            commit_pending(terminal, input, app, agent, theme).await?;
-        }
-    }
-    Ok(())
 }
 
 fn draw(
@@ -804,14 +507,10 @@ fn draw(
     app: &App,
     theme: &Theme,
     route: &ScreenRoute,
-    screen_mode: ScreenMode,
     fullscreen_view: &mut FullscreenView,
 ) {
     match route {
-        ScreenRoute::Agent if screen_mode == ScreenMode::Fullscreen => {
-            draw_fullscreen_agent(frame, app, theme, fullscreen_view);
-        }
-        ScreenRoute::Agent => draw_agent(frame, app, theme),
+        ScreenRoute::Agent => draw_fullscreen_agent(frame, app, theme, fullscreen_view),
         ScreenRoute::Modal(modal) => {
             clear_screen(frame, theme);
             crate::ui::v2::modal::draw(frame, app, frame.area(), theme, *modal);
@@ -861,27 +560,6 @@ impl AgentLayout {
     }
 }
 
-fn open_assistant_block(session: &SessionState) -> Option<(&str, &str, &str)> {
-    let turn_id = session.timeline.running_turn_id()?;
-    let turn = session
-        .timeline
-        .turns
-        .iter()
-        .find(|turn| turn.turn_id == turn_id)?;
-    for round in turn.rounds.iter().rev() {
-        for block in round.blocks.iter().rev() {
-            if block.kind == TimelineBlockKind::Text && block.state == TimelineBlockState::Open {
-                return Some((
-                    turn.turn_id.as_str(),
-                    block.block_id.as_str(),
-                    block.text.as_str(),
-                ));
-            }
-        }
-    }
-    None
-}
-
 /// 稳定行数：未封口时最后一行始终留在 live tail；封口时才允许提交最后一行。
 fn session_is_working(session: &SessionState) -> bool {
     session.streaming.is_some() || session.timeline.running_turn_id().is_some()
@@ -902,33 +580,6 @@ fn composer_visual_rows(
     build_composer_rows(&session.composer.input, session.composer.cursor, text_width)
         .0
         .len()
-}
-
-/// 当前 open assistant 的未完成尾行。稳定行已经写进 scrollback，这里只画
-/// 最后一行；它每帧可变，因此绝不能再走 `insert_before`。
-fn stream_tail_line(session: &SessionState, width: u16, theme: &Theme) -> Line<'static> {
-    let Some((_, _, text)) = open_assistant_block(session) else {
-        return Line::default();
-    };
-    let prefix = format!("{} ", theme.glyph.assistant);
-    let body_width = usize::from(width)
-        .saturating_sub(prefix.width())
-        .saturating_sub(1)
-        .max(1);
-    let tail = strip_ansi_escapes(text.rsplit('\n').next().unwrap_or_default());
-    let shown = tail_cols(&tail, body_width);
-    let mut spans = vec![Span::styled(
-        prefix,
-        Style::new().fg(theme.accent.assistant),
-    )];
-    if let Some(line) = crate::ui::v2::markdown::render(&shown, body_width, theme).last() {
-        spans.extend(line.spans.clone());
-    }
-    spans.push(Span::styled(
-        theme.glyph.cursor.to_string(),
-        Style::new().fg(theme.accent.assistant),
-    ));
-    Line::from(spans)
 }
 
 /// composer 上方的单行 thinking 状态。
@@ -1128,20 +779,6 @@ fn build_composer_rows(
     (rows, cursor_row, cursor_col)
 }
 
-fn overlay_hint(overlay: &Overlay, theme: &Theme) -> Line<'static> {
-    let text = match overlay {
-        Overlay::SessionList { .. } => " 会话列表 · M5 Workspace",
-        Overlay::Settings(_) => " 设置 · M5 Workspace",
-        Overlay::Help => " 帮助 · M5 Workspace",
-        Overlay::History { .. } => " 历史回合 · M5 Workspace",
-        Overlay::AttachPath { .. } => " 附件路径 · M5 Modal",
-        Overlay::Confirm { .. } => " 确认操作 · M5 Modal",
-        Overlay::CwdInput { .. } => " 新会话目录 · M5 Modal",
-        Overlay::Thinking { .. } => " 思考回放 · M5 Modal",
-    };
-    Line::from(Span::styled(text, Style::new().fg(theme.semantic.warning)))
-}
-
 fn slash_menu_rows(app: &App) -> usize {
     if !app.overlays.is_empty() || app.inspecting() {
         return 0;
@@ -1198,7 +835,7 @@ fn status_line(app: &App, width: u16, theme: &Theme) -> Line<'static> {
         format!(" {mark} {label}"),
         Style::new().fg(color),
     )];
-    // v2 此前**完全没有 toast 面**：v1 在状态栏中间渲染 `app.toasts`，v2 的
+    // V2 fullscreen 需要在底部状态区提供 toast 面。
     // status_line 只画连接相位与常驻信息，于是命令失败 / 应答超时 / 上传失败
     // 这类反馈在 Agent View 里**完全不可见**（后端 issue #41 第 2 项正是靠
     // `permission-hang` 把这个洞暴露出来的）。
@@ -1340,22 +977,17 @@ fn shortcuts_line(app: &App, width: u16, theme: &Theme) -> Line<'static> {
 #[cfg(test)]
 mod tests {
     use super::fullscreen::{FullscreenTranscriptCache, MessageHit, assistant_markdown};
-    use super::inline::{
-        COMMIT_CHUNK_BLOCKS, MAX_VIEWPORT_HEIGHT, VIEWPORT_HEIGHT_PERCENT, agent_layout,
-        clear_wide_trailing_cells, render_agent,
-    };
     use super::*;
-    use crate::app::session::{AskPanel, SessionState, StreamPhase, StreamingState};
+    use crate::app::Overlay;
+    use crate::app::session::SessionState;
     use crate::app::timeline_model::TimelineModel;
     use crate::theme::{ColorSupport, ThemeKind};
     use crate::ui::v2::fullscreen::{FullscreenState, MessageMenu, MessageRole};
     use qaqh_client::{
-        AskMode, DomainAskQuestion as AskQuestion, TimelineBlock, TimelineBlockKind,
-        TimelineBlockState, TimelineEntry, TimelineEvent, TimelineTool, TimelineToolState,
+        TimelineBlock, TimelineBlockKind, TimelineBlockState, TimelineEntry, TimelineEvent,
     };
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
-    use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use ratatui::layout::Rect;
 
     fn test_theme() -> Theme {
@@ -1379,19 +1011,6 @@ mod tests {
         app.tabs.push(seed.clone());
         app.sessions.insert(seed, session);
         app
-    }
-
-    fn text_of(lines: &[Line<'static>]) -> String {
-        lines
-            .iter()
-            .map(|line| {
-                line.spans
-                    .iter()
-                    .map(|span| span.content.as_ref())
-                    .collect::<String>()
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
     }
 
     fn model_with_sealed_answer() -> TimelineModel {
@@ -1449,703 +1068,6 @@ mod tests {
         model
     }
 
-    fn model_with_live_activity() -> TimelineModel {
-        let mut model = TimelineModel::default();
-        model.apply(&entry(
-            1,
-            "turn-1",
-            TimelineEvent::TurnOpened {
-                user_text: "inspect".to_string(),
-            },
-        ));
-        model.apply(&entry(
-            2,
-            "turn-1",
-            TimelineEvent::BlockOpened {
-                block: TimelineBlock {
-                    block_id: "thinking-1".to_string(),
-                    block_order: 0,
-                    kind: TimelineBlockKind::Reasoning,
-                    state: TimelineBlockState::Open,
-                    text: "checking the workspace".to_string(),
-                    tool: None,
-                },
-            },
-        ));
-        model.apply(&entry(
-            3,
-            "turn-1",
-            TimelineEvent::BlockOpened {
-                block: TimelineBlock {
-                    block_id: "tool-1".to_string(),
-                    block_order: 1,
-                    kind: TimelineBlockKind::Tool,
-                    state: TimelineBlockState::Open,
-                    text: String::new(),
-                    tool: Some(TimelineTool {
-                        tool_call_id: "call-1".to_string(),
-                        name: "read".to_string(),
-                        state: TimelineToolState::Running,
-                        summary: Some("src/main.rs".to_string()),
-                        args_json: None,
-                        output: None,
-                        diff: None,
-                        progress: String::new(),
-                        progress_truncated: false,
-                        progress_stream: None,
-                        progress_bytes_total: 0,
-                        display: None,
-                        failure: None,
-                        permission: None,
-                    }),
-                },
-            },
-        ));
-        model
-    }
-
-    fn model_with_live_answer_after_thinking() -> TimelineModel {
-        let mut model = TimelineModel::default();
-        model.apply(&entry(
-            1,
-            "turn-1",
-            TimelineEvent::TurnOpened {
-                user_text: "question".to_string(),
-            },
-        ));
-        model.apply(&entry(
-            2,
-            "turn-1",
-            TimelineEvent::BlockOpened {
-                block: TimelineBlock {
-                    block_id: "thinking-1".to_string(),
-                    block_order: 0,
-                    kind: TimelineBlockKind::Reasoning,
-                    state: TimelineBlockState::Open,
-                    text: "internal reasoning".to_string(),
-                    tool: None,
-                },
-            },
-        ));
-        model.apply(&entry(
-            3,
-            "turn-1",
-            TimelineEvent::BlockOpened {
-                block: TimelineBlock {
-                    block_id: "answer-1".to_string(),
-                    block_order: 1,
-                    kind: TimelineBlockKind::Text,
-                    state: TimelineBlockState::Open,
-                    text: "assistant answer".to_string(),
-                    tool: None,
-                },
-            },
-        ));
-        model
-    }
-
-    fn model_with_live_reasoning(text: &str) -> TimelineModel {
-        let mut model = TimelineModel::default();
-        model.apply(&entry(
-            1,
-            "turn-1",
-            TimelineEvent::TurnOpened {
-                user_text: "question".to_string(),
-            },
-        ));
-        model.apply(&entry(
-            2,
-            "turn-1",
-            TimelineEvent::BlockOpened {
-                block: TimelineBlock {
-                    block_id: "thinking-1".to_string(),
-                    block_order: 0,
-                    kind: TimelineBlockKind::Reasoning,
-                    state: TimelineBlockState::Open,
-                    text: text.to_string(),
-                    tool: None,
-                },
-            },
-        ));
-        model
-    }
-
-    #[test]
-    fn first_snapshot_replays_once_then_syncs_incrementally() {
-        let app = app_with_model(model_with_sealed_answer());
-        let mut state = AgentState::default();
-
-        let first = state.sync(&app);
-        assert!(first.reset_scrollback);
-        assert_eq!(first.pending.len(), 2);
-
-        let second = state.sync(&app);
-        assert!(!second.reset_scrollback);
-        assert!(second.pending.is_empty());
-    }
-
-    #[test]
-    fn rebaseline_epoch_forces_scrollback_replay() {
-        let mut app = app_with_model(model_with_sealed_answer());
-        let mut state = AgentState::default();
-        let first = state.sync(&app);
-        assert_eq!(first.pending.len(), 2);
-
-        let session = app.sessions.get_mut("seed-1").expect("session");
-        session.timeline.rebaseline_epoch = session.timeline.rebaseline_epoch.saturating_add(1);
-        session.timeline.version = session.timeline.version.saturating_add(1);
-
-        let replayed = state.sync(&app);
-        assert!(replayed.reset_scrollback);
-        assert_eq!(replayed.pending.len(), 2);
-    }
-
-    #[test]
-    fn forced_replay_resets_and_replays_after_scrollback_purge() {
-        let app = app_with_model(model_with_sealed_answer());
-        let mut state = AgentState::default();
-        let first = state.sync(&app);
-        assert_eq!(first.pending.len(), 2);
-
-        state.force_replay(&app);
-        assert!(state.replay_active);
-        assert!(state.pending_commits.is_empty());
-        assert!(state.pending_stream_lines.is_empty());
-
-        let replayed = state.sync(&app);
-        assert_eq!(replayed.pending.len(), 2, "缩屏重建后必须从 timeline 重放");
-    }
-
-    #[test]
-    fn streaming_commits_complete_lines_and_flushes_tail_on_seal() {
-        let mut model = model_with_live_answer_after_thinking();
-        model.apply(&entry(
-            4,
-            "turn-1",
-            TimelineEvent::TextDelta {
-                block_id: "answer-1".to_string(),
-                fragment_seq: 1,
-                delta: "\nsecond".to_string(),
-            },
-        ));
-        let app = app_with_model(model.clone());
-        let mut state = AgentState::default();
-
-        let first = state.sync_streaming(&app, 60, &test_theme());
-        let first_text = text_of(&first);
-        assert!(first_text.contains("assistant answer"), "{first_text}");
-        assert!(!first_text.contains("second"), "{first_text}");
-        assert!(state.streamed_blocks.is_empty());
-
-        model.apply(&entry(
-            5,
-            "turn-1",
-            TimelineEvent::BlockSealed {
-                block_id: "answer-1".to_string(),
-            },
-        ));
-        let sealed_app = app_with_model(model);
-        let second = state.sync_streaming(&sealed_app, 60, &test_theme());
-        let second_text = text_of(&second);
-        assert!(second_text.contains("second"), "{second_text}");
-        assert!(
-            state
-                .streamed_blocks
-                .contains(&("turn-1".to_string(), "answer-1".to_string())),
-            "已流式提交的 block 必须在 sealed 整体渲染时被抑制"
-        );
-    }
-
-    #[test]
-    fn session_switch_resets_scrollback_and_replays_each_seed() {
-        let mut app = app_with_model(model_with_sealed_answer());
-        let mut second = TimelineModel::default();
-        second.apply(&entry(
-            1,
-            "turn-2",
-            TimelineEvent::TurnOpened {
-                user_text: "second session".to_string(),
-            },
-        ));
-        second.apply(&entry(
-            2,
-            "turn-2",
-            TimelineEvent::BlockOpened {
-                block: TimelineBlock {
-                    block_id: "b2".to_string(),
-                    block_order: 0,
-                    kind: TimelineBlockKind::Text,
-                    state: TimelineBlockState::Sealed,
-                    text: "second answer".to_string(),
-                    tool: None,
-                },
-            },
-        ));
-        app.tabs.push("seed-2".to_string());
-        let mut session = SessionState::new("seed-2".to_string());
-        session.timeline = second;
-        app.sessions.insert("seed-2".to_string(), session);
-
-        let mut state = AgentState::default();
-        let first = state.sync(&app);
-        assert!(first.reset_scrollback);
-        assert_eq!(first.pending.len(), 2);
-
-        app.active = 1;
-        let switched = state.sync(&app);
-        assert!(switched.reset_scrollback);
-        assert_eq!(switched.pending.len(), 2);
-        assert!(
-            switched
-                .pending
-                .iter()
-                .all(|pending| pending.seed == "seed-2")
-        );
-
-        app.active = 0;
-        let switched_back = state.sync(&app);
-        assert!(switched_back.reset_scrollback);
-        assert_eq!(
-            switched_back.pending.len(),
-            2,
-            "切回旧会话时必须先清 scrollback，因此允许重新 emit"
-        );
-    }
-
-    #[test]
-    fn replay_commits_are_drained_in_bounded_chunks() {
-        fn pending(index: usize) -> PendingCommit {
-            let mut block = crate::ui::v2::transcript::TranscriptBlock::new(
-                format!("b{index}"),
-                crate::ui::v2::transcript::BlockKind::Assistant {
-                    text: format!("block {index}"),
-                },
-            )
-            .with_turn_id("turn-1");
-            assert!(block.seal());
-            PendingCommit {
-                seed: "seed".into(),
-                block,
-            }
-        }
-
-        let mut state = AgentState::default();
-        state.pending_commits.extend((0..70).map(pending));
-
-        assert_eq!(
-            state.take_commit_chunk(COMMIT_CHUNK_BLOCKS).len(),
-            COMMIT_CHUNK_BLOCKS
-        );
-        assert_eq!(state.pending_commits.len(), 70 - COMMIT_CHUNK_BLOCKS);
-        assert_eq!(
-            state.take_commit_chunk(COMMIT_CHUNK_BLOCKS).len(),
-            COMMIT_CHUNK_BLOCKS
-        );
-        assert_eq!(state.pending_commits.len(), 70 - 2 * COMMIT_CHUNK_BLOCKS);
-    }
-
-    #[test]
-    fn first_replay_is_chunked_across_frames() {
-        let app = app_with_model(model_with_many_sealed_turns(20));
-        let mut state = AgentState::default();
-
-        let first = state.sync(&app);
-        assert!(first.reset_scrollback);
-        assert_eq!(first.pending.len(), 16);
-        assert!(state.replay_active);
-
-        let second = state.sync(&app);
-        assert_eq!(second.pending.len(), 16);
-        assert!(state.replay_active);
-
-        let third = state.sync(&app);
-        assert_eq!(third.pending.len(), 8);
-        assert!(!state.replay_active);
-
-        assert!(state.sync(&app).pending.is_empty());
-    }
-
-    #[test]
-    fn agent_render_keeps_composer_visible_on_narrow_cjk_input() {
-        let mut app = app_with_model(TimelineModel::default());
-        let input = "这是一个很长的中文输入，用来验证窄屏横向窗口";
-        let session = app.sessions.get_mut("seed-1").expect("session");
-        session.composer.input = input.chars().collect();
-        session.composer.cursor = session.composer.input.len();
-
-        let rendered = render_agent(&app, 20, 8, &test_theme());
-        assert!(rendered.lines.len() <= 8);
-        let cursor = rendered.cursor.expect("composer cursor");
-        assert!(cursor.x < 20, "cursor={cursor:?}");
-        let text: String = rendered
-            .lines
-            .iter()
-            .flat_map(|line| line.spans.iter())
-            .map(|span| span.content.as_ref())
-            .collect();
-        assert!(text.contains("横向窗口"), "{text}");
-    }
-
-    #[test]
-    fn agent_render_sanitizes_control_characters() {
-        let mut app = app_with_model(TimelineModel::default());
-        let session = app.sessions.get_mut("seed-1").expect("session");
-        session.composer.input = vec!['a', '\u{1b}', 'b'];
-        session.composer.cursor = session.composer.input.len();
-
-        let rendered = render_agent(&app, 40, 8, &test_theme());
-        let text: String = rendered
-            .lines
-            .iter()
-            .flat_map(|line| line.spans.iter())
-            .map(|span| span.content.as_ref())
-            .collect();
-        assert!(!text.contains('\u{1b}'), "raw escape reached the terminal");
-        assert!(text.contains('�'), "{text}");
-    }
-
-    #[test]
-    fn composer_rows_split_newlines_and_track_cursor() {
-        let input: Vec<char> = "ab\ncd".chars().collect();
-        let (rows, cursor_row, cursor_col) = build_composer_rows(&input, 3, 20);
-        assert_eq!(rows, vec![vec!['a', 'b'], vec!['c', 'd']]);
-        assert_eq!(cursor_row, 1);
-        assert_eq!(cursor_col, 0);
-    }
-
-    #[test]
-    fn composer_rows_wrap_wide_text_and_keep_cursor_visible() {
-        let input: Vec<char> = "这是很长的中文输入".chars().collect();
-        let (rows, cursor_row, cursor_col) = build_composer_rows(&input, input.len(), 6);
-        assert!(rows.len() > 1);
-        assert_eq!(cursor_row, rows.len() - 1);
-        assert!(cursor_col <= 6);
-
-        let mut app = app_with_model(TimelineModel::default());
-        let session = app.sessions.get_mut("seed-1").expect("session");
-        session.composer.input = input;
-        session.composer.cursor = session.composer.input.len();
-        let rendered = render_agent(&app, 20, 8, &test_theme());
-        let cursor = rendered.cursor.expect("composer cursor");
-        assert!(cursor.y < 8);
-    }
-
-    #[test]
-    fn brand_page_renders_draft_input_box_and_cursor() {
-        let (mut app, _rx) = App::new_for_test();
-        app.draft_composer.insert_str("hello 世界");
-        let rendered = render_agent(&app, 80, 14, &test_theme());
-        let text: String = rendered
-            .lines
-            .iter()
-            .flat_map(|line| line.spans.iter())
-            .map(|span| span.content.as_ref())
-            .collect();
-
-        assert!(text.contains("Q A Q"), "{text}");
-        assert!(text.contains("hello 世界"), "{text}");
-        assert!(text.contains('╭'), "{text}");
-        assert!(
-            rendered.cursor.is_some(),
-            "draft composer must expose cursor"
-        );
-        assert!(rendered.lines.len() <= 14);
-    }
-
-    #[test]
-    fn brand_page_gets_more_than_old_three_row_empty_state() {
-        let (app, _rx) = App::new_for_test();
-        let height = inline_viewport_height(&app, 80, 40, &test_theme());
-        assert!(
-            height > 3,
-            "brand page needs room for logo + input: {height}"
-        );
-        assert!(height <= MAX_VIEWPORT_HEIGHT);
-    }
-
-    #[test]
-    fn dynamic_viewport_grows_for_composer_and_slash_menu() {
-        let mut app = app_with_model(TimelineModel::default());
-        let theme = test_theme();
-        let base = inline_viewport_height(&app, 80, 40, &theme);
-
-        let session = app.sessions.get_mut("seed-1").expect("session");
-        session.composer.input = "line\n".repeat(8).chars().collect();
-        session.composer.cursor = session.composer.input.len();
-        let grown = inline_viewport_height(&app, 80, 40, &theme);
-        assert!(grown > base, "base={base}, grown={grown}");
-        assert!(grown <= MAX_VIEWPORT_HEIGHT, "grown={grown}");
-
-        let session = app.sessions.get_mut("seed-1").expect("session");
-        session.composer.input = vec!['/'];
-        session.composer.cursor = 1;
-        let slash = inline_viewport_height(&app, 80, 40, &theme);
-        assert!(slash > base, "base={base}, slash={slash}");
-        assert!(slash <= MAX_VIEWPORT_HEIGHT, "slash={slash}");
-    }
-
-    #[test]
-    fn narrow_viewport_hides_shortcuts_and_preserves_composer_tail() {
-        let mut app = app_with_model(TimelineModel::default());
-        let input = "这是一个很长的中文输入，用来验证窄屏横向窗口";
-        let session = app.sessions.get_mut("seed-1").expect("session");
-        session.composer.input = input.chars().collect();
-        session.composer.cursor = session.composer.input.len();
-        let theme = test_theme();
-
-        let height = inline_viewport_height(&app, 20, 8, &theme);
-        assert!(height <= 4, "height={height}");
-        let layout = agent_layout(&app, 20, height, &theme);
-        assert_eq!(layout.shortcuts_rows, 0);
-        assert!(layout.composer_rows >= 1);
-        assert_eq!(layout.status_rows, 1);
-
-        let rendered = render_agent(&app, 20, height, &theme);
-        let text: String = rendered
-            .lines
-            .iter()
-            .flat_map(|line| line.spans.iter())
-            .map(|span| span.content.as_ref())
-            .collect();
-        assert!(text.contains("横向窗口"), "{text}");
-        assert!(rendered.lines.len() <= usize::from(height));
-    }
-
-    #[test]
-    fn viewport_height_respects_screen_ratio_and_cap() {
-        let app = app_with_model(TimelineModel::default());
-        let theme = test_theme();
-        for terminal_height in [1, 2, 4, 8, 24, 40, 80] {
-            let height = inline_viewport_height(&app, 80, terminal_height, &theme);
-            let expected_cap = terminal_height
-                .saturating_mul(VIEWPORT_HEIGHT_PERCENT)
-                .checked_div(100)
-                .unwrap_or(0)
-                .clamp(1, MAX_VIEWPORT_HEIGHT)
-                .min(terminal_height)
-                .max(1);
-            assert!(
-                height <= expected_cap,
-                "screen={terminal_height}, height={height}"
-            );
-            assert!(height >= 1);
-        }
-    }
-
-    #[test]
-    fn slash_menu_tracks_selection_and_stays_in_viewport() {
-        let mut app = app_with_model(TimelineModel::default());
-        let session = app.sessions.get_mut("seed-1").expect("session");
-        session.composer.input = vec!['/'];
-        session.composer.cursor = 1;
-        app.slash_selected = 2;
-
-        let rendered = render_agent(&app, 60, 10, &test_theme());
-        let text: String = rendered
-            .lines
-            .iter()
-            .flat_map(|line| line.spans.iter())
-            .map(|span| span.content.as_ref())
-            .collect();
-        assert!(text.contains("/new"), "{text}");
-        assert!(text.contains("▸ /sessions"), "{text}");
-        assert!(text.contains("/settings"), "{text}");
-        assert!(rendered.lines.len() <= 10);
-    }
-
-    #[test]
-    fn live_thinking_and_tool_cards_render_in_agent_viewport() {
-        let app = app_with_model(model_with_live_activity());
-        let rendered = render_agent(&app, 60, 10, &test_theme());
-        let text: String = rendered
-            .lines
-            .iter()
-            .flat_map(|line| line.spans.iter())
-            .map(|span| span.content.as_ref())
-            .collect();
-        assert!(text.contains("checking the workspace"), "{text}");
-        assert!(text.contains("read"), "{text}");
-        assert!(text.contains("src/main.rs"), "{text}");
-    }
-
-    #[test]
-    fn thinking_row_uses_latest_line_and_tail_window() {
-        let app = app_with_model(model_with_live_reasoning(
-            "first line\nsecond line is intentionally long",
-        ));
-        let rendered = render_agent(&app, 24, 8, &test_theme());
-        let text: String = rendered
-            .lines
-            .iter()
-            .flat_map(|line| line.spans.iter())
-            .map(|span| span.content.as_ref())
-            .collect();
-        assert!(text.contains("long"), "{text}");
-        assert!(!text.contains("first line"), "{text}");
-    }
-
-    #[test]
-    fn thinking_row_keeps_spinner_without_reasoning() {
-        let mut app = app_with_model(TimelineModel::default());
-        let session = app.sessions.get_mut("seed-1").expect("session");
-        session.streaming = Some(StreamingState {
-            turn_id: "turn-1".to_string(),
-            phase: StreamPhase::ToolCalling,
-            round_num: 0,
-            tool_name: Some("read".to_string()),
-            armed_at: std::time::Instant::now(),
-        });
-
-        let rendered = render_agent(&app, 40, 8, &test_theme());
-        let text: String = rendered
-            .lines
-            .iter()
-            .flat_map(|line| line.spans.iter())
-            .map(|span| span.content.as_ref())
-            .collect();
-        assert!(text.contains("tool…"), "{text}");
-        let thinking = rendered
-            .lines
-            .iter()
-            .map(|line| {
-                line.spans
-                    .iter()
-                    .map(|span| span.content.as_ref())
-                    .collect::<String>()
-            })
-            .find(|line| line.contains("tool…"))
-            .expect("thinking row");
-        let first = thinking.chars().next().expect("spinner");
-        assert!(
-            matches!(first, '·' | '✢' | '✳' | '✶' | '✻' | '✽'),
-            "thinking row must keep the working spinner: {thinking:?}"
-        );
-    }
-
-    #[test]
-    fn thinking_tail_keeps_latest_characters_and_wide_chars_intact() {
-        assert_eq!(tail_cols("abcdef", 3), "def");
-        assert_eq!(tail_cols("你好世界", 4), "世界");
-    }
-
-    #[test]
-    fn live_answer_tail_and_thinking_use_dedicated_rows() {
-        let app = app_with_model(model_with_live_answer_after_thinking());
-        let rendered = render_agent(&app, 60, 10, &test_theme());
-        let text: String = rendered
-            .lines
-            .iter()
-            .flat_map(|line| line.spans.iter())
-            .map(|span| span.content.as_ref())
-            .collect();
-        assert!(
-            text.contains("assistant answer"),
-            "open assistant 的未完成尾行应在 live viewport 显示：{text}"
-        );
-        assert!(text.contains('▌'), "流式尾行应带光标：{text}");
-        assert!(!text.contains("Thinking…"), "{text}");
-
-        let thinking = rendered
-            .lines
-            .iter()
-            .map(|line| {
-                line.spans
-                    .iter()
-                    .map(|span| span.content.as_ref())
-                    .collect::<String>()
-            })
-            .find(|line| line.contains("internal reasoning"))
-            .expect("thinking row");
-        let first = thinking.chars().next().expect("spinner");
-        assert!(
-            matches!(first, '·' | '✢' | '✳' | '✶' | '✻' | '✽'),
-            "thinking row must lead with a working spinner: {thinking:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn agent_delegates_enter_to_existing_composer_send_path() {
-        let mut app = app_with_model(TimelineModel::default());
-        let session = app.sessions.get_mut("seed-1").expect("session");
-        session.composer.input = "hello".chars().collect();
-        session.composer.cursor = session.composer.input.len();
-
-        app.handle(AppMsg::Key(KeyEvent::new(
-            KeyCode::Enter,
-            KeyModifiers::NONE,
-        )));
-
-        let session = app.sessions.get("seed-1").expect("session");
-        assert!(session.composer.is_empty());
-    }
-
-    #[test]
-    fn agent_draw_routes_pending_ask_to_v2_modal() {
-        let mut app = app_with_model(TimelineModel::default());
-        app.sessions.get_mut("seed-1").expect("session").pending_ask = Some(AskPanel::new(
-            "interaction-1".into(),
-            "turn-1".into(),
-            AskMode::Single,
-            vec![AskQuestion {
-                id: "q1".into(),
-                question: "选择完整方案".into(),
-                options: vec!["方案一".into(), "方案二".into()],
-                allow_custom: true,
-            }],
-        ));
-        let theme = test_theme();
-        let backend = TestBackend::new(80, 24);
-        let mut terminal = Terminal::with_options(
-            backend,
-            TerminalOptions {
-                viewport: Viewport::Inline(10),
-            },
-        )
-        .expect("inline terminal");
-        let route = route::resolve(&app);
-        let mut view = FullscreenView::default();
-        terminal
-            .draw(|frame| draw(frame, &app, &theme, &route, ScreenMode::Inline, &mut view))
-            .expect("draw ask modal");
-        let text: String = terminal
-            .backend()
-            .buffer()
-            .content()
-            .iter()
-            .map(|cell| cell.symbol())
-            .collect::<String>()
-            .chars()
-            .filter(|ch| !ch.is_whitespace())
-            .collect();
-        assert!(text.contains("问题1/1"), "{text}");
-        assert!(text.contains("选择完整方案"), "{text}");
-    }
-
-    #[test]
-    fn inline_agent_draw_survives_resize() {
-        let app = app_with_model(TimelineModel::default());
-        let theme = test_theme();
-        let backend = TestBackend::new(80, 24);
-        let mut terminal = Terminal::with_options(
-            backend,
-            TerminalOptions {
-                viewport: Viewport::Inline(10),
-            },
-        )
-        .expect("inline terminal");
-        let route = route::resolve(&app);
-        let mut view = FullscreenView::default();
-
-        for (width, height) in [(80, 24), (40, 20), (20, 8), (120, 40)] {
-            terminal
-                .resize(Rect::new(0, 0, width, height))
-                .expect("resize");
-            terminal
-                .draw(|frame| draw(frame, &app, &theme, &route, ScreenMode::Inline, &mut view))
-                .expect("draw after resize");
-        }
-    }
-
     #[test]
     fn fullscreen_agent_draw_uses_full_buffer_and_keeps_composer_visible() {
         let mut app = app_with_model(model_with_many_sealed_turns(30));
@@ -2168,16 +1090,7 @@ mod tests {
         };
 
         terminal
-            .draw(|frame| {
-                draw(
-                    frame,
-                    &app,
-                    &theme,
-                    &route,
-                    ScreenMode::Fullscreen,
-                    &mut view,
-                )
-            })
+            .draw(|frame| draw(frame, &app, &theme, &route, &mut view))
             .expect("draw fullscreen agent");
 
         let text: String = terminal
@@ -2207,16 +1120,7 @@ mod tests {
                 .resize(Rect::new(0, 0, width, height))
                 .expect("resize");
             terminal
-                .draw(|frame| {
-                    draw(
-                        frame,
-                        &app,
-                        &theme,
-                        &route,
-                        ScreenMode::Fullscreen,
-                        &mut view,
-                    )
-                })
+                .draw(|frame| draw(frame, &app, &theme, &route, &mut view))
                 .expect("draw fullscreen after resize");
         }
     }
@@ -2240,16 +1144,7 @@ mod tests {
         };
 
         terminal
-            .draw(|frame| {
-                draw(
-                    frame,
-                    &app,
-                    &theme,
-                    &route,
-                    ScreenMode::Fullscreen,
-                    &mut view,
-                )
-            })
+            .draw(|frame| draw(frame, &app, &theme, &route, &mut view))
             .expect("draw context menu");
 
         let text: String = terminal
@@ -2381,56 +1276,5 @@ mod tests {
             assistant_markdown(&app, "turn-1", "block-1").as_deref(),
             Some("answer-1")
         );
-    }
-
-    #[test]
-    fn screen_transition_enters_and_leaves_alternate_once() {
-        let workspace = ScreenRoute::Workspace(route::WorkspaceRoute::Help);
-        let modal = ScreenRoute::Modal(route::ModalRoute::Ask);
-        assert_eq!(
-            screen_transition(ScreenMode::Inline, &ScreenRoute::Agent),
-            ScreenTransition::Stay
-        );
-        assert_eq!(
-            screen_transition(ScreenMode::Inline, &workspace),
-            ScreenTransition::EnterAlternate
-        );
-        assert_eq!(
-            screen_transition(ScreenMode::Alternate, &workspace),
-            ScreenTransition::Stay
-        );
-        assert_eq!(
-            screen_transition(ScreenMode::Alternate, &modal),
-            ScreenTransition::Stay,
-            "Workspace → Modal 不应重复进出 alternate"
-        );
-        assert_eq!(
-            screen_transition(ScreenMode::Alternate, &ScreenRoute::Agent),
-            ScreenTransition::LeaveAlternate
-        );
-        assert_eq!(
-            screen_transition(ScreenMode::Fullscreen, &ScreenRoute::Agent),
-            ScreenTransition::Stay
-        );
-        assert_eq!(
-            screen_transition(ScreenMode::Fullscreen, &workspace),
-            ScreenTransition::Stay,
-            "全屏 shell 在 Agent/Workspace 之间不应退出 alternate"
-        );
-    }
-
-    #[test]
-    fn insert_before_clears_wide_trailing_cells_without_touching_glyph() {
-        let mut buffer = ratatui::buffer::Buffer::empty(Rect::new(0, 0, 8, 1));
-        buffer.set_string(0, 0, "你a", Style::default());
-        assert_eq!(buffer.content[0].symbol(), "你");
-        assert_eq!(buffer.content[1].symbol(), " ");
-        assert_eq!(buffer.content[2].symbol(), "a");
-
-        clear_wide_trailing_cells(&mut buffer);
-
-        assert_eq!(buffer.content[0].symbol(), "你");
-        assert_eq!(buffer.content[1].symbol(), "");
-        assert_eq!(buffer.content[2].symbol(), "a");
     }
 }

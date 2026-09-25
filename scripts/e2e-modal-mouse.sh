@@ -20,14 +20,13 @@
 set -u
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 REPO_ROOT=$(cd -- "$SCRIPT_DIR/.." && pwd)
-BACKEND_ROOT=${QAQH_BACKEND_ROOT:-$REPO_ROOT/../qaqh-backend-anchor}
+BACKEND_ROOT=${QAQH_BACKEND_ROOT:-$REPO_ROOT/../qaqh-backend}
 DAEMON=${DAEMON:-$BACKEND_ROOT/target/debug/qaqh-daemon}
 TUI=${TUI:-$REPO_ROOT/target/debug/qaqh-tui}
 D=${D:-/tmp/qaqh-e2e-modal-mouse}
 RUN_SECS=${RUN_SECS:-30}
-# 鼠标响应属于 fullscreen shell：inline 明确不抓鼠标，保留终端原生选择/复制。
-# 允许覆盖是为了后续在同一个 harness 上跑 `--v1`/其他外壳，但默认必须覆盖本轮验收目标。
-TUI_ARGS=${TUI_ARGS:---v2-fullscreen}
+# 鼠标响应属于唯一的 V2 fullscreen shell。
+TUI_ARGS=${TUI_ARGS:-}
 
 case "$D" in
   /tmp/*|/var/tmp/*) ;;
@@ -290,8 +289,7 @@ wrong_default = any(
 # alternate screen 切换，退出 alt screen 后旧内容还留在它的虚拟屏上（实测会假红）。
 # 直接看字节流里的模式位：进 alt screen / 出 alt screen。
 left_alternate = "\x1b[?1049l" in raw
-# ④ 捕获纪律：fullscreen 进入时开、退出时关。inline 模式不抓鼠标，
-# 因此这个 harness 默认显式启动 `--v2-fullscreen`。
+# ④ 捕获纪律：fullscreen 进入时开、退出时关。
 capture_on = "\x1b[?1000h" in raw and "\x1b[?1003h" in raw and "\x1b[?1006h" in raw
 capture_off = "\x1b[?1000l" in raw and "\x1b[?1003l" in raw and "\x1b[?1006l" in raw
 

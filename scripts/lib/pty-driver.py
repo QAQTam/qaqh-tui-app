@@ -3,7 +3,7 @@
 
 ## 为什么需要它
 
-v2 Agent View 初始化 inline viewport 时会发 `ESC[6n`（DSR / 光标位置查询），
+V2 fullscreen 初始化时会发 `ESC[6n`（DSR / 光标位置查询），
 **等终端回答**。`script(1)` 与 `pty.spawn` 这类"哑"驱动不解析输出、也不回话，
 于是查询超时，TUI 在初始化阶段直接 panic：
 
@@ -11,7 +11,7 @@ v2 Agent View 初始化 inline viewport 时会发 `ESC[6n`（DSR / 光标位置�
     within a normal duration
 
 这条 panic 是**驱动的锅，不是产品的锅**——真终端（xterm/kitty/tmux/…）都会回
-`ESC[row;colR`。alpha1 把默认 UI 从 v1 全屏切到 v2 Agent View 之后，所有仍在用
+`ESC[row;colR`。V2 fullscreen 成为唯一 UI 之后，所有仍在用
 哑驱动的 harness 会**静默变成假红**（渲染都没跑起来，相位解析自然全空）。
 
 `scripts/smoke-tui.sh` 早就踩过这个坑并在脚本内联了修法；本文件把那套逻辑抽成

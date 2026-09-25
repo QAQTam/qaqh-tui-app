@@ -3,13 +3,12 @@
 
 /// 命令的**落点**：声明它会把界面切到哪。
 ///
-/// 为什么要显式声明：Agent View 是 inline + scrollback，而 Workspace 是
-/// alternate screen 全屏。用户按下 `/settings` 会**整屏切换**——这件事应该在
-/// 菜单里就能看见，而不是按下去才知道。后续要做命令面板时，这个字段也是
-/// 分组/过滤的依据（"只显示不换屏的命令"之类）。
+/// 为什么要显式声明：就地命令留在 Agent View，Workspace 命令切到管理页。
+/// 用户按下 `/settings` 会**整屏切换**——这件事应该在菜单里就能看见，而不是
+/// 按下去才知道。后续要做命令面板时，这个字段也是分组/过滤的依据。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SlashSurface {
-    /// 就地生效，不换屏（改输入、开 inline 浮层、直接发命令）。
+    /// 就地生效，不换屏（改输入、开浮层、直接发命令）。
     Inline,
     /// 打开全屏 Workspace（alternate screen；Esc 返回 Agent View）。
     Workspace,

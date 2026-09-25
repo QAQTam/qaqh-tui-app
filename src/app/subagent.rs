@@ -36,18 +36,6 @@ pub enum SubagentState {
 }
 
 impl SubagentState {
-    pub fn label(self) -> &'static str {
-        match self {
-            SubagentState::Starting => "starting",
-            SubagentState::Running => "running",
-            SubagentState::Completed => "completed",
-            SubagentState::Error => "error",
-            SubagentState::Timeout => "timeout",
-            SubagentState::Cancelled => "cancelled",
-            SubagentState::Closed => "closed",
-        }
-    }
-
     pub fn is_terminal(self) -> bool {
         matches!(
             self,
@@ -301,8 +289,6 @@ impl App {
 
     pub(super) fn exit_inspect(&mut self) {
         self.inspect = None;
-        // 返回父会话：重置焦点触发 touch_focus / 渲染缓存重建。
-        self.last_focused = None;
         // 这里**不**剪 overlay：`inspect` 不改变活动标签，而所有会改变它的路径
         // （Alt+数字/方向、点击标签、open_session_tab、close_tab_by_seed）自己
         // 已经剪过；唯一由 Esc 进入的这条路径还要先过 `overlay_key`，那时 overlay
@@ -443,7 +429,6 @@ impl App {
                 // 逐层返回：子代理 → 其父；已是标签直属 → 回到标签视图。
                 if let Some(cur) = self.inspect.clone() {
                     self.inspect = self.subagent_parent(&cur);
-                    self.last_focused = None;
                     true
                 } else {
                     false
@@ -498,7 +483,6 @@ impl App {
             }
         };
         self.inspect = Some(next);
-        self.last_focused = None; // 触发 touch_focus（保护被观察 seed 的缓存）
     }
 
     /// 查找某子代理 seed 的直属父会话 seed（Ctrl+↓ 逐层上溯用）。
@@ -522,7 +506,7 @@ impl App {
     pub(super) fn inspect_key(&mut self, key: KeyEvent) {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         match key.code {
-            KeyCode::PageUp => self.page_up(),
+            KeyCode::PageUp => self.scroll_up(20),
             KeyCode::PageDown => self.scroll_down(20),
             KeyCode::Home if ctrl => self.scroll_top(),
             KeyCode::End if ctrl => self.scroll_bottom(),
