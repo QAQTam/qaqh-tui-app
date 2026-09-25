@@ -1764,58 +1764,64 @@ impl App {
                 result,
                 client_session_id,
             } => {
-                if client_session_id.is_some() {
-                    self.v2_client_session_id = client_session_id;
-                }
                 match result {
                     Ok(b) => {
                         let bootstrap_seed = seed.clone();
-                        let mut pending_interactions = Vec::new();
-                        if let Some(sess) = self.sessions.get_mut(&bootstrap_seed) {
-                            // reducer 先接管 epoch/log/cursor/pending/driver，再由 UI
-                            // 投影消费同一快照；后续事件只经 reducer 放行。
-                            match ringing_v2::bootstrap_from_client(&b) {
-                                Ok(snapshot) => {
-                                    let outcome = sess.ringing_v2.apply_bootstrap(snapshot);
-                                    if outcome != ringing_v2::BootstrapOutcome::Applied {
-                                        log::warn!(
-                                            "bootstrap reducer rejected for {bootstrap_seed}: {outcome:?}"
-                                        );
-                                    }
-                                }
-                                Err(error) => {
-                                    log::warn!(
-                                        "bootstrap reducer mapping failed for {bootstrap_seed}: {error}"
-                                    );
-                                }
+                        let Some(sess) = self.sessions.get_mut(&bootstrap_seed) else {
+                            return;
+                        };
+                        // reducer 先接管 epoch/log/cursor/pending/driver，再由 UI
+                        // 投影消费同一快照；后续事件只经 reducer 放行。被拒的旧响应
+                        // 必须在这里终止，不能继续把旧 UI 状态盖到新模型上。
+                        let snapshot = match ringing_v2::bootstrap_from_client(&b) {
+                            Ok(snapshot) => snapshot,
+                            Err(error) => {
+                                log::warn!(
+                                    "bootstrap reducer mapping failed for {bootstrap_seed}: {error}"
+                                );
+                                return;
                             }
-                            // 纯 v2：bootstrap 是 canonical 三频道 typed 快照
-                            // （`control` / `conversation` / `tool`），不再是 v1 领域
-                            // `state`。v2 control 投影的 activity 词汇比领域粗
-                            // （idle / running / interrupted），映射见下方 helper；
-                            // 挂起交互直接从 `control.state.interactions` 恢复。
-                            let ctl = &b.control.state;
-                            sess.activity = Some(activity_from_v2(ctl.activity));
-                            // bootstrap 是 control 域快照的权威刷新点；这里与 timeline
-                            // 收敛一次，避免上一次连接遗留的 Working/Starting 与
-                            // streaming 状态把 UI 钉在 working（timeline 空则不误判）。
-                            sync_streaming_from_timeline(sess);
-                            // 会话模式的实际来源是 transcript_ops.rs 的乐观更新 +
-                            // SessionMetaChanged 刷新，bootstrap 不携带该字段。
-                            // conversation 快照里本仓只缓存 model/usage（v2 投影不再
-                            // 有聚合的 usage_totals / context_limit）。
-                            let conv = conversation_cache_from_v2(&b.conversation.state);
-                            sess.usage = conv.usage.clone();
-                            sess.usage_totals = conv.usage_totals.clone();
-                            sess.context_limit =
-                                conv.context_limit.map(|v| v.min(u32::MAX as u64) as u32);
-                            sess.conversation = Some(conv);
-                            // v2 bootstrap 的 `interactions` 已由 daemon 过滤为未决集合。
-                            // 不能只恢复 permission：v2 流的 snapshot cursor 会跳过
-                            // “快照中已经挂起”的事实，ask / plan 也必须从这里补面板。
-                            pending_interactions = ctl.interactions.clone();
-                            sess.block_cache = None;
+                        };
+                        let outcome = sess.ringing_v2.apply_bootstrap(snapshot);
+                        if outcome != ringing_v2::BootstrapOutcome::Applied {
+                            log::warn!(
+                                "bootstrap reducer rejected for {bootstrap_seed}: {outcome:?}"
+                            );
+                            return;
                         }
+                        // 只有快照被 reducer 接受后才更新 lease 身份；被拒的旧响应
+                        // 不能连 `client_session_id` 一起把 driver 判断拉回旧代。
+                        if client_session_id.is_some() {
+                            self.v2_client_session_id = client_session_id;
+                        }
+
+                        // 纯 v2：bootstrap 是 canonical 三频道 typed 快照
+                        // （`control` / `conversation` / `tool`），不再是 v1 领域
+                        // `state`。v2 control 投影的 activity 词汇比领域粗
+                        // （idle / running / interrupted），映射见下方 helper；
+                        // 挂起交互直接从 `control.state.interactions` 恢复。
+                        let ctl = &b.control.state;
+                        sess.activity = Some(activity_from_v2(ctl.activity));
+                        // bootstrap 是 control 域快照的权威刷新点；这里与 timeline
+                        // 收敛一次，避免上一次连接遗留的 Working/Starting 与
+                        // streaming 状态把 UI 钉在 working（timeline 空则不误判）。
+                        sync_streaming_from_timeline(sess);
+                        // 会话模式的实际来源是 transcript_ops.rs 的乐观更新 +
+                        // SessionMetaChanged 刷新，bootstrap 不携带该字段。
+                        // conversation 快照里本仓只缓存 model/usage（v2 投影不再
+                        // 有聚合的 usage_totals / context_limit）。
+                        let conv = conversation_cache_from_v2(&b.conversation.state);
+                        sess.usage = conv.usage.clone();
+                        sess.usage_totals = conv.usage_totals.clone();
+                        sess.context_limit =
+                            conv.context_limit.map(|v| v.min(u32::MAX as u64) as u32);
+                        sess.conversation = Some(conv);
+                        // v2 bootstrap 的 `interactions` 已由 daemon 过滤为未决集合。
+                        // 不能只恢复 permission：v2 流的 snapshot cursor 会跳过
+                        // “快照中已经挂起”的事实，ask / plan 也必须从这里补面板。
+                        let pending_interactions = ctl.interactions.clone();
+                        sess.block_cache = None;
+
                         for interaction in pending_interactions {
                             self.restore_pending_interaction(bootstrap_seed.clone(), interaction);
                         }
@@ -2725,6 +2731,79 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn v2_t2_old_bootstrap_response_and_frame_cannot_rollback_after_reset() {
+        let (mut app, _rx) = App::new_for_test();
+        app.sessions
+            .insert("seed".into(), SessionState::new("seed".into()));
+        init_v2_session(&mut app, "seed");
+        app.v2_client_session_id = Some("current-client".into());
+
+        app.handle_runtime(RuntimeMsg::ResetRequired {
+            seed: "seed".into(),
+            reset: Box::new(qaqh_client::ClientV2Reset {
+                schema: qaqh_client::RINGING_SCHEMA.into(),
+                version: qaqh_client::RINGING_V2_VERSION,
+                server_epoch: "e2".into(),
+                seed: "seed".into(),
+                log_id: Some("log-2".into()),
+                snapshot_cursor: Some(
+                    qaqh_client::ClientV2CursorToken::encode_snapshot(
+                        &qaqh_client::ClientV2Cursor::snapshot("log-2", 2),
+                    )
+                    .expect("reset cursor"),
+                ),
+                reason: qaqh_client::ClientV2ResetReason::CursorExpired,
+            }),
+        });
+
+        app.handle(AppMsg::Action(ActionResult::Bootstrap {
+            seed: "seed".into(),
+            result: Ok(v2_bootstrap("seed", "e1", "log-1", 1)),
+            client_session_id: Some("cs-old".into()),
+        }));
+        assert!(app.sessions["seed"].ringing_v2.is_reset_pending());
+        assert_eq!(
+            app.sessions["seed"].ringing_v2.server_epoch(),
+            Some("e1"),
+            "stale bootstrap must not replace the pre-reset model"
+        );
+        assert_eq!(
+            app.v2_client_session_id.as_deref(),
+            Some("current-client"),
+            "stale bootstrap must not replace the active lease identity"
+        );
+
+        app.handle(AppMsg::Action(ActionResult::Bootstrap {
+            seed: "seed".into(),
+            result: Ok(v2_bootstrap("seed", "e2", "log-2", 2)),
+            client_session_id: Some("cs-1".into()),
+        }));
+        assert!(!app.sessions["seed"].ringing_v2.is_reset_pending());
+        assert_eq!(app.sessions["seed"].ringing_v2.server_epoch(), Some("e2"));
+        assert_eq!(app.v2_client_session_id.as_deref(), Some("cs-1"));
+
+        app.force_redraw = false;
+        app.handle(AppMsg::Runtime(v2_reliable_event(
+            "seed",
+            3,
+            0,
+            qaqh_client::ClientV2Payload::ConversationDelta(
+                qaqh_client::ClientV2ConversationDelta::TurnFinished {
+                    revision: 3,
+                    turn_id: qaqh_client::ClientV2TurnId::new("turn-old"),
+                    terminal: qaqh_client::ClientV2TurnTerminal::Completed,
+                    usage: None,
+                    error: None,
+                },
+            ),
+        )));
+        assert!(
+            !app.force_redraw,
+            "old-epoch frame must be dropped after the reset rebaseline"
+        );
+    }
+
     #[test]
     fn timeline_turn_sealed_requests_forced_redraw() {
         let (mut app, _rx) = App::new_for_test();
@@ -3017,6 +3096,48 @@ mod tests {
         }
     }
 
+    /// 构造最小 typed v2 bootstrap；用于 T2 旧响应防护等 App 级回归。
+    fn v2_bootstrap(
+        seed: &str,
+        server_epoch: &str,
+        log_id: &str,
+        snapshot_fact_seq: u64,
+    ) -> qaqh_client::ClientV2Bootstrap {
+        let cursor = qaqh_client::ClientV2CursorToken::encode_snapshot(
+            &qaqh_client::ClientV2Cursor::snapshot(log_id, snapshot_fact_seq),
+        )
+        .expect("snapshot cursor");
+        serde_json::from_value(serde_json::json!({
+            "schema": "qaqh.Ringing",
+            "version": 2,
+            "server_epoch": server_epoch,
+            "seed": seed,
+            "snapshot_cursor": cursor.as_str(),
+            "control": {
+                "channel": "control",
+                "state_revision": 1,
+                "snapshot_version": 1,
+                "state": serde_json::to_value(qaqh_client::ClientV2ControlState::default())
+                    .expect("control baseline")
+            },
+            "conversation": {
+                "channel": "conversation",
+                "state_revision": 1,
+                "snapshot_version": 1,
+                "state": serde_json::to_value(qaqh_client::ClientV2ConversationState::default())
+                    .expect("conversation baseline")
+            },
+            "tool": {
+                "channel": "tool",
+                "state_revision": 1,
+                "snapshot_version": 1,
+                "state": serde_json::to_value(qaqh_client::ClientV2ToolState::default())
+                    .expect("tool baseline")
+            }
+        }))
+        .expect("client bootstrap")
+    }
+
     /// 测试会话接入最小 v2 reducer baseline（生产由 bootstrap 建立）。
     fn init_v2_session(app: &mut App, seed: &str) {
         let session = app.sessions.get_mut(seed).expect("session");
@@ -3028,6 +3149,7 @@ mod tests {
                     seed: seed.into(),
                     log_id: Some("log-1".into()),
                     snapshot_cursor: "v2.snapshot".into(),
+                    snapshot_fact_seq: 0,
                     state_revision: 0,
                     pending_interactions: Vec::new(),
                     driver: None,
