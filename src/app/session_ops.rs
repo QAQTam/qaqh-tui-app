@@ -37,7 +37,12 @@ impl App {
                 return;
             }
             let result = api.bootstrap(&seed).await;
-            let _ = tx.send(AppMsg::Action(ActionResult::Bootstrap { seed, result }));
+            let client_session_id = api.v2_client_session_id().await;
+            let _ = tx.send(AppMsg::Action(ActionResult::Bootstrap {
+                seed,
+                result,
+                client_session_id,
+            }));
         });
     }
 

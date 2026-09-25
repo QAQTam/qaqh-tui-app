@@ -1,21 +1,16 @@
 //! Ringing v2 SessionModel 的纯 reducer。
 //!
 //! 本模块只持有 TUI 自己需要的状态，不解析 wire JSON，也不直接依赖
-//! `qaqh-ringing` / `qaqh-session`。后续由 `qaqh-client` 的 v2 适配层把
-//! typed envelope 映射成这里的 [`EventMeta`] / [`BootstrapSnapshot`]。
+//! `qaqh-ringing` / `qaqh-session`。生产入口由 `qaqh-client` 的 v2 typed
+//! surface 经本模块的适配函数映射为 [`EventMeta`] / [`BootstrapSnapshot`]。
 //!
-//! 这样做的原因：wire 类型还在后端最小锚点里推进，而 cursor、reset、
-//! interaction、driver 的**状态迁移规则**已经冻结。先把不随 wire 字段形状
-//! 变化的核心状态机锁住，等适配层落地时只做机械映射。
-//!
-//! 当前未接线，允许 dead_code；适配层落地后删除本 allow。
-#![allow(dead_code)]
-
+//! wire 类型由后端冻结，cursor、reset、interaction、driver 的状态迁移规则
+//! 在这里独立锁定，便于 fixture 与跨平台回归复用。
 use std::collections::{BTreeMap, BTreeSet};
 
 use qaqh_client::{
-    ClientV2Bootstrap, ClientV2Delivery, ClientV2Event, ClientV2InteractionKind, ClientV2Payload,
-    ClientV2Reset, ClientV2ResetReason,
+    ClientV2Bootstrap, ClientV2Delivery, ClientV2Event, ClientV2InteractionKind, ClientV2Reset,
+    ClientV2ResetReason,
 };
 
 /// v2 delivery 语义。只有 reliable 推进 canonical cursor。
@@ -41,6 +36,7 @@ pub struct EventMeta {
     pub revision: Option<u64>,
 }
 
+#[cfg(test)]
 impl EventMeta {
     pub fn reliable(
         server_epoch: impl Into<String>,
@@ -90,24 +86,15 @@ impl EventMeta {
     }
 }
 
-/// payload 的顶层 family。这里只做路由分类，不尝试从 `ClientV2Payload`
-/// 内部类型中解出 interaction/driver；那部分由 #323 补齐 typed accessor 后接线。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PayloadFamily {
-    Conversation,
-    Timeline,
-    Control,
-    Resource,
-    Meta,
-    AuditRef,
-    Unknown,
-}
-
 /// 从 `qaqh-client` 的 typed bootstrap 构造纯 reducer 输入。
 pub fn bootstrap_from_client(
     bootstrap: &ClientV2Bootstrap,
 ) -> Result<BootstrapSnapshot, &'static str> {
-    let log_id = bootstrap.log_id()?;
+    let cursor = bootstrap
+        .snapshot_cursor
+        .decode_snapshot()
+        .map_err(|_| "invalid_snapshot_cursor")?;
+    let log_id = cursor.log_id.clone();
     let state_revision = bootstrap
         .control
         .state_revision
@@ -143,6 +130,7 @@ pub fn bootstrap_from_client(
         seed: bootstrap.seed.clone(),
         log_id: Some(log_id),
         snapshot_cursor: bootstrap.snapshot_cursor.as_str().to_string(),
+        snapshot_fact_seq: cursor.fact_seq,
         state_revision,
         pending_interactions,
         driver,
@@ -169,18 +157,6 @@ pub fn event_meta_from_client(event: &ClientV2Event) -> EventMeta {
     }
 }
 
-pub fn payload_family(event: &ClientV2Event) -> PayloadFamily {
-    match &event.payload {
-        ClientV2Payload::ConversationDelta(_) => PayloadFamily::Conversation,
-        ClientV2Payload::TimelineDelta(_) => PayloadFamily::Timeline,
-        ClientV2Payload::ControlDelta(_) => PayloadFamily::Control,
-        ClientV2Payload::ResourceDelta(_) => PayloadFamily::Resource,
-        ClientV2Payload::MetaDelta(_) => PayloadFamily::Meta,
-        ClientV2Payload::AuditRef(_) => PayloadFamily::AuditRef,
-        ClientV2Payload::Unknown(_) => PayloadFamily::Unknown,
-    }
-}
-
 /// 把 typed reset 映射为 reducer 的 reset signal。
 pub fn reset_from_client(reset: &ClientV2Reset) -> ResetSignal {
     ResetSignal {
@@ -191,6 +167,11 @@ pub fn reset_from_client(reset: &ClientV2Reset) -> ResetSignal {
             .snapshot_cursor
             .as_ref()
             .map(|cursor| cursor.as_str().to_string()),
+        snapshot_fact_seq: reset
+            .snapshot_cursor
+            .as_ref()
+            .and_then(|cursor| cursor.decode_snapshot().ok())
+            .map(|cursor| cursor.fact_seq),
         reason: match reset.reason {
             ClientV2ResetReason::CursorExpired => ResetReason::CursorExpired,
             ClientV2ResetReason::LogIdMismatch => ResetReason::LogIdMismatch,
@@ -229,6 +210,7 @@ pub struct BootstrapSnapshot {
     pub seed: String,
     pub log_id: Option<String>,
     pub snapshot_cursor: String,
+    pub snapshot_fact_seq: u64,
     pub state_revision: u64,
     pub pending_interactions: Vec<PendingInteraction>,
     pub driver: Option<DriverState>,
@@ -287,6 +269,7 @@ pub struct ResetSignal {
     pub seed: String,
     pub log_id: Option<String>,
     pub snapshot_cursor: Option<String>,
+    pub snapshot_fact_seq: Option<u64>,
     pub reason: ResetReason,
 }
 
@@ -314,6 +297,8 @@ pub enum BootstrapOutcome {
     Applied,
     SeedMismatch,
     Invalid,
+    ResetMismatch,
+    Stale,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -367,34 +352,21 @@ impl RingingV2SessionModel {
         }
     }
 
-    pub fn seed(&self) -> &str {
-        &self.seed
-    }
-
     pub fn server_epoch(&self) -> Option<&str> {
         self.server_epoch.as_deref()
     }
 
-    pub fn log_id(&self) -> Option<&str> {
-        self.log_id.as_deref()
-    }
-
+    #[cfg(test)]
     pub fn cursor(&self) -> Option<&str> {
         self.cursor.as_deref()
     }
 
-    pub fn last_position(&self) -> (u64, u16) {
-        (self.last_fact_seq, self.last_projection_index)
-    }
-
+    #[cfg(test)]
     pub fn state_revision(&self) -> u64 {
         self.state_revision
     }
 
-    pub fn reset(&self) -> Option<&ResetSignal> {
-        self.reset.as_ref()
-    }
-
+    #[cfg(test)]
     pub fn is_reset_pending(&self) -> bool {
         self.reset.is_some()
     }
@@ -416,6 +388,7 @@ impl RingingV2SessionModel {
             == Some(client_session_id)
     }
 
+    #[cfg(test)]
     pub fn pending_interactions(&self) -> impl Iterator<Item = &PendingInteraction> {
         self.pending_interactions.values()
     }
@@ -427,6 +400,30 @@ impl RingingV2SessionModel {
         }
         if bootstrap.server_epoch.trim().is_empty() || bootstrap.snapshot_cursor.trim().is_empty() {
             return BootstrapOutcome::Invalid;
+        }
+
+        // reset 之后的 bootstrap 必须仍指向 reset 宣告的 epoch/log。这样即使
+        // 旧请求的响应比新请求晚到，也不能清掉 reset 或覆盖新快照。
+        if let Some(reset) = &self.reset {
+            if bootstrap.server_epoch != reset.server_epoch {
+                return BootstrapOutcome::ResetMismatch;
+            }
+            if let Some(reset_log_id) = reset.log_id.as_deref()
+                && bootstrap.log_id.as_deref() != Some(reset_log_id)
+            {
+                return BootstrapOutcome::ResetMismatch;
+            }
+            if let Some(reset_fact_seq) = reset.snapshot_fact_seq
+                && bootstrap.snapshot_fact_seq < reset_fact_seq
+            {
+                return BootstrapOutcome::ResetMismatch;
+            }
+        } else if self.server_epoch.as_deref() == Some(bootstrap.server_epoch.as_str())
+            && bootstrap.state_revision < self.state_revision
+        {
+            // 同一 epoch 内 revision 单调；较旧的并发 bootstrap 响应不得把
+            // SessionModel 回滚到更早的 cursor / pending / driver 快照。
+            return BootstrapOutcome::Stale;
         }
 
         self.server_epoch = Some(bootstrap.server_epoch);
@@ -616,6 +613,7 @@ mod tests {
             seed: "seed-1".into(),
             log_id: Some("log-1".into()),
             snapshot_cursor: "v2.snapshot".into(),
+            snapshot_fact_seq: 0,
             state_revision: 7,
             pending_interactions: vec![PendingInteraction {
                 interaction_id: "i1".into(),
@@ -640,6 +638,57 @@ mod tests {
         model
     }
 
+    /// 从 typed client bootstrap 的 wire 形态构造 fixture。三个频道基线统一
+    /// 由客户端 `Default` 生成，只覆写本矩阵关心的 pending/driver 字段。
+    fn client_bootstrap(
+        seed: &str,
+        server_epoch: &str,
+        log_id: &str,
+        snapshot_fact_seq: u64,
+        interactions: impl serde::Serialize,
+        driver: impl serde::Serialize,
+    ) -> ClientV2Bootstrap {
+        let token = ClientV2CursorToken::encode_snapshot(&ClientV2Cursor::snapshot(
+            log_id,
+            snapshot_fact_seq,
+        ))
+        .expect("snapshot cursor");
+        let mut control =
+            serde_json::to_value(ClientV2ControlState::default()).expect("control baseline");
+        control["interactions"] =
+            serde_json::to_value(interactions).expect("interaction fixture JSON");
+        control["driver"] = serde_json::to_value(driver).expect("driver fixture JSON");
+        let conversation = serde_json::to_value(ClientV2ConversationState::default())
+            .expect("conversation baseline");
+        let tool = serde_json::to_value(ClientV2ToolState::default()).expect("tool baseline");
+        serde_json::from_value(serde_json::json!({
+            "schema": "qaqh.Ringing",
+            "version": 2,
+            "server_epoch": server_epoch,
+            "seed": seed,
+            "snapshot_cursor": token.as_str(),
+            "control": {
+                "channel": "control",
+                "state_revision": 7,
+                "snapshot_version": 1,
+                "state": control
+            },
+            "conversation": {
+                "channel": "conversation",
+                "state_revision": 7,
+                "snapshot_version": 1,
+                "state": conversation
+            },
+            "tool": {
+                "channel": "tool",
+                "state_revision": 7,
+                "snapshot_version": 1,
+                "state": tool
+            }
+        }))
+        .expect("client bootstrap")
+    }
+
     #[test]
     fn bootstrap_sets_pending_and_driver() {
         let model = model();
@@ -652,8 +701,11 @@ mod tests {
     }
 
     #[test]
-    fn reliable_is_strictly_forward_and_deduplicated() {
+    fn v2_c1_snapshot_then_subscribe_is_gap_free_and_duplicate_free() {
         let mut model = model();
+        assert_eq!((model.last_fact_seq, model.last_projection_index), (0, 0));
+        assert_eq!(model.cursor(), Some("v2.snapshot"));
+
         let first = EventMeta::reliable("epoch-1", "log-1", 8, 1, "v2.8.1", 8);
         assert_eq!(
             model.apply_event(first.clone()),
@@ -662,15 +714,41 @@ mod tests {
                 projection_index: 1
             }
         );
+        assert_eq!((model.last_fact_seq, model.last_projection_index), (8, 1));
         assert_eq!(model.cursor(), Some("v2.8.1"));
         assert_eq!(model.apply_event(first), ApplyOutcome::Duplicate);
-
-        let stale = EventMeta::reliable("epoch-1", "log-1", 7, 9, "v2.7.9", 9);
-        assert_eq!(model.apply_event(stale), ApplyOutcome::Stale);
     }
 
     #[test]
-    fn replaceable_does_not_advance_cursor() {
+    fn v2_c2_reliable_reconnect_advances_in_global_lexicographic_order() {
+        let mut model = model();
+        for (fact_seq, projection_index) in [(8, 0), (8, 1), (9, 0)] {
+            assert_eq!(
+                model.apply_event(EventMeta::reliable(
+                    "epoch-1",
+                    "log-1",
+                    fact_seq,
+                    projection_index,
+                    format!("v2.{fact_seq}.{projection_index}"),
+                    fact_seq,
+                )),
+                ApplyOutcome::ReliableApplied {
+                    fact_seq,
+                    projection_index
+                }
+            );
+        }
+        assert_eq!((model.last_fact_seq, model.last_projection_index), (9, 0));
+        assert_eq!(
+            model.apply_event(EventMeta::reliable(
+                "epoch-1", "log-1", 8, 99, "v2.stale", 99
+            )),
+            ApplyOutcome::Stale
+        );
+    }
+
+    #[test]
+    fn v2_c3_replaceable_reconnect_is_latest_current_without_cursor_advance() {
         let mut model = model();
         let cursor = model.cursor().map(str::to_string);
         let event = EventMeta::replaceable("epoch-1", Some("log-1".into()), 8);
@@ -684,7 +762,7 @@ mod tests {
     }
 
     #[test]
-    fn ephemeral_never_changes_state() {
+    fn v2_c4_ephemeral_never_persists_or_replays() {
         let mut model = model();
         let before = model.clone();
         assert_eq!(
@@ -695,26 +773,45 @@ mod tests {
     }
 
     #[test]
-    fn epoch_and_log_mismatch_are_rejected() {
+    fn v2_c5_epoch_log_mismatch_is_rejected_and_log_reset_maps_typed_reason() {
         let mut model = model();
         let wrong_epoch = EventMeta::reliable("epoch-2", "log-1", 8, 1, "v2.8.1", 8);
         assert_eq!(model.apply_event(wrong_epoch), ApplyOutcome::EpochMismatch);
 
         let wrong_log = EventMeta::reliable("epoch-1", "log-2", 8, 1, "v2.8.1", 8);
         assert_eq!(model.apply_event(wrong_log), ApplyOutcome::LogMismatch);
+
+        let reset = reset_from_client(&ClientV2Reset {
+            schema: "qaqh.Ringing".into(),
+            version: 2,
+            server_epoch: "epoch-1".into(),
+            seed: "seed-1".into(),
+            log_id: Some("log-2".into()),
+            snapshot_cursor: Some(
+                ClientV2CursorToken::encode_snapshot(&ClientV2Cursor::snapshot("log-2", 8))
+                    .expect("snapshot cursor"),
+            ),
+            reason: ClientV2ResetReason::LogIdMismatch,
+        });
+        assert_eq!(reset.reason, ResetReason::LogIdMismatch);
+        assert!(model.begin_reset(reset));
+        assert!(model.is_reset_pending());
+        assert!(!model.is_read_only());
     }
 
     #[test]
-    fn reset_preserves_old_state_until_bootstrap() {
+    fn v2_c6_cursor_expired_keeps_old_state_until_rebaseline() {
         let mut model = model();
         let old_cursor = model.cursor().map(str::to_string);
-        assert!(model.begin_reset(ResetSignal {
+        let signal = ResetSignal {
             server_epoch: "epoch-1".into(),
             seed: "seed-1".into(),
             log_id: Some("log-1".into()),
             snapshot_cursor: Some("v2.new".into()),
+            snapshot_fact_seq: Some(8),
             reason: ResetReason::CursorExpired,
-        }));
+        };
+        assert!(model.begin_reset(signal));
         assert!(model.is_reset_pending());
         assert_eq!(model.cursor(), old_cursor.as_deref());
         assert_eq!(
@@ -724,6 +821,7 @@ mod tests {
 
         let mut next = bootstrap();
         next.snapshot_cursor = "v2.new".into();
+        next.snapshot_fact_seq = 8;
         next.state_revision = 9;
         assert_eq!(model.apply_bootstrap(next), BootstrapOutcome::Applied);
         assert!(!model.is_reset_pending());
@@ -732,7 +830,33 @@ mod tests {
     }
 
     #[test]
-    fn interaction_id_is_idempotent_and_terminal_after_resolution() {
+    fn v2_c7_snapshot_missing_is_read_only_and_does_not_guess_history() {
+        let mut model = model();
+        let old_cursor = model.cursor().map(str::to_string);
+        let old_revision = model.state_revision();
+        let signal = reset_from_client(&ClientV2Reset {
+            schema: "qaqh.Ringing".into(),
+            version: 2,
+            server_epoch: "epoch-1".into(),
+            seed: "seed-1".into(),
+            log_id: None,
+            snapshot_cursor: None,
+            reason: ClientV2ResetReason::SnapshotMissing,
+        });
+
+        assert!(model.begin_reset(signal));
+        assert!(model.is_reset_pending());
+        assert!(model.is_read_only());
+        assert_eq!(model.cursor(), old_cursor.as_deref());
+        assert_eq!(model.state_revision(), old_revision);
+        assert_eq!(
+            model.apply_event(EventMeta::reliable("epoch-1", "log-1", 8, 1, "v2.8.1", 8)),
+            ApplyOutcome::ResetPending
+        );
+    }
+
+    #[test]
+    fn v2_r4_first_answer_wins_and_terminal_interaction_cannot_reopen() {
         let mut model = model();
         let request = PendingInteraction {
             interaction_id: "i2".into(),
@@ -768,7 +892,87 @@ mod tests {
     }
 
     #[test]
-    fn driver_epoch_is_monotonic_and_duplicate_is_ignored() {
+    fn v2_r1_r3_reconnect_restores_permission_ask_and_plan_by_stable_id() {
+        for (wire_kind, expected_kind) in [
+            ("permission", InteractionKind::Permission),
+            ("ask", InteractionKind::Ask),
+            ("plan", InteractionKind::PlanReview),
+        ] {
+            let interaction_id = format!("int-{wire_kind}");
+            let call_id = format!("call-{wire_kind}");
+            let turn_id = format!("turn-{wire_kind}");
+            let bootstrap = client_bootstrap(
+                "seed-1",
+                "epoch-1",
+                "log-1",
+                7,
+                serde_json::json!([{
+                    "interaction_id": interaction_id,
+                    "call_id": call_id,
+                    "turn_id": turn_id,
+                    "kind": wire_kind,
+                    "request": null
+                }]),
+                (),
+            );
+            let snapshot = bootstrap_from_client(&bootstrap).expect("typed bootstrap adapter");
+            let mut model = RingingV2SessionModel::new("seed-1");
+            assert_eq!(model.apply_bootstrap(snapshot), BootstrapOutcome::Applied);
+
+            let pending: Vec<_> = model.pending_interactions().collect();
+            assert_eq!(pending.len(), 1);
+            assert_eq!(pending[0].interaction_id, interaction_id);
+            assert_eq!(pending[0].call_id, call_id);
+            assert_eq!(pending[0].turn_id, turn_id);
+            assert_eq!(pending[0].kind, expected_kind);
+        }
+    }
+
+    #[test]
+    fn v2_d1_vacant_seat_claim_is_applied_with_monotonic_epoch() {
+        let mut model = model();
+        let vacant = model.driver().expect("bootstrap driver");
+        assert_eq!(vacant.holder, None);
+        assert!(vacant.can_claim);
+
+        let claimed = DriverState {
+            holder: Some("cs-1".into()),
+            driver_epoch: 4,
+            can_claim: false,
+        };
+        assert_eq!(
+            model.apply_driver_state(claimed.clone()),
+            DriverOutcome::Applied
+        );
+        assert!(model.is_driver("cs-1"));
+        assert_eq!(model.apply_driver_state(claimed), DriverOutcome::Duplicate);
+    }
+
+    #[test]
+    fn v2_d2_busy_driver_rejects_other_claimants_stably() {
+        let mut model = model();
+        assert_eq!(
+            model.apply_driver_state(DriverState {
+                holder: Some("cs-1".into()),
+                driver_epoch: 4,
+                can_claim: false,
+            }),
+            DriverOutcome::Applied
+        );
+        assert_eq!(
+            model.apply_driver_state(DriverState {
+                holder: Some("cs-2".into()),
+                driver_epoch: 4,
+                can_claim: true,
+            }),
+            DriverOutcome::Conflict
+        );
+        assert!(model.is_driver("cs-1"));
+        assert!(!model.is_driver("cs-2"));
+    }
+
+    #[test]
+    fn v2_d3_handover_rejects_old_epoch_and_same_epoch_conflicts() {
         let mut model = model();
         let current = DriverState {
             holder: Some("cs-1".into()),
@@ -791,12 +995,105 @@ mod tests {
         assert_eq!(
             model.apply_driver_state(DriverState {
                 holder: Some("cs-2".into()),
-                driver_epoch: 3,
-                can_claim: true,
+                driver_epoch: 5,
+                can_claim: false,
+            }),
+            DriverOutcome::Applied
+        );
+        assert!(model.is_driver("cs-2"));
+        assert_eq!(
+            model.apply_driver_state(DriverState {
+                holder: Some("cs-1".into()),
+                driver_epoch: 4,
+                can_claim: false,
             }),
             DriverOutcome::Stale
         );
-        assert!(model.is_driver("cs-1"));
+        assert!(model.is_driver("cs-2"));
+    }
+
+    #[test]
+    fn v2_t2_stale_bootstrap_cannot_rollback_newer_snapshot() {
+        let mut model = model();
+
+        let mut newer = bootstrap();
+        newer.snapshot_cursor = "v2.new".into();
+        newer.state_revision = 9;
+        assert_eq!(model.apply_bootstrap(newer), BootstrapOutcome::Applied);
+
+        let mut stale = bootstrap();
+        stale.snapshot_cursor = "v2.old".into();
+        stale.state_revision = 8;
+        assert_eq!(model.apply_bootstrap(stale), BootstrapOutcome::Stale);
+        assert_eq!(model.cursor(), Some("v2.new"));
+        assert_eq!(model.state_revision(), 9);
+    }
+
+    #[test]
+    fn v2_t2_old_bootstrap_after_reset_must_match_reset_epoch_and_log() {
+        let mut model = model();
+        assert!(model.begin_reset(ResetSignal {
+            server_epoch: "epoch-2".into(),
+            seed: "seed-1".into(),
+            log_id: Some("log-2".into()),
+            snapshot_cursor: None,
+            snapshot_fact_seq: None,
+            reason: ResetReason::CursorExpired,
+        }));
+
+        let mut stale = bootstrap();
+        stale.server_epoch = "epoch-1".into();
+        stale.log_id = Some("log-1".into());
+        assert_eq!(
+            model.apply_bootstrap(stale),
+            BootstrapOutcome::ResetMismatch
+        );
+        assert!(model.is_reset_pending());
+        assert_eq!(model.server_epoch(), Some("epoch-1"));
+
+        let mut wrong_log = bootstrap();
+        wrong_log.server_epoch = "epoch-2".into();
+        wrong_log.log_id = Some("log-1".into());
+        assert_eq!(
+            model.apply_bootstrap(wrong_log),
+            BootstrapOutcome::ResetMismatch
+        );
+        assert!(model.is_reset_pending());
+
+        let mut fresh = bootstrap();
+        fresh.server_epoch = "epoch-2".into();
+        fresh.log_id = Some("log-2".into());
+        fresh.snapshot_cursor = "v2.fresh".into();
+        fresh.state_revision = 1;
+        assert_eq!(model.apply_bootstrap(fresh), BootstrapOutcome::Applied);
+        assert!(!model.is_reset_pending());
+        assert_eq!(model.server_epoch(), Some("epoch-2"));
+        assert_eq!(model.cursor(), Some("v2.fresh"));
+    }
+
+    #[test]
+    fn v2_t2_old_bootstrap_before_reset_baseline_is_rejected() {
+        let mut model = model();
+        assert!(model.begin_reset(ResetSignal {
+            server_epoch: "epoch-1".into(),
+            seed: "seed-1".into(),
+            log_id: Some("log-1".into()),
+            snapshot_cursor: Some("v2.reset.9".into()),
+            snapshot_fact_seq: Some(9),
+            reason: ResetReason::CursorExpired,
+        }));
+
+        let mut old = bootstrap();
+        old.snapshot_fact_seq = 8;
+        old.state_revision = 8;
+        assert_eq!(model.apply_bootstrap(old), BootstrapOutcome::ResetMismatch);
+        assert!(model.is_reset_pending());
+
+        let mut fresh = bootstrap();
+        fresh.snapshot_fact_seq = 9;
+        fresh.state_revision = 9;
+        assert_eq!(model.apply_bootstrap(fresh), BootstrapOutcome::Applied);
+        assert!(!model.is_reset_pending());
     }
 
     #[test]
@@ -872,7 +1169,7 @@ mod tests {
     }
 
     #[test]
-    fn client_event_adapter_maps_delivery_cursor_and_family() {
+    fn client_event_adapter_maps_delivery_and_cursor() {
         let cursor = ClientV2CursorToken::encode_reliable(&ClientV2Cursor::new("log-1", 8, 1))
             .expect("cursor");
         let value = serde_json::json!({
@@ -903,7 +1200,6 @@ mod tests {
         assert_eq!(meta.fact_seq, Some(8));
         assert_eq!(meta.projection_index, Some(1));
         assert_eq!(meta.cursor.as_deref(), Some(cursor.as_str()));
-        assert_eq!(payload_family(&event), PayloadFamily::AuditRef);
     }
 
     #[test]

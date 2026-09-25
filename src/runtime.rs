@@ -110,6 +110,7 @@ pub enum RuntimeMsg {
     },
     ResetRequired {
         seed: String,
+        reset: Box<qaqh_client::ClientV2Reset>,
     },
     Timeline {
         seed: String,
@@ -540,9 +541,13 @@ fn build_handlers(
         },
         on_v2_reset: {
             let msg_tx = msg_tx.clone();
-            Arc::new(move |seed: String, _reset: qaqh_client::ClientV2Reset| {
-                // reset → app 重新 bootstrap 该会话；v2 单流自会按新 cursor 重连。
-                let _ = msg_tx.send(RuntimeMsg::ResetRequired { seed });
+            Arc::new(move |seed: String, reset: qaqh_client::ClientV2Reset| {
+                // reset → app 标记 rebaseline 并重新 bootstrap；旧 UI 状态保留到
+                // 新 bootstrap 校验通过后再由 reducer 原子替换。
+                let _ = msg_tx.send(RuntimeMsg::ResetRequired {
+                    seed,
+                    reset: Box::new(reset),
+                });
             })
         },
         on_timeline_entry: {
