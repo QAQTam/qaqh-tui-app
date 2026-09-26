@@ -60,6 +60,11 @@ pub enum AgentTarget {
         block_id: String,
         role: MessageRole,
     },
+    /// 历史 thinking 正文展开/收起。
+    Thinking {
+        turn_id: String,
+        block_id: String,
+    },
     /// 工具卡正文展开/收起。
     Tool {
         turn_id: String,

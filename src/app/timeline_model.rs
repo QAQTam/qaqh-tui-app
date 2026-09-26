@@ -278,30 +278,26 @@ pub struct ThinkingStats {
     pub lines: u64,
 }
 
-/// D1（Codex 式思考链路）：sealed 回合的 reasoning body 不驻留——统计进
-/// [`Turn::thinking`] 后就地清空。唯一保留 body 的地方是**活动回合**（Running）
-/// （Ctrl+T 浮层回放当前回合的思考）。
+/// 9/26 P3：sealed 回合的 reasoning body 现在保留，供 thinking 历史展开；
+/// 这里只重算聚合统计，不再清空正文。
 ///
 /// 幂等：`TurnSealed`、分页重放（`Turn::from_wire`）、re-baseline
-/// （`replace_from_page`）三条路都会走到；对已清空的块重复调用是 no-op
-/// （text 已空 → 不再计段不计行）。
+/// （`replace_from_page`）三条路都会走到；每次都从当前 blocks 重算，而不是累加。
 pub(crate) fn discard_sealed_reasoning(turn: &mut Turn) {
     if !turn.sealed {
         return;
     }
-    for round in &mut turn.rounds {
-        for block in &mut round.blocks {
-            // 只计非空 body：空段无内容可数，也保证重复调用幂等。
+    let mut segments = 0u32;
+    let mut lines = 0u64;
+    for round in &turn.rounds {
+        for block in &round.blocks {
             if block.kind == TimelineBlockKind::Reasoning && !block.text.is_empty() {
-                turn.thinking.segments = turn.thinking.segments.saturating_add(1);
-                turn.thinking.lines = turn
-                    .thinking
-                    .lines
-                    .saturating_add(block.text.lines().count() as u64);
-                block.text.clear();
+                segments = segments.saturating_add(1);
+                lines = lines.saturating_add(block.text.lines().count() as u64);
             }
         }
     }
+    turn.thinking = ThinkingStats { segments, lines };
 }
 
 /// 单个回合：一次用户输入的全部模型输出。
@@ -2165,7 +2161,7 @@ mod tests {
     }
 
     #[test]
-    fn turn_seal_discards_reasoning_body_and_counts() {
+    fn turn_seal_counts_reasoning_and_keeps_body_for_expansion() {
         use qaqh_client::{TimelineEvent as E, TimelineTurnState};
         let mut m = reasoning_turn_model();
         m.apply(&entry(
@@ -2186,13 +2182,16 @@ mod tests {
         let t = &m.turns[0];
         assert_eq!(t.thinking.segments, 1);
         assert_eq!(t.thinking.lines, 2);
-        assert_eq!(t.rounds[0].blocks[0].text, "", "body 必须已丢弃");
+        assert_eq!(
+            t.rounds[0].blocks[0].text, "第一段\n第二行",
+            "P3 thinking 历史展开要求保留 body"
+        );
     }
 
     #[test]
     fn rebaseline_replay_discards_idempotently() {
         use qaqh_client::TimelineTurnState;
-        // 分页/re-baseline 重放：sealed reasoning 经 from_wire 同样丢 body 只计数。
+        // 分页/re-baseline 重放：sealed reasoning 经 from_wire 保留 body 并重算计数。
         let wire_turn = TimelineTurn {
             turn_index: Some(1),
             turn_id: "t1".into(),
@@ -2233,8 +2232,11 @@ mod tests {
         let t = &m.turns[0];
         assert_eq!(t.thinking.segments, 1);
         assert_eq!(t.thinking.lines, 2);
-        assert_eq!(t.rounds[0].blocks[0].text, "");
-        // 幂等：对已丢弃的块重复 discard 是 no-op。
+        assert_eq!(
+            t.rounds[0].blocks[0].text, "重放的思考\n两行",
+            "P3 thinking 历史展开要求保留正文"
+        );
+        // 幂等：重复统计只重算聚合值，不重复累加。
         super::discard_sealed_reasoning(&mut m.turns[0]);
         assert_eq!(m.turns[0].thinking.segments, 1);
         assert_eq!(m.turns[0].thinking.lines, 2);

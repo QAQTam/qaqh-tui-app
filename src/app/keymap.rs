@@ -20,6 +20,8 @@ pub(crate) enum GlobalKey {
     ThinkingOverlay,
     /// Alt+W：关闭当前标签（弹 Confirm，实际关闭由 Confirm 分支执行）。
     CloseTab,
+    /// Alt+T：切换当前会话最后一段历史 thinking 正文展开态。
+    ToggleThinking,
     /// Alt+E：切换当前会话最后一张工具卡正文展开态。
     ToggleTool,
     /// Ctrl+L：会话列表。
@@ -53,6 +55,9 @@ pub(crate) fn map_global_key(key: &KeyEvent) -> Option<GlobalKey> {
         KeyCode::Char(',') if ctrl => Some(GlobalKey::ToggleSettings),
         KeyCode::Char('w') if key.modifiers.contains(KeyModifiers::ALT) => {
             Some(GlobalKey::CloseTab)
+        }
+        KeyCode::Char('t') if key.modifiers.contains(KeyModifiers::ALT) => {
+            Some(GlobalKey::ToggleThinking)
         }
         KeyCode::Char('e') if key.modifiers.contains(KeyModifiers::ALT) => {
             Some(GlobalKey::ToggleTool)
@@ -182,6 +187,15 @@ mod tests {
             map_global_key(&key(KeyCode::Char('e'), KeyModifiers::CONTROL)),
             None,
             "Ctrl+E 仍归 composer 的压缩动作"
+        );
+        assert_eq!(
+            map_global_key(&key(KeyCode::Char('t'), KeyModifiers::ALT)),
+            Some(GlobalKey::ToggleThinking)
+        );
+        assert_eq!(
+            map_global_key(&key(KeyCode::Char('t'), KeyModifiers::CONTROL)),
+            Some(GlobalKey::ThinkingOverlay),
+            "Ctrl+T 仍保留思考回放浮层"
         );
     }
 

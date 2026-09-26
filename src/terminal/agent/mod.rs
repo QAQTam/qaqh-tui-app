@@ -653,6 +653,11 @@ fn dispatch_pointer_action(
                     frames.invalidate();
                 }
             }
+            PointerTarget::Agent(AgentTarget::Thinking { block_id, .. }) => {
+                if app.toggle_thinking_expanded(&block_id) {
+                    frames.invalidate();
+                }
+            }
             PointerTarget::Agent(AgentTarget::Tool { block_id, .. }) => {
                 if app.toggle_tool_expanded(&block_id) {
                     frames.invalidate();
@@ -1348,7 +1353,7 @@ fn shortcuts_line(app: &App, width: u16, theme: &Theme) -> Line<'static> {
     } else if has_attachment {
         " Enter 发送 · Ctrl+A 附件 · Ctrl+Y 撤销 · F1 帮助"
     } else if app.active_session().is_some() {
-        " Enter 发送 · Alt+E 展开工具 · Ctrl+P 模式 · Ctrl+L 会话 · F1 帮助"
+        " Enter 发送 · Alt+T 展开思考 · Alt+E 展开工具 · Ctrl+P 模式 · F1 帮助"
     } else {
         " Ctrl+N 新建 · Ctrl+L 会话 · F1 帮助 · Ctrl+Q 退出"
     };
@@ -1451,6 +1456,40 @@ mod tests {
                     text: "answer".to_string(),
                     tool: None,
                 },
+            },
+        ));
+        model
+    }
+
+    fn model_with_thinking_history() -> TimelineModel {
+        let mut model = TimelineModel::default();
+        model.apply(&entry(
+            1,
+            "turn-thinking",
+            TimelineEvent::TurnOpened {
+                user_text: "think".to_string(),
+            },
+        ));
+        model.apply(&entry(
+            2,
+            "turn-thinking",
+            TimelineEvent::BlockOpened {
+                block: TimelineBlock {
+                    block_id: "thinking-1".to_string(),
+                    block_order: 0,
+                    kind: TimelineBlockKind::Reasoning,
+                    state: TimelineBlockState::Sealed,
+                    text: "first thought\nsecond thought".to_string(),
+                    tool: None,
+                },
+            },
+        ));
+        model.apply(&entry(
+            3,
+            "turn-thinking",
+            TimelineEvent::TurnSealed {
+                state: qaqh_client::TimelineTurnState::Completed,
+                failure: None,
             },
         ));
         model
@@ -1843,6 +1882,73 @@ mod tests {
         assert!(
             app.sessions["seed-1"].expanded_tools.contains("tool-1"),
             "Alt+E must provide the keyboard path before mouse wiring"
+        );
+    }
+
+    #[test]
+    fn alt_t_toggles_latest_thinking_history() {
+        let mut app = app_with_model(model_with_thinking_history());
+        app.show_workspace = false;
+        app.handle(AppMsg::Key(KeyEvent::new(
+            KeyCode::Char('t'),
+            KeyModifiers::ALT,
+        )));
+        assert!(
+            app.sessions["seed-1"]
+                .expanded_thinking
+                .contains("thinking-1"),
+            "Alt+T must provide the keyboard path for thinking history"
+        );
+    }
+
+    #[test]
+    fn thinking_click_toggles_expansion_via_presented_frame() {
+        let mut app = app_with_model(model_with_thinking_history());
+        app.show_workspace = false;
+        let mut view = FullscreenView::default();
+        let mut frames = publish_frame(&app, &mut view, 80, 24);
+        let target = frames
+            .current()
+            .expect("published frame")
+            .regions
+            .iter()
+            .find_map(|region| match &region.target {
+                PointerTarget::Agent(AgentTarget::Thinking { block_id, .. })
+                    if block_id == "thinking-1" =>
+                {
+                    Some((region.target.clone(), region.rect))
+                }
+                _ => None,
+            })
+            .expect("thinking block must be registered");
+        assert_target_reachable(frames.current().unwrap(), &target.0);
+
+        let (column, row) = (target.1.x + 1, target.1.y);
+        handle_message(
+            &mut app,
+            AppMsg::Mouse(left_mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                column,
+                row,
+            )),
+            &mut frames,
+            &mut view,
+        );
+        handle_message(
+            &mut app,
+            AppMsg::Mouse(left_mouse(
+                MouseEventKind::Up(MouseButton::Left),
+                column,
+                row,
+            )),
+            &mut frames,
+            &mut view,
+        );
+        assert!(
+            app.sessions["seed-1"]
+                .expanded_thinking
+                .contains("thinking-1"),
+            "click must toggle the historical thinking block"
         );
     }
 

@@ -2203,6 +2203,10 @@ impl App {
                 }
                 return;
             }
+            Some(GlobalKey::ToggleThinking) => {
+                self.toggle_latest_thinking();
+                return;
+            }
             Some(GlobalKey::ToggleTool) => {
                 self.toggle_latest_tool();
                 return;

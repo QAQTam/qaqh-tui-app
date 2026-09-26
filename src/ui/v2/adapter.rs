@@ -19,6 +19,14 @@ pub fn from_turns_with_expanded(
     turns: &[Turn],
     expanded_tools: &HashSet<String>,
 ) -> Vec<TranscriptBlock> {
+    from_turns_with_expanded_blocks(turns, expanded_tools, &HashSet::new())
+}
+
+pub fn from_turns_with_expanded_blocks(
+    turns: &[Turn],
+    expanded_tools: &HashSet<String>,
+    expanded_thinking: &HashSet<String>,
+) -> Vec<TranscriptBlock> {
     let capacity = turns
         .iter()
         .map(|turn| {
@@ -34,8 +42,14 @@ pub fn from_turns_with_expanded(
         blocks.extend(from_turn(turn));
     }
     for block in &mut blocks {
-        if let BlockKind::Tool(tool) = &mut block.kind {
-            tool.expanded = expanded_tools.contains(&block.id.to_string());
+        match &mut block.kind {
+            BlockKind::Tool(tool) => {
+                tool.expanded = expanded_tools.contains(&block.id.to_string());
+            }
+            BlockKind::Thinking { expanded, .. } => {
+                *expanded = expanded_thinking.contains(&block.id.to_string());
+            }
+            _ => {}
         }
     }
     blocks
@@ -81,6 +95,7 @@ fn from_block(turn_id: &str, turn_sealed: bool, block: &Block) -> Option<Transcr
             BlockKind::Thinking {
                 text: block.text.clone(),
                 duration: None,
+                expanded: false,
             }
         }
         TimelineBlockKind::Text => BlockKind::Assistant {
@@ -193,6 +208,26 @@ mod tests {
         assert!(matches!(blocks[1].kind, BlockKind::Assistant { .. }));
         assert!(matches!(blocks[2].kind, BlockKind::Thinking { .. }));
         assert_eq!(blocks[1].revision, 7);
+    }
+
+    #[test]
+    fn expanded_thinking_ids_flow_into_the_view_model() {
+        let turns = vec![turn(vec![block(
+            "thinking",
+            TimelineBlockKind::Reasoning,
+            TimelineBlockState::Sealed,
+            "first\nsecond",
+        )])];
+        let expanded = HashSet::from(["thinking".to_string()]);
+        let blocks = from_turns_with_expanded_blocks(&turns, &HashSet::new(), &expanded);
+        let Some(TranscriptBlock {
+            kind: BlockKind::Thinking { expanded, .. },
+            ..
+        }) = blocks.get(1)
+        else {
+            panic!("thinking block missing");
+        };
+        assert!(*expanded);
     }
 
     #[test]

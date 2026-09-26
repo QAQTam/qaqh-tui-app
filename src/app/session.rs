@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 
 use crate::app::ringing_v2::RingingV2SessionModel;
 use crate::app::timeline_model::TimelineModel;
-use qaqh_client::ConversationMode;
+use qaqh_client::{ConversationMode, TimelineBlockKind};
 use serde::Deserialize;
 // 权威类型与 `qaqh-client` 自身类型重名者带 `Domain` 前缀；在本模块内换回本地惯用名，
 // 这样下文的引用点不必逐个改（映射只此一处）。
@@ -489,6 +489,10 @@ pub struct SessionState {
     pub expanded_tools: HashSet<String>,
     /// 展开态版本；渲染缓存用它失效。
     pub expanded_tools_revision: u64,
+    /// 用户显式展开的历史 thinking block id。
+    pub expanded_thinking: HashSet<String>,
+    /// thinking 展开态版本；与工具卡分开，避免无关缓存失效。
+    pub expanded_thinking_revision: u64,
     /// bootstrap / re-baseline 是否已就绪。
     pub ready: bool,
     /// 加载更早：in-flight 去重。
@@ -523,9 +527,31 @@ impl SessionState {
             },
             expanded_tools: HashSet::new(),
             expanded_tools_revision: 0,
+            expanded_thinking: HashSet::new(),
+            expanded_thinking_revision: 0,
             ready: false,
             loading_older: false,
         }
+    }
+
+    /// 切换历史 thinking 展开态；只有真实存在的 reasoning block 才能改状态。
+    pub fn toggle_thinking_expanded(&mut self, block_id: &str) -> bool {
+        let exists = self.timeline.turns.iter().any(|turn| {
+            turn.rounds
+                .iter()
+                .flat_map(|round| &round.blocks)
+                .any(|block| {
+                    block.block_id == block_id && block.kind == TimelineBlockKind::Reasoning
+                })
+        });
+        if !exists {
+            return false;
+        }
+        if !self.expanded_thinking.remove(block_id) {
+            self.expanded_thinking.insert(block_id.to_owned());
+        }
+        self.expanded_thinking_revision = self.expanded_thinking_revision.wrapping_add(1);
+        true
     }
 
     /// 切换工具卡展开态；只有真实存在的 tool block 才能改状态。
@@ -915,6 +941,39 @@ mod tests {
         assert_eq!(s.expanded_tools_revision, 2);
         assert!(!s.toggle_tool_expanded("missing"));
         assert_eq!(s.expanded_tools_revision, 2, "未知 block 不得改版本");
+    }
+
+    #[test]
+    fn thinking_expansion_toggles_only_reasoning_blocks() {
+        use crate::app::timeline_model::{Block, Round};
+        use qaqh_client::{TimelineBlockKind, TimelineBlockState};
+
+        let mut s = SessionState::new("seed".into());
+        let mut turn = turn("t1", TimelineTurnState::Completed);
+        turn.rounds.push(Round {
+            round_num: 0,
+            sealed: true,
+            is_final: true,
+            blocks: vec![Block {
+                block_id: "thinking".into(),
+                block_order: 0,
+                kind: TimelineBlockKind::Reasoning,
+                state: TimelineBlockState::Sealed,
+                text: "first\nsecond".into(),
+                tool: None,
+                last_fragment: 0,
+                rev: 1,
+            }],
+        });
+        s.timeline.turns = vec![turn];
+
+        assert!(s.toggle_thinking_expanded("thinking"));
+        assert!(s.expanded_thinking.contains("thinking"));
+        assert_eq!(s.expanded_thinking_revision, 1);
+        assert!(s.toggle_thinking_expanded("thinking"));
+        assert!(!s.expanded_thinking.contains("thinking"));
+        assert!(!s.toggle_thinking_expanded("missing"));
+        assert_eq!(s.expanded_thinking_revision, 2);
     }
 
     #[test]

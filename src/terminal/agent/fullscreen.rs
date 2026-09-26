@@ -238,6 +238,10 @@ fn register_agent_messages(hit_map: &mut HitMapBuilder, body: Rect, view: &Fulls
                 block_id: span.block_id.clone(),
                 role,
             }),
+            SpanKind::Thinking => PointerTarget::Agent(AgentTarget::Thinking {
+                turn_id: span.turn_id.clone(),
+                block_id: span.block_id.clone(),
+            }),
             SpanKind::Tool => PointerTarget::Agent(AgentTarget::Tool {
                 turn_id: span.turn_id.clone(),
                 block_id: span.block_id.clone(),
@@ -577,6 +581,7 @@ pub(super) struct FullscreenTranscriptCache {
 #[derive(Debug, Clone, Copy)]
 enum SpanKind {
     Message(MessageRole),
+    Thinking,
     Tool,
 }
 
@@ -595,6 +600,7 @@ struct FullscreenTranscriptKey {
     version: u64,
     width: u16,
     expanded_tools_revision: u64,
+    expanded_thinking_revision: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -629,6 +635,7 @@ impl FullscreenTranscriptCache {
             version: session.timeline.version,
             width,
             expanded_tools_revision: session.expanded_tools_revision,
+            expanded_thinking_revision: session.expanded_thinking_revision,
         };
         if self.key.as_ref() == Some(&key) {
             return;
@@ -637,14 +644,16 @@ impl FullscreenTranscriptCache {
         // Live reasoning 仍在 composer 上方单独显示，避免“单行思考链”在历史区
         // 重复；其余 live block（尤其流式 assistant）必须进入全屏历史，否则全屏
         // 模式下只能看到最后一行。
-        let blocks: Vec<_> =
-            adapter::from_turns_with_expanded(&session.timeline.turns, &session.expanded_tools)
-                .into_iter()
-                .filter(|block| {
-                    !(block.state == BlockState::Live
-                        && matches!(block.kind, BlockKind::Thinking { .. }))
-                })
-                .collect();
+        let blocks: Vec<_> = adapter::from_turns_with_expanded_blocks(
+            &session.timeline.turns,
+            &session.expanded_tools,
+            &session.expanded_thinking,
+        )
+        .into_iter()
+        .filter(|block| {
+            !(block.state == BlockState::Live && matches!(block.kind, BlockKind::Thinking { .. }))
+        })
+        .collect();
 
         let mut used = HashSet::with_capacity(blocks.len());
         let mut spans = Vec::with_capacity(blocks.len());
@@ -667,6 +676,7 @@ impl FullscreenTranscriptCache {
             let kind = match &block.kind {
                 BlockKind::User { .. } => SpanKind::Message(MessageRole::User),
                 BlockKind::Assistant { .. } => SpanKind::Message(MessageRole::Assistant),
+                BlockKind::Thinking { .. } => SpanKind::Thinking,
                 BlockKind::Tool(_) => SpanKind::Tool,
                 _ => continue,
             };

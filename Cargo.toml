@@ -1,6 +1,6 @@
 [package]
 name = "qaqh-tui"
-version = "2.0.0-alpha2"
+version = "2.0.0-alpha3"
 edition = "2024"
 description = "Terminal UI client for the QAQ-Harness daemon (Ringing v2)"
 license = "MIT"

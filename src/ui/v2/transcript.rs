@@ -97,6 +97,7 @@ pub enum BlockKind {
     Thinking {
         text: String,
         duration: Option<Duration>,
+        expanded: bool,
     },
     Tool(ToolBlock),
     System {
@@ -189,10 +190,15 @@ pub fn render_block(block: &TranscriptBlock, width: usize, theme: &Theme) -> Vec
     let mut lines = match &block.kind {
         BlockKind::User { text } => render_user(text, width, theme),
         BlockKind::Assistant { text } => render_assistant(text, width, theme),
-        BlockKind::Thinking { text, duration } => render_thinking(
+        BlockKind::Thinking {
+            text,
+            duration,
+            expanded,
+        } => render_thinking(
             text,
             *duration,
             block.state == BlockState::Live,
+            *expanded,
             width,
             theme,
         ),
@@ -239,6 +245,7 @@ fn render_thinking(
     text: &str,
     duration: Option<Duration>,
     live: bool,
+    expanded: bool,
     width: usize,
     theme: &Theme,
 ) -> Vec<Line<'static>> {
@@ -267,10 +274,39 @@ fn render_thinking(
             || "Thought".to_string(),
             |duration| format!("Thought for {}", format_duration(duration)),
         );
+        let hint = if text.is_empty() {
+            ""
+        } else if expanded {
+            "（点击收起）"
+        } else {
+            "（点击展开）"
+        };
         lines.push(Line::from(vec![
             Span::styled(prefix, fg(theme.accent.thinking)),
-            Span::styled(label, fg(theme.text.muted)),
+            Span::styled(format!("{label}{hint}"), fg(theme.text.muted)),
         ]));
+        if expanded {
+            let body_width = width.saturating_sub(continuation.width() + 2).max(1);
+            if text.is_empty() {
+                lines.push(Line::from(vec![
+                    Span::styled(continuation.clone(), fg(theme.text.dim)),
+                    Span::styled("正文不可用", fg(theme.text.dim)),
+                ]));
+            } else {
+                for line in text.lines() {
+                    for seg in wrap_text(line, body_width) {
+                        lines.push(Line::from(vec![
+                            Span::styled(continuation.clone(), fg(theme.text.dim)),
+                            Span::styled(
+                                format!("{} ", theme.glyph.quote),
+                                fg(theme.accent.thinking),
+                            ),
+                            Span::styled(seg, fg(theme.text.muted)),
+                        ]));
+                    }
+                }
+            }
+        }
     }
     lines
 }
@@ -735,12 +771,30 @@ mod tests {
             BlockKind::Thinking {
                 text: "first\nlatest thought".to_string(),
                 duration: None,
+                expanded: false,
             },
         );
         let text = text_of(&render_block(&block, 40, &theme()));
         assert!(text.contains("Thinking…"));
         assert!(text.contains("latest thought"));
         assert!(!text.contains("first"));
+    }
+
+    #[test]
+    fn expanded_thinking_reveals_full_history() {
+        let block = TranscriptBlock::new(
+            "thinking-history",
+            BlockKind::Thinking {
+                text: "first line\nsecond line".to_string(),
+                duration: Some(Duration::from_millis(1200)),
+                expanded: true,
+            },
+        )
+        .with_state(BlockState::Sealed);
+        let text = text_of(&render_block(&block, 60, &theme()));
+        assert!(text.contains("first line"), "{text}");
+        assert!(text.contains("second line"), "{text}");
+        assert!(text.contains("点击收起"), "{text}");
     }
 
     /// 工具卡的**去冗余**回归锁。四条都来自真机实拍：
@@ -1002,6 +1056,7 @@ mod tests {
                 BlockKind::Thinking {
                     text: String::new(),
                     duration: Some(Duration::from_millis(1200)),
+                    expanded: false,
                 },
             )
             .with_state(BlockState::Sealed),
