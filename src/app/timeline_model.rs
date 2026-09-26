@@ -757,7 +757,8 @@ impl TimelineModel {
         self.turns.last().map(|t| t.turn_id.as_str())
     }
 
-    /// 窗口内是否还有 running turn（任一；正常至多一个）。
+    /// 窗口内是否还有 running turn（仅测试辅助）。
+    #[cfg(test)]
     pub fn is_streaming(&self) -> bool {
         self.turns.iter().any(|t| t.is_streaming())
     }
@@ -801,7 +802,7 @@ mod tests {
             schema: "qaqh.Ringing".into(),
             version: 1,
             server_epoch: "ep".into(),
-            seed: "s".into(),
+            session_id: "s".into(),
             has_more: false,
             total_turns: 0,
             truncated_before: false,
@@ -1312,7 +1313,7 @@ mod tests {
             schema: "qaqh.Ringing".into(),
             version: 1,
             server_epoch: "ep".into(),
-            seed: "s".into(),
+            session_id: "s".into(),
             has_more: false,
             total_turns: 200,
             truncated_before: true,
@@ -1345,7 +1346,7 @@ mod tests {
             schema: "qaqh.Ringing".into(),
             version: 1,
             server_epoch: "ep".into(),
-            seed: "s".into(),
+            session_id: "s".into(),
             has_more: false,
             total_turns: 1,
             truncated_before: false,
@@ -1376,7 +1377,7 @@ mod tests {
             schema: "qaqh.Ringing".into(),
             version: 1,
             server_epoch: "ep".into(),
-            seed: "s".into(),
+            session_id: "s".into(),
             has_more: false,
             total_turns: 4,
             truncated_before: false,
@@ -1423,7 +1424,7 @@ mod tests {
             schema: "qaqh.Ringing".into(),
             version: 1,
             server_epoch: "ep".into(),
-            seed: "s".into(),
+            session_id: "s".into(),
             has_more: true,
             total_turns: 60,
             truncated_before: false,
@@ -1788,7 +1789,7 @@ mod tests {
             schema: "qaqh.Ringing".into(),
             version: 1,
             server_epoch: "ep".into(),
-            seed: "s".into(),
+            session_id: "s".into(),
             has_more: false,
             total_turns: 1,
             truncated_before: false,
@@ -1944,7 +1945,7 @@ mod tests {
             schema: "qaqh.Ringing".into(),
             version: 1,
             server_epoch: "ep".into(),
-            seed: "s".into(),
+            session_id: "s".into(),
             has_more: false,
             total_turns: 1,
             truncated_before: false,
@@ -2220,7 +2221,7 @@ mod tests {
             schema: "qaqh.Ringing".into(),
             version: 1,
             server_epoch: "ep".into(),
-            seed: "s".into(),
+            session_id: "s".into(),
             has_more: false,
             total_turns: 1,
             truncated_before: false,

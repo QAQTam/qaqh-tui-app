@@ -19,13 +19,14 @@ pub mod settings;
 mod settings_ops;
 pub mod slash;
 pub mod subagent;
+pub mod team;
 pub mod timeline_model;
 mod transcript_ops;
 
 use self::keymap::{GlobalKey, ModalRoute};
 use self::paste_guard::PasteGuard;
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -46,6 +47,7 @@ use session::{
     AskPanel, Composer, PermissionPanel, PlanPanel, SessionState, StreamPhase, activity_from_v2,
     conversation_cache_from_v2, streaming_done, sync_streaming_from_timeline,
 };
+use team::TeamState;
 
 // 单会话内存回合**不设硬上限**。
 //
@@ -118,6 +120,10 @@ pub enum ActionResult {
         seed: String,
         result: Result<qaqh_client::DomainDashboardSnapshot, String>,
     },
+    Team {
+        seed: String,
+        result: Result<qaqh_client::ClientV2TeamResponse, String>,
+    },
 }
 
 // 小变体（Key/Mouse/Tick）与大负载变体混排；Box 化推迟到独立性能任务。
@@ -131,6 +137,10 @@ pub enum AppMsg {
     Paste(String),
     Resize,
     Tick,
+    /// 终端窗口失去焦点：指针的 hover/pressed/capture 必须全部作废。
+    ///
+    /// 由终端输入层在收到 `Event::FocusLost` 时合成（spec §3.3 / P0-C-2）。
+    FocusLost,
 }
 
 /// 后台任务取用的 API 句柄。
@@ -181,6 +191,14 @@ impl ApiCtx {
     ) -> Result<qaqh_client::RingingCommandAck, String> {
         self.client()?
             .send_command(seed, command, options)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    /// 拉取一次 Team projection 快照（roster / inbox 的唯一权威来源）。
+    pub async fn team_v2(&self, seed: &str) -> Result<qaqh_client::ClientV2TeamResponse, String> {
+        self.client()?
+            .team_v2(seed)
             .await
             .map_err(|e| e.to_string())
     }
@@ -501,6 +519,11 @@ pub enum Overlay {
         detail: bool,
         scroll: usize,
     },
+    /// `/subagents`：Team projection roster + inbox。
+    Subagents {
+        selected: usize,
+        filter: String,
+    },
     /// 思考回放浮层（§4.5）：当前活动回合的 reasoning body（内存零抓取）。
     /// 只读 + 滚动；Esc 关闭。body 在推入时快照（后续 delta 不刷新——回放语义）。
     Thinking {
@@ -549,6 +572,7 @@ impl Overlay {
             | Overlay::Settings(_)
             | Overlay::Help
             | Overlay::History { .. }
+            | Overlay::Subagents { .. }
             | Overlay::CwdInput { .. } => None,
         }
     }
@@ -639,6 +663,7 @@ pub enum WorkspaceHit {
     SessionRow(usize),
     HistoryTurn(usize),
     TodoTask(usize),
+    SubagentRow(usize),
     SettingsRow(usize),
     Back,
 }
@@ -650,6 +675,14 @@ pub struct App {
 
     pub tabs: Vec<String>,
     pub sessions: HashMap<String, SessionState>,
+    /// root seed → Team projection（roster / inbox）。
+    pub teams: HashMap<String, TeamState>,
+    /// Child id → live status observed before the owning Team snapshot arrived.
+    ///
+    /// Team deltas are ephemeral; a child can become `running` while the root
+    /// snapshot is still in flight. Keep the hint until the Team projection can
+    /// supply the agent identity.
+    pending_team_status: BTreeMap<String, qaqh_client::ClientV2TeamAgentStatus>,
     pub active: usize,
 
     pub overlays: Vec<Overlay>,
@@ -722,8 +755,8 @@ pub struct App {
 /// `TimelineLost` 的处置结论。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TimelineLostEffect {
-    /// 会话确实不存在（404）：子代理收口为 `Closed` 并停止跟踪。
-    CloseSubagent,
+    /// 会话确实不存在（404）：停止 live timeline，roster 条目保留。
+    UntrackSubagent,
     /// 其他错误：**保留原状态**，只给出可见提示。
     Notice,
 }
@@ -738,7 +771,7 @@ pub(crate) fn timeline_lost_effect(
     reason: &TimelineLostReason,
 ) -> TimelineLostEffect {
     if is_subagent && *reason == TimelineLostReason::SessionMissing {
-        TimelineLostEffect::CloseSubagent
+        TimelineLostEffect::UntrackSubagent
     } else {
         TimelineLostEffect::Notice
     }
@@ -779,6 +812,8 @@ impl App {
             msg_tx,
             tabs: Vec::new(),
             sessions: HashMap::new(),
+            teams: HashMap::new(),
+            pending_team_status: BTreeMap::new(),
             active: 0,
             overlays: Vec::new(),
             conn_phase: ConnPhase::Opening,
@@ -831,6 +866,8 @@ impl App {
             AppMsg::Paste(text) => self.handle_paste(text),
             AppMsg::Resize => {}
             AppMsg::Tick => self.handle_tick(),
+            // 指针状态由终端层持有；App 层无需处理。
+            AppMsg::FocusLost => {}
         }
     }
 
@@ -946,15 +983,21 @@ impl App {
                 self.spawn_bootstrap(seed);
             }
             RuntimeMsg::Timeline { seed, entry } => {
-                // 子代理发现：spawn_subagent 工具卡（增量，先于 apply 检查）。
+                // `TurnStarted` is an ephemeral control delta and can race the
+                // child timeline attach. The reliable timeline replay carries
+                // the same live-state signal; use it only as a status hint,
+                // never as roster identity.
+                if matches!(&entry.event, qaqh_client::TimelineEvent::TurnOpened { .. }) {
+                    self.apply_child_activity_hint(
+                        &seed,
+                        qaqh_client::ClientV2ActivityState::Running,
+                    );
+                }
                 let todo_tool_touched = matches!(
                     &entry.event,
                     qaqh_client::TimelineEvent::ToolUpdated { tool, .. }
                         if tool.name.starts_with("todo")
                 );
-                if let qaqh_client::TimelineEvent::ToolUpdated { tool, .. } = &entry.event {
-                    self.discover_spawn_tool(&seed, tool);
-                }
                 let Some(sess) = self.sessions.get_mut(&seed) else {
                     return;
                 };
@@ -980,20 +1023,27 @@ impl App {
                 }
             }
             RuntimeMsg::TimelineRebaseline { seed, page } => {
-                let Some(sess) = self.sessions.get_mut(&seed) else {
-                    return;
+                let running = {
+                    let Some(sess) = self.sessions.get_mut(&seed) else {
+                        return;
+                    };
+                    let was_follow = sess.scroll.follow;
+                    let first_load = !sess.ready;
+                    sess.timeline.replace_from_page(&page);
+                    sess.ready = true;
+                    sync_streaming_from_timeline(sess);
+                    if first_load || was_follow {
+                        sess.scroll.follow = true;
+                        sess.scroll.offset = 0;
+                    }
+                    sess.timeline.running_turn_id().is_some()
                 };
-                let was_follow = sess.scroll.follow;
-                let first_load = !sess.ready;
-                sess.timeline.replace_from_page(&page);
-                sess.ready = true;
-                sync_streaming_from_timeline(sess);
-                if first_load || was_follow {
-                    sess.scroll.follow = true;
-                    sess.scroll.offset = 0;
+                if running {
+                    self.apply_child_activity_hint(
+                        &seed,
+                        qaqh_client::ClientV2ActivityState::Running,
+                    );
                 }
-                // 子代理：重扫工具卡 + 终态兑底推导。
-                self.handle_subagent_rebaseline(&seed);
             }
             RuntimeMsg::TimelineLost { seed, reason } => self.handle_timeline_lost(&seed, &reason),
         }
@@ -1002,9 +1052,10 @@ impl App {
     /// timeline 流丢失：只有 404（会话不存在）才收口子代理，其余保留现状并提示。
     fn handle_timeline_lost(&mut self, seed: &str, reason: &TimelineLostReason) {
         match timeline_lost_effect(self.subagent_seeds.contains(seed), reason) {
-            TimelineLostEffect::CloseSubagent => {
-                // 子代理会话已消失（404）：静默标记关闭，不再重试。
-                self.mark_subagent_closed(seed);
+            TimelineLostEffect::UntrackSubagent => {
+                // 子代理会话已消失（404）：停止 live 订阅；Team projection
+                // 仍是 roster 权威，不能在这里伪造 completed/closed。
+                self.untrack_subagent(seed);
             }
             TimelineLostEffect::Notice => {
                 // 401/超时/网络错/流结束：会话可能还活着——状态不动，但必须可见。
@@ -1071,7 +1122,7 @@ impl App {
                                 .send_command(
                                     Some(&seed),
                                     RingingCommand::Control(ControlCommand::SessionResume {
-                                        seed: seed.clone(),
+                                        session_id: seed.clone(),
                                     }),
                                     Default::default(),
                                 )
@@ -1084,6 +1135,11 @@ impl App {
                                 }));
                                 continue;
                             }
+                            let team = api.team_v2(&seed).await;
+                            let _ = tx.send(AppMsg::Action(ActionResult::Team {
+                                seed: seed.clone(),
+                                result: team,
+                            }));
                             let result = api.bootstrap(&seed).await;
                             let client_session_id = api.v2_client_session_id().await;
                             let _ = tx.send(AppMsg::Action(ActionResult::Bootstrap {
@@ -1097,7 +1153,7 @@ impl App {
                                 .send_command(
                                     Some(&seed),
                                     RingingCommand::Control(ControlCommand::SessionAttach {
-                                        seed: seed.clone(),
+                                        session_id: seed.clone(),
                                     }),
                                     Default::default(),
                                 )
@@ -1191,8 +1247,8 @@ impl App {
             qaqh_client::ClientV2Payload::ResourceDelta(delta) => {
                 self.handle_resource_delta(seed, delta)
             }
+            qaqh_client::ClientV2Payload::TeamDelta(delta) => self.handle_team_delta(seed, delta),
             qaqh_client::ClientV2Payload::MailboxDelta(_)
-            | qaqh_client::ClientV2Payload::TeamDelta(_)
             | qaqh_client::ClientV2Payload::TimelineDelta(_)
             | qaqh_client::ClientV2Payload::AuditRef(_)
             | qaqh_client::ClientV2Payload::Unknown(_) => {}
@@ -1220,6 +1276,7 @@ impl App {
                 }
             }
             D::Activity { state, .. } => {
+                self.apply_child_activity_hint(&seed, state);
                 let state = activity_from_v2(state);
                 self.activity_cache.insert(seed.clone(), state);
                 if let Some(sess) = self.sessions.get_mut(&seed) {
@@ -1292,27 +1349,19 @@ impl App {
                 }
             }
             D::SubagentSpawned {
-                child_session_id,
-                parent_call_id,
-                ..
+                child_session_id, ..
             } => {
-                if let Some(sess) = self.sessions.get_mut(&seed) {
-                    subagent::bind_seed(sess, parent_call_id.as_str(), child_session_id.as_str());
-                }
+                // Control snapshot/delta is not roster authority, but it is a
+                // reliable early signal that the child session exists and should
+                // be attached before TeamDelta/tool-card UI catches up.
+                self.ensure_subagent_tracked(&seed, child_session_id.as_str());
             }
             D::SubagentFinished {
-                child_session_id,
-                status,
-                ..
+                child_session_id, ..
             } => {
-                // 终态标签：同步条目并停止对应 seed 的 timeline 跟踪。
-                let mut done_seed = None;
-                if let Some(sess) = self.sessions.get_mut(&seed) {
-                    done_seed = subagent::apply_terminal(sess, child_session_id.as_str(), status);
-                }
-                if let Some(s) = done_seed {
-                    self.untrack_subagent(&s);
-                }
+                // Roster status is owned by TeamDelta. Here we only stop the
+                // child's live timeline; the roster entry remains visible.
+                self.untrack_subagent(child_session_id.as_str());
             }
             D::DriverChanged {
                 holder,
@@ -1690,6 +1739,7 @@ impl App {
                 match result {
                     Ok(b) => {
                         let bootstrap_seed = seed.clone();
+                        let bootstrap_activity = b.control.state.activity;
                         let Some(sess) = self.sessions.get_mut(&bootstrap_seed) else {
                             return;
                         };
@@ -1739,13 +1789,26 @@ impl App {
                         sess.context_limit =
                             conv.context_limit.map(|v| v.min(u32::MAX as u64) as u32);
                         sess.conversation = Some(conv);
+                        self.apply_child_activity_hint(&bootstrap_seed, bootstrap_activity);
                         // v2 bootstrap 的 `interactions` 已由 daemon 过滤为未决集合。
                         // 不能只恢复 permission：v2 流的 snapshot cursor 会跳过
                         // “快照中已经挂起”的事实，ask / plan 也必须从这里补面板。
                         let pending_interactions = ctl.interactions.clone();
+                        // `control.subagents` 不是 roster 权威，但它是 bootstrap 时
+                        // 唯一能补齐「delta 早于 TeamSnapshot / tool card」的
+                        // live 子会话信号；这里只消费为 timeline attach。
+                        let bootstrap_subagents: Vec<String> = ctl
+                            .subagents
+                            .iter()
+                            .filter(|subagent| subagent.status.is_none())
+                            .map(|subagent| subagent.child_session_id.as_str().to_owned())
+                            .collect();
 
                         for interaction in pending_interactions {
                             self.restore_pending_interaction(bootstrap_seed.clone(), interaction);
+                        }
+                        for child in bootstrap_subagents {
+                            self.ensure_subagent_tracked(&bootstrap_seed, &child);
                         }
                         // 空 seat / 本人已可接管时才显式 claim；有活跃 holder 时
                         // can_claim=false，UI 保持只读并等 reliable DriverChanged。
@@ -1845,7 +1908,7 @@ impl App {
                 if !self.pending_creates.is_empty()
                     && let Some(entry) = list.iter().max_by_key(|e| e.meta.created_at)
                 {
-                    let seed = entry.meta.seed.clone();
+                    let seed = entry.meta.session_id.clone();
                     if !self.tabs.contains(&seed) {
                         self.open_session_tab(&seed);
                         self.pending_creates.clear();
@@ -1869,7 +1932,8 @@ impl App {
             // 与 G2 删掉的那类手解同款。现在字段在类型上，改形状会编译报错。
             ActionResult::SessionActivity(Ok(items)) => {
                 for item in items {
-                    self.activity_cache.insert(item.seed.clone(), item.state);
+                    self.activity_cache
+                        .insert(item.session_id.clone(), item.state);
                 }
             }
             ActionResult::SessionActivity(Err(_)) => {}
@@ -1971,6 +2035,21 @@ impl App {
                     Err(_e) => {}
                 }
             }
+            ActionResult::Team { seed, result } => match result {
+                Ok(response) => {
+                    let snapshot = response.team;
+                    self.teams
+                        .entry(seed.clone())
+                        .or_default()
+                        .replace_from_snapshot(snapshot);
+                    self.reconcile_team_tracking(&seed);
+                    self.flush_pending_team_status();
+                    self.force_redraw = true;
+                }
+                Err(error) => {
+                    log::warn!("team snapshot for {seed} failed: {error}");
+                }
+            },
         }
     }
 
@@ -2166,6 +2245,9 @@ impl App {
             }
             // 上一条标签遗留的确认/附件 overlay 属于旧 seed：不能跟着切过来。
             self.prune_overlays_for_active_seed();
+            if let Some(seed) = self.active_seed() {
+                self.fetch_team(seed);
+            }
             return;
         }
 
@@ -2262,7 +2344,7 @@ mod tests {
     fn list_entry(seed: &str, created_at: u64) -> SessionListEntry {
         SessionListEntry {
             meta: SessionMeta {
-                seed: seed.to_string(),
+                session_id: seed.to_string(),
                 created_at,
                 ..SessionMeta::default()
             },
@@ -2274,7 +2356,7 @@ mod tests {
     fn list_entry_with_cwd(seed: &str, cwd: Option<&str>) -> SessionListEntry {
         SessionListEntry {
             meta: SessionMeta {
-                seed: seed.to_string(),
+                session_id: seed.to_string(),
                 cwd: cwd.map(str::to_owned),
                 ..SessionMeta::default()
             },
@@ -2530,7 +2612,7 @@ mod tests {
                 schema: qaqh_client::RINGING_SCHEMA.into(),
                 version: qaqh_client::RINGING_V2_VERSION,
                 server_epoch: "e1".into(),
-                seed: "seed".into(),
+                session_id: "seed".into(),
                 log_id: Some("log-1".into()),
                 snapshot_cursor: None,
                 reason: qaqh_client::ClientV2ResetReason::SnapshotMissing,
@@ -2573,7 +2655,7 @@ mod tests {
                 schema: qaqh_client::RINGING_SCHEMA.into(),
                 version: qaqh_client::RINGING_V2_VERSION,
                 server_epoch: "e2".into(),
-                seed: "seed".into(),
+                session_id: "seed".into(),
                 log_id: Some("log-2".into()),
                 snapshot_cursor: Some(
                     qaqh_client::ClientV2CursorToken::encode_snapshot(
@@ -2906,7 +2988,7 @@ mod tests {
                 schema: qaqh_client::RINGING_SCHEMA.into(),
                 version: qaqh_client::RINGING_V2_VERSION,
                 server_epoch: "e1".into(),
-                seed: seed.into(),
+                session_id: seed.into(),
                 event_id: "ev-1".into(),
                 stream_key: qaqh_client::ClientV2StreamKey::Channel(
                     qaqh_client::Channel::Conversation,
@@ -2939,7 +3021,7 @@ mod tests {
             "schema": "qaqh.Ringing",
             "version": 2,
             "server_epoch": server_epoch,
-            "seed": seed,
+            "session_id": seed,
             "snapshot_cursor": cursor.as_str(),
             "control": {
                 "channel": "control",
@@ -2999,7 +3081,7 @@ mod tests {
                 schema: qaqh_client::RINGING_SCHEMA.into(),
                 version: qaqh_client::RINGING_V2_VERSION,
                 server_epoch: "e1".into(),
-                seed: seed.into(),
+                session_id: seed.into(),
                 event_id: format!("ev-{fact_seq}-{projection_index}"),
                 stream_key: qaqh_client::ClientV2StreamKey::Channel(
                     qaqh_client::Channel::Conversation,
@@ -3306,82 +3388,57 @@ mod tests {
         );
     }
 
-    use crate::app::subagent::{SubagentEntry, SubagentState};
     use crate::runtime::TimelineLostReason;
 
-    /// 父标签 + 一个正在跟踪（Running）的子代理。
-    fn app_with_running_subagent() -> (App, String) {
+    /// 父标签 + 一个正在跟踪的子代理。
+    fn app_with_tracked_subagent() -> (App, String) {
         let (mut app, _rx) = App::new_for_test();
         let sub = "seed-sub".to_string();
         app.sessions
             .insert(sub.clone(), SessionState::new(sub.clone()));
         app.subagent_seeds.insert(sub.clone());
-        let mut parent = SessionState::new("parent".into());
-        parent.subagents.push(SubagentEntry {
-            tool_call_id: "c1".into(),
-            seed: Some(sub.clone()),
-            name: "explore".into(),
-            state: SubagentState::Running,
-        });
-        app.sessions.insert("parent".into(), parent);
         (app, sub)
     }
 
-    fn subagent_state(app: &App, seed: &str) -> SubagentState {
-        app.sessions["parent"]
-            .subagents
-            .iter()
-            .find(|e| e.seed.as_deref() == Some(seed))
-            .expect("子代理条目存在")
-            .state
-    }
-
-    /// issue #2 缺陷 1：非 404 的失败**不得**把仍在运行的子代理误标 `Closed`，
-    /// 且必须留下可见提示（旧实现只按「是不是子代理」判定 → 静默收口）。
+    /// 非 404 的失败**不得**停止仍在运行的子代理的 timeline 跟踪，
+    /// 且必须留下可见提示。
     #[test]
     fn timeline_lost_keeps_subagent_on_non_404_and_warns() {
-        let (mut app, sub) = app_with_running_subagent();
+        let (mut app, sub) = app_with_tracked_subagent();
         app.handle_runtime(RuntimeMsg::TimelineLost {
             seed: sub.clone(),
             reason: TimelineLostReason::Other(
                 "HTTP 401: /ringing/v1/sessions/seed-sub/timeline".into(),
             ),
         });
-        assert_eq!(
-            subagent_state(&app, &sub),
-            SubagentState::Running,
-            "401/超时/网络错只说明这条流断了，会话可能还活着"
-        );
         assert!(
             app.subagent_seeds.contains(&sub),
-            "非 404 不得停止该 seed 的 timeline 跟踪"
+            "401/超时/网络错只说明这条流断了，会话可能还活着"
         );
         assert!(
             app.toasts
                 .iter()
                 .any(|t| t.level == NoticeLevel::Error && t.text.contains(&sub)),
-            "非 404 必须有可见提示（不能像旧实现那样 return 掉）"
+            "非 404 必须有可见提示"
         );
     }
 
-    /// 404 = 会话确实不存在：这才收口为 `Closed` 并停止跟踪。
+    /// 404 = 会话确实不存在：停止 live 订阅，但 roster 不由本地伪造 Closed。
     #[test]
-    fn timeline_lost_closes_subagent_on_404() {
-        let (mut app, sub) = app_with_running_subagent();
+    fn timeline_lost_untracks_subagent_on_404() {
+        let (mut app, sub) = app_with_tracked_subagent();
         app.handle_runtime(RuntimeMsg::TimelineLost {
             seed: sub.clone(),
             reason: TimelineLostReason::SessionMissing,
         });
-        assert_eq!(subagent_state(&app, &sub), SubagentState::Closed);
         assert!(!app.subagent_seeds.contains(&sub));
     }
 
-    /// 判据矩阵：只有「子代理 + 404」收口；非子代理 seed 一律只提示。
     #[test]
     fn timeline_lost_effect_requires_404_and_subagent() {
         assert_eq!(
             timeline_lost_effect(true, &TimelineLostReason::SessionMissing),
-            TimelineLostEffect::CloseSubagent
+            TimelineLostEffect::UntrackSubagent
         );
         assert_eq!(
             timeline_lost_effect(true, &TimelineLostReason::Other("boom".into())),
@@ -3393,40 +3450,53 @@ mod tests {
         );
     }
 
-    /// issue #2 缺陷 3 的端到端路径（「后端主动关父」）：daemon 关掉一个
-    /// **不是本地标签**的父会话时，`handle_control` 也必须走一遍回收——旧实现
-    /// 被 `if self.tabs.contains(&seed)` 挡在门外，子代理永远留在跟踪集里。
-    ///
-    /// 这里刻意让父**本身也是子代理**（嵌套）：它挂在 `root` 名下，不在 tabs。
+    /// daemon 主动关掉非标签父会话时，后代 live 订阅必须回收；
+    /// Team projection 的 roster 条目仍然保留。
     #[test]
-    fn closed_event_for_non_tab_parent_reclaims_subagents() {
+    fn closed_event_for_non_tab_parent_reclaims_live_subscriptions() {
         let (mut app, _rx) = App::new_for_test();
-        let mut parent = SessionState::new("parent".into());
-        parent.subagents.push(SubagentEntry {
-            tool_call_id: "c1".into(),
-            seed: Some("sub".into()),
-            name: "explore".into(),
-            state: SubagentState::Running,
-        });
-        app.sessions.insert("parent".into(), parent);
-        init_v2_session(&mut app, "parent");
-        app.sessions
-            .insert("sub".into(), SessionState::new("sub".into()));
-        for s in ["parent", "sub"] {
-            app.subagent_seeds.insert(s.into());
+        for seed in ["root", "parent", "sub"] {
+            app.sessions
+                .insert(seed.into(), SessionState::new(seed.into()));
         }
-        let mut root = SessionState::new("root".into());
-        root.subagents.push(SubagentEntry {
-            tool_call_id: "c0".into(),
-            seed: Some("parent".into()),
-            name: "nested".into(),
-            state: SubagentState::Running,
-        });
-        app.sessions.insert("root".into(), root);
-        assert!(
-            !app.tabs.contains(&"parent".to_string()),
-            "前提：父不是本地标签"
-        );
+        init_v2_session(&mut app, "parent");
+        for seed in ["parent", "sub"] {
+            app.subagent_seeds.insert(seed.into());
+        }
+        let snapshot: qaqh_client::ClientV2TeamSnapshot =
+            serde_json::from_value(serde_json::json!({
+                "root_session_id": "root",
+                "agents": [
+                    {
+                        "agent_id": "root",
+                        "agent_path": "/root",
+                        "status": "running",
+                        "residency": "loaded"
+                    },
+                    {
+                        "agent_id": "parent",
+                        "agent_path": "/root/parent",
+                        "status": "running",
+                        "residency": "loaded",
+                        "parent_agent_path": "/root"
+                    },
+                    {
+                        "agent_id": "sub",
+                        "agent_path": "/root/parent/sub",
+                        "status": "running",
+                        "residency": "loaded",
+                        "parent_agent_path": "/root/parent"
+                    }
+                ],
+                "unread_messages": [],
+                "revision": 1,
+                "last_fact_seq": 1
+            }))
+            .expect("team snapshot");
+        app.teams
+            .entry("root".into())
+            .or_default()
+            .replace_from_snapshot(snapshot);
 
         app.handle(AppMsg::Runtime(v2_event(
             "parent",
@@ -3440,13 +3510,12 @@ mod tests {
 
         assert!(
             !app.subagent_seeds.contains("sub") && !app.subagent_seeds.contains("parent"),
-            "daemon 主动关父时必须回收它自己与它的子代理"
+            "daemon 主动关父时必须回收它自己与它的子代理的 live 订阅"
         );
         assert!(!app.sessions.contains_key("sub"));
-        assert_eq!(
-            app.sessions["root"].subagents[0].state,
-            SubagentState::Closed,
-            "会话已消失 → 挂在 root 名下的父条目收口为 Closed"
+        assert!(
+            app.teams["root"].agent_by_id("sub").is_some(),
+            "停止 live 订阅不能把 roster 条目删掉"
         );
     }
 

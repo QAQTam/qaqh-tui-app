@@ -49,10 +49,13 @@ Workspace/Modal、会话选择器、设置、权限/ask/plan 共用 v2 路由层
 
 鼠标能力已覆盖：
 
-- 滚轮滚动、回到底部、滚动条
+- 滚轮滚动、回到底部、滚动条轨道点击与 thumb 拖动
 - 助手消息菜单：复制 Markdown、撤销
 - permission / ask / plan 按钮 hover / 按下 / 点击
 - Settings 行点击
+
+Fullscreen 会启用鼠标捕获；需要终端原生选择/复制时按住 `Shift` 拖选（tmux
+中同样用 `Shift` 绕过应用的 mouse tracking，或使用 `prefix + [` 的 copy-mode）。
 
 `--no-spawn` 只连接已有 daemon，不自动拉起。旧的 `--v1` 与
 `--v2-inline` 入口会明确报错退出。
@@ -81,16 +84,17 @@ Slash：`/new [cwd]` 新建 · `/help` 帮助 · `/clear` 清空输入 ·
 
 ### 子代理实时观测（Ctrl+↑/↓）
 
-父会话通过 `spawn_subagent` 拉起的子代理会在标签栏以 `↳N` 徽标显示
-（运行中高亮）；子代理 seed 从父会话 timeline 的工具卡自动发现，经
-`SessionAttach`（无 actor 副作用）attach 后实时订阅其 timeline 流。
+父会话通过 `spawn_subagent` 拉起的子代理来自后端 `TeamSnapshot/TeamDelta`
+投影；roster 以稳定 `AgentPath` 为键，`unloaded` 条目仍保留。`control.subagents`
+只用于 bootstrap 时建立 child timeline attach，不再从工具卡 JSON 推导身份。
 
 - `Ctrl+↑`：深入最近拉起的子代理；再次按下在子代理间循环切换
 - `Ctrl+↓` / `Esc`：返回父会话
+- `/subagents`：查看 roster、inbox、path prefix 过滤，并打开 child transcript
 - 观测中 transcript 显示子代理实时 transcript（任务/思考/工具/作答），
   composer 折叠为只读提示条；PgUp/PgDn/Ctrl+Home/End 滚动
 - 观测为只读：子代理无人值守运行，终态结果自动注入父会话；
-  会话关闭后本地保留最后快照
+  会话关闭后本地保留最后快照，卸载不等于删除
 
 交互弹窗（优先级 permission > ask > plan）：工具权限 `a` 批准 / `d` 拒绝 /
 `t` 信任目录（高风险+路径时）；ask `1-9` 选项、`e` 自定义输入、`Esc` 跳过；
@@ -117,8 +121,8 @@ src/
   runtime.rs     open/续租循环（renew_interval/2，2 次失败重 open）+ 三频道 SSE 流 +
                  per-seed timeline 流（严格 +1，gap/reset/epoch 变化 → 快照 re-baseline）
   app/           App 状态机 + timeline reducer（幂等）+ 渲染 IR
-    subagent.rs   子代理观测：seed 发现（spawn_subagent 工具卡）+ 状态机 +
-                  视图栈导航（Ctrl+↑/↓，SessionAttach 无副作用接入）
+    team.rs       TeamSnapshot/TeamDelta roster + inbox 归并（AgentPath 为主键）
+    subagent.rs   子代理 timeline 跟踪与视图栈导航（Ctrl+↑/↓，SessionAttach 无副作用接入）
   ui/            ratatui 0.30 视图（标签栏/对话/弹窗/覆盖层/状态栏）
 ```
 
@@ -151,8 +155,8 @@ todo 是**领域状态**，不是事件流——侧栏直接消费状态面，tr
 - agent 调 `todo` 工具时 daemon 即时推送 `DashboardSnapshot`（replaceable，
   含 `tasks[{id,subject,description,status,evidence}]` + `current_todo_id` +
   `recent_edits`，engine_tool.rs "Instant refresh for todo tools"）；
-- `todo.status {seed}` / `session.dashboard {seed}` 为拉取兜底（当前未轮询，
-  遵循事件驱动纪律）。
+- `todo.status {session_id}` / `session.dashboard {session_id}` 为拉取兜底
+  （当前未轮询，遵循事件驱动纪律）。
 
 ## 协议纪律对照（PLAN.md §2）
 
@@ -165,9 +169,9 @@ todo 是**领域状态**，不是事件流——侧栏直接消费状态面，tr
 5. timeline bootstrap + `?before_turn&limit` 分页 + timeline SSE 严格 +1，gap 一律
    re-baseline；
 6. 服务面 `POST /ringing/v1/service/{method}` 方法名全部来自 `protocol::methods`
-   常量；Read 带 `seed`（envelope/参数双级）；错误码 `query_failed`/`action_failed`/
+   常量；Read 带 `session_id`（envelope/参数双级）；错误码 `query_failed`/`action_failed`/
    `unknown_method`；
-7. 附件 `POST /ringing/v1/content`（seed/media_type/content 三字段 multipart）→
+7. 附件 `POST /ringing/v1/content`（session_id/media_type/content 三字段 multipart）→
    `ContentRef`，命令只传引用不传路径；下载校验 sha256；
 8. 禁 WebSocket/轮询；不调用 `/control/v1/stop*`（安装器专用）。
 
@@ -175,10 +179,11 @@ todo 是**领域状态**，不是事件流——侧栏直接消费状态面，tr
 
 - 新会话发现：消费 `SessionStateChanged{created}` 的信封 `causation_id == command_id`
   关联，不做 15s 列表轮询 diff；
-- 不读 `sessions/{seed}/meta.json` 磁盘旁路，元数据全部走 `session.list`/bootstrap；
+- 不读 `sessions/{session_id}/meta.json` 磁盘旁路，元数据全部走
+  `session.list`/bootstrap；
 - 附件上传失败显式 toast（winui 静默吞错）；
-- envelope 级 `seed`（与命令体 seed 是两个独立字段，后端 validate 强制）——经
-  真实 daemon 实测修正；
+- envelope 级 `session_id`（与命令体 `session_id` 是两个独立字段，后端 validate
+  强制）——经真实 daemon 实测修正；
 - 频道 SSE 光标与帧 id 严格比对，失配重连；timeline gap → 快照 re-baseline
   （对齐 `qaqh-client` 参考实现，而非 winui 的 15s 停滞检测兜底）；
 - 重 open（同 epoch）后对所有打开的会话重 attach + re-bootstrap（租约条目按

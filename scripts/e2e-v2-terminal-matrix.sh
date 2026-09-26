@@ -168,9 +168,8 @@ def run_profile(name, extra_env):
 
     raw = bytes(capture)
     (out_dir / f"{name}.raw").write_bytes(raw)
-    # 鼠标/复制维度：v2 Agent View **不得**开启鼠标追踪——开了就吃掉终端原生
-    # 选择/复制（README「该模式不启用鼠标捕获」的承诺）。这里直接扫原始字节流，
-    # 因为这是「输出里有没有那几个私有模式序列」的问题，模拟器侧看不出来。
+    # 鼠标/复制维度：V2 fullscreen 会申请 mouse tracking；退出路径必须成对
+    # disable。原生选择/复制由终端侧的 Shift 覆盖，README 已明确。
     mouse_enable = [
         seq
         for seq in (
@@ -179,19 +178,34 @@ def run_profile(name, extra_env):
             b"\x1b[?1003h",  # 任意移动
             b"\x1b[?1006h",  # SGR 扩展坐标
             b"\x1b[?1015h",  # urxvt 扩展坐标
+            b"\x1b[?1004h",  # focus change
         )
         if seq in raw
     ]
+    mouse_disable = [
+        seq
+        for seq in (
+            b"\x1b[?1000l",
+            b"\x1b[?1002l",
+            b"\x1b[?1003l",
+            b"\x1b[?1006l",
+            b"\x1b[?1015l",
+            b"\x1b[?1004l",
+        )
+        if seq in raw
+    ]
+    mouse_paired = bool(mouse_enable) and bool(mouse_disable)
     passed = (
         proc.returncode == 0
         and b"panicked at" not in raw
         and b"cursor position could not be read" not in raw
-        and not mouse_enable
+        and mouse_paired
     )
     print(
         f"  [{'✓' if passed else '✗'}] {name:<16} "
         f"exit={proc.returncode} queries={queries} bytes={len(raw)} "
-        f"mouse={'ON ' + ','.join(s.decode() for s in mouse_enable) if mouse_enable else 'off'}"
+        f"mouse={'ON ' + ','.join(s.decode() for s in mouse_enable) if mouse_enable else 'off'} "
+        f"disable={'ON' if mouse_disable else 'off'}"
     )
     return passed
 

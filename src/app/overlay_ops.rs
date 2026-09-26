@@ -98,7 +98,7 @@ impl App {
         let Some(&meta_idx) = self.filtered_sessions(show_archived).get(filtered_index) else {
             return;
         };
-        let seed = self.session_list_cache[meta_idx].meta.seed.clone();
+        let seed = self.session_list_cache[meta_idx].meta.session_id.clone();
         self.overlays.pop();
         self.open_session_tab(&seed);
     }
@@ -142,6 +142,7 @@ impl App {
                 Overlay::History { .. }
                 | Overlay::SessionList { .. }
                 | Overlay::Settings(_)
+                | Overlay::Subagents { .. }
                 | Overlay::Help,
             ) => {
                 self.overlays.pop();
@@ -187,6 +188,19 @@ impl App {
                     selected: move_index(selected, count, delta),
                     detail: false,
                     scroll: 0,
+                });
+            }
+            Overlay::Subagents { selected, filter } => {
+                let count = self
+                    .active_team_state()
+                    .map(|team| team.roster(Some(&filter)).len())
+                    .unwrap_or(0);
+                if count == 0 {
+                    return;
+                }
+                self.replace_overlay(Overlay::Subagents {
+                    selected: move_index(selected, count, delta),
+                    filter,
                 });
             }
             Overlay::Settings(mut state) => {
@@ -267,7 +281,7 @@ impl App {
             }
             KeyCode::Enter => {
                 if let Some(&idx) = items.get(self.home_selected) {
-                    let seed = self.session_list_cache[idx].meta.seed.clone();
+                    let seed = self.session_list_cache[idx].meta.session_id.clone();
                     self.open_session_tab(&seed);
                 }
                 return true;
@@ -287,7 +301,7 @@ impl App {
             }
             KeyCode::Char('x') => {
                 if let Some(&idx) = items.get(self.home_selected) {
-                    let seed = self.session_list_cache[idx].meta.seed.clone();
+                    let seed = self.session_list_cache[idx].meta.session_id.clone();
                     self.overlays.push(Overlay::Confirm {
                         action: ConfirmAction::ArchiveSession(seed),
                     });
@@ -296,14 +310,14 @@ impl App {
             }
             KeyCode::Char('u') => {
                 if let Some(&idx) = items.get(self.home_selected) {
-                    let seed = self.session_list_cache[idx].meta.seed.clone();
+                    let seed = self.session_list_cache[idx].meta.session_id.clone();
                     self.unarchive_session(seed);
                 }
                 return true;
             }
             KeyCode::Char('D') => {
                 if let Some(&idx) = items.get(self.home_selected) {
-                    let seed = self.session_list_cache[idx].meta.seed.clone();
+                    let seed = self.session_list_cache[idx].meta.session_id.clone();
                     self.overlays.push(Overlay::Confirm {
                         action: ConfirmAction::DeleteSession(seed),
                     });
@@ -669,6 +683,83 @@ impl App {
                 }
                 true
             }
+            Overlay::Subagents { selected, filter } => {
+                let count = self
+                    .active_team_state()
+                    .map(|team| team.roster(Some(&filter)).len())
+                    .unwrap_or(0);
+                let last = count.saturating_sub(1);
+                match key.code {
+                    KeyCode::Esc => {
+                        self.overlays.pop();
+                    }
+                    KeyCode::Up => {
+                        self.replace_overlay(Overlay::Subagents {
+                            selected: selected.saturating_sub(1),
+                            filter,
+                        });
+                    }
+                    KeyCode::Down => {
+                        self.replace_overlay(Overlay::Subagents {
+                            selected: (selected + 1).min(last),
+                            filter,
+                        });
+                    }
+                    KeyCode::Char('k') if filter.is_empty() => {
+                        self.replace_overlay(Overlay::Subagents {
+                            selected: selected.saturating_sub(1),
+                            filter,
+                        });
+                    }
+                    KeyCode::Char('j') if filter.is_empty() => {
+                        self.replace_overlay(Overlay::Subagents {
+                            selected: (selected + 1).min(last),
+                            filter,
+                        });
+                    }
+                    KeyCode::PageUp => {
+                        self.replace_overlay(Overlay::Subagents {
+                            selected: selected.saturating_sub(10),
+                            filter,
+                        });
+                    }
+                    KeyCode::PageDown => {
+                        self.replace_overlay(Overlay::Subagents {
+                            selected: (selected + 10).min(last),
+                            filter,
+                        });
+                    }
+                    KeyCode::Enter => {
+                        self.workspace_open_subagent(selected);
+                    }
+                    KeyCode::Backspace => {
+                        let mut filter = filter;
+                        filter.pop();
+                        self.replace_overlay(Overlay::Subagents {
+                            selected: 0,
+                            filter,
+                        });
+                    }
+                    KeyCode::Char('q') if filter.is_empty() => {
+                        self.overlays.pop();
+                    }
+                    KeyCode::Char('r') if filter.is_empty() => {
+                        if let Some(seed) = self.active_seed() {
+                            self.fetch_team(seed);
+                        }
+                    }
+                    KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        let mut filter = filter;
+                        filter.push(c);
+                        self.replace_overlay(Overlay::Subagents {
+                            selected: 0,
+                            filter,
+                        });
+                    }
+                    _ => {}
+                }
+                true
+            }
             Overlay::SessionList {
                 selected,
                 show_archived,
@@ -706,14 +797,14 @@ impl App {
                     }
                     KeyCode::Enter => {
                         if let Some(&meta_idx) = items.get(selected) {
-                            let seed = self.session_list_cache[meta_idx].meta.seed.clone();
+                            let seed = self.session_list_cache[meta_idx].meta.session_id.clone();
                             self.overlays.pop();
                             self.open_session_tab(&seed);
                         }
                     }
                     KeyCode::Char('x') => {
                         if let Some(&meta_idx) = items.get(selected) {
-                            let seed = self.session_list_cache[meta_idx].meta.seed.clone();
+                            let seed = self.session_list_cache[meta_idx].meta.session_id.clone();
                             self.overlays.push(Overlay::Confirm {
                                 action: ConfirmAction::ArchiveSession(seed),
                             });
@@ -721,13 +812,13 @@ impl App {
                     }
                     KeyCode::Char('u') => {
                         if let Some(&meta_idx) = items.get(selected) {
-                            let seed = self.session_list_cache[meta_idx].meta.seed.clone();
+                            let seed = self.session_list_cache[meta_idx].meta.session_id.clone();
                             self.unarchive_session(seed);
                         }
                     }
                     KeyCode::Char('D') => {
                         if let Some(&meta_idx) = items.get(selected) {
-                            let seed = self.session_list_cache[meta_idx].meta.seed.clone();
+                            let seed = self.session_list_cache[meta_idx].meta.session_id.clone();
                             self.overlays.push(Overlay::Confirm {
                                 action: ConfirmAction::DeleteSession(seed),
                             });

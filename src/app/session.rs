@@ -489,8 +489,6 @@ pub struct SessionState {
     pub ready: bool,
     /// 加载更早：in-flight 去重。
     pub loading_older: bool,
-    /// 本会话拉起的子代理（spawn 顺序；身份锚点 = timeline 工具卡 id）。
-    pub subagents: Vec<super::subagent::SubagentEntry>,
 }
 
 impl SessionState {
@@ -521,7 +519,6 @@ impl SessionState {
             },
             ready: false,
             loading_older: false,
-            subagents: Vec::new(),
         }
     }
 

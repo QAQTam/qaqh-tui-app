@@ -7,89 +7,14 @@
 use super::*;
 use crate::ui::v2::fullscreen as ui_fullscreen;
 use crate::ui::v2::fullscreen::{FullscreenState, MessageAction, MessageMenu, MessageRole};
+use crate::ui::v2::hit::{
+    AgentTarget, HitMapBuilder, PointerTarget, ScrollbarPart, VisualAnchor, anchor_region,
+    line_region, z,
+};
+use crate::ui::v2::scrollbar::ScrollbarMetrics;
+use ratatui::crossterm::event::MouseButton;
 
 const NARROW_VIEWPORT_WIDTH: u16 = 40;
-
-pub(super) fn handle_fullscreen_agent_mouse(
-    app: &mut App,
-    view: &mut FullscreenView,
-    area: ratatui::layout::Rect,
-    mouse: ratatui::crossterm::event::MouseEvent,
-) {
-    use ratatui::crossterm::event::{MouseButton, MouseEventKind};
-
-    if view.menu.is_some() {
-        let hit = view.menu.as_ref().and_then(|menu| {
-            ui_fullscreen::message_menu_hit_test(area, menu, mouse.column, mouse.row)
-        });
-        match mouse.kind {
-            MouseEventKind::Moved => {
-                if let Some(menu) = view.menu.as_mut() {
-                    menu.hover = hit;
-                }
-            }
-            MouseEventKind::Down(MouseButton::Left) => {
-                if hit.is_none() {
-                    view.close_menu();
-                    return;
-                }
-                if let Some(menu) = view.menu.as_mut() {
-                    menu.hover = hit;
-                    menu.pressed = hit;
-                }
-            }
-            MouseEventKind::Up(MouseButton::Left) => {
-                let pressed = view.menu.as_mut().and_then(|menu| menu.pressed.take());
-                if let Some(menu) = view.menu.as_mut() {
-                    menu.hover = hit;
-                }
-                if pressed.is_some()
-                    && pressed == hit
-                    && let Some(action) = view.menu.as_ref().and_then(MessageMenu::activate)
-                {
-                    activate_message_action(app, view, action);
-                }
-            }
-            _ => {}
-        }
-        return;
-    }
-
-    let show_back_to_latest =
-        view.can_scroll() && !app.active_session().is_some_and(|s| s.scroll.follow);
-    let hit_back_to_latest = || {
-        show_back_to_latest
-            .then(|| ui_fullscreen::hit_test(area, mouse.column, mouse.row))
-            .flatten()
-    };
-
-    match mouse.kind {
-        MouseEventKind::ScrollUp => view.scroll_up(app, 3),
-        MouseEventKind::ScrollDown => view.scroll_down(app, 3),
-        MouseEventKind::Moved => {
-            view.pointer.back_to_latest_hover = hit_back_to_latest().is_some();
-        }
-        MouseEventKind::Down(MouseButton::Left) => {
-            let target = hit_back_to_latest();
-            view.pointer.back_to_latest_hover = target.is_some();
-            view.pointer.back_to_latest_pressed = target.is_some();
-            if target.is_none()
-                && let Some(hit) = view.message_at(mouse.column, mouse.row)
-            {
-                view.open_menu(hit, mouse.column, mouse.row);
-            }
-        }
-        MouseEventKind::Up(MouseButton::Left) => {
-            let released = hit_back_to_latest();
-            view.pointer.back_to_latest_hover = released.is_some();
-            if view.pointer.back_to_latest_pressed && released.is_some() {
-                app.scroll_bottom();
-            }
-            view.pointer.back_to_latest_pressed = false;
-        }
-        _ => {}
-    }
-}
 
 pub(super) fn handle_fullscreen_menu_key(
     app: &mut App,
@@ -122,7 +47,11 @@ pub(super) fn handle_fullscreen_menu_key(
     }
 }
 
-fn activate_message_action(app: &mut App, view: &mut FullscreenView, action: MessageAction) {
+pub(super) fn activate_message_action(
+    app: &mut App,
+    view: &mut FullscreenView,
+    action: MessageAction,
+) {
     match action {
         MessageAction::CopyMarkdown => {
             let copied = view.menu.as_ref().and_then(|menu| {
@@ -186,6 +115,7 @@ pub(super) fn draw_fullscreen_agent(
     app: &App,
     theme: &Theme,
     view: &mut FullscreenView,
+    hit_map: &mut HitMapBuilder,
 ) {
     let area = frame.area();
     let rendered = render_fullscreen_agent(app, area.width, area.height, theme, view);
@@ -198,7 +128,9 @@ pub(super) fn draw_fullscreen_agent(
     }
 
     let (body, _) = fullscreen_layout(app, area, theme);
-    if let Some(session) = app.active_session() {
+    if !body.is_empty()
+        && let Some(session) = app.active_session()
+    {
         ui_fullscreen::draw_scrollbar(
             frame,
             body,
@@ -208,16 +140,157 @@ pub(super) fn draw_fullscreen_agent(
             session.scroll.offset,
             theme,
         );
+        let track = Rect::new(
+            body.x.saturating_add(body.width.saturating_sub(1)),
+            body.y,
+            1,
+            body.height,
+        );
+        if let Some(metrics) = ScrollbarMetrics::new(
+            track,
+            view.transcript.lines.len(),
+            usize::from(view.body_height),
+            session.scroll.follow,
+            session.scroll.offset,
+        ) {
+            if let Some(region) = anchor_region(
+                metrics.track,
+                body,
+                PointerTarget::Scrollbar(ScrollbarPart::Track),
+                MouseButton::Left,
+                true,
+                z::AGENT_SCROLLBAR,
+                VisualAnchor::non_empty(Position::new(metrics.track.x, metrics.track.y)),
+            ) {
+                hit_map.push(region);
+            }
+            if let Some(region) = anchor_region(
+                metrics.thumb,
+                body,
+                PointerTarget::Scrollbar(ScrollbarPart::Thumb),
+                MouseButton::Left,
+                true,
+                z::AGENT_SCROLLBAR_THUMB,
+                VisualAnchor::glyph(Position::new(metrics.thumb.x, metrics.thumb.y), '┃'),
+            ) {
+                hit_map.push(region);
+            }
+        }
     }
-    if view.can_scroll()
+    // 消息行与浮层都按**刚画完的这一帧**登记：行窗口来自 render 写回的
+    // `visible_start`，按钮/菜单矩形复用 ui_fullscreen 的渲染几何。
+    register_agent_messages(hit_map, body, view);
+    let show_back_to_latest = view.can_scroll()
         && app
             .active_session()
-            .is_some_and(|session| !session.scroll.follow)
-    {
+            .is_some_and(|session| !session.scroll.follow);
+    if show_back_to_latest {
         ui_fullscreen::draw_back_to_latest(frame, body, view.pointer, theme);
+        if let Some(rect) = ui_fullscreen::back_to_latest_rect(body)
+            && let Some(region) = anchor_region(
+                rect,
+                body,
+                PointerTarget::Agent(AgentTarget::BackToLatest),
+                MouseButton::Left,
+                true,
+                z::AGENT_OVERLAY,
+                VisualAnchor::non_empty(Position::new(rect.x, rect.y)),
+            )
+        {
+            hit_map.push(region);
+        }
     }
     if let Some(menu) = view.menu.as_ref() {
         ui_fullscreen::draw_message_menu(frame, area, menu, theme);
+        register_agent_menu(hit_map, area, menu);
+    }
+}
+
+/// 把 transcript 里当前可见的消息行登记成 HitRegion。
+///
+/// 行窗口就是 `render_fullscreen_agent` 写回 `view.visible_start` 的那一份；
+/// 行宽避开最右侧的滚动条列，所以 P2 接滚动条时不会和消息行抢同一列。
+fn register_agent_messages(hit_map: &mut HitMapBuilder, body: Rect, view: &FullscreenView) {
+    if body.is_empty() || view.body_height == 0 {
+        return;
+    }
+    let clip = Rect::new(
+        body.x,
+        body.y,
+        body.width.saturating_sub(1).max(1),
+        body.height,
+    );
+    let visible_end = view
+        .visible_start
+        .saturating_add(usize::from(view.body_height));
+    for span in &view.transcript.spans {
+        let start = span.start.max(view.visible_start);
+        let end = span.end.min(visible_end);
+        if start >= end {
+            continue;
+        }
+        let Some(line) = view.transcript.lines.get(start) else {
+            continue;
+        };
+        let rect = Rect::new(
+            clip.x,
+            clip.y.saturating_add((start - view.visible_start) as u16),
+            clip.width,
+            (end - start) as u16,
+        );
+        if let Some(region) = line_region(
+            rect,
+            clip,
+            PointerTarget::Agent(AgentTarget::Message {
+                turn_id: span.turn_id.clone(),
+                block_id: span.block_id.clone(),
+                role: span.role,
+            }),
+            MouseButton::Left,
+            true,
+            z::AGENT_MESSAGE,
+            line,
+        ) {
+            hit_map.push(region);
+        }
+    }
+}
+
+/// 登记消息菜单：外框是阻断层，每一行是一个独立目标（disabled 行仍登记但
+/// `enabled = false`，`resolve` 会跳过它们，点击落到外框上）。
+fn register_agent_menu(hit_map: &mut HitMapBuilder, area: Rect, menu: &MessageMenu) {
+    let rect = ui_fullscreen::message_menu_rect(area, menu);
+    if let Some(region) = anchor_region(
+        rect,
+        area,
+        PointerTarget::Agent(AgentTarget::MenuRoot),
+        MouseButton::Left,
+        true,
+        z::AGENT_MENU,
+        VisualAnchor::non_empty(Position::new(rect.x, rect.y)),
+    ) {
+        hit_map.push(region);
+    }
+    for (index, action) in menu.actions().iter().enumerate() {
+        let Some(row) = ui_fullscreen::message_menu_row_rect(area, menu, index) else {
+            continue;
+        };
+        // 行内布局是 `" {marker} {glyph} "`，glyph 固定在行首 +3 列。
+        let anchor = VisualAnchor::non_empty(Position::new(
+            row.x.saturating_add(3).min(row.right().saturating_sub(1)),
+            row.y,
+        ));
+        if let Some(region) = anchor_region(
+            row,
+            area,
+            PointerTarget::Agent(AgentTarget::MenuAction(*action)),
+            MouseButton::Left,
+            action.enabled(),
+            z::AGENT_MENU_ROW,
+            anchor,
+        ) {
+            hit_map.push(region);
+        }
     }
 }
 /// 全屏 shell：上半屏是 App 自己持有的 transcript 视口，下半屏是 slash 菜单、
@@ -394,6 +467,9 @@ fn render_fullscreen_chrome(app: &App, width: u16, height: u16, theme: &Theme) -
 
 #[derive(Debug, Default)]
 pub(super) struct FullscreenView {
+    /// Single source of truth for pointer transitions.
+    pub(super) pointer_state: super::pointer::PointerState,
+    /// Rendering mirror derived from `pointer_state` after every event batch.
     pub(super) pointer: FullscreenState,
     pub(super) transcript: FullscreenTranscriptCache,
     pub(super) body_area: Rect,
@@ -410,28 +486,6 @@ pub(super) struct MessageHit {
 }
 
 impl FullscreenView {
-    pub(super) fn message_at(&self, column: u16, row: u16) -> Option<MessageHit> {
-        if column < self.body_area.x
-            || column >= self.body_area.x.saturating_add(self.body_area.width)
-            || row < self.body_area.y
-            || row >= self.body_area.y.saturating_add(self.body_area.height)
-        {
-            return None;
-        }
-        let line = self
-            .visible_start
-            .saturating_add(usize::from(row.saturating_sub(self.body_area.y)));
-        self.transcript
-            .spans
-            .iter()
-            .find(|span| line >= span.start && line < span.end)
-            .map(|span| MessageHit {
-                turn_id: span.turn_id.clone(),
-                block_id: span.block_id.clone(),
-                role: span.role,
-            })
-    }
-
     pub(super) fn open_menu(&mut self, hit: MessageHit, column: u16, row: u16) {
         self.menu = Some(MessageMenu::new(
             hit.turn_id,
@@ -540,6 +594,10 @@ struct FullscreenBlockKey {
 }
 
 impl FullscreenTranscriptCache {
+    pub(super) fn line_count(&self) -> usize {
+        self.lines.len()
+    }
+
     fn clear(&mut self) {
         self.key = None;
         self.blocks.clear();

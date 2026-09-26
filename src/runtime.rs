@@ -566,7 +566,10 @@ fn build_handlers(
                 // 流结束（主动停用 / 客户端关闭）**不等于**会话消失：`reason`
                 // 只是流侧描述，故归入 `Other`——app 不会再据此把子代理标 Closed。
                 // 「会话真的没了」只能由 `activate_timeline` 的 404 证明。
-                TimelineStatus::Closed { seed, reason } => {
+                TimelineStatus::Closed {
+                    session_id: seed,
+                    reason,
+                } => {
                     let _ = msg_tx.send(RuntimeMsg::TimelineLost {
                         seed: seed.clone(),
                         reason: TimelineLostReason::Other(format!("timeline 流结束：{reason}")),
@@ -578,7 +581,7 @@ fn build_handlers(
                     }));
                 }
                 TimelineStatus::Reconnecting {
-                    seed,
+                    session_id: seed,
                     retry_ms,
                     reason,
                     ..
@@ -589,7 +592,9 @@ fn build_handlers(
                         error: reconnect_message(&label, reason.as_ref(), retry_ms),
                     }));
                 }
-                TimelineStatus::Open { seed, .. } => {
+                TimelineStatus::Open {
+                    session_id: seed, ..
+                } => {
                     // timeline 重连/重定基成功：撤掉它自己的告警。
                     let _ = msg_tx.send(RuntimeMsg::Conn(ConnEvent::StreamRecovered {
                         stream: StreamKey::Timeline(seed),
@@ -601,7 +606,7 @@ fn build_handlers(
         on_timeline_snapshot: {
             let msg_tx = msg_tx.clone();
             Arc::new(move |page: qaqh_client::TimelinePage| {
-                let seed = page.seed.clone();
+                let seed = page.session_id.clone();
                 let _ = msg_tx.send(RuntimeMsg::TimelineRebaseline {
                     seed,
                     page: Box::new(page),
@@ -708,18 +713,18 @@ mod tests {
         let b = StreamKey::Timeline("B".into());
 
         (handlers.on_timeline_status)(TimelineStatus::Reconnecting {
-            seed: "A".into(),
+            session_id: "A".into(),
             retry_ms: 800,
             cursor: 1,
             reason: None,
         });
         (handlers.on_timeline_status)(TimelineStatus::Open {
-            seed: "A".into(),
+            session_id: "A".into(),
             server_epoch: "e1".into(),
             cursor: 2,
         });
         (handlers.on_timeline_status)(TimelineStatus::Closed {
-            seed: "B".into(),
+            session_id: "B".into(),
             reason: "stopped".into(),
         });
 

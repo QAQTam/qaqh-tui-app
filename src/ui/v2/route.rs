@@ -19,6 +19,10 @@ pub enum WorkspaceRoute {
         scroll: usize,
     },
     Todo,
+    Subagents {
+        selected: usize,
+        filter: String,
+    },
     Subagent {
         seed: String,
     },
@@ -81,6 +85,12 @@ pub fn resolve(app: &App) -> ScreenRoute {
                     selected: *selected,
                     detail: *detail,
                     scroll: *scroll,
+                });
+            }
+            Overlay::Subagents { selected, filter } => {
+                return ScreenRoute::Workspace(WorkspaceRoute::Subagents {
+                    selected: *selected,
+                    filter: filter.clone(),
                 });
             }
             Overlay::Confirm { .. } => return ScreenRoute::Modal(ModalRoute::Confirm),

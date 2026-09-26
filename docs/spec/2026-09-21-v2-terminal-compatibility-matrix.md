@@ -20,8 +20,9 @@ scripts/e2e-v2-alacritty.sh          # 真实终端模拟器（Alacritty，**仅
 - TUI 退出码为 0；
 - 无 panic；
 - 无 cursor-position timeout；
-- **未开启鼠标追踪**（`?1000h/1002h/1003h/1006h/1015h` 一个都不出现）——
-  这是「鼠标/复制」维度：开了就吃掉终端原生选择/复制。
+- **鼠标/焦点捕获进入/退出成对**（`?1000h/?1003h/?1006h/?1004h`
+  必须出现，并在退出路径成对 disable）。鼠标捕获由 V2 fullscreen 主动申请；
+  原生选择/复制由终端侧的 `Shift` 覆盖应用捕获。
 
 后两个分别把 TUI 放进**真正的终端模拟器**（kitty）与**真正的 multiplexer**
 （tmux），判据取自对方的回读接口（`kitten @ get-text` / `tmux capture-pane`）。
@@ -49,7 +50,7 @@ alternate-screen 进出、嵌套清理都在这层出过问题。
 | alacritty | `TERM=alacritty` | 默认 | PASS | Alacritty 环境分支 |
 | ssh-xterm | `TERM=xterm-256color` + `SSH_TTY` | 默认 | PASS | SSH 环境变量分支 |
 
-最近一次实测（2026-09-23，新增 `mouse` 列）：
+最近一次历史实测（2026-09-23；mouse 期望已在 2026-09-26 反转为 on + disable 成对）：
 
 ```text
 [✓] night-16         exit=0 queries=3 bytes=6258 mouse=off
@@ -67,6 +68,10 @@ alternate-screen 进出、嵌套清理都在这层出过问题。
 RESULT: PASS
 ```
 
+> 2026-09-26 起，PTY/terminal matrix 的 mouse 列改为要求
+> `EnableMouseCapture/EnableFocusChange` 出现且退出路径成对 disable；
+> 上表 `mouse=off` 是历史输出，保留用于对照。
+
 ## 3. 真实终端模拟器矩阵
 
 `scripts/e2e-v2-real-terminal.sh`（kitty）、`scripts/e2e-v2-tmux.sh`（tmux）与
@@ -80,13 +85,13 @@ RESULT: PASS
 | resize | 真实几何变化触发 SIGWINCH 后网格变化 **且屏幕内容确实重排** | kitty 改字号；tmux `resize-window`；WezTerm `split-pane`；见下方说明 |
 | scrollback | 横幅**滚出可见区**后仍能从历史读回，且可见区里没有 | kitty 用 READY/GO 握手；tmux 用 `capture-pane -S -`；WezTerm 用 `--start-line -1000` |
 | exit | Ctrl+Q 后回显 `TUI_EXIT=0` | 退出码回显 = 终端状态已还原、shell 拿回控制权 |
-| 鼠标/复制 | 未申请鼠标追踪 | tmux 用 `#{mouse_any_flag}`；PTY 矩阵扫私有模式序列；kitty/WezTerm **无此查询面** |
+| 鼠标/复制 | 申请 mouse tracking，退出成对 disable | tmux 用 `#{mouse_any_flag}=1`；PTY 矩阵扫私有模式序列；原生选择/复制用 `Shift` 覆盖 |
 
 | 终端 | scrollback | inline viewport | resize | truecolor | 鼠标/复制 | 状态 |
 |---|---|---|---|---|---|---|
-| **Kitty 0.48.2** | ✅ 已测 | ✅ 已测（render 维度） | ✅ 已测（SIGWINCH 重排） | ✅ 已测（`38:2:`） | ✅ 未开捕获 | **PASS**（2026-09-23） |
-| **tmux 3.7c** | ✅ 已测（`capture-pane -S -`） | ✅ 已测（render 维度） | ✅ 已测（`resize-window` → SIGWINCH） | ✅ 已测（透传 `38:2:`） | ✅ `mouse_any_flag=0` | **PASS**（2026-09-23） |
-| **WezTerm 20260716** | ✅ 已测（`--start-line -1000`） | ✅ 已测（render 维度） | ✅ 已测（`split-pane` → SIGWINCH） | ✅ 已测（`38:2::`） | ⚠️ 无查询面 | **PASS**（2026-09-23） |
+| **Kitty 0.48.2** | ✅ 已测 | ✅ 已测（render 维度） | ✅ 已测（SIGWINCH 重排） | ✅ 已测（`38:2:`） | ✅ 已开捕获（Shift 覆盖） | **PASS**（2026-09-23） |
+| **tmux 3.7c** | ✅ 已测（`capture-pane -S -`） | ✅ 已测（render 维度） | ✅ 已测（`resize-window` → SIGWINCH） | ✅ 已测（透传 `38:2:`） | ✅ `mouse_any_flag=1`（Shift 覆盖） | **PASS**（2026-09-23） |
+| **WezTerm 20260716** | ✅ 已测（`--start-line -1000`） | ✅ 已测（render 维度） | ✅ 已测（`split-pane` → SIGWINCH） | ✅ 已测（`38:2::`） | ✅ 已开捕获（Shift 覆盖；无查询面） | **PASS**（2026-09-23） |
 | Alacritty 0.17.0 | ⚠️ 无回读接口 | ⚠️ 无回读接口 | ⚠️ 无回读接口 | ⚠️ 无回读接口 | ⚠️ 无查询面 | **部分**（进程级，2026-09-23；见 §3.4） |
 | Windows Terminal / PowerShell | — | — | — | — | — | **不计划**（仅 ConHost `ClearType::Purge` 保留人工确认，见 §3.5） |
 | iTerm2 | — | — | — | — | — | **不计划**（macOS 专属；kitty 已覆盖同类行为） |
@@ -146,7 +151,7 @@ RESULT: PASS
 [✓] 启动渲染：无 panic
 [✓] 启动渲染：tmux pane 尺寸符合预期
 [✓] truecolor：tmux 回读含 24-bit SGR
-[✓] 鼠标/复制：TUI 未向 tmux 申请鼠标追踪
+[✓] 鼠标/复制：TUI 已向 tmux 申请 mouse tracking（Shift 覆盖选择）
 [✓] resize：pane 尺寸已变（真实 SIGWINCH 路径）
 [✓] resize：重排后 UI 仍在（composer 可见）
 [✓] resize：重排后无 panic
@@ -154,8 +159,8 @@ RESULT: PASS
 RESULT: PASS
 ```
 
-**鼠标判据的证伪**：在 wrapper 里先 `printf "\033[?1003h"`（模拟应用申请鼠标）
-→ `mouse_any_flag` 立刻变 `1`、该条变红、`RESULT: FAIL`（已实测后还原）。
+**鼠标判据的证伪**：去掉 `TerminalHost::enable_capture()` 中的
+`EnableMouseCapture` 后，`mouse_any_flag` 会回到 `0`、该条变红。
 说明这条不是恒真断言。
 
 ### 3.4 WezTerm 专项与 Alacritty 的能力边界

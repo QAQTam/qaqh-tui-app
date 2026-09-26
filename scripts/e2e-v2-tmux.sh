@@ -284,12 +284,12 @@ check(
 
 # 2.5) 鼠标/复制：tmux 自己就知道应用有没有申请鼠标追踪
 #      （`#{mouse_any_flag}` 在应用发出 `?1000h/?1002h/?1003h/…` 后变 1）。
-#      这比扫原始字节流更准——是 multiplexer 侧的权威判定，不是字符串匹配。
-#      开了就吃掉终端原生选择/复制，与 README 的承诺冲突。
+#      V2 fullscreen 现在主动申请 mouse tracking；原生选择/复制由 Shift
+#      覆盖应用捕获，README 已说明。
 mouse_flag = tmux("display", "-p", "-t", SESSION, "#{mouse_any_flag}").stdout.strip()
 check(
-    "鼠标/复制：TUI 未向 tmux 申请鼠标追踪",
-    mouse_flag == "0",
+    "鼠标/复制：TUI 已向 tmux 申请 mouse tracking（Shift 覆盖选择）",
+    mouse_flag == "1",
     f"mouse_any_flag={mouse_flag}",
 )
 

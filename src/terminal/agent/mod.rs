@@ -12,12 +12,14 @@ use std::thread;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use ratatui::buffer::Buffer;
 use ratatui::crossterm::event::{
-    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, Event,
-    KeyEventKind, poll, read,
+    DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, EnableBracketedPaste,
+    EnableFocusChange, EnableMouseCapture, Event, KeyEventKind, MouseEvent, MouseEventKind, poll,
+    read,
 };
 use ratatui::crossterm::{event::KeyCode, execute};
-use ratatui::layout::{Position, Rect};
+use ratatui::layout::{Position, Rect, Size};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
@@ -30,16 +32,23 @@ use crate::app::{App, AppMsg, ConnPhase, ModalHit, StartupIntent, WorkspaceHit};
 use crate::runtime::{Runtime, RuntimeMsg};
 use crate::theme::Theme;
 use crate::ui::v2::adapter;
-use crate::ui::v2::route::{self, ScreenRoute};
+use crate::ui::v2::hit::{
+    AgentTarget, FrameHitMap, FrameId, HitMapBuilder, HitProbe, PointerTarget, ProbeFailure,
+    ScrollbarPart,
+};
+use crate::ui::v2::route::{self, ModalRoute, ScreenRoute};
+use crate::ui::v2::scrollbar::ScrollbarMetrics;
 use crate::ui::v2::transcript::{BlockKind, BlockState, TranscriptBlock};
 use crate::ui::v2::workspace;
 use qaqh_client::{ConversationMode, NoticeLevel, TimelineBlockKind};
 
 mod fullscreen;
+mod pointer;
 use fullscreen::{
-    FullscreenView, draw_fullscreen_agent, handle_fullscreen_agent_mouse,
+    FullscreenView, MessageHit, activate_message_action, draw_fullscreen_agent,
     handle_fullscreen_menu_key,
 };
+use pointer::{PointerAction, PointerEvent};
 
 const TICK_INTERVAL: Duration = Duration::from_millis(200);
 const MAX_SLASH_ROWS: usize = 4;
@@ -77,12 +86,13 @@ pub async fn run(no_spawn: bool, resume: bool) -> Result<()> {
         app.open_session_list();
     }
     let theme = Theme::current();
-    let mut terminal = TerminalHost::init();
-    if let Err(error) = execute!(stdout(), EnableMouseCapture, EnableBracketedPaste) {
-        ratatui::restore();
-        runtime.shutdown().await;
-        return Err(error).context("启用终端输入");
-    }
+    let mut terminal = match TerminalHost::init() {
+        Ok(terminal) => terminal,
+        Err(error) => {
+            runtime.shutdown().await;
+            return Err(error);
+        }
+    };
 
     let mut input = InputPump::new(app_tx.clone());
     spawn_tick(app_tx.clone());
@@ -99,7 +109,7 @@ pub async fn run(no_spawn: bool, resume: bool) -> Result<()> {
     .await;
 
     input.suspend().await;
-    let _ = execute!(stdout(), DisableMouseCapture, DisableBracketedPaste);
+    terminal.disable_capture();
     runtime.shutdown().await;
     ratatui::restore();
     result
@@ -143,6 +153,8 @@ impl InputPump {
                                 Event::Resize(_, _) => AppMsg::Resize,
                                 // Fullscreen shell captures mouse input globally.
                                 Event::Mouse(mouse) => AppMsg::Mouse(mouse),
+                                // 焦点丢失 = 合成 Leave：hover/pressed/capture 全部作废。
+                                Event::FocusLost => AppMsg::FocusLost,
                                 _ => continue,
                             };
                             if tx.send(msg).is_err() {
@@ -196,6 +208,10 @@ async fn run_loop(
     fullscreen_view: &mut FullscreenView,
     theme: &'static Theme,
 ) -> Result<()> {
+    // 已发布帧：只有真正 flush 成功的帧才会进来，鼠标事件只查它。
+    let mut frames = FramePublisher::default();
+    // `QAQH_HIT_PROBE=1|strict`（spec §8.1）；默认关闭。
+    let probe = HitProbe::from_env();
     loop {
         if app.quit {
             break;
@@ -208,15 +224,24 @@ async fn run_loop(
         if terminal.note_terminal_size(size.width, size.height) {
             fullscreen_view.close_menu();
             terminal.terminal.autoresize()?;
+            // resize 后旧坐标不再对应屏幕上的任何东西。
+            frames.invalidate();
+            reset_pointer_state(app, fullscreen_view, PointerEvent::Resized);
         }
 
         if app.force_redraw {
             terminal.terminal.clear()?;
             app.force_redraw = false;
         }
-        terminal
-            .terminal
-            .draw(|frame| draw(frame, app, theme, &route, fullscreen_view))?;
+        draw_and_publish(
+            terminal,
+            &mut frames,
+            app,
+            theme,
+            &route,
+            fullscreen_view,
+            probe,
+        )?;
         if route == ScreenRoute::Agent {
             fullscreen_view.clamp_scroll(app);
         }
@@ -224,9 +249,9 @@ async fn run_loop(
         let Some(msg) = app_rx.recv().await else {
             break;
         };
-        handle_message(app, msg, terminal, &route, fullscreen_view)?;
+        handle_message(app, msg, &mut frames, fullscreen_view);
         while let Ok(msg) = app_rx.try_recv() {
-            handle_message(app, msg, terminal, &route, fullscreen_view)?;
+            handle_message(app, msg, &mut frames, fullscreen_view);
             if app.quit {
                 break;
             }
@@ -235,54 +260,254 @@ async fn run_loop(
             input.suspend().await;
             let result = terminal.run_pager(&text);
             input.resume();
+            // pager 销毁并重建了 alternate screen，旧帧不再对应任何画面。
+            frames.invalidate();
+            clear_pointer_state(app, fullscreen_view);
             result?;
         }
     }
     Ok(())
 }
 
+/// 已发布帧的持有者。
+///
+/// 只有**真正 flush 成功**的帧才会出现在 `current` 里；鼠标事件只查它。
+/// 任何会让画面与 `current` 不一致的操作都必须 `invalidate()`，让后续鼠标
+/// 等到下一次成功绘制（spec §3.3）。
+#[derive(Debug, Default)]
+struct FramePublisher {
+    current: Option<FrameHitMap>,
+    next_frame_id: FrameId,
+}
+
+impl FramePublisher {
+    /// 开始收集下一帧。帧序号只在 `publish` 成功后才推进。
+    fn begin(
+        &self,
+        route: ScreenRoute,
+        terminal_size: Size,
+        scroll_offset: usize,
+    ) -> HitMapBuilder {
+        HitMapBuilder::new(self.next_frame_id, route, terminal_size, scroll_offset)
+    }
+
+    /// 发布一帧；几何不自洽或探针失败的帧**不发布**（鼠标等下一帧重绘）。
+    ///
+    /// `probe` 关闭时只跑 `validate` 几何门禁；`Warn`/`Strict` 时对真实渲染
+    /// buffer 跑 spec §8.2 的全套自检。
+    fn publish(
+        &mut self,
+        map: FrameHitMap,
+        buffer: &Buffer,
+        probe: HitProbe,
+        expected_route: &ScreenRoute,
+    ) -> Result<(), Vec<ProbeFailure>> {
+        let failures = if probe.enabled() {
+            map.probe(buffer, self.next_frame_id, expected_route).err()
+        } else {
+            map.validate().err().map(|_| Vec::new())
+        };
+        if let Some(failures) = failures {
+            self.current = None;
+            return Err(failures);
+        }
+        self.next_frame_id = map.frame_id.next();
+        self.current = Some(map);
+        Ok(())
+    }
+
+    fn invalidate(&mut self) {
+        self.current = None;
+    }
+
+    fn route(&self) -> Option<&ScreenRoute> {
+        self.current.as_ref().map(|frame| &frame.route)
+    }
+
+    /// 当前已发布帧；指针状态机只读它，不重算布局。
+    fn current(&self) -> Option<&FrameHitMap> {
+        self.current.as_ref()
+    }
+
+    /// 在已发布帧里查坐标；测试用 helper。生产事件走 `PointerState::handle`。
+    #[cfg(test)]
+    fn resolve(
+        &self,
+        column: u16,
+        row: u16,
+        button: ratatui::crossterm::event::MouseButton,
+    ) -> Option<PointerTarget> {
+        let frame = self.current.as_ref()?;
+        match frame.resolve(column, row, button) {
+            Ok(Some(region)) => Some(region.target.clone()),
+            _ => None,
+        }
+    }
+}
+
+fn draw_and_publish(
+    terminal: &mut TerminalHost,
+    frames: &mut FramePublisher,
+    app: &App,
+    theme: &Theme,
+    route: &ScreenRoute,
+    fullscreen_view: &mut FullscreenView,
+    probe: HitProbe,
+) -> Result<()> {
+    let size = terminal.terminal.size()?;
+    let mut hit_map = frames.begin(
+        route.clone(),
+        Size::new(size.width, size.height),
+        frame_scroll_offset(app, route),
+    );
+    let completed = terminal
+        .terminal
+        .draw(|frame| draw(frame, app, theme, route, fullscreen_view, &mut hit_map))?;
+    match frames.publish(hit_map.finish(), completed.buffer, probe, route) {
+        Ok(()) => Ok(()),
+        Err(failures) => {
+            let report = failures
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("\n");
+            if probe == HitProbe::Strict {
+                return Err(anyhow::anyhow!(
+                    "QAQH_HIT_PROBE=strict 失败（本帧不发布）：\n{report}"
+                ));
+            }
+            // `Warn`：写结构化诊断，但不打断 TUI；本帧不发布，鼠标等下一帧。
+            eprintln!("{report}");
+            Ok(())
+        }
+    }
+}
+
+/// 这一帧对应的滚动量；用于 stale 判定与诊断。
+fn frame_scroll_offset(app: &App, route: &ScreenRoute) -> usize {
+    match route {
+        ScreenRoute::Agent => app
+            .active_session()
+            .map_or(0, |session| session.scroll.offset),
+        ScreenRoute::Modal(ModalRoute::Ask) => app
+            .active_session()
+            .and_then(|session| session.pending_ask.as_ref())
+            .map_or(0, |panel| usize::from(panel.scroll)),
+        ScreenRoute::Modal(ModalRoute::Plan) => app
+            .active_session()
+            .and_then(|session| session.pending_plan.as_ref())
+            .map_or(0, |panel| panel.scroll),
+        _ => 0,
+    }
+}
+
 fn handle_message(
     app: &mut App,
     msg: AppMsg,
-    terminal: &TerminalHost,
+    frames: &mut FramePublisher,
+    fullscreen_view: &mut FullscreenView,
+) {
+    // 每条消息都重新解析 route：批次里前面那条键可能已经切了页，后面的消息
+    // 不能再用批次开始时的旧 route（spec §3.3 / P0-C-3）。
+    let route = route::resolve(app);
+
+    // 焦点丢失 = 合成 Leave：指针状态作废，但屏幕内容没变，帧仍然可信。
+    if matches!(msg, AppMsg::FocusLost) {
+        reset_pointer_state(app, fullscreen_view, PointerEvent::FocusLost);
+        return;
+    }
+
+    if let AppMsg::Mouse(mouse) = msg {
+        // 鼠标只能解释用户已经看到的那一帧。帧路由和当前路由不一致，说明中间
+        // 切了页 / 开了弹窗；旧坐标必须作废，等下一次重绘。
+        if frames.route() != Some(&route) {
+            frames.invalidate();
+            reset_pointer_state(app, fullscreen_view, PointerEvent::RouteChanged);
+            return;
+        }
+        handle_pointer(app, frames, fullscreen_view, &route, mouse);
+        return;
+    }
+
+    let is_key = matches!(msg, AppMsg::Key(_));
+    handle_non_mouse_message(app, msg, &route, fullscreen_view);
+    // 键可能改路由 / 滚动 / 模态；后端消息可能开新 overlay。只要画面可能变了，
+    // 已发布帧立刻作废，后续鼠标等下一次重绘（spec §3.3 / P0-C-2）。
+    if is_key || route::resolve(app) != route {
+        frames.invalidate();
+        clear_pointer_state(app, fullscreen_view);
+    }
+}
+
+/// 帧失效时一并清掉指针的瞬时视觉状态：旧帧的 hover/pressed 不允许残留到新画面。
+fn clear_pointer_state(app: &mut App, fullscreen_view: &mut FullscreenView) {
+    reset_pointer_state(app, fullscreen_view, PointerEvent::Leave);
+}
+
+fn reset_pointer_state(app: &mut App, fullscreen_view: &mut FullscreenView, event: PointerEvent) {
+    let _ = fullscreen_view.pointer_state.handle(None, event);
+    sync_pointer_visual(app, fullscreen_view);
+}
+
+/// 把唯一状态机 `PointerState` 派生为绘制镜像。
+///
+/// `App::*_hover/pressed`、`FullscreenState`、`MessageMenu` 的鼠标字段都只是
+/// 渲染缓存；生产路径不再直接写它们。
+fn sync_pointer_visual(app: &mut App, fullscreen_view: &mut FullscreenView) {
+    let visual = fullscreen_view.pointer_state.visual();
+    app.modal_hover = match visual.hovered.as_ref() {
+        Some(PointerTarget::Modal(hit)) => Some(*hit),
+        _ => None,
+    };
+    app.modal_pressed = match visual.pressed.as_ref() {
+        Some(PointerTarget::Modal(hit)) => Some(*hit),
+        _ => None,
+    };
+    app.workspace_hover = match visual.hovered.as_ref() {
+        Some(PointerTarget::Workspace(hit)) => Some(*hit),
+        _ => None,
+    };
+    app.workspace_pressed = match visual.pressed.as_ref() {
+        Some(PointerTarget::Workspace(hit)) => Some(*hit),
+        _ => None,
+    };
+
+    let back = PointerTarget::Agent(AgentTarget::BackToLatest);
+    fullscreen_view.pointer.back_to_latest_hover = visual.hovered.as_ref() == Some(&back);
+    fullscreen_view.pointer.back_to_latest_pressed = visual.pressed.as_ref() == Some(&back);
+
+    let menu_hover = visual
+        .hovered
+        .as_ref()
+        .and_then(|target| menu_row_for(fullscreen_view, Some(target)));
+    let menu_pressed = visual
+        .pressed
+        .as_ref()
+        .and_then(|target| menu_row_for(fullscreen_view, Some(target)));
+    if let Some(menu) = fullscreen_view.menu.as_mut() {
+        menu.hover = menu_hover;
+        menu.pressed = menu_pressed;
+    }
+}
+
+fn handle_non_mouse_message(
+    app: &mut App,
+    msg: AppMsg,
     route: &ScreenRoute,
     fullscreen_view: &mut FullscreenView,
-) -> Result<()> {
-    // 鼠标由渲染层接管：命中测试需要当前 shell/弹窗几何。
-    if let AppMsg::Mouse(mouse) = msg {
-        match route {
-            ScreenRoute::Agent => {
-                let size = terminal.terminal.size()?;
-                let area = ratatui::layout::Rect::new(0, 0, size.width, size.height);
-                handle_fullscreen_agent_mouse(app, fullscreen_view, area, mouse);
-            }
-            ScreenRoute::Workspace(workspace_route) => {
-                fullscreen_view.pointer.clear_pointer();
-                let size = terminal.terminal.size()?;
-                let area = ratatui::layout::Rect::new(0, 0, size.width, size.height);
-                handle_workspace_mouse(app, workspace_route, area, mouse);
-            }
-            ScreenRoute::Modal(modal) => {
-                fullscreen_view.pointer.clear_pointer();
-                let size = terminal.terminal.size()?;
-                let area = ratatui::layout::Rect::new(0, 0, size.width, size.height);
-                handle_modal_mouse(app, *modal, area, mouse);
-            }
-        }
-        return Ok(());
-    }
+) {
     if *route == ScreenRoute::Agent
         && fullscreen_view.menu.is_some()
         && matches!(&msg, AppMsg::Paste(_))
     {
-        return Ok(());
+        return;
     }
     if *route == ScreenRoute::Agent
         && fullscreen_view.menu.is_some()
         && let AppMsg::Key(key) = &msg
     {
         handle_fullscreen_menu_key(app, fullscreen_view, key);
-        return Ok(());
+        return;
     }
     if let AppMsg::Key(key) = &msg
         && *route == ScreenRoute::Agent
@@ -290,11 +515,11 @@ fn handle_message(
         match key.code {
             KeyCode::PageUp => {
                 fullscreen_view.page_up(app);
-                return Ok(());
+                return;
             }
             KeyCode::PageDown => {
                 fullscreen_view.scroll_down(app, 20);
-                return Ok(());
+                return;
             }
             _ => {}
         }
@@ -303,77 +528,218 @@ fn handle_message(
         && key.code == KeyCode::Esc
         && route::resolve(app) == ScreenRoute::Workspace(route::WorkspaceRoute::Todo)
     {
-        app.workspace_hover = None;
-        app.workspace_pressed = None;
+        clear_pointer_state(app, fullscreen_view);
         app.show_workspace = false;
-        return Ok(());
+        return;
     }
     if matches!(msg, AppMsg::Key(_)) {
-        app.workspace_hover = None;
-        app.workspace_pressed = None;
+        clear_pointer_state(app, fullscreen_view);
     }
     app.handle(msg);
-    Ok(())
 }
 
-fn handle_workspace_mouse(
+/// 鼠标事件 → `PointerState` → 语义动作。命中只来自已发布帧，不再重算布局。
+fn handle_pointer(
     app: &mut App,
-    route: &route::WorkspaceRoute,
-    area: ratatui::layout::Rect,
-    mouse: ratatui::crossterm::event::MouseEvent,
+    frames: &mut FramePublisher,
+    fullscreen_view: &mut FullscreenView,
+    route: &ScreenRoute,
+    mouse: MouseEvent,
 ) {
-    use ratatui::crossterm::event::{MouseButton, MouseEventKind};
+    let event = match mouse.kind {
+        MouseEventKind::Moved => PointerEvent::Moved {
+            column: mouse.column,
+            row: mouse.row,
+        },
+        MouseEventKind::Down(button) => PointerEvent::Down {
+            button,
+            column: mouse.column,
+            row: mouse.row,
+        },
+        MouseEventKind::Up(button) => PointerEvent::Up {
+            button,
+            column: mouse.column,
+            row: mouse.row,
+        },
+        MouseEventKind::Drag(button) => PointerEvent::Drag {
+            button,
+            column: mouse.column,
+            row: mouse.row,
+        },
+        MouseEventKind::ScrollUp => PointerEvent::ScrollUp {
+            column: mouse.column,
+            row: mouse.row,
+        },
+        MouseEventKind::ScrollDown => PointerEvent::ScrollDown {
+            column: mouse.column,
+            row: mouse.row,
+        },
+        _ => return,
+    };
+    let action = fullscreen_view
+        .pointer_state
+        .handle(frames.current(), event);
+    dispatch_pointer_action(app, frames, fullscreen_view, route, action);
+    sync_pointer_visual(app, fullscreen_view);
+}
 
-    let hit =
-        crate::ui::v2::workspace::workspace_hit_test(app, route, area, mouse.column, mouse.row);
-    match mouse.kind {
-        MouseEventKind::Moved => app.workspace_hover = hit,
-        MouseEventKind::Down(MouseButton::Left) => {
-            app.workspace_hover = hit;
-            app.workspace_pressed = hit;
-        }
-        MouseEventKind::Up(MouseButton::Left) => {
-            let pressed = app.workspace_pressed.take();
-            app.workspace_hover = hit;
-            if let (Some(pressed), Some(released)) = (pressed, hit)
-                && pressed == released
+fn dispatch_pointer_action(
+    app: &mut App,
+    frames: &mut FramePublisher,
+    fullscreen_view: &mut FullscreenView,
+    route: &ScreenRoute,
+    action: PointerAction,
+) {
+    match action {
+        PointerAction::None | PointerAction::Redraw => {}
+        PointerAction::Invalidate => frames.invalidate(),
+        PointerAction::Pressed {
+            target,
+            column,
+            row,
+        } => {
+            if fullscreen_view.menu.is_some()
+                && menu_row_for(fullscreen_view, Some(&target)).is_none()
             {
-                dispatch_workspace_hit(app, pressed);
-                app.workspace_hover = None;
-                app.workspace_pressed = None;
+                fullscreen_view.close_menu();
+                fullscreen_view.pointer_state.clear();
+                frames.invalidate();
+                return;
+            }
+            if let PointerTarget::Agent(AgentTarget::Message {
+                turn_id,
+                block_id,
+                role,
+            }) = target
+            {
+                fullscreen_view.open_menu(
+                    MessageHit {
+                        turn_id,
+                        block_id,
+                        role,
+                    },
+                    column,
+                    row,
+                );
+                fullscreen_view.pointer_state.clear();
+                frames.invalidate();
             }
         }
-        MouseEventKind::ScrollUp => {
-            handle_workspace_scroll(app, route, true);
-            app.workspace_hover = crate::ui::v2::workspace::workspace_hit_test(
-                app,
-                route,
-                area,
-                mouse.column,
-                mouse.row,
-            );
-            app.workspace_pressed = None;
+        PointerAction::Activate { target, row, .. } => match target {
+            PointerTarget::Modal(hit) => {
+                dispatch_modal_hit(app, hit);
+                fullscreen_view.pointer_state.clear();
+                frames.invalidate();
+            }
+            PointerTarget::Workspace(hit) => {
+                dispatch_workspace_hit(app, hit);
+                fullscreen_view.pointer_state.clear();
+                frames.invalidate();
+            }
+            PointerTarget::Agent(AgentTarget::BackToLatest) => {
+                app.scroll_bottom();
+                frames.invalidate();
+            }
+            PointerTarget::Agent(AgentTarget::MenuAction(action)) => {
+                if action.enabled() {
+                    activate_message_action(app, fullscreen_view, action);
+                    fullscreen_view.pointer_state.clear();
+                    frames.invalidate();
+                }
+            }
+            PointerTarget::Scrollbar(ScrollbarPart::Track) => {
+                if let Some(metrics) = scrollbar_metrics(app, fullscreen_view) {
+                    set_scroll_offset(app, fullscreen_view, metrics.offset_for_track_row(row));
+                    frames.invalidate();
+                }
+            }
+            PointerTarget::Agent(AgentTarget::Message { .. }) => {
+                // Message rows open their menu on press; a stale release is a no-op.
+            }
+            _ => {}
+        },
+        PointerAction::Scroll { up, .. } => {
+            match route {
+                ScreenRoute::Workspace(workspace_route) => {
+                    handle_workspace_scroll(app, workspace_route, up)
+                }
+                ScreenRoute::Agent => {
+                    if up {
+                        fullscreen_view.scroll_up(app, 3);
+                    } else {
+                        fullscreen_view.scroll_down(app, 3);
+                    }
+                }
+                ScreenRoute::Modal(_) => {}
+            }
+            frames.invalidate();
         }
-        MouseEventKind::ScrollDown => {
-            handle_workspace_scroll(app, route, false);
-            app.workspace_hover = crate::ui::v2::workspace::workspace_hit_test(
-                app,
-                route,
-                area,
-                mouse.column,
-                mouse.row,
-            );
-            app.workspace_pressed = None;
+        PointerAction::CaptureStarted { .. } | PointerAction::CaptureEnded { .. } => {}
+        PointerAction::CaptureDragged {
+            target,
+            row,
+            grab_offset,
+            ..
+        } => {
+            if target == PointerTarget::Scrollbar(ScrollbarPart::Thumb)
+                && let Some(metrics) = scrollbar_metrics(app, fullscreen_view)
+            {
+                set_scroll_offset(
+                    app,
+                    fullscreen_view,
+                    metrics.offset_for_drag_row(row, grab_offset.1),
+                );
+                frames.invalidate();
+            }
         }
-        _ => {}
+        PointerAction::CaptureCancelled { .. } => {}
     }
+}
+
+fn scrollbar_metrics(app: &App, view: &FullscreenView) -> Option<ScrollbarMetrics> {
+    let session = app.active_session()?;
+    let body = view.body_area;
+    let track = Rect::new(
+        body.x.saturating_add(body.width.saturating_sub(1)),
+        body.y,
+        1,
+        body.height,
+    );
+    ScrollbarMetrics::new(
+        track,
+        view.transcript.line_count(),
+        usize::from(view.body_height),
+        session.scroll.follow,
+        session.scroll.offset,
+    )
+}
+
+fn set_scroll_offset(app: &mut App, view: &FullscreenView, offset: usize) {
+    let max = view.max_offset();
+    if let Some(session) = app.active_session_mut() {
+        session.scroll.follow = false;
+        session.scroll.offset = offset.min(max);
+    }
+}
+
+/// 命中目标对应的菜单行下标；非菜单行（含菜单外框）返回 `None`。
+fn menu_row_for(view: &FullscreenView, target: Option<&PointerTarget>) -> Option<usize> {
+    let Some(PointerTarget::Agent(AgentTarget::MenuAction(action))) = target else {
+        return None;
+    };
+    view.menu.as_ref().and_then(|menu| {
+        menu.actions()
+            .iter()
+            .position(|candidate| candidate == action)
+    })
 }
 
 fn handle_workspace_scroll(app: &mut App, route: &route::WorkspaceRoute, up: bool) {
     match route {
         route::WorkspaceRoute::Sessions { .. }
         | route::WorkspaceRoute::Settings
-        | route::WorkspaceRoute::History { detail: false, .. } => {
+        | route::WorkspaceRoute::History { detail: false, .. }
+        | route::WorkspaceRoute::Subagents { .. } => {
             app.workspace_move_selection(if up { -1 } else { 1 });
         }
         route::WorkspaceRoute::History { detail: true, .. } => {
@@ -395,40 +761,9 @@ fn dispatch_workspace_hit(app: &mut App, hit: WorkspaceHit) {
         WorkspaceHit::SessionRow(index) => app.workspace_open_session(index),
         WorkspaceHit::HistoryTurn(index) => app.workspace_open_history(index),
         WorkspaceHit::TodoTask(_) => app.workspace_toggle_todo_detail(),
+        WorkspaceHit::SubagentRow(index) => app.workspace_open_subagent(index),
         WorkspaceHit::SettingsRow(index) => app.mouse_settings_row(index),
         WorkspaceHit::Back => app.workspace_back(),
-    }
-}
-
-fn handle_modal_mouse(
-    app: &mut App,
-    modal: route::ModalRoute,
-    area: ratatui::layout::Rect,
-    mouse: ratatui::crossterm::event::MouseEvent,
-) {
-    use ratatui::crossterm::event::{MouseButton, MouseEventKind};
-    let hit = |app: &App| crate::ui::v2::modal::hit_test(app, modal, area, mouse.column, mouse.row);
-    match mouse.kind {
-        MouseEventKind::Moved => {
-            app.modal_hover = hit(app);
-        }
-        MouseEventKind::Down(MouseButton::Left) => {
-            let target = hit(app);
-            app.modal_hover = target;
-            app.modal_pressed = target;
-        }
-        MouseEventKind::Up(MouseButton::Left) => {
-            let released = hit(app);
-            app.modal_hover = released;
-            let pressed = app.modal_pressed.take();
-            if let (Some(pressed), Some(released)) = (pressed, released)
-                && pressed == released
-            {
-                dispatch_modal_hit(app, pressed);
-            }
-        }
-        // 其它按钮（右键/中键）与滚轮：弹窗里暂不接。
-        _ => {}
     }
 }
 
@@ -449,21 +784,64 @@ fn dispatch_modal_hit(app: &mut App, hit: ModalHit) {
 struct TerminalHost {
     terminal: DefaultTerminal,
     last_terminal_size: (u16, u16),
+    capture_enabled: bool,
 }
 
 impl TerminalHost {
     /// alternate-screen fullscreen shell.
     ///
     /// `ratatui::init()` enables raw mode, enters the alternate screen and installs
-    /// the panic restore hook. Mouse capture is enabled separately after init so
-    /// initialization failures still restore the terminal.
-    fn init() -> Self {
+    /// the panic restore hook. This host is the only owner of mouse / paste /
+    /// focus-change capture; every enable has an idempotent disable counterpart.
+    fn init() -> Result<Self> {
         let terminal = ratatui::init();
         let terminal_size = ratatui::crossterm::terminal::size().unwrap_or((0, 0));
-        Self {
+        let mut host = Self {
             terminal,
             last_terminal_size: terminal_size,
+            capture_enabled: false,
+        };
+        if let Err(error) = host.enable_capture() {
+            host.disable_capture();
+            ratatui::restore();
+            return Err(error).context("启用终端输入");
         }
+        Ok(host)
+    }
+
+    fn enable_capture(&mut self) -> Result<()> {
+        if self.capture_enabled {
+            return Ok(());
+        }
+        if let Err(error) = execute!(
+            stdout(),
+            EnableMouseCapture,
+            EnableBracketedPaste,
+            EnableFocusChange
+        ) {
+            let _ = execute!(
+                stdout(),
+                DisableFocusChange,
+                DisableBracketedPaste,
+                DisableMouseCapture
+            );
+            return Err(error.into());
+        }
+        self.capture_enabled = true;
+        Ok(())
+    }
+
+    fn disable_capture(&mut self) {
+        if !self.capture_enabled {
+            return;
+        }
+        let _ = execute!(
+            stdout(),
+            DisableFocusChange,
+            DisableBracketedPaste,
+            DisableMouseCapture
+        );
+        self.capture_enabled = false;
     }
 
     fn note_terminal_size(&mut self, width: u16, height: u16) -> bool {
@@ -480,6 +858,7 @@ impl TerminalHost {
             return Ok(());
         }
 
+        self.disable_capture();
         ratatui::restore();
         let command = format!(
             "{} {}",
@@ -495,10 +874,19 @@ impl TerminalHost {
         }
 
         self.terminal = ratatui::init();
-        execute!(stdout(), EnableMouseCapture, EnableBracketedPaste)?;
+        if let Err(error) = self.enable_capture() {
+            ratatui::restore();
+            return Err(error).context("恢复终端输入");
+        }
         let _ = self.terminal.clear();
         let _ = std::fs::remove_file(&path);
         Ok(())
+    }
+}
+
+impl Drop for TerminalHost {
+    fn drop(&mut self) {
+        self.disable_capture();
     }
 }
 
@@ -508,16 +896,18 @@ fn draw(
     theme: &Theme,
     route: &ScreenRoute,
     fullscreen_view: &mut FullscreenView,
+    hit_map: &mut HitMapBuilder,
 ) {
+    let area = frame.area();
     match route {
-        ScreenRoute::Agent => draw_fullscreen_agent(frame, app, theme, fullscreen_view),
+        ScreenRoute::Agent => draw_fullscreen_agent(frame, app, theme, fullscreen_view, hit_map),
         ScreenRoute::Modal(modal) => {
             clear_screen(frame, theme);
-            crate::ui::v2::modal::draw(frame, app, frame.area(), theme, *modal);
+            crate::ui::v2::modal::draw(frame, app, area, theme, *modal, hit_map);
         }
         ScreenRoute::Workspace(workspace_route) => {
             clear_screen(frame, theme);
-            workspace::draw(frame, app, workspace_route, theme);
+            workspace::draw(frame, app, workspace_route, theme, hit_map);
         }
     }
 }
@@ -979,19 +1369,41 @@ mod tests {
     use super::fullscreen::{FullscreenTranscriptCache, MessageHit, assistant_markdown};
     use super::*;
     use crate::app::Overlay;
-    use crate::app::session::SessionState;
+    use crate::app::session::{PermissionPanel, SessionState};
     use crate::app::timeline_model::TimelineModel;
     use crate::theme::{ColorSupport, ThemeKind};
-    use crate::ui::v2::fullscreen::{FullscreenState, MessageMenu, MessageRole};
+    use crate::ui::v2::fullscreen::{FullscreenState, MessageAction, MessageMenu, MessageRole};
+    use crate::ui::v2::hit::{AgentTarget, FrameHitMap, HitRegion, PointerTarget, VisualAnchor, z};
     use qaqh_client::{
-        TimelineBlock, TimelineBlockKind, TimelineBlockState, TimelineEntry, TimelineEvent,
+        PermissionCategory, PermissionRisk, SessionListEntry, SessionMeta, TimelineBlock,
+        TimelineBlockKind, TimelineBlockState, TimelineEntry, TimelineEvent,
     };
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
+    use ratatui::crossterm::event::{KeyEvent, KeyModifiers, MouseButton};
     use ratatui::layout::Rect;
 
     fn test_theme() -> Theme {
         Theme::resolve(ThemeKind::QaqhNight, ColorSupport::TrueColor)
+    }
+
+    /// 测试用：跑一帧 Agent 绘制（HitMap 丢弃；只看画面）。
+    fn draw_agent_frame(
+        terminal: &mut Terminal<TestBackend>,
+        app: &App,
+        route: &ScreenRoute,
+        view: &mut FullscreenView,
+    ) {
+        let size = terminal.size().expect("terminal size");
+        let mut hit_map = HitMapBuilder::new(
+            FrameId::new(1),
+            route.clone(),
+            ratatui::layout::Size::new(size.width, size.height),
+            0,
+        );
+        terminal
+            .draw(|frame| draw(frame, app, &test_theme(), route, view, &mut hit_map))
+            .expect("draw fullscreen agent");
     }
 
     fn entry(seq: u64, turn: &str, event: TimelineEvent) -> TimelineEntry {
@@ -1077,7 +1489,6 @@ mod tests {
             .expect("session")
             .scroll
             .follow = false;
-        let theme = test_theme();
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).expect("fullscreen terminal");
         let route = route::resolve(&app);
@@ -1089,9 +1500,7 @@ mod tests {
             ..Default::default()
         };
 
-        terminal
-            .draw(|frame| draw(frame, &app, &theme, &route, &mut view))
-            .expect("draw fullscreen agent");
+        draw_agent_frame(&mut terminal, &app, &route, &mut view);
 
         let text: String = terminal
             .backend()
@@ -1109,7 +1518,6 @@ mod tests {
     fn fullscreen_agent_draw_survives_resize() {
         let mut app = app_with_model(model_with_sealed_answer());
         app.show_workspace = false;
-        let theme = test_theme();
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).expect("fullscreen terminal");
         let route = route::resolve(&app);
@@ -1119,9 +1527,7 @@ mod tests {
             terminal
                 .resize(Rect::new(0, 0, width, height))
                 .expect("resize");
-            terminal
-                .draw(|frame| draw(frame, &app, &theme, &route, &mut view))
-                .expect("draw fullscreen after resize");
+            draw_agent_frame(&mut terminal, &app, &route, &mut view);
         }
     }
 
@@ -1129,7 +1535,6 @@ mod tests {
     fn fullscreen_context_menu_renders_copy_and_disabled_actions() {
         let mut app = app_with_model(model_with_sealed_answer());
         app.show_workspace = false;
-        let theme = test_theme();
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).expect("fullscreen terminal");
         let route = route::resolve(&app);
@@ -1143,9 +1548,7 @@ mod tests {
             ..Default::default()
         };
 
-        terminal
-            .draw(|frame| draw(frame, &app, &theme, &route, &mut view))
-            .expect("draw context menu");
+        draw_agent_frame(&mut terminal, &app, &route, &mut view);
 
         let text: String = terminal
             .backend()
@@ -1243,38 +1646,866 @@ mod tests {
     }
 
     #[test]
-    fn fullscreen_assistant_hit_uses_semantic_block_spans() {
-        let app = app_with_model(model_with_many_sealed_turns(3));
-        let theme = test_theme();
-        let mut view = FullscreenView::default();
-        view.transcript.sync(&app, 79, &theme);
-        view.body_area = Rect::new(0, 0, 80, 10);
-        view.visible_start = 0;
-
-        assert_eq!(
-            view.message_at(2, 0),
-            Some(MessageHit {
-                turn_id: "turn-0".into(),
-                block_id: "turn-0:user".into(),
-                role: MessageRole::User,
-            })
-        );
-        assert_eq!(
-            view.message_at(2, 2),
-            Some(MessageHit {
-                turn_id: "turn-0".into(),
-                block_id: "block-0".into(),
-                role: MessageRole::Assistant,
-            })
-        );
-    }
-
-    #[test]
     fn assistant_markdown_prefers_the_clicked_block() {
         let app = app_with_model(model_with_many_sealed_turns(2));
         assert_eq!(
             assistant_markdown(&app, "turn-1", "block-1").as_deref(),
             Some("answer-1")
         );
+    }
+
+    /// 跑真实 Agent draw 并把这一帧的 HitMap 取出来。
+    fn draw_agent_to_map(
+        app: &App,
+        view: &mut FullscreenView,
+        width: u16,
+        height: u16,
+    ) -> (FrameHitMap, TestBackend) {
+        let theme = test_theme();
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        let mut builder = HitMapBuilder::new(
+            FrameId::new(1),
+            ScreenRoute::Agent,
+            ratatui::layout::Size::new(width, height),
+            0,
+        );
+        terminal
+            .draw(|frame| draw_fullscreen_agent(frame, app, &theme, view, &mut builder))
+            .expect("draw fullscreen agent");
+        let map = builder.finish();
+        assert!(
+            map.validate().is_ok(),
+            "Agent HitMap 必须通过几何校验：{:?}",
+            map.validate().err()
+        );
+        let probe = map.probe(terminal.backend().buffer(), map.frame_id, &map.route);
+        assert!(
+            probe.is_ok(),
+            "Agent 真实帧必须通过 strict 探针：{:?}",
+            probe.err()
+        );
+        (map, terminal.backend().clone())
+    }
+
+    /// 命中区四角可达、外扩一格不可达。
+    fn assert_target_reachable(map: &FrameHitMap, target: &PointerTarget) {
+        let region = map
+            .regions
+            .iter()
+            .find(|region| &region.target == target)
+            .unwrap_or_else(|| panic!("HitMap 必须登记 {target:?}"));
+        let rect = region.rect;
+        assert!(!rect.is_empty(), "{target:?} 的矩形不能为空");
+        for (x, y) in [
+            (rect.x, rect.y),
+            (rect.right() - 1, rect.y),
+            (rect.x, rect.bottom() - 1),
+            (rect.right() - 1, rect.bottom() - 1),
+            (rect.x + rect.width / 2, rect.y + rect.height / 2),
+        ] {
+            let hit = map
+                .resolve(x, y, MouseButton::Left)
+                .expect("同 z 区域不得重叠");
+            assert_eq!(
+                hit.map(|region| &region.target),
+                Some(target),
+                "({x},{y}) 应命中 {target:?}"
+            );
+        }
+        for (x, y) in [
+            (rect.x.saturating_sub(1), rect.y),
+            (rect.x, rect.y.saturating_sub(1)),
+            (rect.right(), rect.y),
+            (rect.x, rect.bottom()),
+        ] {
+            if x >= map.terminal_size.width
+                || y >= map.terminal_size.height
+                || crate::ui::v2::hit::contains(rect, x, y)
+            {
+                continue;
+            }
+            let hit = map
+                .resolve(x, y, MouseButton::Left)
+                .expect("同 z 区域不得重叠");
+            assert_ne!(
+                hit.map(|region| &region.target),
+                Some(target),
+                "({x},{y}) 在 {target:?} 外扩一格内，不该命中"
+            );
+        }
+    }
+
+    /// 每个登记区的视觉锚点在真实 buffer 里必须非空——P0-C strict probe 的预演。
+    fn assert_anchors_non_empty(backend: &TestBackend, map: &FrameHitMap) {
+        let buffer = backend.buffer();
+        for region in &map.regions {
+            let position = region.anchor.position;
+            let cell = &buffer[(position.x, position.y)];
+            assert!(
+                !cell.symbol().trim().is_empty(),
+                "目标 {:?} 的锚点 {:?} 落在空 cell 上",
+                region.target,
+                position
+            );
+        }
+    }
+
+    #[test]
+    fn agent_draw_registers_visible_message_rows() {
+        let mut app = app_with_model(model_with_many_sealed_turns(3));
+        app.show_workspace = false;
+        let mut view = FullscreenView::default();
+        let (map, backend) = draw_agent_to_map(&app, &mut view, 80, 24);
+        assert_anchors_non_empty(&backend, &map);
+
+        let messages: Vec<PointerTarget> = map
+            .regions
+            .iter()
+            .filter(|region| {
+                matches!(
+                    region.target,
+                    PointerTarget::Agent(AgentTarget::Message { .. })
+                )
+            })
+            .map(|region| region.target.clone())
+            .collect();
+        assert!(!messages.is_empty(), "可见消息必须登记成 HitRegion");
+        for target in &messages {
+            assert_target_reachable(&map, target);
+        }
+        // 贴底时最后一个回合的回复一定在视口里。
+        assert!(
+            map.regions.iter().any(|region| region.target
+                == PointerTarget::Agent(AgentTarget::Message {
+                    turn_id: "turn-2".into(),
+                    block_id: "block-2".into(),
+                    role: MessageRole::Assistant,
+                })),
+            "贴底时应能看到最后一个回合的回复"
+        );
+    }
+
+    #[test]
+    fn agent_draw_registers_back_to_latest_only_when_scrolled() {
+        let mut app = app_with_model(model_with_many_sealed_turns(30));
+        app.show_workspace = false;
+        app.sessions
+            .get_mut("seed-1")
+            .expect("session")
+            .scroll
+            .follow = false;
+        let mut view = FullscreenView::default();
+        let (map, backend) = draw_agent_to_map(&app, &mut view, 80, 24);
+        assert_anchors_non_empty(&backend, &map);
+        assert_target_reachable(&map, &PointerTarget::Agent(AgentTarget::BackToLatest));
+
+        // 贴底（follow=true）时不画也不登记。
+        let mut app = app_with_model(model_with_many_sealed_turns(30));
+        app.show_workspace = false;
+        let mut view = FullscreenView::default();
+        let (map, _backend) = draw_agent_to_map(&app, &mut view, 80, 24);
+        assert!(
+            !map.regions
+                .iter()
+                .any(|region| region.target == PointerTarget::Agent(AgentTarget::BackToLatest)),
+            "贴底时不该有回到最新按钮"
+        );
+    }
+
+    #[test]
+    fn agent_draw_registers_scrollbar_track_and_thumb() {
+        let mut app = app_with_model(model_with_many_sealed_turns(30));
+        app.show_workspace = false;
+        let session = app.sessions.get_mut("seed-1").expect("session");
+        session.scroll.follow = false;
+        session.scroll.offset = 20;
+        let mut view = FullscreenView::default();
+        let (map, backend) = draw_agent_to_map(&app, &mut view, 80, 24);
+        assert_anchors_non_empty(&backend, &map);
+
+        let thumb = PointerTarget::Scrollbar(ScrollbarPart::Thumb);
+        let track = PointerTarget::Scrollbar(ScrollbarPart::Track);
+        assert_target_reachable(&map, &thumb);
+        let track_region = map
+            .regions
+            .iter()
+            .find(|region| region.target == track)
+            .expect("scrollbar track must be registered");
+        let thumb_region = map
+            .regions
+            .iter()
+            .find(|region| region.target == thumb)
+            .expect("scrollbar thumb must be registered");
+        let row = if thumb_region.rect.y > track_region.rect.y {
+            track_region.rect.y
+        } else {
+            thumb_region.rect.bottom()
+        };
+        let hit = map
+            .resolve(track_region.rect.x, row, MouseButton::Left)
+            .expect("track hit")
+            .expect("track point");
+        assert_eq!(hit.target, track);
+    }
+
+    #[test]
+    fn agent_scrollbar_track_click_and_thumb_drag_update_scroll_state() {
+        let mut app = app_with_model(model_with_many_sealed_turns(30));
+        app.show_workspace = false;
+        app.sessions
+            .get_mut("seed-1")
+            .expect("session")
+            .scroll
+            .follow = false;
+        let mut view = FullscreenView::default();
+        let mut frames = publish_frame(&app, &mut view, 80, 24);
+        let route = ScreenRoute::Agent;
+        let metrics = scrollbar_metrics(&app, &view).expect("scrollbar metrics");
+
+        let track_row = metrics.track.y.saturating_add(1);
+        handle_pointer(
+            &mut app,
+            &mut frames,
+            &mut view,
+            &route,
+            left_mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                metrics.track.x,
+                track_row,
+            ),
+        );
+        handle_pointer(
+            &mut app,
+            &mut frames,
+            &mut view,
+            &route,
+            left_mouse(
+                MouseEventKind::Up(MouseButton::Left),
+                metrics.track.x,
+                track_row,
+            ),
+        );
+        assert_eq!(
+            app.sessions["seed-1"].scroll.offset,
+            metrics
+                .offset_for_track_row(track_row)
+                .min(view.max_offset())
+        );
+
+        let mut frames = publish_frame(&app, &mut view, 80, 24);
+        let metrics = scrollbar_metrics(&app, &view).expect("scrollbar metrics");
+        let drag_row = metrics.track.bottom().saturating_sub(1);
+        handle_pointer(
+            &mut app,
+            &mut frames,
+            &mut view,
+            &route,
+            left_mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                metrics.thumb.x,
+                metrics.thumb.y,
+            ),
+        );
+        handle_pointer(
+            &mut app,
+            &mut frames,
+            &mut view,
+            &route,
+            left_mouse(
+                MouseEventKind::Drag(MouseButton::Left),
+                metrics.thumb.x,
+                drag_row,
+            ),
+        );
+        handle_pointer(
+            &mut app,
+            &mut frames,
+            &mut view,
+            &route,
+            left_mouse(
+                MouseEventKind::Up(MouseButton::Left),
+                metrics.thumb.x,
+                drag_row,
+            ),
+        );
+        assert_eq!(
+            app.sessions["seed-1"].scroll.offset,
+            metrics
+                .offset_for_drag_row(drag_row, 0)
+                .min(view.max_offset())
+        );
+    }
+
+    #[test]
+    fn agent_draw_registers_menu_rows_and_blocks_click_through() {
+        let mut app = app_with_model(model_with_many_sealed_turns(3));
+        app.show_workspace = false;
+        let mut view = FullscreenView::default();
+        // 先画一帧拿到 transcript spans，再在 assistant 消息上开菜单。
+        let _ = draw_agent_to_map(&app, &mut view, 80, 24);
+        view.open_menu(
+            MessageHit {
+                turn_id: "turn-2".into(),
+                block_id: "block-2".into(),
+                role: MessageRole::Assistant,
+            },
+            10,
+            5,
+        );
+        let (map, backend) = draw_agent_to_map(&app, &mut view, 80, 24);
+        assert_anchors_non_empty(&backend, &map);
+
+        let copy = PointerTarget::Agent(AgentTarget::MenuAction(MessageAction::CopyMarkdown));
+        assert_target_reachable(&map, &copy);
+
+        // disabled 行照样登记，但 enabled=false；点它只能落到菜单外框。
+        let retry = PointerTarget::Agent(AgentTarget::MenuAction(MessageAction::Retry));
+        let retry_region = map
+            .regions
+            .iter()
+            .find(|region| region.target == retry)
+            .expect("disabled 行也要登记");
+        assert!(!retry_region.enabled);
+        let hit = map
+            .resolve(
+                retry_region.rect.x + 2,
+                retry_region.rect.y,
+                MouseButton::Left,
+            )
+            .expect("同 z 区域不得重叠");
+        assert_eq!(
+            hit.map(|region| &region.target),
+            Some(&PointerTarget::Agent(AgentTarget::MenuRoot)),
+            "disabled 行必须被菜单外框吃掉"
+        );
+
+        // 菜单外框可命中，且优先级高于底下的消息行。
+        let root = PointerTarget::Agent(AgentTarget::MenuRoot);
+        let root_region = map
+            .regions
+            .iter()
+            .find(|region| region.target == root)
+            .expect("菜单外框");
+        let hit = map
+            .resolve(root_region.rect.x, root_region.rect.y, MouseButton::Left)
+            .expect("同 z 区域不得重叠");
+        assert_eq!(hit.map(|region| &region.target), Some(&root));
+    }
+
+    /// 菜单与「回到最新」按钮重叠时，菜单必须赢——z 层级而不是绘制顺序决定命中。
+    #[test]
+    fn agent_menu_wins_over_back_to_latest_when_they_overlap() {
+        let mut app = app_with_model(model_with_many_sealed_turns(30));
+        app.show_workspace = false;
+        app.sessions
+            .get_mut("seed-1")
+            .expect("session")
+            .scroll
+            .follow = false;
+        let mut view = FullscreenView::default();
+        let _ = draw_agent_to_map(&app, &mut view, 80, 24);
+
+        let back = crate::ui::v2::fullscreen::back_to_latest_rect(view.body_area)
+            .expect("滚动状态应有回到最新按钮");
+        view.open_menu(
+            MessageHit {
+                turn_id: "turn-29".into(),
+                block_id: "block-29".into(),
+                role: MessageRole::Assistant,
+            },
+            back.x,
+            back.y,
+        );
+        let (map, _backend) = draw_agent_to_map(&app, &mut view, 80, 24);
+
+        let back_target = PointerTarget::Agent(AgentTarget::BackToLatest);
+        assert!(
+            map.regions
+                .iter()
+                .any(|region| region.target == back_target),
+            "滚动状态仍要登记回到最新"
+        );
+        let root = PointerTarget::Agent(AgentTarget::MenuRoot);
+        let root_region = map
+            .regions
+            .iter()
+            .find(|region| region.target == root)
+            .expect("菜单外框");
+        assert!(
+            crate::ui::v2::hit::contains(back, root_region.rect.x, root_region.rect.y),
+            "构造点必须同时落在两个浮层里，才算真的验证了遮挡"
+        );
+        let hit = map
+            .resolve(root_region.rect.x, root_region.rect.y, MouseButton::Left)
+            .expect("同 z 区域不得重叠");
+        assert_eq!(
+            hit.map(|region| &region.target),
+            Some(&root),
+            "菜单必须压在回到最新之上"
+        );
+    }
+    fn permission_panel() -> PermissionPanel {
+        PermissionPanel {
+            tool_call_id: "tool-1".into(),
+            tool_name: "bash".into(),
+            action_summary: Some("cargo test --all-targets".into()),
+            reason: "运行测试".into(),
+            paths: vec!["/tmp/project".into()],
+            category: PermissionCategory::Exec,
+            level: 2,
+            risk: PermissionRisk::High,
+            consequence: "会执行本地命令".into(),
+            trust_folder: false,
+        }
+    }
+
+    /// 用真实 `draw` 给当前 app 发布一帧（走和 run_loop 一样的 builder → publish 路径）。
+    /// 用真实 `draw` 给当前 app 发布一帧（走和 run_loop 一样的 builder → probe → publish
+    /// 路径）。**固定用 `HitProbe::Strict`**：每条走这条 helper 的测试同时都在证明
+    /// 该路由的真实帧能通过 strict 探针。
+    fn publish_frame(
+        app: &App,
+        view: &mut FullscreenView,
+        width: u16,
+        height: u16,
+    ) -> FramePublisher {
+        let route = route::resolve(app);
+        let mut frames = FramePublisher::default();
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        let mut builder = frames.begin(route.clone(), Size::new(width, height), 0);
+        let completed = terminal
+            .draw(|frame| draw(frame, app, &test_theme(), &route, view, &mut builder))
+            .expect("draw frame");
+        frames
+            .publish(builder.finish(), completed.buffer, HitProbe::Strict, &route)
+            .unwrap_or_else(|failures| {
+                panic!(
+                    "strict 探针必须通过真实帧：\n{}",
+                    failures
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                )
+            });
+        frames
+    }
+
+    fn left_mouse(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    fn message_rect(frames: &FramePublisher) -> Rect {
+        frames
+            .current()
+            .expect("已发布帧")
+            .regions
+            .iter()
+            .find(|region| {
+                matches!(
+                    region.target,
+                    PointerTarget::Agent(AgentTarget::Message { .. })
+                )
+            })
+            .expect("可见消息必须登记")
+            .rect
+    }
+
+    /// 帧序号只在**成功发布**时推进；几何不自洽的帧一律不发布。
+    #[test]
+    fn frame_publisher_advances_id_only_on_valid_publish() {
+        let blank = Buffer::empty(Rect::new(0, 0, 20, 10));
+        let mut frames = FramePublisher::default();
+        assert!(frames.route().is_none());
+        assert!(frames.resolve(0, 0, MouseButton::Left).is_none());
+
+        let builder = frames.begin(ScreenRoute::Agent, Size::new(20, 10), 0);
+        frames
+            .publish(builder.finish(), &blank, HitProbe::Off, &ScreenRoute::Agent)
+            .expect("空 HitMap 是合法帧");
+        assert_eq!(frames.route(), Some(&ScreenRoute::Agent));
+        assert_eq!(frames.next_frame_id, FrameId::new(1));
+
+        frames.invalidate();
+        assert!(frames.route().is_none());
+        assert_eq!(frames.next_frame_id, FrameId::new(1), "失效不推进帧序号");
+
+        // 空 rect 的帧：validate 必须拦下，且不能推进序号。
+        let mut builder = frames.begin(ScreenRoute::Agent, Size::new(20, 10), 0);
+        builder.push(HitRegion::new(
+            Rect::ZERO,
+            Rect::new(0, 0, 20, 10),
+            Rect::ZERO,
+            PointerTarget::Agent(AgentTarget::BackToLatest),
+            MouseButton::Left,
+            true,
+            z::AGENT_OVERLAY,
+            VisualAnchor::non_empty(Position::new(0, 0)),
+        ));
+        assert!(
+            frames
+                .publish(builder.finish(), &blank, HitProbe::Off, &ScreenRoute::Agent)
+                .is_err(),
+            "空 rect 的帧不得发布"
+        );
+        assert!(frames.route().is_none());
+        assert_eq!(frames.next_frame_id, FrameId::new(1));
+
+        // strict 探针下，锚点落在空白 buffer 上必须失败。
+        let mut builder = frames.begin(ScreenRoute::Agent, Size::new(20, 10), 0);
+        builder.push(HitRegion::new(
+            Rect::new(0, 0, 4, 1),
+            Rect::new(0, 0, 20, 10),
+            Rect::new(0, 0, 4, 1),
+            PointerTarget::Agent(AgentTarget::BackToLatest),
+            MouseButton::Left,
+            true,
+            z::AGENT_OVERLAY,
+            VisualAnchor::non_empty(Position::new(0, 0)),
+        ));
+        let failures = frames
+            .publish(
+                builder.finish(),
+                &blank,
+                HitProbe::Strict,
+                &ScreenRoute::Agent,
+            )
+            .expect_err("空白 buffer 上的锚点必须被探针抓到");
+        assert!(
+            failures
+                .iter()
+                .any(|failure| failure.check == "anchor_missing"),
+            "{failures:?}"
+        );
+        assert!(frames.route().is_none(), "探针失败的帧不得发布");
+    }
+
+    /// P0-C 的硬回归锁：同一批里前面那条键切了路由，后面那条鼠标必须被丢掉，
+    /// 不能拿旧帧坐标去解释新画面（spec §3.3）。
+    #[tokio::test]
+    async fn batch_key_route_change_drops_following_mouse() {
+        let mut app = app_with_model(model_with_many_sealed_turns(3));
+        app.show_workspace = false;
+        let mut view = FullscreenView::default();
+        let mut frames = publish_frame(&app, &mut view, 80, 24);
+        assert_eq!(frames.route(), Some(&ScreenRoute::Agent));
+        let message = message_rect(&frames);
+
+        // 批次第一条：Ctrl+L 打开会话列表（Agent → Workspace）
+        let key = KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL);
+        handle_message(&mut app, AppMsg::Key(key), &mut frames, &mut view);
+        assert!(
+            matches!(route::resolve(&app), ScreenRoute::Workspace(_)),
+            "Ctrl+L 应打开 Workspace"
+        );
+        assert!(frames.route().is_none(), "键之后已发布帧必须失效");
+
+        // 批次第二条：同一坐标上的鼠标按下不得再解释成旧帧的消息行
+        let mouse = left_mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            message.x + 2,
+            message.y,
+        );
+        handle_message(&mut app, AppMsg::Mouse(mouse), &mut frames, &mut view);
+        assert!(view.menu.is_none(), "旧帧坐标不得打开消息菜单");
+    }
+
+    /// 滚动会改变画面：旧帧立即失效，后续鼠标等下一次重绘。
+    #[test]
+    fn scroll_mouse_event_invalidates_the_frame() {
+        let mut app = app_with_model(model_with_many_sealed_turns(30));
+        app.show_workspace = false;
+        app.sessions
+            .get_mut("seed-1")
+            .expect("session")
+            .scroll
+            .follow = false;
+        let mut view = FullscreenView::default();
+        let mut frames = publish_frame(&app, &mut view, 80, 24);
+        let before = app.active_session().expect("session").scroll.offset;
+
+        handle_message(
+            &mut app,
+            AppMsg::Mouse(left_mouse(MouseEventKind::ScrollUp, 5, 5)),
+            &mut frames,
+            &mut view,
+        );
+
+        assert!(frames.route().is_none(), "滚动之后旧帧必须失效");
+        assert!(
+            app.active_session().expect("session").scroll.offset > before,
+            "滚动应真的发生"
+        );
+    }
+
+    /// 点消息 → 开菜单 → 点菜单行 → 语义动作：整条链路都走已发布帧。
+    #[test]
+    fn agent_message_click_opens_menu_and_menu_row_activates() {
+        let mut app = app_with_model(model_with_many_sealed_turns(3));
+        app.show_workspace = false;
+        let mut view = FullscreenView::default();
+        let mut frames = publish_frame(&app, &mut view, 80, 24);
+
+        let user_message = frames
+            .current()
+            .expect("已发布帧")
+            .regions
+            .iter()
+            .find(|region| {
+                matches!(
+                    &region.target,
+                    PointerTarget::Agent(AgentTarget::Message {
+                        role: MessageRole::User,
+                        ..
+                    })
+                )
+            })
+            .expect("用户消息必须登记")
+            .rect;
+
+        handle_message(
+            &mut app,
+            AppMsg::Mouse(left_mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                user_message.x + 2,
+                user_message.y,
+            )),
+            &mut frames,
+            &mut view,
+        );
+        assert!(view.menu.is_some(), "点用户消息应打开消息菜单");
+        assert!(frames.route().is_none(), "开菜单后旧帧必须失效");
+
+        // 菜单已经画进下一帧，用新帧里的行坐标点击。
+        frames = publish_frame(&app, &mut view, 80, 24);
+        let undo = frames
+            .current()
+            .expect("已发布帧")
+            .regions
+            .iter()
+            .find(|region| {
+                region.target
+                    == PointerTarget::Agent(AgentTarget::MenuAction(MessageAction::UndoFromHere))
+            })
+            .expect("撤销行必须登记")
+            .rect;
+
+        for kind in [
+            MouseEventKind::Down(MouseButton::Left),
+            MouseEventKind::Up(MouseButton::Left),
+        ] {
+            handle_message(
+                &mut app,
+                AppMsg::Mouse(left_mouse(kind, undo.x + 2, undo.y)),
+                &mut frames,
+                &mut view,
+            );
+        }
+
+        assert!(view.menu.is_none(), "激活菜单行后菜单应关闭");
+        assert!(
+            matches!(app.overlays.last(), Some(Overlay::Confirm { .. })),
+            "撤销应从命中路径走到二次确认"
+        );
+        assert!(frames.route().is_none(), "动作改变画面后旧帧必须失效");
+    }
+
+    /// strict 探针在三条路由的真实帧上都必须通过（`publish_frame` 固定用 Strict）。
+    #[test]
+    fn strict_probe_passes_for_workspace_frames() {
+        let (mut app, _rx) = App::new_for_test();
+        app.session_list_cache = (0..4)
+            .map(|index| SessionListEntry {
+                meta: SessionMeta {
+                    session_id: format!("seed-{index}"),
+                    created_at: index,
+                    ..SessionMeta::default()
+                },
+                running: false,
+                workspace_id: None,
+            })
+            .collect();
+        app.session_list_at = Some(std::time::Instant::now());
+        app.overlays.push(Overlay::SessionList {
+            selected: 0,
+            show_archived: false,
+        });
+        let mut view = FullscreenView::default();
+
+        let frames = publish_frame(&app, &mut view, 100, 20);
+
+        assert!(
+            matches!(frames.route(), Some(ScreenRoute::Workspace(_))),
+            "会话列表必须走 Workspace 路由"
+        );
+        assert!(
+            frames.current().expect("已发布帧").regions.iter().any(
+                |region| region.target == PointerTarget::Workspace(WorkspaceHit::SessionRow(0))
+            ),
+            "会话行必须登记"
+        );
+    }
+
+    /// 即使一张"错帧"里混进了底层 Workspace 目标，Modal 路由也不得把它 dispatch
+    /// 出去（不可点穿透）。
+    #[tokio::test]
+    async fn modal_dispatch_ignores_underlying_targets() {
+        let mut app = app_with_model(model_with_sealed_answer());
+        app.show_workspace = false;
+        app.sessions
+            .get_mut("seed-1")
+            .expect("session")
+            .pending_permissions
+            .push(permission_panel());
+        let mut view = FullscreenView::default();
+
+        let route = route::resolve(&app);
+        assert!(matches!(route, ScreenRoute::Modal(_)));
+        let mut frames = FramePublisher::default();
+        let mut builder = frames.begin(route.clone(), Size::new(20, 6), 0);
+        builder.push(HitRegion::new(
+            Rect::new(0, 0, 5, 1),
+            Rect::new(0, 0, 20, 6),
+            Rect::new(0, 0, 5, 1),
+            PointerTarget::Workspace(WorkspaceHit::Back),
+            MouseButton::Left,
+            true,
+            z::WORKSPACE_ROW,
+            VisualAnchor::non_empty(Position::new(0, 0)),
+        ));
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 20, 6));
+        buffer[(0, 0)].set_symbol("x");
+        frames
+            .publish(builder.finish(), &buffer, HitProbe::Off, &route)
+            .expect("手工帧是合法的");
+
+        for kind in [
+            MouseEventKind::Down(MouseButton::Left),
+            MouseEventKind::Up(MouseButton::Left),
+        ] {
+            handle_message(
+                &mut app,
+                AppMsg::Mouse(left_mouse(kind, 0, 0)),
+                &mut frames,
+                &mut view,
+            );
+        }
+
+        assert!(
+            app.workspace_hover.is_none() && app.workspace_pressed.is_none(),
+            "Modal 路由不得把点击穿透给 Workspace 目标"
+        );
+        assert!(
+            app.active_session()
+                .expect("session")
+                .active_permission()
+                .is_some(),
+            "permission 不该被穿透的点击应答"
+        );
+    }
+
+    /// 焦点丢失 = 合成 Leave：hover/pressed 全部作废，但屏幕没变，帧仍可信。
+    #[test]
+    fn focus_lost_clears_pointer_state() {
+        let mut app = app_with_model(model_with_sealed_answer());
+        app.show_workspace = false;
+        app.modal_hover = Some(ModalHit::PermissionApprove);
+        app.workspace_hover = Some(WorkspaceHit::Back);
+        app.workspace_pressed = Some(WorkspaceHit::Back);
+        let mut view = FullscreenView {
+            pointer: FullscreenState {
+                back_to_latest_hover: true,
+                back_to_latest_pressed: true,
+            },
+            menu: Some(MessageMenu::new(
+                "turn-1".into(),
+                "b1".into(),
+                MessageRole::Assistant,
+                Position::new(1, 1),
+            )),
+            ..Default::default()
+        };
+        if let Some(menu) = view.menu.as_mut() {
+            menu.hover = Some(0);
+            menu.pressed = Some(0);
+        }
+        let mut frames = publish_frame(&app, &mut view, 80, 24);
+
+        handle_message(&mut app, AppMsg::FocusLost, &mut frames, &mut view);
+
+        assert!(app.modal_hover.is_none() && app.modal_pressed.is_none());
+        assert!(app.workspace_hover.is_none() && app.workspace_pressed.is_none());
+        assert!(!view.pointer.back_to_latest_hover);
+        assert!(!view.pointer.back_to_latest_pressed);
+        let menu = view.menu.as_ref().expect("焦点丢失不该关菜单");
+        assert!(menu.hover.is_none() && menu.pressed.is_none());
+        assert!(frames.route().is_some(), "焦点丢失不改画面，帧仍可信");
+    }
+
+    /// Modal 关闭后，旧按钮坐标不能再触发任何动作（不可点穿透）。
+    #[tokio::test]
+    async fn modal_close_makes_old_button_coordinates_inert() {
+        let mut app = app_with_model(model_with_sealed_answer());
+        app.show_workspace = false;
+        app.sessions
+            .get_mut("seed-1")
+            .expect("session")
+            .pending_permissions
+            .push(permission_panel());
+        let mut view = FullscreenView::default();
+        let mut frames = publish_frame(&app, &mut view, 80, 24);
+        assert!(matches!(frames.route(), Some(ScreenRoute::Modal(_))));
+
+        let approve = frames
+            .current()
+            .expect("已发布帧")
+            .regions
+            .iter()
+            .find(|region| region.target == PointerTarget::Modal(ModalHit::PermissionApprove))
+            .expect("批准按钮必须登记")
+            .rect;
+
+        // Down + Up 落在同一个按钮上 → 复用键盘的应答路径，modal 下架。
+        for kind in [
+            MouseEventKind::Down(MouseButton::Left),
+            MouseEventKind::Up(MouseButton::Left),
+        ] {
+            handle_message(
+                &mut app,
+                AppMsg::Mouse(left_mouse(kind, approve.x + 1, approve.y)),
+                &mut frames,
+                &mut view,
+            );
+        }
+        assert!(
+            app.active_session()
+                .expect("session")
+                .active_permission()
+                .is_none(),
+            "批准应答应下架 modal"
+        );
+        assert!(frames.route().is_none(), "modal 关闭后旧帧必须失效");
+
+        // 同一坐标再来一次：没有已发布帧，必须完全无效。
+        for kind in [
+            MouseEventKind::Down(MouseButton::Left),
+            MouseEventKind::Up(MouseButton::Left),
+        ] {
+            handle_message(
+                &mut app,
+                AppMsg::Mouse(left_mouse(kind, approve.x + 1, approve.y)),
+                &mut frames,
+                &mut view,
+            );
+        }
+        assert_eq!(app.modal_pressed, None, "旧 modal 坐标不得再进入 pressed");
+        assert!(frames.route().is_none());
     }
 }

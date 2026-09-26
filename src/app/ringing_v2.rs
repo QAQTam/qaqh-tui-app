@@ -127,7 +127,7 @@ pub fn bootstrap_from_client(
 
     Ok(BootstrapSnapshot {
         server_epoch: bootstrap.server_epoch.clone(),
-        seed: bootstrap.seed.clone(),
+        seed: bootstrap.session_id.clone(),
         log_id: Some(log_id),
         snapshot_cursor: bootstrap.snapshot_cursor.as_str().to_string(),
         snapshot_fact_seq: cursor.fact_seq,
@@ -161,7 +161,7 @@ pub fn event_meta_from_client(event: &ClientV2Event) -> EventMeta {
 pub fn reset_from_client(reset: &ClientV2Reset) -> ResetSignal {
     ResetSignal {
         server_epoch: reset.server_epoch.clone(),
-        seed: reset.seed.clone(),
+        seed: reset.session_id.clone(),
         log_id: reset.log_id.clone(),
         snapshot_cursor: reset
             .snapshot_cursor
@@ -785,7 +785,7 @@ mod tests {
             schema: "qaqh.Ringing".into(),
             version: 2,
             server_epoch: "epoch-1".into(),
-            seed: "seed-1".into(),
+            session_id: "seed-1".into(),
             log_id: Some("log-2".into()),
             snapshot_cursor: Some(
                 ClientV2CursorToken::encode_snapshot(&ClientV2Cursor::snapshot("log-2", 8))
@@ -838,7 +838,7 @@ mod tests {
             schema: "qaqh.Ringing".into(),
             version: 2,
             server_epoch: "epoch-1".into(),
-            seed: "seed-1".into(),
+            session_id: "seed-1".into(),
             log_id: None,
             snapshot_cursor: None,
             reason: ClientV2ResetReason::SnapshotMissing,
@@ -1210,7 +1210,7 @@ mod tests {
             schema: "qaqh.Ringing".into(),
             version: 2,
             server_epoch: "epoch-1".into(),
-            seed: "seed-1".into(),
+            session_id: "seed-1".into(),
             log_id: Some("log-1".into()),
             snapshot_cursor: Some(cursor),
             reason: ClientV2ResetReason::SnapshotMissing,

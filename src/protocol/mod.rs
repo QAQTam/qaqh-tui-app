@@ -51,7 +51,7 @@ mod tests {
     #[test]
     fn session_payload_contract_exposes_fields_tui_needs() {
         let wire = serde_json::json!({
-            "seed": "0123abcd",
+            "session_id": "0123abcd",
             "created_at": 1757800000000u64,
             "updated_at": 1757900000000u64,
             "model": "m1",
@@ -66,7 +66,7 @@ mod tests {
         let entry: SessionListEntry =
             serde_json::from_value(wire.clone()).expect("会话列表条目可解析");
         // 列表渲染真正读的每一个字段（ui/home.rs、ui/overlays.rs、app/overlay_ops.rs）。
-        assert_eq!(entry.meta.seed, "0123abcd");
+        assert_eq!(entry.meta.session_id, "0123abcd");
         assert!(entry.meta.archived && !entry.meta.ephemeral);
         assert!(entry.running);
         assert_eq!(entry.meta.updated_at, 1757900000000);
@@ -74,12 +74,18 @@ mod tests {
         // 未分组/旧 daemon 不带 workspace_id 时必须仍是 `None` 而不是解析失败。
         assert_eq!(entry.workspace_id, None);
 
-        // **严格度差异（须知会）**：`seed`/`created_at`/`updated_at`/`model`/
+        // **严格度差异（须知会）**：`session_id`/`created_at`/`updated_at`/`model`/
         // `message_count` 在 `SessionMeta` 上没有 `#[serde(default)]`，缺一个整条就被
         // 跳过；而 G2 之前那份手解把这些全当可选。实际不受影响——产出方就是
         // `SessionMeta` 本身，缺这些键的记录在 daemon 读盘那一步就已经被丢了，
         // 根本发不到 wire。这条断言是为了让「严格在哪」写成可执行的，而不是靠记忆。
-        for required in ["seed", "created_at", "updated_at", "model", "message_count"] {
+        for required in [
+            "session_id",
+            "created_at",
+            "updated_at",
+            "model",
+            "message_count",
+        ] {
             let mut partial = wire.clone();
             partial.as_object_mut().unwrap().remove(required);
             assert!(
@@ -88,12 +94,12 @@ mod tests {
             );
         }
 
-        // 活动快照：本仓只用 seed + state 两个键（app/mod.rs 的 activity_cache）。
+        // 活动快照：本仓只用 session_id + state 两个键（app/mod.rs 的 activity_cache）。
         let acts: Vec<SessionActivity> = serde_json::from_value(serde_json::json!([
-            { "seed": "0123abcd", "state": "working", "turn_id": "t1", "seq": 3, "updated_at": 1 },
+            { "session_id": "0123abcd", "state": "working", "turn_id": "t1", "seq": 3, "updated_at": 1 },
         ]))
         .expect("活动快照可解析");
-        assert_eq!(acts[0].seed, "0123abcd");
+        assert_eq!(acts[0].session_id, "0123abcd");
         assert_eq!(acts[0].state, qaqh_client::DomainActivityState::Working);
         assert_eq!(acts[0].turn_id.as_deref(), Some("t1"));
     }

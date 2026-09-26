@@ -145,6 +145,20 @@ impl App {
                 });
                 true
             }
+            SlashCmd::Subagents => {
+                if let Some(sess) = self.active_session_mut() {
+                    sess.composer.clear();
+                }
+                self.slash_selected = 0;
+                self.overlays.push(Overlay::Subagents {
+                    selected: 0,
+                    filter: String::new(),
+                });
+                if let Some(seed) = self.active_seed() {
+                    self.fetch_team(seed);
+                }
+                true
+            }
             SlashCmd::Workspace => {
                 if let Some(sess) = self.active_session_mut() {
                     sess.composer.clear();
@@ -346,6 +360,9 @@ impl App {
                 self.autocomplete_slash();
             }
             KeyCode::Tab => {
+                if self.autocomplete_mention() {
+                    return;
+                }
                 // composer 为 /new 或 /n 且无参时，Tab 打开二级编辑（显式 CwdInput）
                 let val = self
                     .active_session()

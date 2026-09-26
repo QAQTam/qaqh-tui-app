@@ -6,11 +6,13 @@
 
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Position, Rect};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 
 use crate::theme::Theme;
+use crate::ui::v2::button::{ButtonState, ButtonVisual};
+use crate::ui::v2::scrollbar::ScrollbarMetrics;
 
 const BUTTON_WIDTH: u16 = 22;
 const BUTTON_HEIGHT: u16 = 3;
@@ -20,19 +22,6 @@ const BUTTON_BOTTOM_MARGIN: u16 = 1;
 pub struct FullscreenState {
     pub back_to_latest_hover: bool,
     pub back_to_latest_pressed: bool,
-}
-
-impl FullscreenState {
-    pub fn clear_pointer(&mut self) {
-        self.back_to_latest_hover = false;
-        self.back_to_latest_pressed = false;
-    }
-}
-
-/// 当前全屏 Agent 视口里可命中的浮层目标。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Hit {
-    BackToLatest,
 }
 
 /// 助手消息上的上下文动作。
@@ -145,7 +134,7 @@ impl MessageMenu {
     }
 }
 
-/// “回到最新消息”按钮的矩形。渲染与 hit-test 必须共用。
+/// “回到最新消息”按钮的矩形。渲染与 HitMap 登记共用。
 pub fn back_to_latest_rect(area: Rect) -> Option<Rect> {
     if area.width < 8 || area.height < BUTTON_HEIGHT {
         return None;
@@ -160,29 +149,15 @@ pub fn back_to_latest_rect(area: Rect) -> Option<Rect> {
     Some(Rect::new(x, y, width, BUTTON_HEIGHT))
 }
 
-pub fn hit_test(area: Rect, column: u16, row: u16) -> Option<Hit> {
-    let rect = back_to_latest_rect(area)?;
-    let inside = column >= rect.x
-        && column < rect.x.saturating_add(rect.width)
-        && row >= rect.y
-        && row < rect.y.saturating_add(rect.height);
-    inside.then_some(Hit::BackToLatest)
-}
-
-fn button_style(hovered: bool, pressed: bool, theme: &Theme) -> Style {
-    let surface = |color: Color| {
-        if color == Color::Reset {
-            Style::new().add_modifier(Modifier::REVERSED)
-        } else {
-            Style::new().bg(color)
-        }
-    };
-    if pressed {
-        surface(theme.surface.highlight).add_modifier(Modifier::BOLD)
-    } else if hovered {
-        surface(theme.surface.hover)
+/// 「回到最新」按钮的样式：Idle 时用 secondary 前景（它是浮层，不该抢视线）。
+///
+/// 交互底色一律走全仓统一的 [`ButtonVisual::surface_style`]（spec §5）。
+fn back_to_latest_style(visual: ButtonVisual, theme: &Theme) -> Style {
+    let style = visual.surface_style(theme, Color::Reset);
+    if visual.state() == ButtonState::Idle {
+        style.fg(theme.text.secondary)
     } else {
-        Style::new().fg(theme.text.secondary)
+        style
     }
 }
 
@@ -190,9 +165,13 @@ pub fn draw_back_to_latest(frame: &mut Frame, area: Rect, state: FullscreenState
     let Some(rect) = back_to_latest_rect(area) else {
         return;
     };
-    let style = button_style(
-        state.back_to_latest_hover,
-        state.back_to_latest_pressed,
+    let style = back_to_latest_style(
+        ButtonVisual::derive(
+            true,
+            false,
+            state.back_to_latest_hover,
+            state.back_to_latest_pressed,
+        ),
         theme,
     );
     frame.render_widget(Clear, rect);
@@ -223,7 +202,8 @@ pub fn draw_back_to_latest(frame: &mut Frame, area: Rect, state: FullscreenState
 
 const MENU_WIDTH: u16 = 34;
 
-fn message_menu_rect(area: Rect, menu: &MessageMenu) -> Rect {
+/// 菜单外框矩形。渲染、命中与 HitMap 登记必须共用。
+pub fn message_menu_rect(area: Rect, menu: &MessageMenu) -> Rect {
     let height = menu.actions().len() as u16 + 2;
     let width = MENU_WIDTH.min(area.width.max(1)).max(8);
     let max_x = area.x.saturating_add(area.width.saturating_sub(width));
@@ -235,28 +215,27 @@ fn message_menu_rect(area: Rect, menu: &MessageMenu) -> Rect {
     Rect::new(x, y, width, height.min(area.height))
 }
 
-pub fn message_menu_hit_test(
-    area: Rect,
-    menu: &MessageMenu,
-    column: u16,
-    row: u16,
-) -> Option<usize> {
+/// 菜单第 `index` 个动作的整行矩形（不含外框）。
+///
+/// 返回 `None` 表示该行没画出来（动作越界或菜单太小）。渲染与 HitMap 登记
+/// 都用它，所以"画出来的行"和"能点的行"必然一一对应。
+pub fn message_menu_row_rect(area: Rect, menu: &MessageMenu, index: usize) -> Option<Rect> {
     let rect = message_menu_rect(area, menu);
-    let inner_x = rect.x.saturating_add(1);
-    let inner_y = rect.y.saturating_add(1);
-    let inner_width = rect.width.saturating_sub(2);
-    if column < inner_x
-        || column >= inner_x.saturating_add(inner_width)
-        || row < inner_y
-        || row >= rect.y.saturating_add(rect.height).saturating_sub(1)
-    {
+    let inner = Rect::new(
+        rect.x.saturating_add(1),
+        rect.y.saturating_add(1),
+        rect.width.saturating_sub(2),
+        rect.height.saturating_sub(2),
+    );
+    if inner.is_empty() || index >= usize::from(inner.height) || index >= menu.actions().len() {
         return None;
     }
-    let index = usize::from(row.saturating_sub(inner_y));
-    menu.actions()
-        .get(index)
-        .filter(|action| action.enabled())
-        .map(|_| index)
+    Some(Rect::new(
+        inner.x,
+        inner.y.saturating_add(index as u16),
+        inner.width,
+        1,
+    ))
 }
 
 pub fn draw_message_menu(frame: &mut Frame, area: Rect, menu: &MessageMenu, theme: &Theme) {
@@ -274,24 +253,26 @@ pub fn draw_message_menu(frame: &mut Frame, area: Rect, menu: &MessageMenu, them
         rect,
     );
 
-    let inner = Rect::new(
-        rect.x.saturating_add(1),
-        rect.y.saturating_add(1),
-        rect.width.saturating_sub(2),
-        rect.height.saturating_sub(2),
-    );
     for (index, action) in menu.actions().iter().enumerate() {
+        let Some(row_rect) = message_menu_row_rect(area, menu, index) else {
+            continue;
+        };
         let hovered = menu.hover == Some(index);
         let pressed = menu.pressed == Some(index);
         let selected = menu.selected == index;
-        let style = if !action.enabled() {
-            Style::new().fg(theme.text.dim)
-        } else if pressed {
-            button_style(true, true, theme)
-        } else if hovered || selected {
-            button_style(true, false, theme).fg(theme.text.bright)
-        } else {
-            Style::new().fg(theme.text.primary)
+        // 优先级与配色全部来自统一按钮模型（spec §5.2）：
+        // Disabled > Pressed > Hovered > Focused > Idle。
+        let visual = ButtonVisual::derive(action.enabled(), selected, hovered, pressed);
+        let style = match visual.state() {
+            ButtonState::Disabled => visual.foreground(theme),
+            ButtonState::Pressed | ButtonState::Hovered => visual
+                .surface_style(theme, Color::Reset)
+                .fg(theme.text.bright),
+            // 键盘选中但没悬停 → Focused 档，用和 Workspace 列表一致的选中底色。
+            ButtonState::Idle if visual.focused() => visual
+                .surface_style(theme, theme.chrome.selection)
+                .fg(theme.text.bright),
+            ButtonState::Idle => visual.foreground(theme),
         };
         let marker = if selected && action.enabled() {
             "▸"
@@ -308,15 +289,7 @@ pub fn draw_message_menu(frame: &mut Frame, area: Rect, menu: &MessageMenu, them
             Span::styled(action.label(), style),
             Span::styled(suffix, Style::new().fg(theme.text.dim)),
         ]);
-        frame.render_widget(
-            Paragraph::new(line).style(style),
-            Rect::new(
-                inner.x,
-                inner.y.saturating_add(index as u16),
-                inner.width,
-                1,
-            ),
-        );
+        frame.render_widget(Paragraph::new(line).style(style), row_rect);
     }
 }
 
@@ -330,19 +303,24 @@ pub fn draw_scrollbar(
     offset: usize,
     theme: &Theme,
 ) {
-    if area.width == 0 || area.height == 0 || total <= viewport_height {
+    if area.width == 0 || area.height == 0 {
         return;
     }
-
-    let height = usize::from(area.height);
-    let top = crate::ui::viewport_top(total, viewport_height, follow, offset);
-    let (thumb_top, thumb_height) = scrollbar_thumb(total, viewport_height, height, top);
+    let track = Rect::new(
+        area.x.saturating_add(area.width.saturating_sub(1)),
+        area.y,
+        1,
+        area.height,
+    );
+    let Some(metrics) = ScrollbarMetrics::new(track, total, viewport_height, follow, offset) else {
+        return;
+    };
 
     let track_style = Style::new().fg(theme.chrome.border);
     let thumb_style = Style::new().fg(theme.text.secondary);
-    let lines: Vec<Line<'static>> = (0..height)
+    let lines: Vec<Line<'static>> = (0..usize::from(metrics.track.height))
         .map(|row| {
-            if row >= thumb_top && row < thumb_top.saturating_add(thumb_height) {
+            if row >= metrics.thumb_top && row < metrics.thumb_top + metrics.thumb_height {
                 Line::from(Span::styled("┃", thumb_style))
             } else {
                 Line::from(Span::styled("│", track_style))
@@ -350,41 +328,7 @@ pub fn draw_scrollbar(
         })
         .collect();
 
-    frame.render_widget(
-        Paragraph::new(lines),
-        Rect::new(
-            area.x.saturating_add(area.width.saturating_sub(1)),
-            area.y,
-            1,
-            area.height,
-        ),
-    );
-}
-
-fn scrollbar_thumb(
-    total: usize,
-    viewport_height: usize,
-    track_height: usize,
-    top: usize,
-) -> (usize, usize) {
-    if track_height == 0 || total == 0 || viewport_height == 0 {
-        return (0, 0);
-    }
-    let thumb_height = track_height
-        .saturating_mul(viewport_height)
-        .checked_div(total)
-        .unwrap_or(1)
-        .clamp(1, track_height);
-    let max_top = total.saturating_sub(viewport_height);
-    let thumb_top = if max_top == 0 {
-        0
-    } else {
-        top.saturating_mul(track_height.saturating_sub(thumb_height))
-            .checked_div(max_top)
-            .unwrap_or(0)
-    }
-    .min(track_height.saturating_sub(thumb_height));
-    (thumb_top, thumb_height)
+    frame.render_widget(Paragraph::new(lines), track);
 }
 
 #[cfg(test)]
@@ -402,21 +346,6 @@ mod tests {
     }
 
     #[test]
-    fn hit_test_matches_rendered_rect() {
-        let area = Rect::new(2, 3, 60, 20);
-        let rect = back_to_latest_rect(area).expect("button");
-        assert_eq!(hit_test(area, rect.x, rect.y), Some(Hit::BackToLatest));
-        assert_eq!(
-            hit_test(
-                area,
-                rect.x.saturating_add(rect.width),
-                rect.y.saturating_add(rect.height)
-            ),
-            None
-        );
-    }
-
-    #[test]
     fn tiny_area_has_no_button() {
         assert!(back_to_latest_rect(Rect::new(0, 0, 7, 10)).is_none());
         assert!(back_to_latest_rect(Rect::new(0, 0, 20, 2)).is_none());
@@ -424,44 +353,18 @@ mod tests {
 
     #[test]
     fn scrollbar_thumb_stays_inside_track() {
-        let (top, height) = scrollbar_thumb(1_000, 20, 20, 0);
-        assert_eq!(top, 0);
-        assert_eq!(height, 1);
+        let track = Rect::new(0, 0, 1, 20);
+        let top = ScrollbarMetrics::new(track, 1_000, 20, false, 980).expect("metrics");
+        assert_eq!(top.thumb_top, 0);
+        assert_eq!(top.thumb_height, 1);
 
-        let (top, height) = scrollbar_thumb(1_000, 20, 20, 980);
-        assert_eq!(top, 19);
-        assert_eq!(height, 1);
+        let bottom = ScrollbarMetrics::new(track, 1_000, 20, false, 0).expect("metrics");
+        assert_eq!(bottom.thumb_top, 19);
+        assert_eq!(bottom.thumb_height, 1);
 
-        let (top, height) = scrollbar_thumb(100, 50, 20, 25);
-        assert_eq!(height, 10);
-        assert_eq!(top, 5);
-    }
-
-    #[test]
-    fn message_menu_hit_only_returns_enabled_rows() {
-        let area = Rect::new(0, 0, 80, 24);
-        let menu = MessageMenu::new(
-            "turn".into(),
-            "block".into(),
-            MessageRole::Assistant,
-            Position::new(10, 5),
-        );
-        let rect = message_menu_rect(area, &menu);
-
-        assert_eq!(
-            message_menu_hit_test(area, &menu, rect.x + 2, rect.y + 1),
-            Some(0)
-        );
-        assert_eq!(
-            message_menu_hit_test(area, &menu, rect.x + 2, rect.y + 2),
-            None,
-            "retry is disabled"
-        );
-        assert_eq!(
-            message_menu_hit_test(area, &menu, rect.x + 2, rect.y + 3),
-            None,
-            "fork is disabled"
-        );
+        let middle = ScrollbarMetrics::new(track, 100, 50, false, 25).expect("metrics");
+        assert_eq!(middle.thumb_height, 10);
+        assert_eq!(middle.thumb_top, 5);
     }
 
     #[test]

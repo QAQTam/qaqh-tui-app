@@ -54,6 +54,12 @@ pub const SLASH_COMMANDS: &[SlashDef] = &[
         surface: SlashSurface::Workspace,
     },
     SlashDef {
+        name: "subagents",
+        desc: "子代理与 inbox",
+        hint: "/subagents  查看 Team roster、未读 inbox 与子代理 transcript",
+        surface: SlashSurface::Workspace,
+    },
+    SlashDef {
         name: "workspace",
         desc: "todo / 工作区",
         hint: "/workspace  打开 todo Workspace",
@@ -80,6 +86,7 @@ pub enum SlashCmd {
     Sessions,
     Settings,
     History,
+    Subagents,
     Workspace,
     Clear,
     Export { path: Option<String> },
@@ -121,6 +128,7 @@ pub fn parse(input: &str) -> Option<SlashCmd> {
         "sessions" => Some(SlashCmd::Sessions),
         "settings" => Some(SlashCmd::Settings),
         "history" => Some(SlashCmd::History),
+        "subagents" => Some(SlashCmd::Subagents),
         "workspace" => Some(SlashCmd::Workspace),
         "clear" => Some(SlashCmd::Clear),
         "export" => {
