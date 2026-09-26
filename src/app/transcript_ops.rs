@@ -3,6 +3,42 @@
 use super::*;
 
 impl App {
+    /// 切换指定工具卡正文；鼠标和键盘共用此语义入口。
+    pub fn toggle_tool_expanded(&mut self, block_id: &str) -> bool {
+        let Some(seed) = self.active_seed() else {
+            return false;
+        };
+        let changed = self
+            .sessions
+            .get_mut(&seed)
+            .is_some_and(|session| session.toggle_tool_expanded(block_id));
+        if changed {
+            self.force_redraw = true;
+        }
+        changed
+    }
+
+    /// `Alt+E` 键盘路径：切换当前会话最后一张工具卡。
+    pub fn toggle_latest_tool(&mut self) {
+        let Some(seed) = self.active_seed() else {
+            return;
+        };
+        let block_id = self.sessions.get(&seed).and_then(|session| {
+            session
+                .timeline
+                .turns
+                .iter()
+                .rev()
+                .flat_map(|turn| turn.rounds.iter().rev())
+                .flat_map(|round| round.blocks.iter().rev())
+                .find(|block| block.tool.is_some())
+                .map(|block| block.block_id.clone())
+        });
+        if let Some(block_id) = block_id {
+            self.toggle_tool_expanded(&block_id);
+        }
+    }
+
     pub fn send_message(&mut self) {
         if self.reject_if_v2_read_only("发送") {
             return;

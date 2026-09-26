@@ -60,6 +60,11 @@ pub enum AgentTarget {
         block_id: String,
         role: MessageRole,
     },
+    /// 工具卡正文展开/收起。
+    Tool {
+        turn_id: String,
+        block_id: String,
+    },
     MenuAction(MessageAction),
     /// 菜单外框（阻断层）：命中它表示"点在菜单里但不在可执行行上"，
     /// 不得穿透到底下的消息行。

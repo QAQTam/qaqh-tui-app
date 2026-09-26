@@ -2203,6 +2203,10 @@ impl App {
                 }
                 return;
             }
+            Some(GlobalKey::ToggleTool) => {
+                self.toggle_latest_tool();
+                return;
+            }
             Some(GlobalKey::SessionList) => {
                 self.open_session_list();
                 return;

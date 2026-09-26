@@ -232,6 +232,17 @@ fn register_agent_messages(hit_map: &mut HitMapBuilder, body: Rect, view: &Fulls
         let Some(line) = view.transcript.lines.get(start) else {
             continue;
         };
+        let target = match span.kind {
+            SpanKind::Message(role) => PointerTarget::Agent(AgentTarget::Message {
+                turn_id: span.turn_id.clone(),
+                block_id: span.block_id.clone(),
+                role,
+            }),
+            SpanKind::Tool => PointerTarget::Agent(AgentTarget::Tool {
+                turn_id: span.turn_id.clone(),
+                block_id: span.block_id.clone(),
+            }),
+        };
         let rect = Rect::new(
             clip.x,
             clip.y.saturating_add((start - view.visible_start) as u16),
@@ -241,11 +252,7 @@ fn register_agent_messages(hit_map: &mut HitMapBuilder, body: Rect, view: &Fulls
         if let Some(region) = line_region(
             rect,
             clip,
-            PointerTarget::Agent(AgentTarget::Message {
-                turn_id: span.turn_id.clone(),
-                block_id: span.block_id.clone(),
-                role: span.role,
-            }),
+            target,
             MouseButton::Left,
             true,
             z::AGENT_MESSAGE,
@@ -567,11 +574,17 @@ pub(super) struct FullscreenTranscriptCache {
     pub(super) render_misses: usize,
 }
 
+#[derive(Debug, Clone, Copy)]
+enum SpanKind {
+    Message(MessageRole),
+    Tool,
+}
+
 #[derive(Debug, Clone)]
 struct FullscreenBlockSpan {
     turn_id: String,
     block_id: String,
-    role: MessageRole,
+    kind: SpanKind,
     start: usize,
     end: usize,
 }
@@ -581,6 +594,7 @@ struct FullscreenTranscriptKey {
     seed: String,
     version: u64,
     width: u16,
+    expanded_tools_revision: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -614,6 +628,7 @@ impl FullscreenTranscriptCache {
             seed: session.seed.clone(),
             version: session.timeline.version,
             width,
+            expanded_tools_revision: session.expanded_tools_revision,
         };
         if self.key.as_ref() == Some(&key) {
             return;
@@ -622,13 +637,14 @@ impl FullscreenTranscriptCache {
         // Live reasoning 仍在 composer 上方单独显示，避免“单行思考链”在历史区
         // 重复；其余 live block（尤其流式 assistant）必须进入全屏历史，否则全屏
         // 模式下只能看到最后一行。
-        let blocks: Vec<_> = adapter::from_turns(&session.timeline.turns)
-            .into_iter()
-            .filter(|block| {
-                !(block.state == BlockState::Live
-                    && matches!(block.kind, BlockKind::Thinking { .. }))
-            })
-            .collect();
+        let blocks: Vec<_> =
+            adapter::from_turns_with_expanded(&session.timeline.turns, &session.expanded_tools)
+                .into_iter()
+                .filter(|block| {
+                    !(block.state == BlockState::Live
+                        && matches!(block.kind, BlockKind::Thinking { .. }))
+                })
+                .collect();
 
         let mut used = HashSet::with_capacity(blocks.len());
         let mut spans = Vec::with_capacity(blocks.len());
@@ -648,14 +664,16 @@ impl FullscreenTranscriptCache {
                 crate::ui::v2::transcript::render_block(block, usize::from(width), theme)
             });
             lines.extend(rendered.iter().cloned());
+            let kind = match &block.kind {
+                BlockKind::User { .. } => SpanKind::Message(MessageRole::User),
+                BlockKind::Assistant { .. } => SpanKind::Message(MessageRole::Assistant),
+                BlockKind::Tool(_) => SpanKind::Tool,
+                _ => continue,
+            };
             spans.push(FullscreenBlockSpan {
                 turn_id: block.turn_id.clone(),
                 block_id: block.id.to_string(),
-                role: match block.kind {
-                    BlockKind::User { .. } => MessageRole::User,
-                    BlockKind::Assistant { .. } => MessageRole::Assistant,
-                    _ => continue,
-                },
+                kind,
                 start,
                 end: lines.len(),
             });

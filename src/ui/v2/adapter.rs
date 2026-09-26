@@ -3,6 +3,8 @@
 //! 适配层是唯一允许同时看到 `timeline_model` 与 V2 block 类型的地方；
 //! renderer 保持纯输入，便于快照和主题矩阵测试。
 
+use std::collections::HashSet;
+
 use crate::app::timeline_model::{Block, ToolCard, Turn};
 use crate::ui::v2::transcript::{
     BlockId, BlockKind, BlockState, ToolBlock, ToolState, TranscriptBlock,
@@ -10,6 +12,13 @@ use crate::ui::v2::transcript::{
 use qaqh_client::{TimelineBlockKind, TimelineBlockState, TimelineToolState};
 
 pub fn from_turns(turns: &[Turn]) -> Vec<TranscriptBlock> {
+    from_turns_with_expanded(turns, &HashSet::new())
+}
+
+pub fn from_turns_with_expanded(
+    turns: &[Turn],
+    expanded_tools: &HashSet<String>,
+) -> Vec<TranscriptBlock> {
     let capacity = turns
         .iter()
         .map(|turn| {
@@ -23,6 +32,11 @@ pub fn from_turns(turns: &[Turn]) -> Vec<TranscriptBlock> {
     let mut blocks = Vec::with_capacity(capacity);
     for turn in turns {
         blocks.extend(from_turn(turn));
+    }
+    for block in &mut blocks {
+        if let BlockKind::Tool(tool) = &mut block.kind {
+            tool.expanded = expanded_tools.contains(&block.id.to_string());
+        }
     }
     blocks
 }
@@ -106,6 +120,7 @@ fn from_tool(tool: &ToolCard) -> ToolBlock {
         }),
         duration: None,
         bytes: (tool.progress_bytes_total > 0).then_some(tool.progress_bytes_total),
+        expanded: false,
     }
 }
 
@@ -189,6 +204,43 @@ mod tests {
             "",
         )]));
         assert_eq!(blocks.len(), 1, "only user block remains");
+    }
+
+    #[test]
+    fn expanded_tool_ids_flow_into_the_view_model() {
+        let mut tool_block = block(
+            "tool",
+            TimelineBlockKind::Tool,
+            TimelineBlockState::Sealed,
+            "",
+        );
+        tool_block.tool = Some(ToolCard {
+            tool_call_id: "call".to_string(),
+            name: "exec".to_string(),
+            state: TimelineToolState::Succeeded,
+            summary: Some("cargo test".to_string()),
+            args_json: None,
+            output: Some("output".to_string()),
+            diff: None,
+            progress: String::new(),
+            progress_truncated: false,
+            progress_bytes_total: 0,
+            progress_stream: None,
+            failure: None,
+            permission: None,
+            display: None,
+        });
+        let turns = vec![turn(vec![tool_block])];
+        let expanded = HashSet::from(["tool".to_string()]);
+        let blocks = from_turns_with_expanded(&turns, &expanded);
+        let Some(TranscriptBlock {
+            kind: BlockKind::Tool(tool),
+            ..
+        }) = blocks.get(1)
+        else {
+            panic!("tool block missing");
+        };
+        assert!(tool.expanded);
     }
 
     #[test]

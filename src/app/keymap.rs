@@ -20,6 +20,8 @@ pub(crate) enum GlobalKey {
     ThinkingOverlay,
     /// Alt+W：关闭当前标签（弹 Confirm，实际关闭由 Confirm 分支执行）。
     CloseTab,
+    /// Alt+E：切换当前会话最后一张工具卡正文展开态。
+    ToggleTool,
     /// Ctrl+L：会话列表。
     SessionList,
     /// Ctrl+, / F10：设置面板。
@@ -51,6 +53,9 @@ pub(crate) fn map_global_key(key: &KeyEvent) -> Option<GlobalKey> {
         KeyCode::Char(',') if ctrl => Some(GlobalKey::ToggleSettings),
         KeyCode::Char('w') if key.modifiers.contains(KeyModifiers::ALT) => {
             Some(GlobalKey::CloseTab)
+        }
+        KeyCode::Char('e') if key.modifiers.contains(KeyModifiers::ALT) => {
+            Some(GlobalKey::ToggleTool)
         }
         KeyCode::F(1) => Some(GlobalKey::Help),
         KeyCode::F(4) => Some(GlobalKey::ToggleWorkspace),
@@ -164,6 +169,19 @@ mod tests {
         assert_eq!(
             map_global_key(&key(KeyCode::Char('w'), KeyModifiers::CONTROL)),
             None
+        );
+    }
+
+    #[test]
+    fn alt_e_toggles_tool_without_stealing_ctrl_e() {
+        assert_eq!(
+            map_global_key(&key(KeyCode::Char('e'), KeyModifiers::ALT)),
+            Some(GlobalKey::ToggleTool)
+        );
+        assert_eq!(
+            map_global_key(&key(KeyCode::Char('e'), KeyModifiers::CONTROL)),
+            None,
+            "Ctrl+E 仍归 composer 的压缩动作"
         );
     }
 

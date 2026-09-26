@@ -82,6 +82,8 @@ pub struct ToolBlock {
     pub failure: Option<String>,
     pub duration: Option<Duration>,
     pub bytes: Option<u64>,
+    /// 用户显式展开后显示完整正文；默认仍保持终态卡的前后文折叠。
+    pub expanded: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -519,7 +521,9 @@ fn render_tool_body(
     }
 
     let running = tool.state.is_running();
-    let (selected, folded) = if running {
+    let (selected, folded) = if tool.expanded {
+        (source.clone(), 0)
+    } else if running {
         let start = source.len().saturating_sub(TOOL_BODY_RUNNING_TAIL);
         (source[start..].to_vec(), 0)
     } else if source.len() <= TOOL_BODY_EDGE * 2 {
@@ -538,7 +542,10 @@ fn render_tool_body(
             out.push(Line::from(vec![
                 Span::styled("    ".to_string(), fg(theme.text.dim)),
                 Span::styled(
-                    format!("{}折叠 {folded} 行{}", theme.glyph.fold, theme.glyph.fold),
+                    format!(
+                        "{}折叠 {folded} 行{}（点击展开）",
+                        theme.glyph.fold, theme.glyph.fold
+                    ),
                     fg(theme.text.dim),
                 ),
             ]));
@@ -754,6 +761,7 @@ mod tests {
             failure: None,
             duration: Some(Duration::from_millis(40)),
             bytes: Some(96),
+            expanded: false,
         };
         let text = text_of(&render_block(
             &TranscriptBlock::new("t1", BlockKind::Tool(tool)),
@@ -783,6 +791,7 @@ mod tests {
             failure: None,
             duration: Some(Duration::from_millis(500)),
             bytes: None,
+            expanded: false,
         };
         let text = text_of(&render_block(
             &TranscriptBlock::new("t2", BlockKind::Tool(tool)),
@@ -806,6 +815,7 @@ mod tests {
             failure: Some("exit 1".into()),
             duration: Some(Duration::from_millis(900)),
             bytes: None,
+            expanded: false,
         };
         let text = text_of(&render_block(
             &TranscriptBlock::new("t3", BlockKind::Tool(tool)),
@@ -831,6 +841,7 @@ mod tests {
             failure: None,
             duration: None,
             bytes: None,
+            expanded: false,
         };
         let text = text_of(&render_block(
             &TranscriptBlock::new("t1", BlockKind::Tool(tool)),
@@ -857,6 +868,29 @@ mod tests {
     }
 
     #[test]
+    fn expanded_tool_body_reveals_the_folded_middle() {
+        let tool = ToolBlock {
+            name: "exec".to_string(),
+            summary: Some("cargo test".to_string()),
+            state: ToolState::Success,
+            output: Some("one\ntwo\nthree\nfour\nfive\nsix\nseven\neight".to_string()),
+            diff: None,
+            progress: None,
+            failure: None,
+            duration: None,
+            bytes: None,
+            expanded: true,
+        };
+        let text = text_of(&render_block(
+            &TranscriptBlock::new("tool-expanded", BlockKind::Tool(tool)),
+            60,
+            &theme(),
+        ));
+        assert!(text.contains("four"), "展开后必须看到中段：\n{text}");
+        assert!(!text.contains("折叠 2 行"), "展开态不应再画折叠提示");
+    }
+
+    #[test]
     fn tool_failure_is_inline_and_fold_is_visible() {
         let tool = ToolBlock {
             name: "exec".to_string(),
@@ -868,6 +902,7 @@ mod tests {
             failure: Some("exit 1".to_string()),
             duration: Some(Duration::from_millis(1200)),
             bytes: Some(18 * 1024),
+            expanded: false,
         };
         let block = TranscriptBlock::new("tool1", BlockKind::Tool(tool));
         let text = text_of(&render_block(&block, 60, &theme()));
@@ -982,6 +1017,7 @@ mod tests {
                     failure: None,
                     duration: Some(Duration::from_millis(800)),
                     bytes: Some(1024),
+                    expanded: false,
                 }),
             ),
             TranscriptBlock::new(

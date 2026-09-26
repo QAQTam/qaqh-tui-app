@@ -485,6 +485,10 @@ pub struct SessionState {
     pub last_error: Option<DomainError>,
     pub composer: Composer,
     pub scroll: ScrollState,
+    /// 用户显式展开的工具卡 block id。
+    pub expanded_tools: HashSet<String>,
+    /// 展开态版本；渲染缓存用它失效。
+    pub expanded_tools_revision: u64,
     /// bootstrap / re-baseline 是否已就绪。
     pub ready: bool,
     /// 加载更早：in-flight 去重。
@@ -517,9 +521,29 @@ impl SessionState {
                 follow: true,
                 offset: 0,
             },
+            expanded_tools: HashSet::new(),
+            expanded_tools_revision: 0,
             ready: false,
             loading_older: false,
         }
+    }
+
+    /// 切换工具卡展开态；只有真实存在的 tool block 才能改状态。
+    pub fn toggle_tool_expanded(&mut self, block_id: &str) -> bool {
+        let exists = self.timeline.turns.iter().any(|turn| {
+            turn.rounds
+                .iter()
+                .flat_map(|round| &round.blocks)
+                .any(|block| block.block_id == block_id && block.tool.is_some())
+        });
+        if !exists {
+            return false;
+        }
+        if !self.expanded_tools.remove(block_id) {
+            self.expanded_tools.insert(block_id.to_owned());
+        }
+        self.expanded_tools_revision = self.expanded_tools_revision.wrapping_add(1);
+        true
     }
 
     pub fn display_model(&self) -> Option<String> {
@@ -842,6 +866,55 @@ mod tests {
             armed_at,
         });
         session
+    }
+
+    #[test]
+    fn tool_expansion_toggles_only_existing_tool_blocks() {
+        use crate::app::timeline_model::{Block, Round, ToolCard};
+        use qaqh_client::{TimelineBlockKind, TimelineBlockState, TimelineToolState};
+
+        let mut s = SessionState::new("seed".into());
+        let mut turn = turn("t1", TimelineTurnState::Running);
+        turn.rounds.push(Round {
+            round_num: 0,
+            sealed: false,
+            is_final: false,
+            blocks: vec![Block {
+                block_id: "tool".into(),
+                block_order: 0,
+                kind: TimelineBlockKind::Tool,
+                state: TimelineBlockState::Sealed,
+                text: String::new(),
+                tool: Some(ToolCard {
+                    tool_call_id: "call".into(),
+                    name: "exec".into(),
+                    state: TimelineToolState::Succeeded,
+                    summary: Some("cargo test".into()),
+                    args_json: None,
+                    output: Some("one\ntwo\nthree\nfour\nfive\nsix\nseven\neight".into()),
+                    diff: None,
+                    progress: String::new(),
+                    progress_truncated: false,
+                    progress_bytes_total: 0,
+                    progress_stream: None,
+                    failure: None,
+                    permission: None,
+                    display: None,
+                }),
+                last_fragment: 0,
+                rev: 1,
+            }],
+        });
+        s.timeline.turns = vec![turn];
+
+        assert!(s.toggle_tool_expanded("tool"));
+        assert!(s.expanded_tools.contains("tool"));
+        assert_eq!(s.expanded_tools_revision, 1);
+        assert!(s.toggle_tool_expanded("tool"));
+        assert!(!s.expanded_tools.contains("tool"));
+        assert_eq!(s.expanded_tools_revision, 2);
+        assert!(!s.toggle_tool_expanded("missing"));
+        assert_eq!(s.expanded_tools_revision, 2, "未知 block 不得改版本");
     }
 
     #[test]

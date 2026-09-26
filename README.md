@@ -68,12 +68,13 @@ ask_user 采用阻塞式单题分页：`←/→` 切题，`↑/↓` 移动选项
 
 | 区域 | 说明 |
 |---|---|
-| transcript | timeline 权威投影：回合 → 块（text / reasoning 折叠 / 工具卡） |
+| transcript | timeline 权威投影：回合 → 块（text / reasoning 折叠 / 工具卡；`Alt+E` 切换最近工具卡，点击卡片正文切换当前卡） |
 | Workspace | F4 打开 todo / 最近改动 / 会话 / 设置 / 帮助工作区 |
 | composer | Enter 发送 · Ctrl+P 模式 · Ctrl+A 附件 · Ctrl+Y 撤销回合 · Ctrl+E 压缩 |
 | 状态栏 | 连接相位 + epoch · toast · token 用量与上下文占比 · 活动 · 时钟 |
 
 全局：Ctrl+T 思考回放（当前回合）· Ctrl+N 新建会话 · Alt+W 关闭标签（会话保留）·
+Alt+E 展开/收起最近工具卡 ·
 Ctrl+L 会话列表（恢复/归档/删除，D 删除需确认）· Ctrl+, 配置面板 · F1 帮助 ·
 Ctrl+C×2 / Ctrl+Q 退出。
 思考回放浮层：↑↓/PgUp/PgDn 滚动 · `e` 交给 `$PAGER` 全文浏览（默认 `less -R`）· Esc 关闭。

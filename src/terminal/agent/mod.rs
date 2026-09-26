@@ -653,6 +653,11 @@ fn dispatch_pointer_action(
                     frames.invalidate();
                 }
             }
+            PointerTarget::Agent(AgentTarget::Tool { block_id, .. }) => {
+                if app.toggle_tool_expanded(&block_id) {
+                    frames.invalidate();
+                }
+            }
             PointerTarget::Agent(AgentTarget::Message { .. }) => {
                 // Message rows open their menu on press; a stale release is a no-op.
             }
@@ -1343,7 +1348,7 @@ fn shortcuts_line(app: &App, width: u16, theme: &Theme) -> Line<'static> {
     } else if has_attachment {
         " Enter 发送 · Ctrl+A 附件 · Ctrl+Y 撤销 · F1 帮助"
     } else if app.active_session().is_some() {
-        " Enter 发送 · Alt+Enter 换行 · Ctrl+P 模式 · Ctrl+L 会话 · F1 帮助"
+        " Enter 发送 · Alt+E 展开工具 · Ctrl+P 模式 · Ctrl+L 会话 · F1 帮助"
     } else {
         " Ctrl+N 新建 · Ctrl+L 会话 · F1 帮助 · Ctrl+Q 退出"
     };
@@ -1445,6 +1450,47 @@ mod tests {
                     state: TimelineBlockState::Sealed,
                     text: "answer".to_string(),
                     tool: None,
+                },
+            },
+        ));
+        model
+    }
+
+    fn model_with_tool_card() -> TimelineModel {
+        let mut model = TimelineModel::default();
+        model.apply(&entry(
+            1,
+            "turn-tool",
+            TimelineEvent::TurnOpened {
+                user_text: "run tests".to_string(),
+            },
+        ));
+        model.apply(&entry(
+            2,
+            "turn-tool",
+            TimelineEvent::BlockOpened {
+                block: TimelineBlock {
+                    block_id: "tool-1".to_string(),
+                    block_order: 0,
+                    kind: TimelineBlockKind::Tool,
+                    state: TimelineBlockState::Sealed,
+                    text: String::new(),
+                    tool: Some(qaqh_client::TimelineTool {
+                        tool_call_id: "call-1".to_string(),
+                        name: "exec".to_string(),
+                        state: qaqh_client::TimelineToolState::Succeeded,
+                        summary: Some("cargo test".to_string()),
+                        args_json: None,
+                        output: Some("one\ntwo\nthree\nfour\nfive\nsix\nseven\neight".to_string()),
+                        diff: None,
+                        progress: String::new(),
+                        progress_truncated: false,
+                        progress_stream: None,
+                        progress_bytes_total: 0,
+                        display: None,
+                        failure: None,
+                        permission: None,
+                    }),
                 },
             },
         ));
@@ -1783,6 +1829,69 @@ mod tests {
                     role: MessageRole::Assistant,
                 })),
             "贴底时应能看到最后一个回合的回复"
+        );
+    }
+
+    #[test]
+    fn alt_e_toggles_latest_tool_card() {
+        let mut app = app_with_model(model_with_tool_card());
+        app.show_workspace = false;
+        app.handle(AppMsg::Key(KeyEvent::new(
+            KeyCode::Char('e'),
+            KeyModifiers::ALT,
+        )));
+        assert!(
+            app.sessions["seed-1"].expanded_tools.contains("tool-1"),
+            "Alt+E must provide the keyboard path before mouse wiring"
+        );
+    }
+
+    #[test]
+    fn tool_card_click_toggles_expansion_via_presented_frame() {
+        let mut app = app_with_model(model_with_tool_card());
+        app.show_workspace = false;
+        let mut view = FullscreenView::default();
+        let mut frames = publish_frame(&app, &mut view, 80, 24);
+        let target = frames
+            .current()
+            .expect("published frame")
+            .regions
+            .iter()
+            .find_map(|region| match &region.target {
+                PointerTarget::Agent(AgentTarget::Tool { block_id, .. })
+                    if block_id == "tool-1" =>
+                {
+                    Some((region.target.clone(), region.rect))
+                }
+                _ => None,
+            })
+            .expect("tool card must be registered");
+        assert_target_reachable(frames.current().unwrap(), &target.0);
+
+        let (column, row) = (target.1.x + 1, target.1.y);
+        handle_message(
+            &mut app,
+            AppMsg::Mouse(left_mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                column,
+                row,
+            )),
+            &mut frames,
+            &mut view,
+        );
+        handle_message(
+            &mut app,
+            AppMsg::Mouse(left_mouse(
+                MouseEventKind::Up(MouseButton::Left),
+                column,
+                row,
+            )),
+            &mut frames,
+            &mut view,
+        );
+        assert!(
+            app.sessions["seed-1"].expanded_tools.contains("tool-1"),
+            "click must toggle the tool card through the same App path"
         );
     }
 
