@@ -475,6 +475,9 @@ fn sync_pointer_visual(app: &mut App, fullscreen_view: &mut FullscreenView) {
     let back = PointerTarget::Agent(AgentTarget::BackToLatest);
     fullscreen_view.pointer.back_to_latest_hover = visual.hovered.as_ref() == Some(&back);
     fullscreen_view.pointer.back_to_latest_pressed = visual.pressed.as_ref() == Some(&back);
+    let load_older = PointerTarget::Agent(AgentTarget::LoadOlder);
+    fullscreen_view.pointer.load_older_hover = visual.hovered.as_ref() == Some(&load_older);
+    fullscreen_view.pointer.load_older_pressed = visual.pressed.as_ref() == Some(&load_older);
 
     let menu_hover = visual
         .hovered
@@ -638,6 +641,10 @@ fn dispatch_pointer_action(
             }
             PointerTarget::Agent(AgentTarget::BackToLatest) => {
                 app.scroll_bottom();
+                frames.invalidate();
+            }
+            PointerTarget::Agent(AgentTarget::LoadOlder) => {
+                app.load_older();
                 frames.invalidate();
             }
             PointerTarget::Agent(AgentTarget::MenuAction(action)) => {
@@ -1581,6 +1588,7 @@ mod tests {
             pointer: FullscreenState {
                 back_to_latest_hover: true,
                 back_to_latest_pressed: false,
+                ..Default::default()
             },
             ..Default::default()
         };
@@ -2209,6 +2217,54 @@ mod tests {
     }
 
     /// 菜单与「回到最新」按钮重叠时，菜单必须赢——z 层级而不是绘制顺序决定命中。
+    #[tokio::test]
+    async fn load_older_button_is_clickable_and_starts_pagination() {
+        let mut app = app_with_model(model_with_many_sealed_turns(3));
+        app.show_workspace = false;
+        {
+            let session = app.sessions.get_mut("seed-1").expect("session");
+            session.timeline.has_more = true;
+            session.timeline.turns[0].turn_index = Some(0);
+        }
+        let mut view = FullscreenView::default();
+        let mut frames = publish_frame(&app, &mut view, 80, 24);
+        let target = PointerTarget::Agent(AgentTarget::LoadOlder);
+        assert_target_reachable(frames.current().unwrap(), &target);
+        let rect = frames
+            .current()
+            .unwrap()
+            .regions
+            .iter()
+            .find(|region| region.target == target)
+            .expect("load older region")
+            .rect;
+        let (column, row) = (rect.x + 1, rect.y);
+        handle_message(
+            &mut app,
+            AppMsg::Mouse(left_mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                column,
+                row,
+            )),
+            &mut frames,
+            &mut view,
+        );
+        handle_message(
+            &mut app,
+            AppMsg::Mouse(left_mouse(
+                MouseEventKind::Up(MouseButton::Left),
+                column,
+                row,
+            )),
+            &mut frames,
+            &mut view,
+        );
+        assert!(
+            app.sessions["seed-1"].loading_older,
+            "clicking the top entry must start the same pagination path as PgUp"
+        );
+    }
+
     #[test]
     fn agent_menu_wins_over_back_to_latest_when_they_overlap() {
         let mut app = app_with_model(model_with_many_sealed_turns(30));
@@ -2638,6 +2694,7 @@ mod tests {
             pointer: FullscreenState {
                 back_to_latest_hover: true,
                 back_to_latest_pressed: true,
+                ..Default::default()
             },
             menu: Some(MessageMenu::new(
                 "turn-1".into(),

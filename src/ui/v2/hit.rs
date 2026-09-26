@@ -55,6 +55,7 @@ pub enum PointerTarget {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AgentTarget {
     BackToLatest,
+    LoadOlder,
     Message {
         turn_id: String,
         block_id: String,

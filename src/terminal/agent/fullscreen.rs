@@ -200,6 +200,36 @@ pub(super) fn draw_fullscreen_agent(
             hit_map.push(region);
         }
     }
+    if let Some(session) = app.active_session() {
+        let loading = session.loading_older;
+        let has_more = session.timeline.has_more;
+        let truncated = session.timeline.truncated_before;
+        if loading || has_more || truncated {
+            let label = if loading {
+                " ⋯ 正在加载更早消息… "
+            } else if has_more {
+                " ↑ 加载更早消息 "
+            } else {
+                " ↑ 更早消息不可用 "
+            };
+            let enabled = has_more && !loading;
+            ui_fullscreen::draw_load_older(frame, body, view.pointer, theme, label, enabled);
+            if enabled
+                && let Some(rect) = ui_fullscreen::load_older_rect(body)
+                && let Some(region) = anchor_region(
+                    rect,
+                    body,
+                    PointerTarget::Agent(AgentTarget::LoadOlder),
+                    MouseButton::Left,
+                    true,
+                    z::AGENT_OVERLAY,
+                    VisualAnchor::non_empty(Position::new(rect.x, rect.y)),
+                )
+            {
+                hit_map.push(region);
+            }
+        }
+    }
     if let Some(menu) = view.menu.as_ref() {
         ui_fullscreen::draw_message_menu(frame, area, menu, theme);
         register_agent_menu(hit_map, area, menu);

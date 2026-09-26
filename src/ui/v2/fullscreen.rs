@@ -22,6 +22,8 @@ const BUTTON_BOTTOM_MARGIN: u16 = 1;
 pub struct FullscreenState {
     pub back_to_latest_hover: bool,
     pub back_to_latest_pressed: bool,
+    pub load_older_hover: bool,
+    pub load_older_pressed: bool,
 }
 
 /// 助手消息上的上下文动作。
@@ -134,6 +136,17 @@ impl MessageMenu {
     }
 }
 
+/// “加载更早消息”按钮的矩形。渲染与 HitMap 登记共用。
+pub fn load_older_rect(area: Rect) -> Option<Rect> {
+    if area.width < 8 || area.height < BUTTON_HEIGHT {
+        return None;
+    }
+    let width = BUTTON_WIDTH.min(area.width.saturating_sub(2)).max(8);
+    let x = area.x.saturating_add(area.width.saturating_sub(width) / 2);
+    let y = area.y.saturating_add(BUTTON_BOTTOM_MARGIN);
+    Some(Rect::new(x, y, width, BUTTON_HEIGHT))
+}
+
 /// “回到最新消息”按钮的矩形。渲染与 HitMap 登记共用。
 pub fn back_to_latest_rect(area: Rect) -> Option<Rect> {
     if area.width < 8 || area.height < BUTTON_HEIGHT {
@@ -159,6 +172,44 @@ fn back_to_latest_style(visual: ButtonVisual, theme: &Theme) -> Style {
     } else {
         style
     }
+}
+
+pub fn draw_load_older(
+    frame: &mut Frame,
+    area: Rect,
+    state: FullscreenState,
+    theme: &Theme,
+    label: &str,
+    enabled: bool,
+) {
+    let Some(rect) = load_older_rect(area) else {
+        return;
+    };
+    let style = ButtonVisual::derive(
+        enabled,
+        false,
+        state.load_older_hover,
+        state.load_older_pressed,
+    )
+    .surface_style(theme, Color::Reset);
+    frame.render_widget(Clear, rect);
+    frame.render_widget(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(style)
+            .style(style),
+        rect,
+    );
+    let inner = Rect::new(
+        rect.x.saturating_add(1),
+        rect.y.saturating_add(1),
+        rect.width.saturating_sub(2),
+        1,
+    );
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(label, style))).alignment(Alignment::Center),
+        inner,
+    );
 }
 
 pub fn draw_back_to_latest(frame: &mut Frame, area: Rect, state: FullscreenState, theme: &Theme) {
@@ -380,6 +431,16 @@ mod tests {
         assert_eq!(menu.selected_action(), MessageAction::CopyMarkdown);
         menu.move_selection(-1);
         assert_eq!(menu.selected_action(), MessageAction::CopyMarkdown);
+    }
+
+    #[test]
+    fn load_older_button_uses_top_centered_geometry() {
+        let area = Rect::new(0, 0, 80, 24);
+        let rect = load_older_rect(area).expect("button");
+        assert_eq!(rect.y, area.y + BUTTON_BOTTOM_MARGIN);
+        assert_eq!(rect.width, BUTTON_WIDTH);
+        assert!(load_older_rect(Rect::new(0, 0, 7, 10)).is_none());
+        assert!(load_older_rect(Rect::new(0, 0, 20, 2)).is_none());
     }
 
     #[test]
