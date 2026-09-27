@@ -228,6 +228,11 @@ pub fn is_absolute_path(p: &str) -> bool {
         let rest = &s[2..];
         return rest.starts_with('\\') || rest.starts_with('/');
     }
+    // POSIX 风格的 / 前缀：daemon 可能在 Linux 侧，/tmp/foo 也算绝对路径
+    // （Windows 的 Path::is_absolute 对它返回 false，这里显式放行）。
+    if s.starts_with('/') || s.starts_with('\\') {
+        return true;
+    }
     if s.starts_with("\\\\") {
         return true;
     }
