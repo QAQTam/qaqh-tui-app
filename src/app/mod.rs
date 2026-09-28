@@ -41,7 +41,7 @@ use qaqh_client::{ContentRef, DomainActivityState as ActivityState, NoticeLevel,
 use qaqh_client::{
     ControlCommand, ConversationCommand, ConversationInputPurpose, RingingCommand, ToolCommand,
 };
-use qaqh_client::{RingingCommandState as CommandState, RingingCommandStatus};
+use qaqh_client::{RingingCommandState as CommandState, ClientV2CommandStatus};
 use qaqh_client::{SessionActivity, SessionListEntry};
 use session::{
     AskPanel, Composer, PermissionPanel, PlanPanel, SessionState, StreamPhase, activity_from_v2,
@@ -89,7 +89,7 @@ pub enum ActionResult {
     CommandAck {
         seed: Option<String>,
         label: &'static str,
-        result: Result<qaqh_client::RingingCommandAck, String>,
+        result: Result<qaqh_client::ClientV2CommandAck, String>,
     },
     SessionList(Result<Vec<SessionListEntry>, String>),
     SessionActivity(Result<Vec<SessionActivity>, String>),
@@ -114,7 +114,7 @@ pub enum ActionResult {
     Receipt {
         label: &'static str,
         seed: Option<String>,
-        result: Result<RingingCommandStatus, String>,
+        result: Result<ClientV2CommandStatus, String>,
     },
     Dashboard {
         seed: String,
@@ -188,7 +188,7 @@ impl ApiCtx {
         seed: Option<&str>,
         command: qaqh_client::RingingCommand,
         options: qaqh_client::CommandOptions,
-    ) -> Result<qaqh_client::RingingCommandAck, String> {
+    ) -> Result<qaqh_client::ClientV2CommandAck, String> {
         self.client()?
             .send_command(seed, command, options)
             .await
@@ -212,7 +212,7 @@ impl ApiCtx {
         &self,
         seed: Option<&str>,
         command: qaqh_client::RingingCommand,
-    ) -> Result<qaqh_client::RingingCommandAck, String> {
+    ) -> Result<qaqh_client::ClientV2CommandAck, String> {
         let command_id = uuid::Uuid::new_v4().to_string();
         let options = qaqh_client::CommandOptions {
             command_id: Some(command_id.clone()),
@@ -323,7 +323,7 @@ impl ApiCtx {
     }
 
     /// 命令回执轮询（ACK ≠ 完成）。
-    pub async fn command_status(&self, command_id: &str) -> Result<RingingCommandStatus, String> {
+    pub async fn command_status(&self, command_id: &str) -> Result<ClientV2CommandStatus, String> {
         self.client()?
             .command_status(command_id)
             .await
@@ -2347,7 +2347,7 @@ pub fn guess_media_type(path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use qaqh_client::{RingingCommandAck, RingingCommandAckStatus, SessionMeta};
+    use qaqh_client::{ClientV2CommandAck, RingingCommandAckStatus, SessionMeta};
 
     fn list_entry(seed: &str, created_at: u64) -> SessionListEntry {
         SessionListEntry {
@@ -2886,13 +2886,14 @@ mod tests {
         );
     }
 
-    fn create_ack(command_id: &str, status: RingingCommandAckStatus) -> RingingCommandAck {
-        RingingCommandAck {
+    fn create_ack(command_id: &str, status: RingingCommandAckStatus) -> ClientV2CommandAck {
+        ClientV2CommandAck {
             command_id: command_id.to_string(),
             status,
             code: Some("rate_limited".into()),
             message: Some("too many sessions".into()),
             retry_after_ms: Some(500),
+            existing: None,
         }
     }
 

@@ -66,7 +66,7 @@ fn main() -> Result<()> {
             println!(
                 "qaqh-tui {} — QAQ-Harness 终端客户端 (qaqh.Ringing v{})",
                 env!("CARGO_PKG_VERSION"),
-                qaqh_client::RINGING_VERSION
+                qaqh_client::RINGING_V2_VERSION
             );
             println!();
             println!("用法:");

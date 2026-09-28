@@ -280,7 +280,7 @@ impl App {
             match result {
                 Ok(_) => {
                     // ACK ≠ 完成：轮询 receipt 到终态（对齐 winui，但消费其结果）。
-                    let mut state: Option<RingingCommandStatus> = None;
+                    let mut state: Option<ClientV2CommandStatus> = None;
                     for _ in 0..30 {
                         tokio::time::sleep(Duration::from_millis(100)).await;
                         if let Ok(status) = api
@@ -302,12 +302,13 @@ impl App {
                     let _ = tx.send(AppMsg::Action(ActionResult::Receipt {
                         label: "撤销回合",
                         seed: Some(seed),
-                        result: Ok(state.unwrap_or(RingingCommandStatus {
+                        result: Ok(state.unwrap_or(ClientV2CommandStatus {
                             command_id: String::new(),
                             state: CommandState::Running,
                             payload_fingerprint: String::new(),
                             terminal_event_id: None,
                             error_code: None,
+                            result: None,
                         })),
                     }));
                 }
