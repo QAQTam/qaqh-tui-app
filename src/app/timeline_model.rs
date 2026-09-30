@@ -5,6 +5,8 @@
 //! 层保证），但 reducer 本身必须对重复应用幂等——undo 后的重取、断点续传的
 //! 回放都可能造成重复条目。
 
+use std::collections::BTreeMap;
+
 use qaqh_client::{
     TimelineBlock, TimelineBlockKind, TimelineBlockState, TimelineEntry, TimelineFailure,
     TimelinePage, TimelineTool, TimelineToolState, TimelineTurn, TimelineTurnState,
@@ -310,6 +312,17 @@ pub struct Turn {
     /// `TimelineAppender::open_turn` 明确容忍原地 reopen，注释里记着实测的 `t14`
     /// 重启重号）。实时追加的回合不带序号（`None`），故取游标时要 `and_then`。
     pub turn_index: Option<u64>,
+    /// 本回合的**权威源 fact 墙钟**（毫秒，来自 v2 信封的 `ts_ms`，beta-readiness
+    /// W1/C3）。
+    ///
+    /// 为什么不在 timeline wire 上取：`TimelineEntry` 根本没有时间字段，唯一的
+    /// 权威墙钟在 canonical v2 信封上。所以这里由 `record_turn_time` 从
+    /// `ConversationDelta::TurnStarted` 的信封时间回填。
+    ///
+    /// `None` = **时间未知**（合成 ephemeral 事件按协议不带 `ts_ms`，历史快照也
+    /// 不携带）。TUI 绝不补本地时钟——本地时钟会把「服务端时间」画成一个看起来
+    /// 同样权威的值。
+    pub started_at_ms: Option<u64>,
     pub user_text: String,
     pub state: TimelineTurnState,
     pub failure: Option<TimelineFailure>,
@@ -336,6 +349,9 @@ impl Turn {
         let mut turn = Self {
             turn_id: t.turn_id,
             turn_index: t.turn_index,
+            // timeline wire 不携带墙钟（见 `Turn::started_at_ms`）：快照回合的
+            // 时间在历史路径上确实不可得，保持未知而不是伪造。
+            started_at_ms: None,
             user_text: t.user_text,
             state: t.state,
             failure: t.failure,
@@ -374,6 +390,23 @@ pub struct TurnTerminal {
     pub state: TimelineTurnState,
 }
 
+/// 一次上下文压缩在 transcript 里的分隔锚点。
+///
+/// 后端 `CompactionApplied`（beta-readiness W3/D10）是 **conversation** 频道事实，
+/// 它说的是「服务端把截至某个 fact 的历史折进摘要」——transcript 侧没有对应的
+/// timeline 条目，所以只能在事件到达的时刻就地打一个锚。
+///
+/// 锚用**回合身份**而不是下标：`cap_turns` 淘汰头部、`prepend_older` 前插历史都会
+/// 让下标漂移，而身份不会。锚点回合被淘汰后，渲染侧把分隔条顶到窗口最前面
+/// （与 webui 同一口径）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompactionMark {
+    /// 锚定在该回合**之后**（`None` = 当时窗口里还没有回合）。
+    pub after_turn_id: Option<String>,
+    /// 权威 `CompactionApplied.context_revision`（去重与诊断用）。
+    pub context_revision: u64,
+}
+
 /// 单会话 transcript 模型。`version` 每次变更自增，用于渲染缓存。
 #[derive(Debug, Clone, Default)]
 pub struct TimelineModel {
@@ -400,11 +433,71 @@ pub struct TimelineModel {
     /// B1 可观测：事件引用的 turn 缺失被丢弃的次数（快照窗口外迟到条目，
     /// re-baseline 自愈；持续增长 = 契约破坏或窗口配置异常）。
     pub dropped_missing_turn: u64,
+    /// W3/D10：本会话已发生的压缩分隔锚（见 [`CompactionMark`]）。
+    pub compaction_marks: Vec<CompactionMark>,
+    /// 信封墙钟比 timeline 条目先到时暂存（回合尚未物化）。
+    ///
+    /// 只存尚未被 `TurnOpened` 兑现的那几个；兑现即移除。快照替换时清空——
+    /// 快照是权威全量，任何「等待回填」的暂存都不该跨代存活。
+    pending_turn_ms: BTreeMap<String, u64>,
 }
 
 impl TimelineModel {
     fn bump(&mut self) {
         self.version += 1;
+    }
+
+    /// 回填一个回合的**权威源 fact 墙钟**（v2 信封 `ts_ms`）。
+    ///
+    /// `None` 是合法输入（合成 ephemeral 事件按协议不带 `ts_ms`）：它表示
+    /// 「时间不可知」，调用方不得退化成 `Instant::now()`。
+    ///
+    /// 回合还没物化（timeline 流尚未 attach / 条目还没到）时暂存，等
+    /// `TurnOpened` 建立回合时兑现——两条独立 SSE 的到达顺序不保证。
+    pub fn record_turn_time(&mut self, turn_id: &str, ts_ms: Option<u64>) {
+        let Some(ts_ms) = ts_ms else {
+            return;
+        };
+        match self.turns.iter_mut().find(|t| t.turn_id == turn_id) {
+            Some(turn) => {
+                if turn.started_at_ms == Some(ts_ms) {
+                    return; // 幂等重放
+                }
+                turn.started_at_ms = Some(ts_ms);
+            }
+            None => {
+                self.pending_turn_ms.insert(turn_id.to_string(), ts_ms);
+            }
+        }
+        self.bump();
+    }
+
+    /// 记录一次上下文压缩（权威 `CompactionApplied.context_revision`）。
+    ///
+    /// 锚定「事件到达时窗口里的最后一个回合之后」——与 webui W3 同口径。同一
+    /// `context_revision` 重复到达（回放 / reset 后重投）按幂等处理。
+    pub fn record_compaction(&mut self, context_revision: u64) {
+        if self
+            .compaction_marks
+            .iter()
+            .any(|mark| mark.context_revision == context_revision)
+        {
+            return;
+        }
+        self.compaction_marks.push(CompactionMark {
+            after_turn_id: self.turns.last().map(|turn| turn.turn_id.clone()),
+            context_revision,
+        });
+        self.bump();
+    }
+
+    /// 某回合的权威墙钟（`None` = 未知）。
+    #[cfg(test)]
+    pub fn turn_started_at_ms(&self, turn_id: &str) -> Option<u64> {
+        self.turns
+            .iter()
+            .find(|turn| turn.turn_id == turn_id)
+            .and_then(|turn| turn.started_at_ms)
     }
 
     fn find_turn_mut(&mut self, turn_id: &str) -> Option<&mut Turn> {
@@ -445,6 +538,10 @@ impl TimelineModel {
                         turn_id: turn_id.to_owned(),
                         // 实时事件不带全局序号：分页游标只服务历史（参见 `Turn::turn_index`）。
                         turn_index: None,
+                        // 信封时间可能比 timeline 条目先到（两条独立 SSE，且
+                        // timeline 需要先 attach）：先到的那个暂存在
+                        // `pending_turn_ms`，在这里兑现。
+                        started_at_ms: self.pending_turn_ms.remove(turn_id),
                         user_text: user_text.clone(),
                         state: TimelineTurnState::Running,
                         failure: None,
@@ -467,11 +564,15 @@ impl TimelineModel {
                 // 内容混在同一回合；且 state 停在终态 → `running_turn_id()` 不认它，
                 // 流式指示与后续收口全部错位（后端称之为「同一族错位症状」）。
                 Some(idx) if self.turns[idx].sealed => {
+                    let pending_ts = self.pending_turn_ms.remove(turn_id);
                     let turn = &mut self.turns[idx];
                     turn.user_text = user_text.clone();
                     turn.state = TimelineTurnState::Running;
                     turn.failure = None;
                     turn.sealed = false;
+                    // 原地 reopen = 新输入复用同一 turn_id：上一个时间戳属于
+                    // 上一轮，必须清掉（新 TurnStarted 会重新回填）。
+                    turn.started_at_ms = pending_ts;
                     turn.thinking = ThinkingStats::default();
                     // 清 rounds 同时丢弃 per-block `last_fragment`——等价于后端
                     // 重置 `next_fragment`，使续流复用块 id 时 seq=0 不被拒。
@@ -674,6 +775,11 @@ impl TimelineModel {
         self.total_turns = page.total_turns;
         self.truncated_before = page.truncated_before;
         self.dropped_turns = page.total_turns.saturating_sub(self.turns.len());
+        // 快照整体替换 = 权威全量。跨代残留的「等待回填」状态必须清掉：
+        // 压缩锚同理（与 webui 一致：快照重载清除分隔），否则旧代的锚会画在
+        // 新一代的回合之间。
+        self.pending_turn_ms.clear();
+        self.compaction_marks.clear();
         self.rebaseline_epoch = self.rebaseline_epoch.saturating_add(1);
         self.bump();
     }
@@ -716,7 +822,7 @@ impl TimelineModel {
 
     /// 内存中回合滑动窗口上限（对照 opencode sync 的 messages limit=100 +
     /// 窗口外裁剪）。超出时从最旧一侧丢弃并置 has_more=true——加载更早仍可用
-    /// （before_turn 锚点取内存窗口首回合，服务端始终是权威历史）。
+    /// （深翻页锚点取内存窗口首回合的 `turn_index`，服务端始终是权威历史）。
     /// 裁剪内存回合窗口至 `max`（**当前无生产调用者**）。
     ///
     /// 保留原因：这是唯一能主动释放 `turns` 的入口，作为极端情况（如 daemon
@@ -813,6 +919,130 @@ mod tests {
         assert_eq!(model.rebaseline_epoch, 1);
         assert_eq!(model.dropped_turns, 0);
         assert_eq!(model.version, version + 1);
+    }
+
+    fn empty_page() -> TimelinePage {
+        TimelinePage {
+            schema: "qaqh.Ringing".into(),
+            version: 1,
+            server_epoch: "ep".into(),
+            session_id: "s".into(),
+            has_more: false,
+            total_turns: 0,
+            truncated_before: false,
+            snapshot: qaqh_client::TimelineSnapshot {
+                watermark: 0,
+                turns: vec![],
+            },
+        }
+    }
+
+    /// 权威墙钟来自 v2 信封（timeline wire 根本没有时间字段），且**不伪造**：
+    /// 缺席保持 `None`，绝不用本地时钟兜底。
+    #[test]
+    fn authoritative_wall_clock_comes_from_the_envelope_and_is_never_faked() {
+        use qaqh_client::TimelineEvent as E;
+        let mut m = TimelineModel::default();
+        m.apply(&entry(
+            1,
+            "t1",
+            E::TurnOpened {
+                user_text: "hi".into(),
+            },
+        ));
+        assert_eq!(m.turns[0].started_at_ms, None, "timeline wire 不带墙钟");
+
+        m.record_turn_time("t1", Some(1_759_000_000_000));
+        assert_eq!(m.turns[0].started_at_ms, Some(1_759_000_000_000));
+        assert_eq!(m.turn_started_at_ms("t1"), Some(1_759_000_000_000));
+
+        // 幂等：重放同一时间不推 version。
+        let version = m.version;
+        m.record_turn_time("t1", Some(1_759_000_000_000));
+        assert_eq!(m.version, version);
+
+        // 无时间戳的合成事件（协议如此）不得把已知时间抹掉，也不得造一个。
+        m.record_turn_time("t1", None);
+        assert_eq!(m.turns[0].started_at_ms, Some(1_759_000_000_000));
+    }
+
+    /// 信封时间早于 timeline 条目时暂存，回合物化时兑现（两条独立 SSE 的乱序）。
+    #[test]
+    fn envelope_time_arriving_before_the_turn_is_applied_on_materialization() {
+        use qaqh_client::TimelineEvent as E;
+        let mut m = TimelineModel::default();
+        m.record_turn_time("t-late", Some(42));
+        assert!(m.turns.is_empty());
+
+        m.apply(&entry(
+            1,
+            "t-late",
+            E::TurnOpened {
+                user_text: "hi".into(),
+            },
+        ));
+        assert_eq!(m.turns[0].started_at_ms, Some(42));
+    }
+
+    /// 快照整体替换是权威全量：跨代暂存与压缩锚都必须清除。
+    #[test]
+    fn snapshot_rebaseline_clears_pending_time_and_compaction_anchors() {
+        use qaqh_client::TimelineEvent as E;
+        let mut m = TimelineModel::default();
+        m.apply(&entry(
+            1,
+            "t1",
+            E::TurnOpened {
+                user_text: "hi".into(),
+            },
+        ));
+        m.record_compaction(3);
+        m.record_turn_time("t-pending", Some(7));
+        assert_eq!(m.compaction_marks.len(), 1);
+
+        m.replace_from_page(&empty_page());
+        assert!(m.compaction_marks.is_empty());
+        assert!(m.turns.is_empty());
+        // 暂存也清了：物化一个同名回合不得再兑现旧代时间。
+        m.apply(&entry(
+            2,
+            "t-pending",
+            E::TurnOpened {
+                user_text: "again".into(),
+            },
+        ));
+        assert_eq!(m.turns[0].started_at_ms, None);
+    }
+
+    /// W3/D10：压缩锚定「事件到达时窗口最后一个回合之后」，按 `context_revision`
+    /// 幂等；锚点回合被淘汰时渲染侧应把分隔条顶到最前。
+    #[test]
+    fn compaction_anchor_follows_the_last_turn_and_is_idempotent() {
+        use qaqh_client::TimelineEvent as E;
+        let mut m = TimelineModel::default();
+        // 窗口里还没有回合：锚为 None（渲染在顶部）。
+        m.record_compaction(1);
+        assert_eq!(m.compaction_marks[0].after_turn_id, None);
+
+        m.apply(&entry(
+            1,
+            "t1",
+            E::TurnOpened {
+                user_text: "one".into(),
+            },
+        ));
+        m.record_compaction(2);
+        assert_eq!(m.compaction_marks[1].after_turn_id.as_deref(), Some("t1"));
+
+        // 回放同一 revision：幂等。
+        let version = m.version;
+        m.record_compaction(2);
+        assert_eq!(m.compaction_marks.len(), 2);
+        assert_eq!(m.version, version);
+
+        // 锚点回合被淘汰后，锚身份仍在（渲染侧据此顶到最前，而不是丢失）。
+        m.cap_turns(0);
+        assert_eq!(m.compaction_marks[1].after_turn_id.as_deref(), Some("t1"));
     }
 
     /// 权威语义：`BlockCheckpoint.arg` 是**增量**，必须**追加**而不是覆盖。

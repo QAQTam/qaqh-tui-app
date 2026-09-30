@@ -1,12 +1,12 @@
 //! 运行时适配层：`qaqh_client::Client` ↔ 本仓 `RuntimeMsg`。
 //!
 //! T-01 阶段一之后，连接生命周期**不再由本仓实现**——open/续租/重新协商、
-//! 三条频道 SSE 流、per-seed timeline 流（含 gap 重定基、epoch 重基线、终止帧
+//! 三条频道 SSE 流、per-session_id timeline 流（含 gap 重定基、epoch 重基线、终止帧
 //! 归一、BOM 剥离、退避重连）全部由 `qaqh-client` 承担。本文件只剩三件事：
 //!
 //! 1. 把 `ClientHandlers` 回调转投为本仓既有的 `RuntimeMsg`（app 层因此几乎
 //!    不用改）；
-//! 2. 把 app 维护的 seed 集合 diff 成 `activate_timeline` / `deactivate_timeline`
+//! 2. 把 app 维护的 session_id 集合 diff 成 `activate_timeline` / `deactivate_timeline`
 //!    调用；
 //! 3. 订阅 `session_ctx`（epoch/client_session_id）向 app 报告连接相位。
 //!
@@ -58,15 +58,15 @@ const STALL_TICK: Duration = Duration::from_secs(1);
 const ATTACH_RETRY_INTERVAL: Duration = Duration::from_millis(400);
 const ATTACH_RETRY_ATTEMPTS: u32 = 75; // ≈30s
 
-/// 流的身份：三条主频道流 + 每个 seed 的 timeline 流。
+/// 流的身份：三条主频道流 + 每个 session_id 的 timeline 流。
 ///
 /// 告警与恢复必须**按流**记账：某条 timeline 流断开的同时另一条频道流恰好重连
 /// 成功，不能把前者的告警当成「一切正常」清掉（反向顺序下文案也会串成后者）。
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum StreamKey {
-    /// 某个 seed 的 canonical v2 单流（control / conversation / tool / … 全在一条上）。
+    /// 某个 session_id 的 canonical v2 单流（control / conversation / tool / … 全在一条上）。
     V2(String),
-    /// 某个 seed 的 timeline 流。
+    /// 某个 session_id 的 timeline 流。
     Timeline(String),
 }
 
@@ -94,9 +94,9 @@ pub enum ConnEvent {
 #[derive(Debug)]
 pub enum RuntimeMsg {
     Conn(ConnEvent),
-    /// 一条 canonical v2 投影事件（每 seed 一条单流）。
+    /// 一条 canonical v2 投影事件（每 session_id 一条单流）。
     V2Event {
-        seed: String,
+        session_id: String,
         event: Box<ClientV2Event>,
     },
     /// v2 单流刚建立（或重连成功）：app 必须重新 bootstrap 该会话。
@@ -106,22 +106,22 @@ pub enum RuntimeMsg {
     /// 事实落盘前 v2 快照是 404/409，流要等到物化后才能连上；这段时间里写入的
     /// 交互请求只能靠这次 bootstrap 补齐。
     V2StreamOpen {
-        seed: String,
+        session_id: String,
     },
     ResetRequired {
-        seed: String,
+        session_id: String,
         reset: Box<qaqh_client::ClientV2Reset>,
     },
     Timeline {
-        seed: String,
+        session_id: String,
         entry: Box<TimelineEntry>,
     },
     TimelineRebaseline {
-        seed: String,
+        session_id: String,
         page: Box<TimelinePage>,
     },
     TimelineLost {
-        seed: String,
+        session_id: String,
         /// **结构化**原因：字符串化会抹掉「404 = 会话真的没了」与「超时/网络
         /// 错 = 会话可能还活着」的区别，app 只能把任何一次抖动都当成消失。
         reason: TimelineLostReason,
@@ -166,7 +166,7 @@ pub struct Runtime {
     /// 「没有连接也要照跑」的路径走 [`Runtime::client_opt`]。
     client: RwLock<Option<Arc<Client>>>,
     msg_tx: mpsc::UnboundedSender<RuntimeMsg>,
-    /// app 当前跟踪的 seed 集（重连后据此恢复 timeline 流）。
+    /// app 当前跟踪的 session_id 集（重连后据此恢复 timeline 流）。
     tracked: std::sync::Mutex<HashSet<String>>,
     /// 重建串行化：并发重建会得到两个 Client、两套 SSE 流。
     rebuilding: AtomicBool,
@@ -245,7 +245,7 @@ impl Runtime {
     /// 当前客户端；没有连接时返回 `None`（只有 [`Runtime::stub_for_test`] 会这样）。
     ///
     /// 给「没有连接也要走完」的路径用：`spawn_api`（任务照起，取用连接时才失败）
-    /// 与 [`Runtime::set_tracked_seeds`]（没有连接就没有 timeline 流可建/可撤）。
+    /// 与 [`Runtime::set_tracked_session_ids`]（没有连接就没有 timeline 流可建/可撤）。
     pub fn client_opt(&self) -> Option<Arc<Client>> {
         self.client.read().expect("client lock").clone()
     }
@@ -271,11 +271,11 @@ impl Runtime {
         })
     }
 
-    /// app 维护的 open 标签页/子代理 seed 集合。
-    pub fn set_tracked_seeds(&self, seeds: Vec<String>) {
+    /// app 维护的 open 标签页/子代理 session_id 集合。
+    pub fn set_tracked_session_ids(&self, session_ids: Vec<String>) {
         let (to_add, to_remove) = {
             let mut guard = self.tracked.lock().expect("tracked lock");
-            let wanted: HashSet<String> = seeds.into_iter().collect();
+            let wanted: HashSet<String> = session_ids.into_iter().collect();
             let add: Vec<String> = wanted.difference(&guard).cloned().collect();
             let remove: Vec<String> = guard.difference(&wanted).cloned().collect();
             *guard = wanted;
@@ -291,11 +291,11 @@ impl Runtime {
         let msg_tx = self.msg_tx.clone();
         let generation = self.generation.load(Ordering::SeqCst);
         tokio::spawn(async move {
-            for seed in to_remove {
-                client.deactivate_timeline(&seed).await;
+            for session_id in to_remove {
+                client.deactivate_timeline(&session_id).await;
             }
-            for seed in to_add {
-                activate_with_attach_retry(&client, &seed, &msg_tx, generation).await;
+            for session_id in to_add {
+                activate_with_attach_retry(&client, &session_id, &msg_tx, generation).await;
             }
         });
     }
@@ -347,10 +347,10 @@ impl Runtime {
             tokio::spawn(watch_session(this, new.clone(), generation));
         }
 
-        // 恢复 timeline：daemon 侧 seed 归属随旧 client_session_id 一起消失，
-        // 必须重新 attach 才能读 seed 域（否则一路 401）。app 会由
+        // 恢复 timeline：daemon 侧 session_id 归属随旧 client_session_id 一起消失，
+        // 必须重新 attach 才能读 session_id 域（否则一路 401）。app 会由
         // `ConnEvent::Ready` 触发它自己的 attach + bootstrap。
-        let seeds: Vec<String> = self
+        let session_ids: Vec<String> = self
             .tracked
             .lock()
             .expect("tracked lock")
@@ -359,27 +359,27 @@ impl Runtime {
             .collect();
         let msg_tx = self.msg_tx.clone();
         tokio::spawn(async move {
-            for seed in seeds {
-                activate_with_attach_retry(&new, &seed, &msg_tx, generation).await;
+            for session_id in session_ids {
+                activate_with_attach_retry(&new, &session_id, &msg_tx, generation).await;
             }
         });
         Ok(())
     }
 }
 
-/// 激活一个 seed 的 timeline；attach 尚未落地时按 401 重试。
+/// 激活一个 session_id 的 timeline；attach 尚未落地时按 401 重试。
 ///
 /// `open_session_tab` 是「发 SessionResume 命令」与「sync_tracked」两条并行的
 /// 路径，激活可能先于 attach 完成——此时 daemon 回 401。旧实现同样以 400ms
 /// 间隔重试直到 attach 落地；这里保留该行为并加一个上限，避免永久重试。
 async fn activate_with_attach_retry(
     client: &Client,
-    seed: &str,
+    session_id: &str,
     msg_tx: &mpsc::UnboundedSender<RuntimeMsg>,
     generation: u64,
 ) {
     for attempt in 0..ATTACH_RETRY_ATTEMPTS {
-        match client.activate_timeline(seed).await {
+        match client.activate_timeline(session_id).await {
             Ok(_) => return, // 快照经 on_timeline_snapshot 转投 TimelineRebaseline
             Err(ClientError::Http { status: 401, .. }) if attempt + 1 < ATTACH_RETRY_ATTEMPTS => {
                 tokio::time::sleep(ATTACH_RETRY_INTERVAL).await;
@@ -387,7 +387,7 @@ async fn activate_with_attach_retry(
             Err(e) => {
                 let _ = generation;
                 let _ = msg_tx.send(RuntimeMsg::TimelineLost {
-                    seed: seed.to_string(),
+                    session_id: session_id.to_string(),
                     reason: TimelineLostReason::from_client_error(&e),
                 });
                 return;
@@ -495,9 +495,9 @@ fn build_handlers(
         on_v2_event: {
             let msg_tx = msg_tx.clone();
             // 类型已权威化：typed payload 直达 app 层，形状对不上是编译错误。
-            Arc::new(move |seed: String, event: ClientV2Event| {
+            Arc::new(move |session_id: String, event: ClientV2Event| {
                 let _ = msg_tx.send(RuntimeMsg::V2Event {
-                    seed,
+                    session_id,
                     event: Box::new(event),
                 });
             })
@@ -505,33 +505,35 @@ fn build_handlers(
         on_v2_status: {
             let last_open = last_open.clone();
             let msg_tx = msg_tx.clone();
-            Arc::new(move |seed: String, status: V2StreamStatus| match status {
-                V2StreamStatus::Open { .. } => {
-                    note_daemon_activity(&last_open);
-                    // 这条流重连成功 → 只撤它自己的告警。
-                    let _ = msg_tx.send(RuntimeMsg::Conn(ConnEvent::StreamRecovered {
-                        stream: StreamKey::V2(seed.clone()),
-                    }));
-                    // 规范顺序 open -> bootstrap -> subscribe：快照不进流，故每次
-                    // 建立/重建流都要让 app 重新 bootstrap 该 seed。
-                    let _ = msg_tx.send(RuntimeMsg::V2StreamOpen { seed });
-                }
-                V2StreamStatus::Reconnecting {
-                    retry_ms, reason, ..
-                } => {
-                    let _ = msg_tx.send(RuntimeMsg::Conn(ConnEvent::StreamIssue {
-                        stream: StreamKey::V2(seed),
-                        error: reconnect_message("v2 流", reason.as_ref(), retry_ms),
-                    }));
-                }
-                V2StreamStatus::Closed { reason } => {
-                    let _ = msg_tx.send(RuntimeMsg::Conn(ConnEvent::StreamIssue {
-                        stream: StreamKey::V2(seed),
-                        error: format!("v2 流已关闭：{reason}"),
-                    }));
-                }
-                V2StreamStatus::Connecting => {}
-            })
+            Arc::new(
+                move |session_id: String, status: V2StreamStatus| match status {
+                    V2StreamStatus::Open { .. } => {
+                        note_daemon_activity(&last_open);
+                        // 这条流重连成功 → 只撤它自己的告警。
+                        let _ = msg_tx.send(RuntimeMsg::Conn(ConnEvent::StreamRecovered {
+                            stream: StreamKey::V2(session_id.clone()),
+                        }));
+                        // 规范顺序 open -> bootstrap -> subscribe：快照不进流，故每次
+                        // 建立/重建流都要让 app 重新 bootstrap 该 session_id。
+                        let _ = msg_tx.send(RuntimeMsg::V2StreamOpen { session_id });
+                    }
+                    V2StreamStatus::Reconnecting {
+                        retry_ms, reason, ..
+                    } => {
+                        let _ = msg_tx.send(RuntimeMsg::Conn(ConnEvent::StreamIssue {
+                            stream: StreamKey::V2(session_id),
+                            error: reconnect_message("v2 流", reason.as_ref(), retry_ms),
+                        }));
+                    }
+                    V2StreamStatus::Closed { reason } => {
+                        let _ = msg_tx.send(RuntimeMsg::Conn(ConnEvent::StreamIssue {
+                            stream: StreamKey::V2(session_id),
+                            error: format!("v2 流已关闭：{reason}"),
+                        }));
+                    }
+                    V2StreamStatus::Connecting => {}
+                },
+            )
         },
         on_liveness: {
             // 唯一的存活信号源：客户端每从 socket 读到一块字节就调一次，
@@ -541,24 +543,28 @@ fn build_handlers(
         },
         on_v2_reset: {
             let msg_tx = msg_tx.clone();
-            Arc::new(move |seed: String, reset: qaqh_client::ClientV2Reset| {
-                // reset → app 标记 rebaseline 并重新 bootstrap；旧 UI 状态保留到
-                // 新 bootstrap 校验通过后再由 reducer 原子替换。
-                let _ = msg_tx.send(RuntimeMsg::ResetRequired {
-                    seed,
-                    reset: Box::new(reset),
-                });
-            })
+            Arc::new(
+                move |session_id: String, reset: qaqh_client::ClientV2Reset| {
+                    // reset → app 标记 rebaseline 并重新 bootstrap；旧 UI 状态保留到
+                    // 新 bootstrap 校验通过后再由 reducer 原子替换。
+                    let _ = msg_tx.send(RuntimeMsg::ResetRequired {
+                        session_id,
+                        reset: Box::new(reset),
+                    });
+                },
+            )
         },
         on_timeline_entry: {
             let msg_tx = msg_tx.clone();
             // 类型已权威化：不再过桥，回调给的就是 `qaqh_client` 的类型。
-            Arc::new(move |seed: String, entry: qaqh_client::TimelineEntry| {
-                let _ = msg_tx.send(RuntimeMsg::Timeline {
-                    seed,
-                    entry: Box::new(entry),
-                });
-            })
+            Arc::new(
+                move |session_id: String, entry: qaqh_client::TimelineEntry| {
+                    let _ = msg_tx.send(RuntimeMsg::Timeline {
+                        session_id,
+                        entry: Box::new(entry),
+                    });
+                },
+            )
         },
         on_timeline_status: {
             let msg_tx = msg_tx.clone();
@@ -566,38 +572,33 @@ fn build_handlers(
                 // 流结束（主动停用 / 客户端关闭）**不等于**会话消失：`reason`
                 // 只是流侧描述，故归入 `Other`——app 不会再据此把子代理标 Closed。
                 // 「会话真的没了」只能由 `activate_timeline` 的 404 证明。
-                TimelineStatus::Closed {
-                    session_id: seed,
-                    reason,
-                } => {
+                TimelineStatus::Closed { session_id, reason } => {
                     let _ = msg_tx.send(RuntimeMsg::TimelineLost {
-                        seed: seed.clone(),
+                        session_id: session_id.clone(),
                         reason: TimelineLostReason::Other(format!("timeline 流结束：{reason}")),
                     });
                     // 这条 timeline 流到此为止（会话被 GC / 停止跟踪），不会再发
                     // `Open`：若不在这里撤掉它的告警，那条告警会永久留在账本里。
                     let _ = msg_tx.send(RuntimeMsg::Conn(ConnEvent::StreamRecovered {
-                        stream: StreamKey::Timeline(seed),
+                        stream: StreamKey::Timeline(session_id),
                     }));
                 }
                 TimelineStatus::Reconnecting {
-                    session_id: seed,
+                    session_id,
                     retry_ms,
                     reason,
                     ..
                 } => {
-                    let label = format!("timeline[{seed}]");
+                    let label = format!("timeline[{session_id}]");
                     let _ = msg_tx.send(RuntimeMsg::Conn(ConnEvent::StreamIssue {
-                        stream: StreamKey::Timeline(seed),
+                        stream: StreamKey::Timeline(session_id),
                         error: reconnect_message(&label, reason.as_ref(), retry_ms),
                     }));
                 }
-                TimelineStatus::Open {
-                    session_id: seed, ..
-                } => {
+                TimelineStatus::Open { session_id, .. } => {
                     // timeline 重连/重定基成功：撤掉它自己的告警。
                     let _ = msg_tx.send(RuntimeMsg::Conn(ConnEvent::StreamRecovered {
-                        stream: StreamKey::Timeline(seed),
+                        stream: StreamKey::Timeline(session_id),
                     }));
                 }
                 _ => {}
@@ -606,9 +607,9 @@ fn build_handlers(
         on_timeline_snapshot: {
             let msg_tx = msg_tx.clone();
             Arc::new(move |page: qaqh_client::TimelinePage| {
-                let seed = page.session_id.clone();
+                let session_id = page.session_id.clone();
                 let _ = msg_tx.send(RuntimeMsg::TimelineRebaseline {
-                    seed,
+                    session_id,
                     page: Box::new(page),
                 });
             })
@@ -646,7 +647,7 @@ mod tests {
 
     /// 阻断项 1 的运行时半边：`Open` 只能为**它自己**那条流发恢复信号。
     ///
-    /// 证伪方式：把 `on_v2_status` 改回「任意 seed 的 Open 都发一个无身份的
+    /// 证伪方式：把 `on_v2_status` 改回「任意 session_id 的 Open 都发一个无身份的
     /// `StreamRecovered`」——下面「A 不得被别人的 Open 恢复」与「恢复信号必须带
     /// B 身份」两条断言同时变红。
     #[test]
@@ -704,10 +705,10 @@ mod tests {
         assert!(terminated.contains("protocol_version"), "{terminated}");
     }
 
-    /// timeline 流的告警/恢复也必须按 seed 记账；被关闭（不再重连）的流要撤销告警，
+    /// timeline 流的告警/恢复也必须按 session_id 记账；被关闭（不再重连）的流要撤销告警，
     /// 否则那条告警会永久留在 app 的账本里。
     #[test]
-    fn timeline_events_are_scoped_to_their_seed() {
+    fn timeline_events_are_scoped_to_their_session_id() {
         let (handlers, mut rx) = handlers_and_rx();
         let a = StreamKey::Timeline("A".into());
         let b = StreamKey::Timeline("B".into());
@@ -740,7 +741,7 @@ mod tests {
         assert!(
             msgs.iter().any(|m| matches!(
                 m,
-                RuntimeMsg::TimelineLost { seed, .. } if seed == "B"
+                RuntimeMsg::TimelineLost { session_id, .. } if session_id == "B"
             )),
             "B 关闭仍要报 TimelineLost：{msgs:?}"
         );

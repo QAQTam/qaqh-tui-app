@@ -15,7 +15,7 @@ use qaqh_client::{TimelineBlockKind, TimelineToolBody, TimelineToolState, Timeli
 pub(crate) fn export_markdown(sess: &SessionState) -> String {
     let mut out = String::new();
     out.push_str("# qaqh 会话导出\n\n");
-    out.push_str(&format!("- 会话：`{}`\n", sess.seed));
+    out.push_str(&format!("- 会话：`{}`\n", sess.session_id));
     out.push_str(&format!(
         "- 回合数：{}（当前窗口内）\n",
         sess.timeline.turns.len()
@@ -44,9 +44,9 @@ pub(crate) fn export_turn_markdown(turn: &Turn, number: usize) -> String {
     out
 }
 
-/// 默认导出路径：`./qaqh-export-{seed 前 8 位}-{时间戳}.md`。
-pub(crate) fn default_export_path(seed: &str) -> std::path::PathBuf {
-    let short: String = seed.chars().take(8).collect();
+/// 默认导出路径：`./qaqh-export-{session_id 前 8 位}-{时间戳}.md`。
+pub(crate) fn default_export_path(session_id: &str) -> std::path::PathBuf {
+    let short: String = session_id.chars().take(8).collect();
     let ts = chrono::Local::now().format("%Y%m%d-%H%M%S");
     std::path::PathBuf::from(format!("qaqh-export-{short}-{ts}.md"))
 }
@@ -329,8 +329,12 @@ mod tests {
         }
     }
 
+    /// 导出夹具用的会话身份：取**规范的 UUID-ish 形状**（首 8 位是纯十六进制），
+    /// 这样 `default_export_path` 的「前 8 位」断言不会因为分隔符落进切片而变味。
+    const SESSION: &str = "abcdef1234567890";
+
     fn sess_with(turns: Vec<Turn>) -> SessionState {
-        let mut s = SessionState::new("seed-abcdef123".to_string());
+        let mut s = SessionState::new(SESSION.to_string());
         s.timeline.turns = turns;
         s
     }
@@ -340,6 +344,7 @@ mod tests {
         let mut t = Turn {
             turn_id: "t1".into(),
             turn_index: Some(1),
+            started_at_ms: None,
             user_text: "修复登录 bug".into(),
             state: TimelineTurnState::Completed,
             failure: None,
@@ -389,7 +394,7 @@ mod tests {
         let md = export_markdown(&sess);
 
         assert!(md.contains("# qaqh 会话导出"), "{md}");
-        assert!(md.contains("- 会话：`seed-abcdef123`"), "{md}");
+        assert!(md.contains("- 会话：`abcdef1234567890`"), "{md}");
         assert!(
             md.contains("## Turn 1 · 已完成 · 思考 3 段/120 行 · 2 工具（1✗）"),
             "回合头聚合：{md}"
@@ -419,9 +424,9 @@ mod tests {
 
     #[test]
     fn default_path_shape() {
-        let p = default_export_path("seed-abcdef123");
+        let p = default_export_path(SESSION);
         let s = p.to_string_lossy().to_string();
-        assert!(s.starts_with("qaqh-export-seed-abc-"), "{s}");
+        assert!(s.starts_with("qaqh-export-abcdef12-"), "{s}");
         assert!(s.ends_with(".md"), "{s}");
     }
 }

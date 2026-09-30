@@ -154,8 +154,8 @@ impl App {
                     selected: 0,
                     filter: String::new(),
                 });
-                if let Some(seed) = self.active_seed() {
-                    self.fetch_team(seed);
+                if let Some(session_id) = self.active_session_id() {
+                    self.fetch_team(session_id);
                 }
                 true
             }
@@ -165,8 +165,8 @@ impl App {
                 }
                 self.slash_selected = 0;
                 self.show_workspace = true;
-                if let Some(seed) = self.active_seed() {
-                    self.fetch_dashboard(seed);
+                if let Some(session_id) = self.active_session_id() {
+                    self.fetch_dashboard(session_id);
                 }
                 true
             }
@@ -213,7 +213,7 @@ impl App {
                 let expanded = crate::app::slash::expand_tilde(p);
                 std::path::PathBuf::from(expanded)
             }
-            None => crate::app::export::default_export_path(&sess.seed),
+            None => crate::app::export::default_export_path(&sess.session_id),
         };
         match std::fs::write(&target, md) {
             Ok(()) => self.toast(NoticeLevel::Info, format!("已导出：{}", target.display())),
@@ -224,7 +224,7 @@ impl App {
     /// `/history` 详情里的「导出此回合」。
     ///
     /// 与详情视图共用 `export_turn_markdown`，所以导出的就是屏幕上看到的那份；
-    /// 默认落到当前目录 `qaqh-turn-{seed 前 8 位}-{序号}-{时间戳}.md`。
+    /// 默认落到当前目录 `qaqh-turn-{session_id 前 8 位}-{序号}-{时间戳}.md`。
     pub(super) fn export_history_turn(&mut self, index: usize) {
         let Some(sess) = self.active_session() else {
             self.toast(NoticeLevel::Error, "无活动会话，无法导出");
@@ -236,7 +236,7 @@ impl App {
         };
         let number = sess.timeline.turn_number(index);
         let md = crate::app::export::export_turn_markdown(turn, number as usize);
-        let short: String = sess.seed.chars().take(8).collect();
+        let short: String = sess.session_id.chars().take(8).collect();
         let ts = chrono::Local::now().format("%Y%m%d-%H%M%S");
         let target = std::path::PathBuf::from(format!("qaqh-turn-{short}-{number}-{ts}.md"));
         match std::fs::write(&target, md) {
@@ -529,11 +529,11 @@ impl App {
             KeyCode::PageUp => self.scroll_up(20),
             KeyCode::PageDown => self.scroll_down(20),
             KeyCode::Char('a') if ctrl => {
-                if let Some(seed) = self.active_seed() {
+                if let Some(session_id) = self.active_session_id() {
                     self.overlays.push(Overlay::AttachPath {
                         input: Vec::new(),
                         cursor: 0,
-                        seed,
+                        session_id,
                     });
                 }
             }
@@ -577,15 +577,18 @@ impl App {
 
     /// 上传附件到 [`AttachSubmit`] 指定的会话。
     ///
-    /// 目标 seed **只**来自 `AttachSubmit`（即 `Overlay::AttachPath` 里存的那个），
-    /// 这里不再查 `active_seed()`——那会让「判据说属于 seed X、执行挂到活动标签」
+    /// 目标 session_id **只**来自 `AttachSubmit`（即 `Overlay::AttachPath` 里存的那个），
+    /// 这里不再查 `active_session_id()`——那会让「判据说属于 session_id X、执行挂到活动标签」
     /// 两条路径相反，切标签后附件落到用户没在看的会话上。
     pub fn upload_attachment(&mut self, submit: AttachSubmit) {
-        let (seed, path) = submit.into_parts();
+        let (session_id, path) = submit.into_parts();
         // 目标会话已关闭：剪枝理论上已经拦住了（关闭标签会剪掉它的 overlay），
         // 这里兜住竞态（overlay 打开期间会话被 daemon 关掉），别静默丢附件。
-        if !self.sessions.contains_key(&seed) {
-            self.toast(NoticeLevel::Error, format!("附件目标会话已关闭：{seed}"));
+        if !self.sessions.contains_key(&session_id) {
+            self.toast(
+                NoticeLevel::Error,
+                format!("附件目标会话已关闭：{session_id}"),
+            );
             return;
         }
         self.spawn_api(move |api, tx| async move {
@@ -603,17 +606,17 @@ impl App {
                 Ok((bytes, media)) => {
                     // 上传走 qaqh-client（multipart 组装在 client 侧），返回的
                     // ContentRef 过桥回本仓镜像类型。没有连接（测试替身）时
-                    // `upload_content` 立刻返回 Err——`seed` 仍然照实回传。
-                    let uploaded = api.upload_content(&seed, &media, bytes).await;
+                    // `upload_content` 立刻返回 Err——`session_id` 仍然照实回传。
+                    let uploaded = api.upload_content(&session_id, &media, bytes).await;
                     let _ = tx.send(AppMsg::Action(ActionResult::Uploaded {
-                        seed,
+                        session_id,
                         path,
                         result: uploaded,
                     }));
                 }
                 Err(e) => {
                     let _ = tx.send(AppMsg::Action(ActionResult::Uploaded {
-                        seed,
+                        session_id,
                         path,
                         result: Err(e),
                     }));

@@ -297,29 +297,29 @@ pub fn delivery_label(delivery: Delivery) -> &'static str {
 
 impl App {
     /// Fetch the authoritative roster/inbox snapshot for a root session.
-    pub fn fetch_team(&mut self, seed: String) {
+    pub fn fetch_team(&mut self, session_id: String) {
         if self.runtime.client_opt().is_none() {
             return;
         }
         self.spawn_api(move |api, tx| async move {
-            let result = api.team_v2(&seed).await;
-            let _ = tx.send(AppMsg::Action(ActionResult::Team { seed, result }));
+            let result = api.team_v2(&session_id).await;
+            let _ = tx.send(AppMsg::Action(ActionResult::Team { session_id, result }));
         });
     }
 
     /// Apply an ephemeral TeamDelta only after the root snapshot was accepted.
     ///
-    /// Deltas for a child are delivered on that child's per-seed stream; find
+    /// Deltas for a child are delivered on that child's per-session_id stream; find
     /// the owning root projection before folding them into the roster.
-    pub(super) fn handle_team_delta(&mut self, seed: String, delta: Delta) {
-        let root = if self.teams.contains_key(&seed) {
-            seed.clone()
+    pub(super) fn handle_team_delta(&mut self, session_id: String, delta: Delta) {
+        let root = if self.teams.contains_key(&session_id) {
+            session_id.clone()
         } else {
             self.teams
                 .iter()
-                .find(|(_, state)| state.agent_by_id(&seed).is_some())
+                .find(|(_, state)| state.agent_by_id(&session_id).is_some())
                 .map(|(root, _)| root.clone())
-                .unwrap_or(seed)
+                .unwrap_or(session_id)
         };
         let applied = self
             .teams
@@ -410,7 +410,7 @@ impl App {
         }
 
         let stale: Vec<String> = self
-            .subagent_seeds
+            .subagent_session_ids
             .iter()
             .filter(|agent_id| !trackable.iter().any(|candidate| candidate == *agent_id))
             .cloned()
@@ -420,19 +420,22 @@ impl App {
         }
     }
 
-    pub fn team_state(&self, seed: &str) -> Option<&TeamState> {
-        self.teams.get(seed)
+    pub fn team_state(&self, session_id: &str) -> Option<&TeamState> {
+        self.teams.get(session_id)
     }
 
     pub fn active_team_state(&self) -> Option<&TeamState> {
-        self.active_seed().and_then(|seed| self.team_state(&seed))
+        self.active_session_id()
+            .and_then(|session_id| self.team_state(&session_id))
     }
 
     /// Find the team projection that owns an agent id.
     pub fn team_for_agent(&self, agent_id: &str) -> Option<(&str, &TeamState)> {
-        self.teams
-            .iter()
-            .find_map(|(seed, state)| state.agent_by_id(agent_id).map(|_| (seed.as_str(), state)))
+        self.teams.iter().find_map(|(session_id, state)| {
+            state
+                .agent_by_id(agent_id)
+                .map(|_| (session_id.as_str(), state))
+        })
     }
 
     pub fn child_agent_ids(&self, parent_id: &str) -> Vec<String> {
@@ -460,7 +463,7 @@ impl App {
 
     /// Open a child transcript from the `/subagents` roster.
     pub fn workspace_open_subagent(&mut self, filtered_index: usize) {
-        let Some(root) = self.active_seed() else {
+        let Some(root) = self.active_session_id() else {
             return;
         };
         let filter = match self.overlays.last() {
@@ -502,13 +505,13 @@ impl App {
     /// Agent paths are inserted because the path is the stable identity; nickname
     /// is accepted as a query alias but is never used as the roster key.
     pub(super) fn autocomplete_mention(&mut self) -> bool {
-        let Some(seed) = self.active_seed() else {
+        let Some(session_id) = self.active_session_id() else {
             return false;
         };
-        let Some(team) = self.teams.get(&seed) else {
+        let Some(team) = self.teams.get(&session_id) else {
             return false;
         };
-        let Some(session) = self.sessions.get(&seed) else {
+        let Some(session) = self.sessions.get(&session_id) else {
             return false;
         };
         let cursor = session.composer.cursor.min(session.composer.input.len());
@@ -554,17 +557,17 @@ mod tests {
 
     fn snapshot() -> Snapshot {
         serde_json::from_value(json!({
-            "root_session_id": "root-seed",
+            "root_session_id": "root-session_id",
             "agents": [
                 {
-                    "agent_id": "root-seed",
+                    "agent_id": "root-session_id",
                     "agent_path": "/root",
                     "role": "root",
                     "status": "running",
                     "residency": "loaded"
                 },
                 {
-                    "agent_id": "child-seed",
+                    "agent_id": "child-session_id",
                     "agent_path": "/root/reviewer",
                     "nickname": "reviewer",
                     "role": "review",
@@ -599,7 +602,7 @@ mod tests {
                     "kind": "agent_residency_changed",
                     "data": {
                         "revision": 8,
-                        "agent_id": "child-seed",
+                        "agent_id": "child-session_id",
                         "residency": "unloaded"
                     }
                 }))
@@ -615,7 +618,7 @@ mod tests {
                     "kind": "agent_residency_changed",
                     "data": {
                         "revision": 8,
-                        "agent_id": "child-seed",
+                        "agent_id": "child-session_id",
                         "residency": "unloaded"
                     }
                 }))
@@ -626,7 +629,7 @@ mod tests {
         let child = state
             .agent_by_path("/root/reviewer")
             .expect("unloaded child remains in roster");
-        assert_eq!(child.agent_id.as_str(), "child-seed");
+        assert_eq!(child.agent_id.as_str(), "child-session_id");
         assert_eq!(child.status, Status::Running);
         assert_eq!(child.residency, Residency::Unloaded);
         assert_eq!(state.roster(None).len(), 2);
@@ -643,7 +646,7 @@ mod tests {
                     "kind": "agent_completed",
                     "data": {
                         "revision": 9,
-                        "agent_id": "child-seed",
+                        "agent_id": "child-session_id",
                         "status": "completed"
                     }
                 }))
@@ -651,14 +654,14 @@ mod tests {
             )
         );
 
-        let child = state.agent_by_id("child-seed").expect("child");
+        let child = state.agent_by_id("child-session_id").expect("child");
         assert_eq!(child.status, Status::Completed);
         assert_eq!(child.residency, Residency::Unloaded);
         assert!(
             state
                 .roster(None)
                 .iter()
-                .any(|agent| { agent.agent_id.as_str() == "child-seed" })
+                .any(|agent| { agent.agent_id.as_str() == "child-session_id" })
         );
     }
 
@@ -669,12 +672,12 @@ mod tests {
         initial.agents[1].status = Status::PendingInit;
         state.replace_from_snapshot(initial);
 
-        assert!(state.apply_status_hint("child-seed", Status::Running));
+        assert!(state.apply_status_hint("child-session_id", Status::Running));
         assert_eq!(
-            state.agent_by_id("child-seed").unwrap().status,
+            state.agent_by_id("child-session_id").unwrap().status,
             Status::Running
         );
-        assert!(!state.apply_status_hint("child-seed", Status::Running));
+        assert!(!state.apply_status_hint("child-session_id", Status::Running));
 
         assert!(
             state.apply_delta(
@@ -682,16 +685,16 @@ mod tests {
                     "kind": "agent_completed",
                     "data": {
                         "revision": 9,
-                        "agent_id": "child-seed",
+                        "agent_id": "child-session_id",
                         "status": "completed"
                     }
                 }))
                 .expect("delta")
             )
         );
-        assert!(!state.apply_status_hint("child-seed", Status::Running));
+        assert!(!state.apply_status_hint("child-session_id", Status::Running));
         assert_eq!(
-            state.agent_by_id("child-seed").unwrap().status,
+            state.agent_by_id("child-session_id").unwrap().status,
             Status::Completed
         );
     }
@@ -722,10 +725,10 @@ mod tests {
         let mut state = TeamState::default();
         state.replace_from_snapshot(
             serde_json::from_value(json!({
-                "root_session_id": "root-seed",
+                "root_session_id": "root-session_id",
                 "agents": [
                     {
-                        "agent_id": "root-seed",
+                        "agent_id": "root-session_id",
                         "agent_path": "/root",
                         "status": "running",
                         "residency": "loaded"
@@ -744,7 +747,7 @@ mod tests {
                     "kind": "agent_residency_changed",
                     "data": {
                         "revision": 2,
-                        "agent_id": "child-seed",
+                        "agent_id": "child-session_id",
                         "residency": "loaded"
                     }
                 }))
@@ -758,7 +761,7 @@ mod tests {
                     "data": {
                         "revision": 3,
                         "agent": {
-                            "agent_id": "child-seed",
+                            "agent_id": "child-session_id",
                             "agent_path": "/root/reviewer",
                             "status": "pending_init",
                             "residency": "unloaded",
@@ -770,7 +773,7 @@ mod tests {
             )
         );
 
-        let child = state.agent_by_id("child-seed").expect("child");
+        let child = state.agent_by_id("child-session_id").expect("child");
         assert_eq!(child.residency, Residency::Loaded);
         assert_eq!(child.status, Status::PendingInit);
     }
@@ -786,45 +789,47 @@ mod tests {
         assert_eq!(state.mention_candidates().len(), 1);
         assert_eq!(
             state.mention_candidates()[0].agent_id.as_str(),
-            "child-seed"
+            "child-session_id"
         );
     }
 
     #[test]
     fn mention_completion_uses_agent_path_not_nickname_as_key() {
         let (mut app, _rx) = App::new_for_test();
-        app.tabs.push("root-seed".into());
-        app.sessions
-            .insert("root-seed".into(), SessionState::new("root-seed".into()));
+        app.tabs.push("root-session_id".into());
+        app.sessions.insert(
+            "root-session_id".into(),
+            SessionState::new("root-session_id".into()),
+        );
         app.teams
-            .entry("root-seed".into())
+            .entry("root-session_id".into())
             .or_default()
             .replace_from_snapshot(snapshot());
-        let session = app.sessions.get_mut("root-seed").expect("session");
+        let session = app.sessions.get_mut("root-session_id").expect("session");
         session.composer.input = "@rev".chars().collect();
         session.composer.cursor = session.composer.input.len();
 
         assert!(app.autocomplete_mention());
         assert_eq!(
-            app.sessions["root-seed"].composer.value(),
+            app.sessions["root-session_id"].composer.value(),
             "@/root/reviewer "
         );
     }
 
     #[tokio::test]
-    async fn child_seed_delta_is_folded_into_the_owning_root_projection() {
+    async fn child_session_id_delta_is_folded_into_the_owning_root_projection() {
         let (mut app, _rx) = App::new_for_test();
         app.teams
-            .entry("root-seed".into())
+            .entry("root-session_id".into())
             .or_default()
             .replace_from_snapshot(snapshot());
         app.handle_team_delta(
-            "child-seed".into(),
+            "child-session_id".into(),
             serde_json::from_value(json!({
                 "kind": "agent_status_changed",
                 "data": {
                     "revision": 8,
-                    "agent_id": "child-seed",
+                    "agent_id": "child-session_id",
                     "status": "running"
                 }
             }))
@@ -832,8 +837,8 @@ mod tests {
         );
 
         assert_eq!(
-            app.teams["root-seed"]
-                .agent_by_id("child-seed")
+            app.teams["root-session_id"]
+                .agent_by_id("child-session_id")
                 .expect("child")
                 .status,
             Status::Running

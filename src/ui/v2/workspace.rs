@@ -68,7 +68,7 @@ pub fn draw(
         WorkspaceRoute::Subagents { selected, filter } => {
             draw_subagents(f, app, body, *selected, filter, theme, hit_map)
         }
-        WorkspaceRoute::Subagent { seed } => draw_subagent(f, app, body, seed, theme),
+        WorkspaceRoute::Subagent { session_id } => draw_subagent(f, app, body, session_id, theme),
     }
     let back = workspace_visual(app, WorkspaceHit::Back, false);
     let line = footer_line(route, theme, back);
@@ -174,7 +174,7 @@ fn header_line(route: &WorkspaceRoute, app: &App, theme: &Theme) -> Line<'static
                 format!("{agents} agents · {unread} unread · r{revision}/f{fact_seq}{filter}"),
             )
         }
-        WorkspaceRoute::Subagent { seed } => ("Subagent", seed.clone()),
+        WorkspaceRoute::Subagent { session_id } => ("Subagent", session_id.clone()),
     };
     Line::from(vec![
         Span::styled(
@@ -1029,8 +1029,8 @@ fn draw_team_inbox(f: &mut Frame, team: &crate::app::team::TeamState, area: Rect
     f.render_widget(Paragraph::new(lines), area);
 }
 
-fn draw_subagent(f: &mut Frame, app: &App, area: Rect, seed: &str, theme: &Theme) {
-    let Some(session) = app.sessions.get(seed) else {
+fn draw_subagent(f: &mut Frame, app: &App, area: Rect, session_id: &str, theme: &Theme) {
+    let Some(session) = app.sessions.get(session_id) else {
         f.render_widget(
             Paragraph::new(Span::styled(
                 " 子代理会话已不可用",
@@ -1278,12 +1278,13 @@ mod tests {
         };
 
         let (mut app, _rx) = App::new_for_test();
-        let seed = "seed-history".to_string();
-        let mut session = SessionState::new(seed.clone());
+        let session_id = "session-history".to_string();
+        let mut session = SessionState::new(session_id.clone());
         session.timeline.turns = vec![
             Turn {
                 turn_id: "t1".into(),
                 turn_index: Some(1),
+                started_at_ms: None,
                 user_text: "第一个问题：读一下文件".into(),
                 state: TimelineTurnState::Completed,
                 failure: None,
@@ -1309,6 +1310,7 @@ mod tests {
             Turn {
                 turn_id: "t2".into(),
                 turn_index: Some(2),
+                started_at_ms: None,
                 user_text: "第二个问题：跑一下测试".into(),
                 state: TimelineTurnState::Completed,
                 failure: None,
@@ -1359,8 +1361,8 @@ mod tests {
                 }],
             },
         ];
-        app.tabs.push(seed.clone());
-        app.sessions.insert(seed, session);
+        app.tabs.push(session_id.clone());
+        app.sessions.insert(session_id, session);
         app
     }
 
@@ -1500,7 +1502,7 @@ mod tests {
         app.session_list_cache = (0..6)
             .map(|index| SessionListEntry {
                 meta: SessionMeta {
-                    session_id: format!("seed-{index}"),
+                    session_id: format!("session-{index}"),
                     created_at: index,
                     ..SessionMeta::default()
                 },
@@ -1593,10 +1595,10 @@ mod tests {
 
     fn app_with_todo_tasks() -> App {
         let (mut app, _rx) = App::new_for_test();
-        app.tabs.push("seed".into());
-        let mut session = SessionState::new("seed".into());
+        app.tabs.push("session".into());
+        let mut session = SessionState::new("session".into());
         session.dashboard = Some(qaqh_client::DomainDashboardSnapshot {
-            session_id: "seed".into(),
+            session_id: "session".into(),
             documents: Vec::new(),
             recent_edits: Vec::new(),
             tasks: vec![
@@ -1617,7 +1619,7 @@ mod tests {
             ],
             current_todo_id: Some("t1".into()),
         });
-        app.sessions.insert("seed".into(), session);
+        app.sessions.insert("session".into(), session);
         app
     }
 
@@ -1657,10 +1659,10 @@ mod tests {
     #[test]
     fn narrow_todo_workspace_keeps_cjk_safe() {
         let (mut app, _rx) = App::new_for_test();
-        app.tabs.push("seed".into());
-        let mut session = SessionState::new("seed".into());
+        app.tabs.push("session".into());
+        let mut session = SessionState::new("session".into());
         session.dashboard = Some(qaqh_client::DomainDashboardSnapshot {
-            session_id: "seed".into(),
+            session_id: "session".into(),
             documents: Vec::new(),
             recent_edits: Vec::new(),
             tasks: vec![qaqh_client::DashboardTask {
@@ -1672,7 +1674,7 @@ mod tests {
             }],
             current_todo_id: Some("t1".into()),
         });
-        app.sessions.insert("seed".into(), session);
+        app.sessions.insert("session".into(), session);
         let mut terminal = Terminal::new(TestBackend::new(24, 8)).expect("terminal");
         let route = WorkspaceRoute::Todo;
         let mut hit_map = scratch_map(&route, 24, 8);

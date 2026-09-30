@@ -1434,11 +1434,11 @@ mod tests {
 
     fn app_with_model(model: TimelineModel) -> App {
         let (mut app, _rx) = App::new_for_test();
-        let seed = "seed-1".to_string();
-        let mut session = SessionState::new(seed.clone());
+        let session_id = "session-1".to_string();
+        let mut session = SessionState::new(session_id.clone());
         session.timeline = model;
-        app.tabs.push(seed.clone());
-        app.sessions.insert(seed, session);
+        app.tabs.push(session_id.clone());
+        app.sessions.insert(session_id, session);
         app
     }
 
@@ -1577,7 +1577,7 @@ mod tests {
         let mut app = app_with_model(model_with_many_sealed_turns(30));
         app.show_workspace = false;
         app.sessions
-            .get_mut("seed-1")
+            .get_mut("session-1")
             .expect("session")
             .scroll
             .follow = false;
@@ -1664,8 +1664,8 @@ mod tests {
         assert!(matches!(
             app.overlays.last(),
             Some(Overlay::Confirm {
-                action: crate::app::ConfirmAction::UndoTurn { seed, turn_id }
-            }) if seed == "seed-1" && turn_id == "turn-1"
+                action: crate::app::ConfirmAction::UndoTurn { session_id, turn_id }
+            }) if session_id == "session-1" && turn_id == "turn-1"
         ));
     }
 
@@ -1696,14 +1696,14 @@ mod tests {
         view.transcript.sync(&app, 79, &theme);
         view.body_height = 10;
 
-        let session = app.sessions.get_mut("seed-1").expect("session");
+        let session = app.sessions.get_mut("session-1").expect("session");
         session.timeline.has_more = true;
         session.timeline.turns[0].turn_index = Some(1);
         session.scroll.offset = view.max_offset();
 
         view.page_up(&mut app);
 
-        assert!(app.sessions["seed-1"].loading_older);
+        assert!(app.sessions["session-1"].loading_older);
     }
 
     #[test]
@@ -1719,7 +1719,7 @@ mod tests {
         cache.sync(&app, 79, &theme);
         assert_eq!(cache.render_misses, before, "same version must be a no-op");
 
-        let session = app.sessions.get_mut("seed-1").expect("session");
+        let session = app.sessions.get_mut("session-1").expect("session");
         session.timeline.version = session.timeline.version.saturating_add(1);
         let turn = session.timeline.turns.last_mut().expect("turn");
         let block = turn
@@ -1888,7 +1888,7 @@ mod tests {
             KeyModifiers::ALT,
         )));
         assert!(
-            app.sessions["seed-1"].expanded_tools.contains("tool-1"),
+            app.sessions["session-1"].expanded_tools.contains("tool-1"),
             "Alt+E must provide the keyboard path before mouse wiring"
         );
     }
@@ -1902,7 +1902,7 @@ mod tests {
             KeyModifiers::ALT,
         )));
         assert!(
-            app.sessions["seed-1"]
+            app.sessions["session-1"]
                 .expanded_thinking
                 .contains("thinking-1"),
             "Alt+T must provide the keyboard path for thinking history"
@@ -1953,7 +1953,7 @@ mod tests {
             &mut view,
         );
         assert!(
-            app.sessions["seed-1"]
+            app.sessions["session-1"]
                 .expanded_thinking
                 .contains("thinking-1"),
             "click must toggle the historical thinking block"
@@ -2004,7 +2004,7 @@ mod tests {
             &mut view,
         );
         assert!(
-            app.sessions["seed-1"].expanded_tools.contains("tool-1"),
+            app.sessions["session-1"].expanded_tools.contains("tool-1"),
             "click must toggle the tool card through the same App path"
         );
     }
@@ -2014,7 +2014,7 @@ mod tests {
         let mut app = app_with_model(model_with_many_sealed_turns(30));
         app.show_workspace = false;
         app.sessions
-            .get_mut("seed-1")
+            .get_mut("session-1")
             .expect("session")
             .scroll
             .follow = false;
@@ -2040,7 +2040,7 @@ mod tests {
     fn agent_draw_registers_scrollbar_track_and_thumb() {
         let mut app = app_with_model(model_with_many_sealed_turns(30));
         app.show_workspace = false;
-        let session = app.sessions.get_mut("seed-1").expect("session");
+        let session = app.sessions.get_mut("session-1").expect("session");
         session.scroll.follow = false;
         session.scroll.offset = 20;
         let mut view = FullscreenView::default();
@@ -2077,7 +2077,7 @@ mod tests {
         let mut app = app_with_model(model_with_many_sealed_turns(30));
         app.show_workspace = false;
         app.sessions
-            .get_mut("seed-1")
+            .get_mut("session-1")
             .expect("session")
             .scroll
             .follow = false;
@@ -2110,7 +2110,7 @@ mod tests {
             ),
         );
         assert_eq!(
-            app.sessions["seed-1"].scroll.offset,
+            app.sessions["session-1"].scroll.offset,
             metrics
                 .offset_for_track_row(track_row)
                 .min(view.max_offset())
@@ -2153,7 +2153,7 @@ mod tests {
             ),
         );
         assert_eq!(
-            app.sessions["seed-1"].scroll.offset,
+            app.sessions["session-1"].scroll.offset,
             metrics
                 .offset_for_drag_row(drag_row, 0)
                 .min(view.max_offset())
@@ -2222,7 +2222,7 @@ mod tests {
         let mut app = app_with_model(model_with_many_sealed_turns(3));
         app.show_workspace = false;
         {
-            let session = app.sessions.get_mut("seed-1").expect("session");
+            let session = app.sessions.get_mut("session-1").expect("session");
             session.timeline.has_more = true;
             session.timeline.turns[0].turn_index = Some(0);
         }
@@ -2260,7 +2260,7 @@ mod tests {
             &mut view,
         );
         assert!(
-            app.sessions["seed-1"].loading_older,
+            app.sessions["session-1"].loading_older,
             "clicking the top entry must start the same pagination path as PgUp"
         );
     }
@@ -2270,7 +2270,7 @@ mod tests {
         let mut app = app_with_model(model_with_many_sealed_turns(30));
         app.show_workspace = false;
         app.sessions
-            .get_mut("seed-1")
+            .get_mut("session-1")
             .expect("session")
             .scroll
             .follow = false;
@@ -2494,7 +2494,7 @@ mod tests {
         let mut app = app_with_model(model_with_many_sealed_turns(30));
         app.show_workspace = false;
         app.sessions
-            .get_mut("seed-1")
+            .get_mut("session-1")
             .expect("session")
             .scroll
             .follow = false;
@@ -2595,7 +2595,7 @@ mod tests {
         app.session_list_cache = (0..4)
             .map(|index| SessionListEntry {
                 meta: SessionMeta {
-                    session_id: format!("seed-{index}"),
+                    session_id: format!("session-{index}"),
                     created_at: index,
                     ..SessionMeta::default()
                 },
@@ -2631,7 +2631,7 @@ mod tests {
         let mut app = app_with_model(model_with_sealed_answer());
         app.show_workspace = false;
         app.sessions
-            .get_mut("seed-1")
+            .get_mut("session-1")
             .expect("session")
             .pending_permissions
             .push(permission_panel());
@@ -2727,7 +2727,7 @@ mod tests {
         let mut app = app_with_model(model_with_sealed_answer());
         app.show_workspace = false;
         app.sessions
-            .get_mut("seed-1")
+            .get_mut("session-1")
             .expect("session")
             .pending_permissions
             .push(permission_panel());

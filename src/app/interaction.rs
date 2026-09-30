@@ -12,11 +12,11 @@ impl App {
 
     /// 点击 ask 的某个选项：等价于在该项上按 **Enter**（选中 + 前进，最后一题提交）。
     pub fn mouse_ask_option(&mut self, question: usize, option: usize) {
-        let Some(seed) = self.active_seed() else {
+        let Some(session_id) = self.active_session_id() else {
             return;
         };
         let mut submit_after = false;
-        if let Some(sess) = self.sessions.get_mut(&seed)
+        if let Some(sess) = self.sessions.get_mut(&session_id)
             && let Some(panel) = sess.pending_ask.as_mut()
         {
             panel.select_option(question, option);
@@ -34,10 +34,10 @@ impl App {
 
     /// 点击 ask 的「自定义输入」行：等价于按 `e`/`z`（进入编辑态）。
     pub fn mouse_ask_custom(&mut self, question: usize) {
-        let Some(seed) = self.active_seed() else {
+        let Some(session_id) = self.active_session_id() else {
             return;
         };
-        if let Some(sess) = self.sessions.get_mut(&seed)
+        if let Some(sess) = self.sessions.get_mut(&session_id)
             && let Some(panel) = sess.pending_ask.as_mut()
         {
             panel.editing_custom = Some(question);
@@ -53,10 +53,10 @@ impl App {
 
     /// 点击 permission 的「信任此目录」：等价于按 `t`。
     pub fn mouse_permission_toggle_trust(&mut self) {
-        let Some(seed) = self.active_seed() else {
+        let Some(session_id) = self.active_session_id() else {
             return;
         };
-        if let Some(sess) = self.sessions.get_mut(&seed)
+        if let Some(sess) = self.sessions.get_mut(&session_id)
             && let Some(panel) = sess.pending_permissions.first_mut()
         {
             panel.trust_folder = !panel.trust_folder;
@@ -65,10 +65,10 @@ impl App {
 
     /// 点击 plan 的「拒绝并填写理由」：等价于按 `r`（进入理由输入态，**不是**直接拒绝）。
     pub fn mouse_plan_start_reject(&mut self) {
-        let Some(seed) = self.active_seed() else {
+        let Some(session_id) = self.active_session_id() else {
             return;
         };
-        if let Some(sess) = self.sessions.get_mut(&seed)
+        if let Some(sess) = self.sessions.get_mut(&session_id)
             && let Some(panel) = sess.pending_plan.as_mut()
         {
             panel.entering_message = true;
@@ -76,12 +76,12 @@ impl App {
     }
 
     pub fn submit_ask(&mut self) {
-        let Some(seed) = self.active_seed() else {
+        let Some(session_id) = self.active_session_id() else {
             return;
         };
         let Some(panel) = self
             .sessions
-            .get_mut(&seed)
+            .get_mut(&session_id)
             .and_then(|s| s.pending_ask.as_ref())
         else {
             return;
@@ -90,7 +90,7 @@ impl App {
         let answers = match panel.collect_answers() {
             Ok(a) => a,
             Err(e) => {
-                if let Some(sess) = self.sessions.get_mut(&seed)
+                if let Some(sess) = self.sessions.get_mut(&session_id)
                     && let Some(p) = sess.pending_ask.as_mut()
                 {
                     if let Some(idx) = missing {
@@ -104,12 +104,12 @@ impl App {
         };
         let interaction_id = self
             .sessions
-            .get(&seed)
+            .get(&session_id)
             .and_then(|s| s.pending_ask.as_ref())
             .map(|p| p.interaction_id.clone())
             .expect("panel");
         self.suppressed_interactions.insert(interaction_id.clone());
-        if let Some(sess) = self.sessions.get_mut(&seed) {
+        if let Some(sess) = self.sessions.get_mut(&session_id) {
             sess.pending_ask = None;
         }
         let answers = answers
@@ -120,7 +120,7 @@ impl App {
             })
             .collect();
         self.send_interaction_command(
-            seed,
+            session_id,
             ControlCommand::InteractionAskRespond {
                 interaction_id,
                 answers,
@@ -130,35 +130,35 @@ impl App {
     }
 
     pub fn dismiss_ask(&mut self) {
-        let Some(seed) = self.active_seed() else {
+        let Some(session_id) = self.active_session_id() else {
             return;
         };
         let Some(interaction_id) = self
             .sessions
-            .get(&seed)
+            .get(&session_id)
             .and_then(|s| s.pending_ask.as_ref())
             .map(|p| p.interaction_id.clone())
         else {
             return;
         };
         self.suppressed_interactions.insert(interaction_id.clone());
-        if let Some(sess) = self.sessions.get_mut(&seed) {
+        if let Some(sess) = self.sessions.get_mut(&session_id) {
             sess.pending_ask = None;
         }
         self.send_interaction_command(
-            seed,
+            session_id,
             ControlCommand::InteractionAskDismiss { interaction_id },
             "跳过 ask",
         );
     }
 
     pub fn respond_plan(&mut self, approved: bool, autonomous: bool) {
-        let Some(seed) = self.active_seed() else {
+        let Some(session_id) = self.active_session_id() else {
             return;
         };
         let panel = self
             .sessions
-            .get(&seed)
+            .get(&session_id)
             .and_then(|s| s.pending_plan.as_ref());
         let Some(panel) = panel else { return };
         let interaction_id = panel.interaction_id.clone();
@@ -169,11 +169,11 @@ impl App {
             let m = panel.message.trim().to_owned();
             (!m.is_empty()).then_some(m)
         };
-        if let Some(sess) = self.sessions.get_mut(&seed) {
+        if let Some(sess) = self.sessions.get_mut(&session_id) {
             sess.pending_plan = None;
         }
         self.send_interaction_command(
-            seed,
+            session_id,
             ControlCommand::PlanReviewRespond {
                 interaction_id,
                 approved,
@@ -185,19 +185,19 @@ impl App {
     }
 
     pub fn respond_permission(&mut self, approved: bool) {
-        let Some(seed) = self.active_seed() else {
+        let Some(session_id) = self.active_session_id() else {
             return;
         };
         let Some(panel) = self
             .sessions
-            .get(&seed)
+            .get(&session_id)
             .and_then(|s| s.active_permission().cloned())
         else {
             return;
         };
         self.suppressed_interactions
             .insert(panel.tool_call_id.clone());
-        if let Some(sess) = self.sessions.get_mut(&seed) {
+        if let Some(sess) = self.sessions.get_mut(&session_id) {
             // 下架 + 记入已解决：应答之后补投的同 id 权限请求不再入队（防幽灵面板）。
             sess.resolve_permission(&panel.tool_call_id);
         }
@@ -207,9 +207,11 @@ impl App {
             trust_folder: panel.trust_folder,
         });
         self.spawn_api(move |api, tx| async move {
-            let result = api.send_interaction_command(Some(&seed.clone()), cmd).await;
+            let result = api
+                .send_interaction_command(Some(&session_id.clone()), cmd)
+                .await;
             let _ = tx.send(AppMsg::Action(ActionResult::CommandAck {
-                seed: Some(seed),
+                session_id: Some(session_id),
                 label: "权限",
                 result,
             }));
@@ -218,11 +220,11 @@ impl App {
 
     /// 交互弹窗按键。返回 true = 已消费。优先级 permission > ask > plan。
     pub(super) fn modal_key(&mut self, key: KeyEvent) -> bool {
-        let Some(seed) = self.active_seed() else {
+        let Some(session_id) = self.active_session_id() else {
             return false;
         };
         let route = {
-            let Some(sess) = self.sessions.get(&seed) else {
+            let Some(sess) = self.sessions.get(&session_id) else {
                 return false;
             };
             keymap::modal_route(
@@ -232,14 +234,14 @@ impl App {
             )
         };
         match route {
-            Some(ModalRoute::Permission) => self.permission_key(&seed, key),
-            Some(ModalRoute::Ask) => self.ask_key(&seed, key),
-            Some(ModalRoute::Plan) => self.plan_key(&seed, key),
+            Some(ModalRoute::Permission) => self.permission_key(&session_id, key),
+            Some(ModalRoute::Ask) => self.ask_key(&session_id, key),
+            Some(ModalRoute::Plan) => self.plan_key(&session_id, key),
             None => false,
         }
     }
 
-    pub(super) fn permission_key(&mut self, seed: &str, key: KeyEvent) -> bool {
+    pub(super) fn permission_key(&mut self, session_id: &str, key: KeyEvent) -> bool {
         use ratatui::crossterm::event::KeyCode;
         enum D {
             Approve,
@@ -248,7 +250,7 @@ impl App {
             None,
         }
         let decision = {
-            let Some(sess) = self.sessions.get(seed) else {
+            let Some(sess) = self.sessions.get(session_id) else {
                 return true;
             };
             let Some(perm) = sess.active_permission() else {
@@ -269,7 +271,7 @@ impl App {
             D::Approve => self.respond_permission(true),
             D::Deny => self.respond_permission(false),
             D::ToggleTrust => {
-                if let Some(s) = self.sessions.get_mut(seed)
+                if let Some(s) = self.sessions.get_mut(session_id)
                     && let Some(p) = s.pending_permissions.first_mut()
                 {
                     p.trust_folder = !p.trust_folder;
@@ -280,7 +282,7 @@ impl App {
         true
     }
 
-    pub(super) fn ask_key(&mut self, seed: &str, key: KeyEvent) -> bool {
+    pub(super) fn ask_key(&mut self, session_id: &str, key: KeyEvent) -> bool {
         use crate::app::session::option_index_for_key;
         use ratatui::crossterm::event::{KeyCode, KeyModifiers};
         enum D {
@@ -309,7 +311,7 @@ impl App {
             None,
         }
         let decision = {
-            let Some(sess) = self.sessions.get(seed) else {
+            let Some(sess) = self.sessions.get(session_id) else {
                 return true;
             };
             let Some(ask) = sess.pending_ask.as_ref() else {
@@ -385,7 +387,7 @@ impl App {
         let mut submit_after = false;
         match decision {
             D::Switch(delta) => {
-                if let Some(s) = self.sessions.get_mut(seed)
+                if let Some(s) = self.sessions.get_mut(session_id)
                     && let Some(p) = s.pending_ask.as_mut()
                     && !p.questions.is_empty()
                 {
@@ -395,14 +397,14 @@ impl App {
                 }
             }
             D::Cursor(delta) => {
-                if let Some(s) = self.sessions.get_mut(seed)
+                if let Some(s) = self.sessions.get_mut(session_id)
                     && let Some(p) = s.pending_ask.as_mut()
                 {
                     p.move_option_cursor(p.focus, delta);
                 }
             }
             D::CursorFirst => {
-                if let Some(s) = self.sessions.get_mut(seed)
+                if let Some(s) = self.sessions.get_mut(session_id)
                     && let Some(p) = s.pending_ask.as_mut()
                     && let Some(cursor) = p.option_cursor.get_mut(p.focus)
                 {
@@ -410,7 +412,7 @@ impl App {
                 }
             }
             D::CursorLast => {
-                if let Some(s) = self.sessions.get_mut(seed)
+                if let Some(s) = self.sessions.get_mut(session_id)
                     && let Some(p) = s.pending_ask.as_mut()
                 {
                     let last = p.option_count(p.focus).saturating_sub(1);
@@ -420,7 +422,7 @@ impl App {
                 }
             }
             D::Scroll(delta) => {
-                if let Some(s) = self.sessions.get_mut(seed)
+                if let Some(s) = self.sessions.get_mut(session_id)
                     && let Some(p) = s.pending_ask.as_mut()
                 {
                     p.scroll = if delta < 0 {
@@ -436,7 +438,7 @@ impl App {
                 advance,
             } => {
                 let mut on_last = false;
-                if let Some(s) = self.sessions.get_mut(seed)
+                if let Some(s) = self.sessions.get_mut(session_id)
                     && let Some(p) = s.pending_ask.as_mut()
                 {
                     p.select_option(question, option);
@@ -451,14 +453,14 @@ impl App {
                 submit_after = on_last;
             }
             D::Toggle { question, option } => {
-                if let Some(s) = self.sessions.get_mut(seed)
+                if let Some(s) = self.sessions.get_mut(session_id)
                     && let Some(p) = s.pending_ask.as_mut()
                 {
                     p.toggle_option(question, option);
                 }
             }
             D::StartEdit { question } => {
-                if let Some(s) = self.sessions.get_mut(seed)
+                if let Some(s) = self.sessions.get_mut(session_id)
                     && let Some(p) = s.pending_ask.as_mut()
                 {
                     p.editing_custom = Some(question);
@@ -472,21 +474,21 @@ impl App {
                 }
             }
             D::EditChar(c) => {
-                if let Some(s) = self.sessions.get_mut(seed)
+                if let Some(s) = self.sessions.get_mut(session_id)
                     && let Some(p) = s.pending_ask.as_mut()
                 {
                     p.input.push(c);
                 }
             }
             D::EditBackspace => {
-                if let Some(s) = self.sessions.get_mut(seed)
+                if let Some(s) = self.sessions.get_mut(session_id)
                     && let Some(p) = s.pending_ask.as_mut()
                 {
                     p.input.pop();
                 }
             }
             D::EditCommit => {
-                if let Some(s) = self.sessions.get_mut(seed)
+                if let Some(s) = self.sessions.get_mut(session_id)
                     && let Some(p) = s.pending_ask.as_mut()
                 {
                     let qi = p.editing_custom.take().unwrap_or(0);
@@ -509,7 +511,7 @@ impl App {
                 }
             }
             D::EditCancel => {
-                if let Some(s) = self.sessions.get_mut(seed)
+                if let Some(s) = self.sessions.get_mut(session_id)
                     && let Some(p) = s.pending_ask.as_mut()
                 {
                     p.editing_custom = None;
@@ -525,7 +527,7 @@ impl App {
         true
     }
 
-    pub(super) fn plan_key(&mut self, seed: &str, key: KeyEvent) -> bool {
+    pub(super) fn plan_key(&mut self, session_id: &str, key: KeyEvent) -> bool {
         use ratatui::crossterm::event::{KeyCode, KeyModifiers};
         enum D {
             Approve,
@@ -539,7 +541,7 @@ impl App {
             None,
         }
         let decision = {
-            let Some(sess) = self.sessions.get(seed) else {
+            let Some(sess) = self.sessions.get(session_id) else {
                 return true;
             };
             let entering = sess
@@ -574,14 +576,14 @@ impl App {
             D::Approve => self.respond_plan(true, false),
             D::ApproveAuto => self.respond_plan(true, true),
             D::StartReject => {
-                if let Some(s) = self.sessions.get_mut(seed)
+                if let Some(s) = self.sessions.get_mut(session_id)
                     && let Some(p) = s.pending_plan.as_mut()
                 {
                     p.entering_message = true;
                 }
             }
             D::Scroll(delta) => {
-                if let Some(s) = self.sessions.get_mut(seed)
+                if let Some(s) = self.sessions.get_mut(session_id)
                     && let Some(p) = s.pending_plan.as_mut()
                 {
                     if delta > 0 {
@@ -592,14 +594,14 @@ impl App {
                 }
             }
             D::EditChar(c) => {
-                if let Some(s) = self.sessions.get_mut(seed)
+                if let Some(s) = self.sessions.get_mut(session_id)
                     && let Some(p) = s.pending_plan.as_mut()
                 {
                     p.message.push(c);
                 }
             }
             D::EditBackspace => {
-                if let Some(s) = self.sessions.get_mut(seed)
+                if let Some(s) = self.sessions.get_mut(session_id)
                     && let Some(p) = s.pending_plan.as_mut()
                 {
                     p.message.pop();
@@ -607,7 +609,7 @@ impl App {
             }
             D::SubmitReject => self.respond_plan(false, false),
             D::CancelEdit => {
-                if let Some(s) = self.sessions.get_mut(seed)
+                if let Some(s) = self.sessions.get_mut(session_id)
                     && let Some(p) = s.pending_plan.as_mut()
                 {
                     p.entering_message = false;
@@ -629,8 +631,8 @@ mod tests {
 
     fn app_with_ask() -> App {
         let (mut app, _rx) = App::new_for_test();
-        let seed = "seed-ask".to_string();
-        let mut session = SessionState::new(seed.clone());
+        let session_id = "session-ask".to_string();
+        let mut session = SessionState::new(session_id.clone());
         session.pending_ask = Some(AskPanel::new(
             "interaction-1".into(),
             "turn-1".into(),
@@ -650,8 +652,8 @@ mod tests {
                 },
             ],
         ));
-        app.tabs.push(seed.clone());
-        app.sessions.insert(seed, session);
+        app.tabs.push(session_id.clone());
+        app.sessions.insert(session_id, session);
         app
     }
 
@@ -659,13 +661,13 @@ mod tests {
     fn number_shortcut_selects_one_based_option_and_advances() {
         let mut app = app_with_ask();
         app.ask_key(
-            "seed-ask",
+            "session-ask",
             KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE),
         );
 
         let ask = app
             .sessions
-            .get("seed-ask")
+            .get("session-ask")
             .and_then(|s| s.pending_ask.as_ref())
             .expect("ask panel");
         assert_eq!(ask.focus, 1);
@@ -676,20 +678,23 @@ mod tests {
     fn left_and_right_switch_question_pages() {
         let mut app = app_with_ask();
         app.ask_key(
-            "seed-ask",
+            "session-ask",
             KeyEvent::new(KeyCode::Right, KeyModifiers::NONE),
         );
         assert_eq!(
-            app.sessions["seed-ask"]
+            app.sessions["session-ask"]
                 .pending_ask
                 .as_ref()
                 .expect("ask")
                 .focus,
             1
         );
-        app.ask_key("seed-ask", KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+        app.ask_key(
+            "session-ask",
+            KeyEvent::new(KeyCode::Left, KeyModifiers::NONE),
+        );
         assert_eq!(
-            app.sessions["seed-ask"]
+            app.sessions["session-ask"]
                 .pending_ask
                 .as_ref()
                 .expect("ask")
@@ -704,7 +709,7 @@ mod tests {
         {
             let ask = app
                 .sessions
-                .get_mut("seed-ask")
+                .get_mut("session-ask")
                 .and_then(|s| s.pending_ask.as_mut())
                 .expect("ask panel");
             ask.selections[0] = Some(0);
@@ -712,12 +717,12 @@ mod tests {
             ask.option_cursor[1] = 1;
         }
         app.ask_key(
-            "seed-ask",
+            "session-ask",
             KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
         );
 
         assert!(
-            app.sessions["seed-ask"].pending_ask.is_none(),
+            app.sessions["session-ask"].pending_ask.is_none(),
             "last question Enter should submit"
         );
     }
@@ -728,19 +733,19 @@ mod tests {
         {
             let ask = app
                 .sessions
-                .get_mut("seed-ask")
+                .get_mut("session-ask")
                 .and_then(|s| s.pending_ask.as_mut())
                 .expect("ask panel");
             ask.option_cursor[0] = ask.questions[0].options.len();
         }
         app.ask_key(
-            "seed-ask",
+            "session-ask",
             KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
         );
 
         let ask = app
             .sessions
-            .get("seed-ask")
+            .get("session-ask")
             .and_then(|s| s.pending_ask.as_ref())
             .expect("ask panel");
         assert_eq!(ask.editing_custom, Some(0));
@@ -765,20 +770,20 @@ mod tests {
         {
             let ask = app
                 .sessions
-                .get_mut("seed-ask")
+                .get_mut("session-ask")
                 .and_then(|s| s.pending_ask.as_mut())
                 .expect("ask panel");
             ask.focus = 1;
             ask.selections[1] = Some(0);
         }
         app.ask_key(
-            "seed-ask",
+            "session-ask",
             KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
         );
 
         let ask = app
             .sessions
-            .get("seed-ask")
+            .get("session-ask")
             .and_then(|s| s.pending_ask.as_ref())
             .expect("ask panel");
         assert_eq!(ask.focus, 0);

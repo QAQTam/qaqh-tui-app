@@ -112,6 +112,11 @@ pub struct TranscriptBlock {
     pub revision: u64,
     pub state: BlockState,
     pub kind: BlockKind,
+    /// 权威源 fact 墙钟（epoch ms，v2 信封 `ts_ms`）。`None` = 时间不可知。
+    ///
+    /// 只有用户回合头会渲染它；其余块保留该字段是为了让上层（消息菜单 / 导出）
+    /// 拿到同一个权威值，而不是各自去猜。
+    pub at_ms: Option<u64>,
 }
 
 impl TranscriptBlock {
@@ -123,6 +128,7 @@ impl TranscriptBlock {
             revision: 1,
             state: BlockState::Live,
             kind,
+            at_ms: None,
         }
     }
 
@@ -188,7 +194,7 @@ pub fn render_transcript(
 pub fn render_block(block: &TranscriptBlock, width: usize, theme: &Theme) -> Vec<Line<'static>> {
     let width = width.max(MIN_WIDTH);
     let mut lines = match &block.kind {
-        BlockKind::User { text } => render_user(text, width, theme),
+        BlockKind::User { text } => render_user(block.at_ms, text, width, theme),
         BlockKind::Assistant { text } => render_assistant(text, width, theme),
         BlockKind::Thinking {
             text,
@@ -217,10 +223,16 @@ pub fn render_block(block: &TranscriptBlock, width: usize, theme: &Theme) -> Vec
     lines
 }
 
-fn render_user(text: &str, width: usize, theme: &Theme) -> Vec<Line<'static>> {
+fn render_user(at_ms: Option<u64>, text: &str, width: usize, theme: &Theme) -> Vec<Line<'static>> {
     let text = sanitize_text(text);
     let outer = " ".repeat(usize::from(theme.spacing.outer_pad));
-    let first_prefix = format!("{outer}{} ", theme.glyph.user);
+    // 时间戳直接来自权威源 fact 墙钟；缺席时**什么都不画**，不用本地时钟兜底
+    // （那会让「服务端时间」与「猜的时间」长得一模一样）。
+    let stamp = at_ms
+        .and_then(format_wall_clock)
+        .map(|stamp| format!("{stamp} "))
+        .unwrap_or_default();
+    let first_prefix = format!("{outer}{stamp}{} ", theme.glyph.user);
     let continuation = " ".repeat(first_prefix.width());
     render_prefixed_text(
         &text,
@@ -229,6 +241,18 @@ fn render_user(text: &str, width: usize, theme: &Theme) -> Vec<Line<'static>> {
         &continuation,
         fg(theme.accent.user),
         fg(theme.text.primary),
+    )
+}
+
+/// 权威墙钟（epoch ms）→ 本地 `MM-DD HH:MM`。
+///
+/// **纯函数**：只依赖入参、不含 `now()`，所以渲染缓存键与快照测试都稳定。
+fn format_wall_clock(ts_ms: u64) -> Option<String> {
+    let utc = chrono::DateTime::from_timestamp_millis(i64::try_from(ts_ms).ok()?)?;
+    Some(
+        utc.with_timezone(&chrono::Local)
+            .format("%m-%d %H:%M")
+            .to_string(),
     )
 }
 

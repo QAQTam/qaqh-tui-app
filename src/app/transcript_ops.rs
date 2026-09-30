@@ -5,12 +5,12 @@ use super::*;
 impl App {
     /// 切换指定工具卡正文；鼠标和键盘共用此语义入口。
     pub fn toggle_tool_expanded(&mut self, block_id: &str) -> bool {
-        let Some(seed) = self.active_seed() else {
+        let Some(session_id) = self.active_session_id() else {
             return false;
         };
         let changed = self
             .sessions
-            .get_mut(&seed)
+            .get_mut(&session_id)
             .is_some_and(|session| session.toggle_tool_expanded(block_id));
         if changed {
             self.force_redraw = true;
@@ -20,12 +20,12 @@ impl App {
 
     /// 切换指定历史 thinking 正文；鼠标和键盘共用此语义入口。
     pub fn toggle_thinking_expanded(&mut self, block_id: &str) -> bool {
-        let Some(seed) = self.active_seed() else {
+        let Some(session_id) = self.active_session_id() else {
             return false;
         };
         let changed = self
             .sessions
-            .get_mut(&seed)
+            .get_mut(&session_id)
             .is_some_and(|session| session.toggle_thinking_expanded(block_id));
         if changed {
             self.force_redraw = true;
@@ -35,10 +35,10 @@ impl App {
 
     /// `Alt+T` 键盘路径：切换当前会话最后一段有正文的历史 thinking。
     pub fn toggle_latest_thinking(&mut self) {
-        let Some(seed) = self.active_seed() else {
+        let Some(session_id) = self.active_session_id() else {
             return;
         };
-        let block_id = self.sessions.get(&seed).and_then(|session| {
+        let block_id = self.sessions.get(&session_id).and_then(|session| {
             session
                 .timeline
                 .turns
@@ -59,10 +59,10 @@ impl App {
 
     /// `Alt+E` 键盘路径：切换当前会话最后一张工具卡。
     pub fn toggle_latest_tool(&mut self) {
-        let Some(seed) = self.active_seed() else {
+        let Some(session_id) = self.active_session_id() else {
             return;
         };
-        let block_id = self.sessions.get(&seed).and_then(|session| {
+        let block_id = self.sessions.get(&session_id).and_then(|session| {
             session
                 .timeline
                 .turns
@@ -82,10 +82,10 @@ impl App {
         if self.reject_if_v2_read_only("发送") {
             return;
         }
-        let Some(seed) = self.active_seed() else {
+        let Some(session_id) = self.active_session_id() else {
             return;
         };
-        let Some(sess) = self.sessions.get_mut(&seed) else {
+        let Some(sess) = self.sessions.get_mut(&session_id) else {
             return;
         };
         if sess.composer.is_empty() {
@@ -96,7 +96,7 @@ impl App {
         self.spawn_api(move |api, tx| async move {
             let result = api
                 .send_command(
-                    Some(&seed.clone()),
+                    Some(&session_id.clone()),
                     RingingCommand::Conversation(ConversationCommand::ConversationSendMessage {
                         text,
                         images: vec![],
@@ -121,7 +121,7 @@ impl App {
                 .await
                 .map_err(|e| e.to_string());
             let _ = tx.send(AppMsg::Action(ActionResult::CommandAck {
-                seed: Some(seed),
+                session_id: Some(session_id),
                 label: "发送",
                 result,
             }));
@@ -132,12 +132,12 @@ impl App {
         if self.reject_if_v2_read_only("中止") {
             return;
         }
-        let Some(seed) = self.active_seed() else {
+        let Some(session_id) = self.active_session_id() else {
             return;
         };
         let streaming = self
             .sessions
-            .get(&seed)
+            .get(&session_id)
             .is_some_and(|s| s.streaming.is_some());
         if !streaming {
             return;
@@ -145,7 +145,7 @@ impl App {
         self.spawn_api(move |api, tx| async move {
             let result = api
                 .send_command(
-                    Some(&seed.clone()),
+                    Some(&session_id.clone()),
                     RingingCommand::Conversation(ConversationCommand::ConversationCancel {
                         turn_id: None,
                     }),
@@ -154,7 +154,7 @@ impl App {
                 .await
                 .map_err(|e| e.to_string());
             let _ = tx.send(AppMsg::Action(ActionResult::CommandAck {
-                seed: Some(seed),
+                session_id: Some(session_id),
                 label: "中止",
                 result,
             }));
@@ -165,20 +165,20 @@ impl App {
         if self.reject_if_v2_read_only("切换模式") {
             return;
         }
-        let Some(seed) = self.active_seed() else {
+        let Some(session_id) = self.active_session_id() else {
             return;
         };
-        let next = match self.sessions.get(&seed).map(|s| s.mode) {
+        let next = match self.sessions.get(&session_id).map(|s| s.mode) {
             Some(qaqh_client::ConversationMode::Plan) => qaqh_client::ConversationMode::Code,
             _ => qaqh_client::ConversationMode::Plan,
         };
-        if let Some(sess) = self.sessions.get_mut(&seed) {
+        if let Some(sess) = self.sessions.get_mut(&session_id) {
             sess.mode = next; // 乐观更新
         }
         self.spawn_api(move |api, tx| async move {
             let result = api
                 .send_command(
-                    Some(&seed.clone()),
+                    Some(&session_id.clone()),
                     RingingCommand::Conversation(ConversationCommand::ConversationSetMode {
                         mode: next,
                     }),
@@ -187,7 +187,7 @@ impl App {
                 .await
                 .map_err(|e| e.to_string());
             let _ = tx.send(AppMsg::Action(ActionResult::CommandAck {
-                seed: Some(seed),
+                session_id: Some(session_id),
                 label: "切换模式",
                 result,
             }));
@@ -198,13 +198,13 @@ impl App {
         if self.reject_if_v2_read_only("压缩") {
             return;
         }
-        let Some(seed) = self.active_seed() else {
+        let Some(session_id) = self.active_session_id() else {
             return;
         };
         self.spawn_api(move |api, tx| async move {
             let result = api
                 .send_command(
-                    Some(&seed.clone()),
+                    Some(&session_id.clone()),
                     RingingCommand::Conversation(ConversationCommand::ConversationCompact {
                         turn_id: None,
                     }),
@@ -213,7 +213,7 @@ impl App {
                 .await
                 .map_err(|e| e.to_string());
             let _ = tx.send(AppMsg::Action(ActionResult::CommandAck {
-                seed: Some(seed),
+                session_id: Some(session_id),
                 label: "compact",
                 result,
             }));
@@ -224,17 +224,17 @@ impl App {
         if self.reject_if_v2_read_only("撤销") {
             return;
         }
-        let Some(seed) = self.active_seed() else {
+        let Some(session_id) = self.active_session_id() else {
             return;
         };
         let Some(turn_id) = self
             .sessions
-            .get(&seed)
+            .get(&session_id)
             .and_then(|s| s.timeline.last_turn_id().map(str::to_owned))
         else {
             return;
         };
-        self.undo_turn_from(seed, turn_id);
+        self.undo_turn_from(session_id, turn_id);
     }
 
     /// 用户消息 context menu 的二次确认入口。
@@ -242,10 +242,10 @@ impl App {
         if self.reject_if_v2_read_only("撤销") {
             return;
         }
-        let Some(seed) = self.active_seed() else {
+        let Some(session_id) = self.active_session_id() else {
             return;
         };
-        let exists = self.sessions.get(&seed).is_some_and(|session| {
+        let exists = self.sessions.get(&session_id).is_some_and(|session| {
             session
                 .timeline
                 .turns
@@ -257,17 +257,20 @@ impl App {
             return;
         }
         self.overlays.push(Overlay::Confirm {
-            action: ConfirmAction::UndoTurn { seed, turn_id },
+            action: ConfirmAction::UndoTurn {
+                session_id,
+                turn_id,
+            },
         });
     }
 
-    pub fn undo_turn_from(&mut self, seed: String, turn_id: String) {
+    pub fn undo_turn_from(&mut self, session_id: String, turn_id: String) {
         self.spawn_api(move |api, tx| async move {
             // command_id 由本侧生成：ack 之后要拿它轮询 receipt。
             let command_id = uuid::Uuid::new_v4().to_string();
             let result = api
                 .send_command(
-                    Some(&seed),
+                    Some(&session_id),
                     RingingCommand::Conversation(ConversationCommand::ConversationUndoTurn {
                         turn_id,
                     }),
@@ -301,7 +304,7 @@ impl App {
                     }
                     let _ = tx.send(AppMsg::Action(ActionResult::Receipt {
                         label: "撤销回合",
-                        seed: Some(seed),
+                        session_id: Some(session_id),
                         result: Ok(state.unwrap_or(ClientV2CommandStatus {
                             command_id: String::new(),
                             state: CommandState::Running,
@@ -314,7 +317,7 @@ impl App {
                 }
                 Err(e) => {
                     let _ = tx.send(AppMsg::Action(ActionResult::CommandAck {
-                        seed: Some(seed),
+                        session_id: Some(session_id),
                         label: "撤销回合",
                         result: Err(e.to_string()),
                     }));
@@ -323,24 +326,27 @@ impl App {
         });
     }
 
-    pub(super) fn request_rebaseline(&mut self, seed: &str) {
-        let seed = seed.to_owned();
+    pub(super) fn request_rebaseline(&mut self, session_id: &str) {
+        let session_id = session_id.to_owned();
         self.spawn_api(move |api, tx| async move {
             let result = api
-                .timeline_page(&seed, None, crate::runtime::TIMELINE_PAGE_LIMIT)
+                .timeline_page(&session_id, None, crate::runtime::TIMELINE_PAGE_LIMIT)
                 .await
                 .map_err(|e| e.to_string());
-            let _ = tx.send(AppMsg::Action(ActionResult::Rebaseline { seed, result }));
+            let _ = tx.send(AppMsg::Action(ActionResult::Rebaseline {
+                session_id,
+                result,
+            }));
         });
     }
 
     pub fn load_older(&mut self) {
-        let Some(seed) = self.active_seed() else {
+        let Some(session_id) = self.active_session_id() else {
             return;
         };
         let loading = self
             .sessions
-            .get(&seed)
+            .get(&session_id)
             .is_some_and(|s| s.loading_older || !s.timeline.has_more);
         if loading {
             return;
@@ -349,18 +355,25 @@ impl App {
         // （实时追加的回合不带序号）说明窗口里没有可当游标的回合，直接放弃。
         let first_index = self
             .sessions
-            .get(&seed)
+            .get(&session_id)
             .and_then(|s| s.timeline.turns.first().and_then(|t| t.turn_index));
         let Some(before) = first_index else { return };
-        if let Some(sess) = self.sessions.get_mut(&seed) {
+        if let Some(sess) = self.sessions.get_mut(&session_id) {
             sess.loading_older = true;
         }
         self.spawn_api(move |api, tx| async move {
             let result = api
-                .timeline_page(&seed, Some(before), crate::runtime::TIMELINE_PAGE_LIMIT)
+                .timeline_page(
+                    &session_id,
+                    Some(before),
+                    crate::runtime::TIMELINE_PAGE_LIMIT,
+                )
                 .await
                 .map_err(|e| e.to_string());
-            let _ = tx.send(AppMsg::Action(ActionResult::LoadOlder { seed, result }));
+            let _ = tx.send(AppMsg::Action(ActionResult::LoadOlder {
+                session_id,
+                result,
+            }));
         });
     }
 
@@ -368,20 +381,20 @@ impl App {
 
     pub(super) fn send_control_command(
         &mut self,
-        seed: String,
+        session_id: String,
         command: ControlCommand,
         label: &'static str,
     ) {
         self.spawn_api(move |api, tx| async move {
             let result = api
                 .send_command(
-                    Some(&seed),
+                    Some(&session_id),
                     RingingCommand::Control(command),
                     Default::default(),
                 )
                 .await;
             let _ = tx.send(AppMsg::Action(ActionResult::CommandAck {
-                seed: Some(seed),
+                session_id: Some(session_id),
                 label,
                 result,
             }));
@@ -393,16 +406,16 @@ impl App {
     /// 落到状态栏 toast。
     pub(super) fn send_interaction_command(
         &mut self,
-        seed: String,
+        session_id: String,
         command: ControlCommand,
         label: &'static str,
     ) {
         self.spawn_api(move |api, tx| async move {
             let result = api
-                .send_interaction_command(Some(&seed), RingingCommand::Control(command))
+                .send_interaction_command(Some(&session_id), RingingCommand::Control(command))
                 .await;
             let _ = tx.send(AppMsg::Action(ActionResult::CommandAck {
-                seed: Some(seed),
+                session_id: Some(session_id),
                 label,
                 result,
             }));
@@ -412,10 +425,10 @@ impl App {
     // ───────────────────────── 服务面 ─────────────────────────
 
     pub fn scroll_up(&mut self, lines: usize) {
-        let Some(seed) = self.view_seed() else {
+        let Some(session_id) = self.view_session_id() else {
             return;
         };
-        let Some(sess) = self.sessions.get_mut(&seed) else {
+        let Some(sess) = self.sessions.get_mut(&session_id) else {
             return;
         };
         sess.scroll.follow = false;
@@ -423,10 +436,10 @@ impl App {
     }
 
     pub fn scroll_down(&mut self, lines: usize) {
-        let Some(seed) = self.view_seed() else {
+        let Some(session_id) = self.view_session_id() else {
             return;
         };
-        let Some(sess) = self.sessions.get_mut(&seed) else {
+        let Some(sess) = self.sessions.get_mut(&session_id) else {
             return;
         };
         if sess.scroll.offset <= lines {
@@ -438,20 +451,20 @@ impl App {
     }
 
     pub fn scroll_top(&mut self) {
-        let Some(seed) = self.view_seed() else {
+        let Some(session_id) = self.view_session_id() else {
             return;
         };
-        if let Some(sess) = self.sessions.get_mut(&seed) {
+        if let Some(sess) = self.sessions.get_mut(&session_id) {
             sess.scroll.follow = false;
             sess.scroll.offset = usize::MAX / 2; // 渲染时 clamp
         }
     }
 
     pub fn scroll_bottom(&mut self) {
-        let Some(seed) = self.view_seed() else {
+        let Some(session_id) = self.view_session_id() else {
             return;
         };
-        if let Some(sess) = self.sessions.get_mut(&seed) {
+        if let Some(sess) = self.sessions.get_mut(&session_id) {
             sess.scroll.follow = true;
             sess.scroll.offset = 0;
         }

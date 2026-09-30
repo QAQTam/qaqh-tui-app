@@ -27,9 +27,25 @@
 # 改动这里必须同步 `Cargo.toml` 里 [patch.crates-io] 的注释，以及本机
 # `.cargo/config.toml` 的 paths 覆盖（见 .gitignore）。
 #
-# 后端侧对应 rev `2f362e036eb98a88f4e58017a23f8d785d2aa058`（后端 main）：
-# 已包含 TUI 当前消费的 plan wire、canonical interaction request 正文、
-# 结构化工具终态 `outcome` 与 stdout/stderr 分离的 `Streams` body。
+# 后端侧对应 rev `1154ec7ec05eddb145f0e22b6812314519769722`（后端 main，2026-09-30）：
+# 本次「协议权威化」迁移的**目标锚点**。TUI 现在直接消费下面这些后端接口，
+# 少任何一项都会编译失败（不是运行期降级）：
+#
+#   - 信封 `ts_ms`（beta-readiness W1/C3，`0607efa`）：`handle_v2_event` 直接读
+#     `ClientV2Event.ts_ms` 作为 transcript 的权威墙钟，不再自建时间戳；
+#   - `CompactionApplied`（W3/D10，`58c9c76`）：此前被 `=> {}` 丢弃，现在渲染
+#     「此前已压缩」分隔锚；
+#   - canonical `session_id`：bootstrap/reset 的类型字段名与全部手抄 fixture；
+#   - `before_index` 排他游标 + 归档深翻页 `turn_index` 回填（D4，`42820ff`）：
+#     `fetch_timeline_page` 的翻页游标链。
+#
+# ⚠ **推送前置**：这 11 个提交目前只在后端**本地** `main` 上
+# （`origin/main` 仍是 `7bb83f0`）。CNB CI 从 `origin` clone，因此在后端把
+# `main` 推到 `https://cnb.cool/QAQ-Harness/qaqh-backend.git` 之前，本 pipeline
+# 会以「checkout 不到该 rev」失败。**这是有意的**：钉在旧 rev 上只会得到
+# 一堆指向 TUI 代码的误导性编译错误，而真正缺的东西在后端仓。
+# 推送后 CI 无需改动即可转绿。
+#
 # **注意 rev 必须是完整 40 位 SHA**：下面的 prepare() 用 `git rev-parse HEAD` 与它
 # 做字符串比对，写 tag 名会判不等。换锚点时后端会新开 tag，**不要移动旧 tag**。
 # ratatui 用的是**上游未发版的 main**（ratatui#2743 修复尚未发版）。
@@ -47,7 +63,7 @@ set -euo pipefail
 
 # 与 Cargo.toml 的 path 依赖对应。改动请同步 Cargo.toml 的注释。
 QAQH_BACKEND_REPO="${QAQH_BACKEND_REPO:-https://cnb.cool/QAQ-Harness/qaqh-backend.git}"
-QAQH_BACKEND_REV="${QAQH_BACKEND_REV:-2f362e036eb98a88f4e58017a23f8d785d2aa058}"
+QAQH_BACKEND_REV="${QAQH_BACKEND_REV:-1154ec7ec05eddb145f0e22b6812314519769722}"
 RATATUI_REPO="${RATATUI_REPO:-https://github.com/ratatui/ratatui.git}"
 RATATUI_REV="${RATATUI_REV:-e02e2a622eda6e4cae105df48a48f641cdba0303}"
 

@@ -14,14 +14,14 @@ fn move_index(current: usize, count: usize, delta: isize) -> usize {
 }
 
 impl App {
-    /// 标签/观测切换后调用：清掉不属于当前标签 seed 的 overlay。
+    /// 标签/观测切换后调用：清掉不属于当前标签 session_id 的 overlay。
     ///
-    /// 判据见 [`Overlay::bound_seed`]——全局 overlay（设置/帮助/会话列表/cwd）保留。
-    /// 不这么做的话，`Ctrl+W` 弹出的 `Confirm(CloseTab(旧 seed))` 会在切标签后
+    /// 判据见 [`Overlay::bound_session_id`]——全局 overlay（设置/帮助/会话列表/cwd）保留。
+    /// 不这么做的话，`Ctrl+W` 弹出的 `Confirm(CloseTab(旧 session_id))` 会在切标签后
     /// 仍然吃 `y`，把确认动作落到那个已经不在前台的会话上。
-    pub(super) fn prune_overlays_for_active_seed(&mut self) {
-        let seed = self.active_seed();
-        prune_seed_bound_overlays(&mut self.overlays, seed.as_deref());
+    pub(super) fn prune_overlays_for_active_session_id(&mut self) {
+        let session_id = self.active_session_id();
+        prune_session_id_bound_overlays(&mut self.overlays, session_id.as_deref());
     }
 
     pub fn open_session_list(&mut self) {
@@ -50,10 +50,10 @@ impl App {
     /// （D1 唯一保留点），零抓取。无活动回合/无思考内容 → toast，不推空浮层。
     /// 历史回合不在此列：offloaded 的远端只有预览壳，全文回放 v2 立项。
     pub(crate) fn open_thinking_overlay(&mut self) {
-        let Some(seed) = self.view_seed() else {
+        let Some(session_id) = self.view_session_id() else {
             return;
         };
-        let Some(sess) = self.sessions.get(&seed) else {
+        let Some(sess) = self.sessions.get(&session_id) else {
             return;
         };
         let mut parts: Vec<String> = Vec::new();
@@ -73,7 +73,7 @@ impl App {
             return;
         }
         self.overlays.push(Overlay::Thinking {
-            seed,
+            session_id,
             scroll: 0,
             body: parts.join("\n\n"),
         });
@@ -98,9 +98,9 @@ impl App {
         let Some(&meta_idx) = self.filtered_sessions(show_archived).get(filtered_index) else {
             return;
         };
-        let seed = self.session_list_cache[meta_idx].meta.session_id.clone();
+        let session_id = self.session_list_cache[meta_idx].meta.session_id.clone();
         self.overlays.pop();
-        self.open_session_tab(&seed);
+        self.open_session_tab(&session_id);
     }
 
     /// Workspace 回合行点击：与 History 列表的 Enter 一致，进入只读详情。
@@ -281,8 +281,8 @@ impl App {
             }
             KeyCode::Enter => {
                 if let Some(&idx) = items.get(self.home_selected) {
-                    let seed = self.session_list_cache[idx].meta.session_id.clone();
-                    self.open_session_tab(&seed);
+                    let session_id = self.session_list_cache[idx].meta.session_id.clone();
+                    self.open_session_tab(&session_id);
                 }
                 return true;
             }
@@ -301,25 +301,25 @@ impl App {
             }
             KeyCode::Char('x') => {
                 if let Some(&idx) = items.get(self.home_selected) {
-                    let seed = self.session_list_cache[idx].meta.session_id.clone();
+                    let session_id = self.session_list_cache[idx].meta.session_id.clone();
                     self.overlays.push(Overlay::Confirm {
-                        action: ConfirmAction::ArchiveSession(seed),
+                        action: ConfirmAction::ArchiveSession(session_id),
                     });
                 }
                 return true;
             }
             KeyCode::Char('u') => {
                 if let Some(&idx) = items.get(self.home_selected) {
-                    let seed = self.session_list_cache[idx].meta.session_id.clone();
-                    self.unarchive_session(seed);
+                    let session_id = self.session_list_cache[idx].meta.session_id.clone();
+                    self.unarchive_session(session_id);
                 }
                 return true;
             }
             KeyCode::Char('D') => {
                 if let Some(&idx) = items.get(self.home_selected) {
-                    let seed = self.session_list_cache[idx].meta.session_id.clone();
+                    let session_id = self.session_list_cache[idx].meta.session_id.clone();
                     self.overlays.push(Overlay::Confirm {
-                        action: ConfirmAction::DeleteSession(seed),
+                        action: ConfirmAction::DeleteSession(session_id),
                     });
                 }
                 return true;
@@ -504,7 +504,7 @@ impl App {
             Overlay::AttachPath {
                 mut input,
                 mut cursor,
-                seed,
+                session_id,
             } => {
                 match key.code {
                     KeyCode::Esc => {
@@ -512,9 +512,9 @@ impl App {
                     }
                     KeyCode::Enter => {
                         self.overlays.pop();
-                        // 目标 seed 只从 overlay 自己的字段取（单一事实源，见
-                        // `AttachSubmit`）——这里没有任何别的 seed 可查；空路径 → None。
-                        if let Some(submit) = Overlay::attach_submit(&input, &seed) {
+                        // 目标 session_id 只从 overlay 自己的字段取（单一事实源，见
+                        // `AttachSubmit`）——这里没有任何别的 session_id 可查；空路径 → None。
+                        if let Some(submit) = Overlay::attach_submit(&input, &session_id) {
                             self.upload_attachment(submit);
                         }
                     }
@@ -526,7 +526,7 @@ impl App {
                         self.replace_overlay(Overlay::AttachPath {
                             input,
                             cursor,
-                            seed,
+                            session_id,
                         });
                     }
                     KeyCode::Delete => {
@@ -536,7 +536,7 @@ impl App {
                         self.replace_overlay(Overlay::AttachPath {
                             input,
                             cursor,
-                            seed,
+                            session_id,
                         });
                     }
                     KeyCode::Left => {
@@ -544,7 +544,7 @@ impl App {
                         self.replace_overlay(Overlay::AttachPath {
                             input,
                             cursor,
-                            seed,
+                            session_id,
                         });
                     }
                     KeyCode::Right => {
@@ -554,14 +554,14 @@ impl App {
                         self.replace_overlay(Overlay::AttachPath {
                             input,
                             cursor,
-                            seed,
+                            session_id,
                         });
                     }
                     KeyCode::Home => {
                         self.replace_overlay(Overlay::AttachPath {
                             input,
                             cursor: 0,
-                            seed,
+                            session_id,
                         });
                     }
                     KeyCode::End => {
@@ -569,7 +569,7 @@ impl App {
                         self.replace_overlay(Overlay::AttachPath {
                             input,
                             cursor: n,
-                            seed,
+                            session_id,
                         });
                     }
                     KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -578,7 +578,7 @@ impl App {
                         self.replace_overlay(Overlay::AttachPath {
                             input,
                             cursor,
-                            seed,
+                            session_id,
                         });
                     }
                     _ => {}
@@ -588,14 +588,21 @@ impl App {
             Overlay::Confirm { action } => {
                 match key.code {
                     KeyCode::Char('y') | KeyCode::Char('Y') => match action {
-                        ConfirmAction::DeleteSession(seed) => self.delete_session(seed.clone()),
-                        ConfirmAction::ArchiveSession(seed) => self.archive_session(seed.clone()),
-                        ConfirmAction::CloseTab(seed) => {
-                            let seed = seed.clone();
-                            self.close_tab_by_seed(&seed);
+                        ConfirmAction::DeleteSession(session_id) => {
+                            self.delete_session(session_id.clone())
                         }
-                        ConfirmAction::UndoTurn { seed, turn_id } => {
-                            self.undo_turn_from(seed.clone(), turn_id.clone());
+                        ConfirmAction::ArchiveSession(session_id) => {
+                            self.archive_session(session_id.clone())
+                        }
+                        ConfirmAction::CloseTab(session_id) => {
+                            let session_id = session_id.clone();
+                            self.close_tab_by_session_id(&session_id);
+                        }
+                        ConfirmAction::UndoTurn {
+                            session_id,
+                            turn_id,
+                        } => {
+                            self.undo_turn_from(session_id.clone(), turn_id.clone());
                         }
                     },
                     _ => {}
@@ -744,8 +751,8 @@ impl App {
                         self.overlays.pop();
                     }
                     KeyCode::Char('r') if filter.is_empty() => {
-                        if let Some(seed) = self.active_seed() {
-                            self.fetch_team(seed);
+                        if let Some(session_id) = self.active_session_id() {
+                            self.fetch_team(session_id);
                         }
                     }
                     KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -797,30 +804,34 @@ impl App {
                     }
                     KeyCode::Enter => {
                         if let Some(&meta_idx) = items.get(selected) {
-                            let seed = self.session_list_cache[meta_idx].meta.session_id.clone();
+                            let session_id =
+                                self.session_list_cache[meta_idx].meta.session_id.clone();
                             self.overlays.pop();
-                            self.open_session_tab(&seed);
+                            self.open_session_tab(&session_id);
                         }
                     }
                     KeyCode::Char('x') => {
                         if let Some(&meta_idx) = items.get(selected) {
-                            let seed = self.session_list_cache[meta_idx].meta.session_id.clone();
+                            let session_id =
+                                self.session_list_cache[meta_idx].meta.session_id.clone();
                             self.overlays.push(Overlay::Confirm {
-                                action: ConfirmAction::ArchiveSession(seed),
+                                action: ConfirmAction::ArchiveSession(session_id),
                             });
                         }
                     }
                     KeyCode::Char('u') => {
                         if let Some(&meta_idx) = items.get(selected) {
-                            let seed = self.session_list_cache[meta_idx].meta.session_id.clone();
-                            self.unarchive_session(seed);
+                            let session_id =
+                                self.session_list_cache[meta_idx].meta.session_id.clone();
+                            self.unarchive_session(session_id);
                         }
                     }
                     KeyCode::Char('D') => {
                         if let Some(&meta_idx) = items.get(selected) {
-                            let seed = self.session_list_cache[meta_idx].meta.session_id.clone();
+                            let session_id =
+                                self.session_list_cache[meta_idx].meta.session_id.clone();
                             self.overlays.push(Overlay::Confirm {
-                                action: ConfirmAction::DeleteSession(seed),
+                                action: ConfirmAction::DeleteSession(session_id),
                             });
                         }
                     }
@@ -896,47 +907,49 @@ mod tests {
     use super::*;
     use ratatui::crossterm::event::{KeyCode, KeyModifiers};
 
-    fn confirm_close(seed: &str) -> Overlay {
+    fn confirm_close(session_id: &str) -> Overlay {
         Overlay::Confirm {
-            action: ConfirmAction::CloseTab(seed.into()),
+            action: ConfirmAction::CloseTab(session_id.into()),
         }
     }
 
-    fn attach(seed: &str) -> Overlay {
+    fn attach(session_id: &str) -> Overlay {
         Overlay::AttachPath {
             input: Vec::new(),
             cursor: 0,
-            seed: seed.into(),
+            session_id: session_id.into(),
         }
     }
 
-    fn attach_with_path(seed: &str, path: &str) -> Overlay {
+    fn attach_with_path(session_id: &str, path: &str) -> Overlay {
         Overlay::AttachPath {
             input: path.chars().collect(),
             cursor: path.chars().count(),
-            seed: seed.into(),
+            session_id: session_id.into(),
         }
     }
 
     /// 与 `overlay_key` 的 Enter 分支同款取值（从 `AttachPath` 的字段直接构造提交）。
     fn submit_of(ov: &Overlay) -> Option<AttachSubmit> {
         match ov {
-            Overlay::AttachPath { input, seed, .. } => Overlay::attach_submit(input, seed),
+            Overlay::AttachPath {
+                input, session_id, ..
+            } => Overlay::attach_submit(input, session_id),
             _ => None,
         }
     }
 
-    /// 附件提交的目标 seed 只能来自 overlay 自己（纯函数半边）。
+    /// 附件提交的目标 session_id 只能来自 overlay 自己（纯函数半边）。
     ///
     /// 证伪方式：把 `attach_submit` 的目标换成别的来源（活动标签 / 空串）→ 第一条
-    /// 断言变红。**注意**：这条只锁「提交语义」；「Enter 分支真的把 overlay 的 seed
-    /// 交出去」由下面的 `enter_uploads_to_the_overlays_own_seed_not_the_active_tab`
+    /// 断言变红。**注意**：这条只锁「提交语义」；「Enter 分支真的把 overlay 的 session_id
+    /// 交出去」由下面的 `enter_uploads_to_the_overlays_own_session_id_not_the_active_tab`
     /// 走全链路锁住（那条才是能证伪原缺陷的）。
     #[test]
-    fn attach_submit_targets_its_own_seed() {
+    fn attach_submit_targets_its_own_session_id() {
         let submit = submit_of(&attach_with_path("a", "/tmp/shot.png")).expect("非空路径应提交");
         let (target, path) = submit.into_parts();
-        assert_eq!(target, "a", "目标 seed 必须取 overlay 存的那个");
+        assert_eq!(target, "a", "目标 session_id 必须取 overlay 存的那个");
         assert_eq!(path, "/tmp/shot.png");
 
         // 空 / 纯空白路径不提交（沿用旧行为）。
@@ -950,19 +963,19 @@ mod tests {
     }
 
     /// 剪枝判据与提交目标必须自洽：切到别的标签后 `AttachPath` 已被剪掉，不存在
-    /// 「提交到别的标签」的窗口；只要它还在，目标就恒为自己那个 seed。
+    /// 「提交到别的标签」的窗口；只要它还在，目标就恒为自己那个 session_id。
     ///
-    /// 证伪方式：把 `bound_seed()` 对 `AttachPath` 改回 `None`（审查给过的备选
+    /// 证伪方式：把 `bound_session_id()` 对 `AttachPath` 改回 `None`（审查给过的备选
     /// 方案），或把剪枝改回 no-op——`overlays.is_empty()` 立刻变红。
     #[test]
-    fn attach_target_and_pruning_agree_on_the_seed() {
+    fn attach_target_and_pruning_agree_on_the_session_id() {
         let mut overlays = vec![attach_with_path("a", "/tmp/x.png")];
         assert_eq!(
             submit_of(&overlays[0]).map(|s| s.into_parts().0),
             Some("a".to_string())
         );
 
-        prune_seed_bound_overlays(&mut overlays, Some("b"));
+        prune_session_id_bound_overlays(&mut overlays, Some("b"));
         assert!(
             overlays.is_empty(),
             "切到别的标签后 AttachPath 必须被剪掉：{overlays:?}"
@@ -975,12 +988,16 @@ mod tests {
 
     // ───────── 阻断 1（PR #20 第二轮复审）：Enter 分支的全链路 ─────────
 
-    /// 从消息通道里取出上传结果的归属 seed（等后台任务投递）。
-    async fn upload_seed(rx: &mut tokio::sync::mpsc::UnboundedReceiver<AppMsg>) -> Option<String> {
+    /// 从消息通道里取出上传结果的归属 session_id（等后台任务投递）。
+    async fn upload_session_id(
+        rx: &mut tokio::sync::mpsc::UnboundedReceiver<AppMsg>,
+    ) -> Option<String> {
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 match rx.recv().await {
-                    Some(AppMsg::Action(ActionResult::Uploaded { seed, .. })) => return Some(seed),
+                    Some(AppMsg::Action(ActionResult::Uploaded { session_id, .. })) => {
+                        return Some(session_id);
+                    }
                     Some(_) => continue,
                     None => return None,
                 }
@@ -991,14 +1008,16 @@ mod tests {
     }
 
     fn test_app_with_tabs(
-        seeds: &[&str],
+        session_ids: &[&str],
         active: usize,
     ) -> (App, tokio::sync::mpsc::UnboundedReceiver<AppMsg>) {
         let (mut app, rx) = App::new_for_test();
-        for seed in seeds {
-            app.tabs.push((*seed).to_string());
-            app.sessions
-                .insert((*seed).to_string(), SessionState::new((*seed).to_string()));
+        for session_id in session_ids {
+            app.tabs.push((*session_id).to_string());
+            app.sessions.insert(
+                (*session_id).to_string(),
+                SessionState::new((*session_id).to_string()),
+            );
         }
         app.active = active;
         (app, rx)
@@ -1016,8 +1035,8 @@ mod tests {
             }
             match tokio::time::timeout(left, rx.recv()).await {
                 Err(_) | Ok(None) => return,
-                Ok(Some(AppMsg::Action(ActionResult::Uploaded { seed, .. }))) => {
-                    panic!("不该起上传任务，却收到 seed={seed} 的上传结果")
+                Ok(Some(AppMsg::Action(ActionResult::Uploaded { session_id, .. }))) => {
+                    panic!("不该起上传任务，却收到 session_id={session_id} 的上传结果")
                 }
                 Ok(Some(_)) => continue,
             }
@@ -1028,11 +1047,11 @@ mod tests {
     /// 派发），overlay 绑 A、活动标签是 B，上传目标必须是 **A**。
     ///
     /// 证伪方式：把上传目标改回「提交那一刻的活动标签」（旧行为：`upload_attachment`
-    /// 内部查 `active_seed()`）→ 本测试读到 `Uploaded { seed: "B" }`，断言立刻变红。
-    /// 路径用一个不存在的文件：读取失败的分支同样会把归属 seed 原样回传，因此断言
+    /// 内部查 `active_session_id()`）→ 本测试读到 `Uploaded { session_id: "B" }`，断言立刻变红。
+    /// 路径用一个不存在的文件：读取失败的分支同样会把归属 session_id 原样回传，因此断言
     /// 不依赖网络，也不需要真 daemon。
     #[tokio::test]
-    async fn enter_uploads_to_the_overlays_own_seed_not_the_active_tab() {
+    async fn enter_uploads_to_the_overlays_own_session_id_not_the_active_tab() {
         let (mut app, mut rx) = test_app_with_tabs(&["A", "B"], 1);
         app.overlays
             .push(attach_with_path("A", "/nonexistent/qaqh-test-attach.png"));
@@ -1044,9 +1063,9 @@ mod tests {
 
         assert!(app.overlays.is_empty(), "Enter 后 AttachPath 应关闭");
         assert_eq!(
-            upload_seed(&mut rx).await.as_deref(),
+            upload_session_id(&mut rx).await.as_deref(),
             Some("A"),
-            "上传目标必须是 overlay 自己的 seed（A），而不是活动标签（B）"
+            "上传目标必须是 overlay 自己的 session_id（A），而不是活动标签（B）"
         );
     }
 
@@ -1092,7 +1111,7 @@ mod tests {
     fn upload_result_for_a_vanished_session_is_visible() {
         let (mut app, _rx) = App::new_for_test();
         app.handle(AppMsg::Action(ActionResult::Uploaded {
-            seed: "gone".into(),
+            session_id: "gone".into(),
             path: "/tmp/x.png".into(),
             result: Ok(qaqh_client::ContentRef {
                 content_id: "c1".into(),
@@ -1110,12 +1129,12 @@ mod tests {
         );
     }
 
-    /// 上传结果按 seed 归属：活动标签是 B，结果带 seed A → 附件落在 A 的 composer。
+    /// 上传结果按 session_id 归属：活动标签是 B，结果带 session_id A → 附件落在 A 的 composer。
     #[test]
-    fn upload_result_lands_on_the_seed_it_carries() {
+    fn upload_result_lands_on_the_session_id_it_carries() {
         let (mut app, _rx) = test_app_with_tabs(&["A", "B"], 1);
         app.handle(AppMsg::Action(ActionResult::Uploaded {
-            seed: "A".into(),
+            session_id: "A".into(),
             path: "/tmp/shot.png".into(),
             result: Ok(qaqh_client::ContentRef {
                 content_id: "c1".into(),
@@ -1127,7 +1146,7 @@ mod tests {
         assert_eq!(
             app.sessions["A"].composer.attachments.len(),
             1,
-            "附件必须落在 seed A 的会话上"
+            "附件必须落在 session_id A 的会话上"
         );
         assert_eq!(
             app.sessions["B"].composer.attachments.len(),
@@ -1136,23 +1155,23 @@ mod tests {
         );
     }
 
-    /// 回归：切标签后，绑在旧 seed 上的 overlay 必须消失。
+    /// 回归：切标签后，绑在旧 session_id 上的 overlay 必须消失。
     ///
-    /// 证伪方式：去掉 `prune_overlays_for_active_seed()` 的调用（旧行为）——此时
+    /// 证伪方式：去掉 `prune_overlays_for_active_session_id()` 的调用（旧行为）——此时
     /// `Confirm(CloseTab("a"))` 会留在栈里，切到标签 b 后按 `y` 仍然关闭 a。
-    /// 本测试直接锁住「切换后旧 seed 的 overlay 不在了」这个不变量。
+    /// 本测试直接锁住「切换后旧 session_id 的 overlay 不在了」这个不变量。
     #[test]
-    fn seed_bound_overlays_do_not_survive_a_tab_switch() {
+    fn session_id_bound_overlays_do_not_survive_a_tab_switch() {
         let mut overlays = vec![
             confirm_close("a"),
             Overlay::Settings(crate::app::settings::SettingsState::default()),
             attach("a"),
         ];
-        prune_seed_bound_overlays(&mut overlays, Some("b"));
+        prune_session_id_bound_overlays(&mut overlays, Some("b"));
         assert_eq!(
             overlays.len(),
             1,
-            "旧 seed 的确认/附件 overlay 必须被清掉：{overlays:?}"
+            "旧 session_id 的确认/附件 overlay 必须被清掉：{overlays:?}"
         );
         assert!(
             matches!(overlays[0], Overlay::Settings(_)),
@@ -1160,19 +1179,19 @@ mod tests {
         );
     }
 
-    /// 反方向：目标就是同一个 seed 时不清；没有活动标签（首页）时 seed 绑定的一律作废。
+    /// 反方向：目标就是同一个 session_id 时不清；没有活动标签（首页）时 session_id 绑定的一律作废。
     #[test]
-    fn pruning_is_seed_scoped_not_a_blanket_clear() {
+    fn pruning_is_session_id_scoped_not_a_blanket_clear() {
         let mut same = vec![confirm_close("a"), attach("a")];
-        prune_seed_bound_overlays(&mut same, Some("a"));
-        assert_eq!(same.len(), 2, "同 seed 的 overlay 不该被清：{same:?}");
+        prune_session_id_bound_overlays(&mut same, Some("a"));
+        assert_eq!(same.len(), 2, "同 session_id 的 overlay 不该被清：{same:?}");
 
         let mut home = vec![confirm_close("a"), Overlay::Help];
-        prune_seed_bound_overlays(&mut home, None);
+        prune_session_id_bound_overlays(&mut home, None);
         assert_eq!(
             home.len(),
             1,
-            "首页没有 seed，绑定的 overlay 作废：{home:?}"
+            "首页没有 session_id，绑定的 overlay 作废：{home:?}"
         );
         assert!(matches!(home[0], Overlay::Help));
     }
@@ -1188,7 +1207,7 @@ mod tests {
             Overlay::Help,
             attach("a"),
         ];
-        prune_seed_bound_overlays(&mut overlays, Some("b"));
+        prune_session_id_bound_overlays(&mut overlays, Some("b"));
         assert_eq!(overlays.len(), 2, "只剩两个全局层：{overlays:?}");
         assert!(
             matches!(overlays[0], Overlay::Settings(_)),
@@ -1199,49 +1218,51 @@ mod tests {
             "相对顺序不变：{overlays:?}"
         );
         assert!(
-            overlays.last().is_some_and(|o| o.bound_seed().is_none()),
+            overlays
+                .last()
+                .is_some_and(|o| o.bound_session_id().is_none()),
             "栈顶必须是全局 overlay：{overlays:?}"
         );
 
         // 连续切换（b → a → 无标签）不会把已经作废的层捞回来。
-        prune_seed_bound_overlays(&mut overlays, Some("a"));
-        prune_seed_bound_overlays(&mut overlays, None);
+        prune_session_id_bound_overlays(&mut overlays, Some("a"));
+        prune_session_id_bound_overlays(&mut overlays, None);
         assert_eq!(overlays.len(), 2, "全局层始终在：{overlays:?}");
         assert!(matches!(overlays[1], Overlay::Help));
     }
 
-    /// 判据本身（这是「别一刀切」的可执行说明）：哪些算 seed 绑定、哪些算全局。
+    /// 判据本身（这是「别一刀切」的可执行说明）：哪些算 session_id 绑定、哪些算全局。
     #[test]
-    fn bound_seed_classifies_overlays() {
-        assert_eq!(confirm_close("a").bound_seed(), Some("a"));
+    fn bound_session_id_classifies_overlays() {
+        assert_eq!(confirm_close("a").bound_session_id(), Some("a"));
         assert_eq!(
             Overlay::Confirm {
                 action: ConfirmAction::DeleteSession("x".into())
             }
-            .bound_seed(),
+            .bound_session_id(),
             Some("x")
         );
         assert_eq!(
             Overlay::Confirm {
                 action: ConfirmAction::ArchiveSession("y".into())
             }
-            .bound_seed(),
+            .bound_session_id(),
             Some("y")
         );
-        assert_eq!(attach("s").bound_seed(), Some("s"));
+        assert_eq!(attach("s").bound_session_id(), Some("s"));
 
         assert_eq!(
-            Overlay::Settings(crate::app::settings::SettingsState::default()).bound_seed(),
+            Overlay::Settings(crate::app::settings::SettingsState::default()).bound_session_id(),
             None,
             "设置页是全局 overlay"
         );
-        assert_eq!(Overlay::Help.bound_seed(), None);
+        assert_eq!(Overlay::Help.bound_session_id(), None);
         assert_eq!(
             Overlay::SessionList {
                 selected: 0,
                 show_archived: false
             }
-            .bound_seed(),
+            .bound_session_id(),
             None,
             "会话列表是 daemon 全局的，不属于某个标签"
         );
@@ -1250,9 +1271,9 @@ mod tests {
                 input: Vec::new(),
                 cursor: 0
             }
-            .bound_seed(),
+            .bound_session_id(),
             None,
-            "/new 的 cwd 输入此时还没有 seed"
+            "/new 的 cwd 输入此时还没有 session_id"
         );
     }
 }

@@ -601,14 +601,17 @@ fn draw_confirm(
     hit_map: &mut HitMapBuilder,
 ) {
     let (title, body) = match action {
-        ConfirmAction::DeleteSession(seed) => (
+        ConfirmAction::DeleteSession(session_id) => (
             "确认删除",
-            format!("彻底删除会话 {seed}？磁盘数据不可恢复。"),
+            format!("彻底删除会话 {session_id}？磁盘数据不可恢复。"),
         ),
-        ConfirmAction::ArchiveSession(seed) => ("确认归档", format!("归档会话 {seed}？")),
-        ConfirmAction::CloseTab(seed) => {
-            ("确认关闭", format!("关闭标签 {seed}？会话仍保留在列表中。"))
+        ConfirmAction::ArchiveSession(session_id) => {
+            ("确认归档", format!("归档会话 {session_id}？"))
         }
+        ConfirmAction::CloseTab(session_id) => (
+            "确认关闭",
+            format!("关闭标签 {session_id}？会话仍保留在列表中。"),
+        ),
         ConfirmAction::UndoTurn { turn_id, .. } => (
             "确认撤销",
             format!("撤销回合 {turn_id} 及其后的全部对话？工具副作用不会回滚。"),
@@ -1139,11 +1142,11 @@ mod tests {
     /// 造一个「带挂起 ask」的 App：`hit_test` 要从 `app.active_session()` 取面板。
     fn app_with_ask(panel: AskPanel) -> App {
         let (mut app, _rx) = App::new_for_test();
-        let seed = "seed-ask".to_string();
-        let mut session = crate::app::session::SessionState::new(seed.clone());
+        let session_id = "session-ask".to_string();
+        let mut session = crate::app::session::SessionState::new(session_id.clone());
         session.pending_ask = Some(panel);
-        app.tabs.push(seed.clone());
-        app.sessions.insert(seed, session);
+        app.tabs.push(session_id.clone());
+        app.sessions.insert(session_id, session);
         app
     }
 
@@ -1264,21 +1267,21 @@ mod tests {
 
     fn app_with_permission(panel: PermissionPanel) -> App {
         let (mut app, _rx) = App::new_for_test();
-        let seed = "seed-permission".to_string();
-        let mut session = crate::app::session::SessionState::new(seed.clone());
+        let session_id = "session-permission".to_string();
+        let mut session = crate::app::session::SessionState::new(session_id.clone());
         session.pending_permissions.push(panel);
-        app.tabs.push(seed.clone());
-        app.sessions.insert(seed, session);
+        app.tabs.push(session_id.clone());
+        app.sessions.insert(session_id, session);
         app
     }
 
     fn app_with_plan(panel: PlanPanel) -> App {
         let (mut app, _rx) = App::new_for_test();
-        let seed = "seed-plan".to_string();
-        let mut session = crate::app::session::SessionState::new(seed.clone());
+        let session_id = "session-plan".to_string();
+        let mut session = crate::app::session::SessionState::new(session_id.clone());
         session.pending_plan = Some(panel);
-        app.tabs.push(seed.clone());
-        app.sessions.insert(seed, session);
+        app.tabs.push(session_id.clone());
+        app.sessions.insert(session_id, session);
         app
     }
 

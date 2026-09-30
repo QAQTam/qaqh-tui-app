@@ -407,7 +407,7 @@ impl SettingsState {
     /// 开始编辑：Text/Secret/Number/Float 返回预填缓冲（Secret 恒空），
     /// Enum/Toggle/Port 返回 None（由 cycle/端口逻辑处理）。
     pub fn start_edit(&self, loaded: Option<&ConfigDto>) -> Option<EditBuffer> {
-        let seed = match self.row().id {
+        let session_id = match self.row().id {
             FieldId::Model => self.effective(loaded, |d, c| {
                 d.model.clone().unwrap_or_else(|| c.model.clone())
             }),
@@ -492,9 +492,9 @@ impl SettingsState {
             | FieldId::PermissionLevel
             | FieldId::ActiveProfile => return None,
         };
-        let cursor = seed.chars().count();
+        let cursor = session_id.chars().count();
         Some(EditBuffer {
-            buf: seed.chars().collect(),
+            buf: session_id.chars().collect(),
             cursor,
         })
     }

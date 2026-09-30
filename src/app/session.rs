@@ -458,7 +458,7 @@ pub struct ScrollState {
 
 #[derive(Debug, Clone)]
 pub struct SessionState {
-    pub seed: String,
+    pub session_id: String,
     pub title: Option<String>,
     pub mode: ConversationMode,
     pub timeline: TimelineModel,
@@ -500,10 +500,10 @@ pub struct SessionState {
 }
 
 impl SessionState {
-    pub fn new(seed: String) -> Self {
-        let ringing_v2 = RingingV2SessionModel::new(seed.clone());
+    pub fn new(session_id: String) -> Self {
+        let ringing_v2 = RingingV2SessionModel::new(session_id.clone());
         Self {
-            seed,
+            session_id,
             title: None,
             mode: ConversationMode::Code,
             timeline: TimelineModel::default(),
@@ -869,6 +869,7 @@ mod tests {
         Turn {
             thinking: Default::default(),
             turn_index: None,
+            started_at_ms: None,
             turn_id: id.into(),
             user_text: "hi".into(),
             state,
@@ -882,7 +883,7 @@ mod tests {
     }
 
     fn session_with(turns: Vec<Turn>, streaming: Option<(&str, Instant)>) -> SessionState {
-        let mut session = SessionState::new("seed".into());
+        let mut session = SessionState::new("session".into());
         session.timeline.turns = turns;
         session.streaming = streaming.map(|(turn_id, armed_at)| StreamingState {
             turn_id: turn_id.into(),
@@ -899,7 +900,7 @@ mod tests {
         use crate::app::timeline_model::{Block, Round, ToolCard};
         use qaqh_client::{TimelineBlockKind, TimelineBlockState, TimelineToolState};
 
-        let mut s = SessionState::new("seed".into());
+        let mut s = SessionState::new("session".into());
         let mut turn = turn("t1", TimelineTurnState::Running);
         turn.rounds.push(Round {
             round_num: 0,
@@ -948,7 +949,7 @@ mod tests {
         use crate::app::timeline_model::{Block, Round};
         use qaqh_client::{TimelineBlockKind, TimelineBlockState};
 
-        let mut s = SessionState::new("seed".into());
+        let mut s = SessionState::new("session".into());
         let mut turn = turn("t1", TimelineTurnState::Completed);
         turn.rounds.push(Round {
             round_num: 0,
@@ -1115,7 +1116,7 @@ mod tests {
     /// `responded_permissions.contains` 判断——已响应面板会复活。
     #[test]
     fn responded_permission_is_not_requeued() {
-        let mut s = SessionState::new("seed".into());
+        let mut s = SessionState::new("session".into());
         assert!(s.restore_permission_from_snapshot(perm("c1")));
         s.resolve_permission("c1"); // 用户按 a/d 应答
         assert!(s.active_permission().is_none(), "应答后面板必须下架");
@@ -1138,7 +1139,7 @@ mod tests {
     /// 回归：真实事故序列——权限请求 → 工具已开始（面板下架）→ 权限请求补投到。
     #[test]
     fn late_permission_after_tool_started_does_not_resurrect_panel() {
-        let mut s = SessionState::new("seed".into());
+        let mut s = SessionState::new("session".into());
         assert!(s.restore_permission_from_snapshot(perm("c1")));
         // ToolStarted / ToolFinished 走的就是 resolve_permission。
         s.resolve_permission("c1");
@@ -1152,7 +1153,7 @@ mod tests {
     /// 反方向：没被解决过的同 id 重放只保留一个面板，且不改变队首优先级。
     #[test]
     fn same_tool_call_redelivery_keeps_existing_panel() {
-        let mut s = SessionState::new("seed".into());
+        let mut s = SessionState::new("session".into());
         let mut original = perm("c1");
         original.reason = "原始理由".into();
         assert!(s.restore_permission_from_snapshot(original));
@@ -1205,7 +1206,7 @@ mod tests {
     /// 「详情不得被降级」两条断言同时变红。
     #[test]
     fn late_snapshot_never_downgrades_live_panels() {
-        let mut s = SessionState::new("seed".into());
+        let mut s = SessionState::new("session".into());
         let mut live = perm("c1");
         live.reason = "需要写文件".into();
         live.risk = PermissionRisk::High;

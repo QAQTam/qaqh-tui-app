@@ -43,7 +43,11 @@ fi
 #   src/app/mod.rs — API **直通**（`query` / `action` / `ConfigLoaded` 的
 #     `Value`），不做展示解析。
 #   src/app/settings_ops.rs — 把 typed draft **序列化**成 wire 值，不解析。
-G2_ALLOWED_FILES='src/app/mod\.rs|src/app/settings_ops\.rs'
+#   src/app/v2_fixtures.rs — 纯 `#[cfg(test)]` 模块（`#[cfg(test)] pub(crate)
+#     mod v2_fixtures;`），不参与生产构建。它是本仓**唯一**允许「权威类型 ↔
+#     JSON」互转的测试夹具：断言用的载荷必须由 `qaqh-client` 自己的类型反序列化
+#     得到（fail-loud），这正是 2026-09-30 协议权威化迁移留下的防漂移面。
+G2_ALLOWED_FILES='src/app/mod\.rs|src/app/settings_ops\.rs|src/app/v2_fixtures\.rs'
 g2_files=$(grep -rl "serde_json::Value" --include=*.rs src/ | sort)
 g2_bad=$(printf '%s\n' "$g2_files" | grep -vE "^($G2_ALLOWED_FILES)$" || true)
 # 解析（from_str::<…Value…>）比类型出现更严格：展示层不允许手解 JSON。
@@ -89,6 +93,29 @@ if [ -n "$g4_hits" ]; then
     fail=1
 else
     note ✓ "G4 分层：reducer / wire model 未引入渲染层类型"
+fi
+
+# ── G5：会话状态机不得重建协议词汇（2026-09-30 协议权威化）─────────
+# 出处：issue「消灭 TUI 自维护协议的局限性，统一使用后端接口」。
+#
+# 背景：`src/app/ringing_v2.rs` 曾经自带六份手抄协议镜像（`Delivery` /
+# `InteractionKind` / `ResetReason` / `PendingInteraction` / `DriverState` /
+# `BootstrapSnapshot`）加三个适配器，漂移**静默发生**过三次（`seed`→
+# `session_id`、缺 `ts_ms`、镜像漏 `request` 字段）。删除之后必须有门禁，
+# 否则下一个人会「顺手」再抄一份。
+#
+# 判据：在状态机与 wire 消费面里，这些**名字**只能来自 `qaqh_client`，不许
+# 本地 `enum` / `struct` / `type` 重声明。grep 结构可判，不做语义推断。
+G5_FILES='src/app/ringing_v2.rs'
+G5_MIRRORS='(enum|struct|type)[[:space:]]+(Delivery|InteractionKind|ResetReason|PendingInteraction|DriverState|BootstrapSnapshot|EventMeta|ResetSignal)[[:space:]]*[{=<]'
+g5_hits=$(grep -nE "$G5_MIRRORS" $G5_FILES 2>/dev/null || true)
+if [ -n "$g5_hits" ]; then
+    note ✗ "G5 协议面：ringing_v2.rs 又出现了本地协议镜像声明"
+    printf '%s\n' "$g5_hits" | sed 's/^/      /'
+    note "   正确做法：这些类型全部 import 自 qaqh-client（权威 wire 视图）"
+    fail=1
+else
+    note ✓ "G5 协议面：状态机未重声明协议词汇（Delivery/ResetReason/… 全部来自 qaqh-client）"
 fi
 
 echo

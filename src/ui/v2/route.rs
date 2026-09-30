@@ -24,7 +24,7 @@ pub enum WorkspaceRoute {
         filter: String,
     },
     Subagent {
-        seed: String,
+        session_id: String,
     },
 }
 
@@ -100,8 +100,8 @@ pub fn resolve(app: &App) -> ScreenRoute {
         }
     }
 
-    if let Some(seed) = app.inspect.clone() {
-        return ScreenRoute::Workspace(WorkspaceRoute::Subagent { seed });
+    if let Some(session_id) = app.inspect.clone() {
+        return ScreenRoute::Workspace(WorkspaceRoute::Subagent { session_id });
     }
     if app.show_workspace && app.active_session().is_some() {
         return ScreenRoute::Workspace(WorkspaceRoute::Todo);
@@ -117,9 +117,9 @@ mod tests {
 
     fn app_with_session() -> App {
         let (mut app, _rx) = App::new_for_test();
-        app.tabs.push("seed".into());
+        app.tabs.push("session".into());
         app.sessions
-            .insert("seed".into(), SessionState::new("seed".into()));
+            .insert("session".into(), SessionState::new("session".into()));
         app
     }
 
@@ -170,7 +170,7 @@ mod tests {
         let mut app = app_with_session();
         app.overlays.push(Overlay::Help);
         {
-            let session = app.sessions.get_mut("seed").expect("session");
+            let session = app.sessions.get_mut("session").expect("session");
             session.pending_plan = Some(plan());
             session.pending_ask = Some(ask());
             session.pending_permissions.push(permission());
@@ -178,13 +178,16 @@ mod tests {
         assert_eq!(resolve(&app), ScreenRoute::Modal(ModalRoute::Permission));
 
         app.sessions
-            .get_mut("seed")
+            .get_mut("session")
             .expect("session")
             .pending_permissions
             .clear();
         assert_eq!(resolve(&app), ScreenRoute::Modal(ModalRoute::Ask));
 
-        app.sessions.get_mut("seed").expect("session").pending_ask = None;
+        app.sessions
+            .get_mut("session")
+            .expect("session")
+            .pending_ask = None;
         assert_eq!(resolve(&app), ScreenRoute::Modal(ModalRoute::Plan));
     }
 
@@ -235,13 +238,13 @@ mod tests {
     fn selector_overlays_route_to_modal() {
         let mut app = app_with_session();
         app.overlays.push(Overlay::Confirm {
-            action: crate::app::ConfirmAction::CloseTab("seed".into()),
+            action: crate::app::ConfirmAction::CloseTab("session".into()),
         });
         assert_eq!(resolve(&app), ScreenRoute::Modal(ModalRoute::Confirm));
 
         app.overlays.clear();
         app.overlays.push(Overlay::Thinking {
-            seed: "seed".into(),
+            session_id: "session".into(),
             scroll: 0,
             body: "思考".into(),
         });
@@ -254,7 +257,9 @@ mod tests {
         app.inspect = Some("sub".into());
         assert_eq!(
             resolve(&app),
-            ScreenRoute::Workspace(WorkspaceRoute::Subagent { seed: "sub".into() })
+            ScreenRoute::Workspace(WorkspaceRoute::Subagent {
+                session_id: "sub".into()
+            })
         );
 
         app.inspect = None;

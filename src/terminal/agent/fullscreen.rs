@@ -582,10 +582,10 @@ impl FullscreenView {
 
     pub(super) fn clamp_scroll(&mut self, app: &mut App) {
         let max_offset = self.max_offset();
-        let Some(seed) = app.active_seed() else {
+        let Some(session_id) = app.active_session_id() else {
             return;
         };
-        if let Some(session) = app.sessions.get_mut(&seed) {
+        if let Some(session) = app.sessions.get_mut(&session_id) {
             if max_offset == 0 {
                 session.scroll.follow = true;
                 session.scroll.offset = 0;
@@ -626,7 +626,7 @@ struct FullscreenBlockSpan {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct FullscreenTranscriptKey {
-    seed: String,
+    session_id: String,
     version: u64,
     width: u16,
     expanded_tools_revision: u64,
@@ -661,7 +661,7 @@ impl FullscreenTranscriptCache {
             return;
         };
         let key = FullscreenTranscriptKey {
-            seed: session.seed.clone(),
+            session_id: session.session_id.clone(),
             version: session.timeline.version,
             width,
             expanded_tools_revision: session.expanded_tools_revision,
@@ -674,8 +674,10 @@ impl FullscreenTranscriptCache {
         // Live reasoning 仍在 composer 上方单独显示，避免“单行思考链”在历史区
         // 重复；其余 live block（尤其流式 assistant）必须进入全屏历史，否则全屏
         // 模式下只能看到最后一行。
-        let blocks: Vec<_> = adapter::from_turns_with_expanded_blocks(
-            &session.timeline.turns,
+        // 走**整个模型**而不是只有 `turns`：压缩分隔锚（W3/D10）与回合墙钟都在
+        // 模型上，只读 turns 会把它们静默丢掉。
+        let blocks: Vec<_> = adapter::from_model_with_expanded_blocks(
+            &session.timeline,
             &session.expanded_tools,
             &session.expanded_thinking,
         )
@@ -765,7 +767,7 @@ fn render_fullscreen_history(
 
 /// 普通启动的品牌首屏：品牌标识 + 输入框 + 一行状态提示。
 ///
-/// 这里不预造 session；`Enter` 由 app 层转成 `SessionCreate`，首条消息在 seed
+/// 这里不预造 session；`Enter` 由 app 层转成 `SessionCreate`，首条消息在 session_id
 /// 确认后补发。
 fn render_brand(app: &App, width: u16, height: u16, theme: &Theme) -> AgentRender {
     let height = usize::from(height.max(1));

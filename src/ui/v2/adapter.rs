@@ -5,7 +5,7 @@
 
 use std::collections::HashSet;
 
-use crate::app::timeline_model::{Block, ToolCard, Turn};
+use crate::app::timeline_model::{Block, CompactionMark, TimelineModel, ToolCard, Turn};
 use crate::ui::v2::transcript::{
     BlockId, BlockKind, BlockState, ToolBlock, ToolState, TranscriptBlock,
 };
@@ -20,6 +20,77 @@ pub fn from_turns_with_expanded(
     expanded_tools: &HashSet<String>,
 ) -> Vec<TranscriptBlock> {
     from_turns_with_expanded_blocks(turns, expanded_tools, &HashSet::new())
+}
+
+/// 从**整个模型**取块：除回合内容外还要带上无损的窗口外状态（压缩分隔锚）。
+///
+/// 这是渲染路径的入口：`from_turns_*` 只看 `turns`，看不到
+/// `compaction_marks`，用它渲染会静默丢掉「此前已压缩」这条事实。
+pub fn from_model_with_expanded_blocks(
+    model: &TimelineModel,
+    expanded_tools: &HashSet<String>,
+    expanded_thinking: &HashSet<String>,
+) -> Vec<TranscriptBlock> {
+    let blocks = from_turns_with_expanded_blocks(&model.turns, expanded_tools, expanded_thinking);
+    splice_compaction_marks(blocks, &model.turns, &model.compaction_marks)
+}
+
+/// 把压缩分隔条插进块序列。
+///
+/// 锚定语义（与 webui W3 同口径）：
+/// - 锚点回合仍在窗口里 → 插在该回合**所有块之后**；
+/// - 锚点回合已被淘汰（`cap_turns` / 深翻页）或当时还没有回合 → 插在**最前面**。
+///
+/// 分隔条用 `BlockKind::System` 承载：它本来就是「非对话的系统陈述」，不需要为
+/// 一个分隔条再造一种块类型（那会波及命中测试、导出、缓存键三处）。
+pub fn splice_compaction_marks(
+    mut blocks: Vec<TranscriptBlock>,
+    turns: &[Turn],
+    marks: &[CompactionMark],
+) -> Vec<TranscriptBlock> {
+    if marks.is_empty() {
+        return blocks;
+    }
+    // 每个锚点解析成「插在 blocks 的哪个下标之前」。多个锚点时倒序插入，
+    // 保证前面的插入不让后面的下标失效。
+    let mut insertions: Vec<(usize, usize)> = Vec::with_capacity(marks.len());
+    for (mark_index, mark) in marks.iter().enumerate() {
+        let at = match mark.after_turn_id.as_deref() {
+            Some(turn_id) => match turns.iter().position(|turn| turn.turn_id == turn_id) {
+                // 该回合之后 = 该回合最后一块的下一块。
+                Some(turn_pos) => {
+                    let last_turn_id = &turns[turn_pos].turn_id;
+                    blocks
+                        .iter()
+                        .rposition(|block| &block.turn_id == last_turn_id)
+                        .map_or(0, |index| index + 1)
+                }
+                // 锚点已被淘汰：顶到最前，分隔条不随锚点消失而消失。
+                None => 0,
+            },
+            None => 0,
+        };
+        insertions.push((at, mark_index));
+    }
+    insertions.sort_by(|a, b| b.0.cmp(&a.0).then(b.1.cmp(&a.1)));
+    for (at, mark_index) in insertions {
+        let at = at.min(blocks.len());
+        blocks.insert(at, compaction_block(&marks[mark_index]));
+    }
+    blocks
+}
+
+fn compaction_block(mark: &CompactionMark) -> TranscriptBlock {
+    TranscriptBlock {
+        id: BlockId::new(format!("compaction:{}", mark.context_revision)),
+        turn_id: mark.after_turn_id.clone().unwrap_or_default(),
+        revision: mark.context_revision,
+        state: BlockState::Sealed,
+        kind: BlockKind::System {
+            text: "── 此前已压缩 ──".to_string(),
+        },
+        at_ms: None,
+    }
 }
 
 pub fn from_turns_with_expanded_blocks(
@@ -66,6 +137,8 @@ pub fn from_turn(turn: &Turn) -> Vec<TranscriptBlock> {
             kind: BlockKind::User {
                 text: turn.user_text.clone(),
             },
+            // 权威源 fact 墙钟由 v2 信封回填到回合上（见 `Turn::started_at_ms`）。
+            at_ms: turn.started_at_ms,
         });
     }
     for round in &turn.rounds {
@@ -115,6 +188,7 @@ fn from_block(turn_id: &str, turn_sealed: bool, block: &Block) -> Option<Transcr
         revision: block.rev,
         state,
         kind,
+        at_ms: None,
     })
 }
 
@@ -172,6 +246,7 @@ mod tests {
         Turn {
             turn_id: "turn-1".to_string(),
             turn_index: Some(1),
+            started_at_ms: None,
             user_text: "hello".to_string(),
             state: TimelineTurnState::Running,
             failure: None,
@@ -320,5 +395,106 @@ mod tests {
                 .as_deref()
                 .is_some_and(|value| value.contains("exit_1"))
         );
+    }
+
+    /// 用户块必须带上**权威**墙钟（来自 v2 信封，落在回合上）；缺席保持 None。
+    #[test]
+    fn user_block_carries_the_authoritative_wall_clock_only_when_known() {
+        let mut unknown = turn(vec![]);
+        unknown.started_at_ms = None;
+        assert_eq!(from_turn(&unknown)[0].at_ms, None);
+
+        let mut known = turn(vec![]);
+        known.started_at_ms = Some(1_759_000_000_000);
+        assert_eq!(from_turn(&known)[0].at_ms, Some(1_759_000_000_000));
+    }
+
+    /// W3/D10：压缩分隔条插在锚点回合之后，且不改变原有块的顺序。
+    #[test]
+    fn compaction_mark_splices_after_its_anchor_turn() {
+        let mut first = turn(vec![block(
+            "a",
+            TimelineBlockKind::Text,
+            TimelineBlockState::Sealed,
+            "one",
+        )]);
+        first.turn_id = "t1".to_string();
+        let mut second = turn(vec![block(
+            "b",
+            TimelineBlockKind::Text,
+            TimelineBlockState::Sealed,
+            "two",
+        )]);
+        second.turn_id = "t2".to_string();
+        let turns = vec![first, second];
+        let marks = vec![CompactionMark {
+            after_turn_id: Some("t1".to_string()),
+            context_revision: 9,
+        }];
+
+        let blocks = from_turns_with_expanded_blocks(&turns, &HashSet::new(), &HashSet::new());
+        let spliced = splice_compaction_marks(blocks, &turns, &marks);
+        let kinds: Vec<&str> = spliced
+            .iter()
+            .map(|block| match &block.kind {
+                BlockKind::User { .. } => "user",
+                BlockKind::Assistant { .. } => "assistant",
+                BlockKind::System { .. } => "divider",
+                BlockKind::Thinking { .. } => "thinking",
+                BlockKind::Tool(_) => "tool",
+            })
+            .collect();
+        // user(t1) assistant(t1) divider user(t2) assistant(t2)
+        assert_eq!(kinds, ["user", "assistant", "divider", "user", "assistant"]);
+        assert_eq!(spliced[2].id.to_string(), "compaction:9");
+    }
+
+    /// 锚点回合已被淘汰（`cap_turns` / 深翻页）时分隔条顶到最前，而不是消失。
+    #[test]
+    fn compaction_mark_with_evicted_anchor_goes_to_the_top() {
+        let turns = vec![turn(vec![block(
+            "a",
+            TimelineBlockKind::Text,
+            TimelineBlockState::Sealed,
+            "one",
+        )])];
+        let marks = vec![CompactionMark {
+            after_turn_id: Some("turn-evicted".to_string()),
+            context_revision: 3,
+        }];
+        let blocks = from_turns_with_expanded_blocks(&turns, &HashSet::new(), &HashSet::new());
+        let spliced = splice_compaction_marks(blocks, &turns, &marks);
+        assert!(matches!(spliced[0].kind, BlockKind::System { .. }));
+        assert_eq!(spliced.len(), 3);
+    }
+
+    /// 窗口里还没有回合时的锚（`None`）同样渲染在顶部。
+    #[test]
+    fn compaction_mark_without_turns_renders_at_the_top() {
+        let marks = vec![CompactionMark {
+            after_turn_id: None,
+            context_revision: 1,
+        }];
+        let spliced = splice_compaction_marks(Vec::new(), &[], &marks);
+        assert_eq!(spliced.len(), 1);
+        assert!(matches!(spliced[0].kind, BlockKind::System { .. }));
+    }
+
+    /// 分隔条文本是「此前已压缩」——与 webui W3 同一句用户可见文案。
+    #[test]
+    fn compaction_divider_text_is_user_visible() {
+        let marks = vec![CompactionMark {
+            after_turn_id: None,
+            context_revision: 1,
+        }];
+        let spliced = splice_compaction_marks(Vec::new(), &[], &marks);
+        let Some(TranscriptBlock {
+            kind: BlockKind::System { text },
+            ..
+        }) = spliced.first()
+        else {
+            panic!("divider missing");
+        };
+        assert!(text.contains("此前已压缩"), "{text}");
     }
 }

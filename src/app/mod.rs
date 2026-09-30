@@ -22,6 +22,9 @@ pub mod subagent;
 pub mod team;
 pub mod timeline_model;
 mod transcript_ops;
+/// v2 权威载荷的测试构造器（见模块文档：手抄信封的漂移已被真实击中过）。
+#[cfg(test)]
+pub(crate) mod v2_fixtures;
 
 use self::keymap::{GlobalKey, ModalRoute};
 use self::paste_guard::PasteGuard;
@@ -37,11 +40,11 @@ use crate::protocol::ConfigDto;
 use crate::runtime::{ConnEvent, Runtime, RuntimeMsg, StreamKey, TimelineLostReason};
 use qaqh_client::TimelinePage;
 use qaqh_client::{ActionRequest, QueryRequest};
+use qaqh_client::{ClientV2CommandStatus, RingingCommandState as CommandState};
 use qaqh_client::{ContentRef, DomainActivityState as ActivityState, NoticeLevel, PermissionRisk};
 use qaqh_client::{
     ControlCommand, ConversationCommand, ConversationInputPurpose, RingingCommand, ToolCommand,
 };
-use qaqh_client::{RingingCommandState as CommandState, ClientV2CommandStatus};
 use qaqh_client::{SessionActivity, SessionListEntry};
 use session::{
     AskPanel, Composer, PermissionPanel, PlanPanel, SessionState, StreamPhase, activity_from_v2,
@@ -70,24 +73,24 @@ use team::TeamState;
 #[derive(Debug)]
 pub enum ActionResult {
     Bootstrap {
-        seed: String,
+        session_id: String,
         result: Result<qaqh_client::ClientV2Bootstrap, String>,
         client_session_id: Option<String>,
     },
     DriverClaimed {
-        seed: String,
+        session_id: String,
         result: Result<(), String>,
     },
     /// v2 ask / plan / permission 交互正文（content store 取回后按 body 构造挂起面板）。
     InteractionBody {
-        seed: String,
+        session_id: String,
         interaction_id: String,
         /// permission 回复需要 canonical call id；ask / plan 为空。
         call_id: Option<String>,
         result: Result<Vec<u8>, String>,
     },
     CommandAck {
-        seed: Option<String>,
+        session_id: Option<String>,
         label: &'static str,
         result: Result<qaqh_client::ClientV2CommandAck, String>,
     },
@@ -99,29 +102,29 @@ pub enum ActionResult {
         result: Result<serde_json::Value, String>,
     },
     Uploaded {
-        seed: String,
+        session_id: String,
         path: String,
         result: Result<ContentRef, String>,
     },
     Rebaseline {
-        seed: String,
+        session_id: String,
         result: Result<TimelinePage, String>,
     },
     LoadOlder {
-        seed: String,
+        session_id: String,
         result: Result<TimelinePage, String>,
     },
     Receipt {
         label: &'static str,
-        seed: Option<String>,
+        session_id: Option<String>,
         result: Result<ClientV2CommandStatus, String>,
     },
     Dashboard {
-        seed: String,
+        session_id: String,
         result: Result<qaqh_client::DomainDashboardSnapshot, String>,
     },
     Team {
-        seed: String,
+        session_id: String,
         result: Result<qaqh_client::ClientV2TeamResponse, String>,
     },
 }
@@ -146,7 +149,7 @@ pub enum AppMsg {
 /// 后台任务取用的 API 句柄。
 ///
 /// T-01 阶段 1.5 后本仓**不再持有自己的 HTTP 客户端**——连接生命周期、三条
-/// 频道流、per-seed timeline 流、命令面（`send_command`）与服务面
+/// 频道流、per-session_id timeline 流、命令面（`send_command`）与服务面
 /// （`query`/`action`）全由 `qaqh-client` 一处承担，凭据热更新因此也只有一份。
 #[derive(Clone)]
 pub struct ApiCtx {
@@ -185,20 +188,23 @@ impl ApiCtx {
     /// 丢帧」）随之消失：现在形状对不上会直接是**编译错误**。
     pub async fn send_command(
         &self,
-        seed: Option<&str>,
+        session_id: Option<&str>,
         command: qaqh_client::RingingCommand,
         options: qaqh_client::CommandOptions,
     ) -> Result<qaqh_client::ClientV2CommandAck, String> {
         self.client()?
-            .send_command(seed, command, options)
+            .send_command(session_id, command, options)
             .await
             .map_err(|e| e.to_string())
     }
 
     /// 拉取一次 Team projection 快照（roster / inbox 的唯一权威来源）。
-    pub async fn team_v2(&self, seed: &str) -> Result<qaqh_client::ClientV2TeamResponse, String> {
+    pub async fn team_v2(
+        &self,
+        session_id: &str,
+    ) -> Result<qaqh_client::ClientV2TeamResponse, String> {
         self.client()?
-            .team_v2(seed)
+            .team_v2(session_id)
             .await
             .map_err(|e| e.to_string())
     }
@@ -210,7 +216,7 @@ impl ApiCtx {
     /// daemon 卡在 worker 时 UI 永远不会给出超时反馈（ask-hang 的原始回归）。
     pub async fn send_interaction_command(
         &self,
-        seed: Option<&str>,
+        session_id: Option<&str>,
         command: qaqh_client::RingingCommand,
     ) -> Result<qaqh_client::ClientV2CommandAck, String> {
         let command_id = uuid::Uuid::new_v4().to_string();
@@ -219,7 +225,7 @@ impl ApiCtx {
             ..Default::default()
         };
         match tokio::time::timeout(INTERACTION_ACK_TIMEOUT, async {
-            let ack = self.send_command(seed, command, options).await?;
+            let ack = self.send_command(session_id, command, options).await?;
             if ack.status == qaqh_client::RingingCommandAckStatus::Rejected {
                 return Ok(ack);
             }
@@ -255,25 +261,28 @@ impl ApiCtx {
     /// （见后端 `TimelineAppender::open_turn` 的 reopen 注释），当不了稳定游标。
     pub async fn timeline_page(
         &self,
-        seed: &str,
+        session_id: &str,
         before_index: Option<u64>,
         limit: u32,
     ) -> Result<qaqh_client::TimelinePage, String> {
         // 类型已权威化：不再有过桥这一步，返回的就是 `qaqh_client` 的类型。
         self.client()?
-            .fetch_timeline_page(seed, before_index, Some(limit))
+            .fetch_timeline_page(session_id, before_index, Some(limit))
             .await
             .map_err(|e| e.to_string())
     }
 
     /// 会话 bootstrap（v2 三频道 typed 快照原子恢复）。
-    pub async fn bootstrap(&self, seed: &str) -> Result<qaqh_client::ClientV2Bootstrap, String> {
+    pub async fn bootstrap(
+        &self,
+        session_id: &str,
+    ) -> Result<qaqh_client::ClientV2Bootstrap, String> {
         let client = self.client()?;
         // 新建会话在首个 canonical 事实落盘前，v2 快照端点是 404/409（会话尚未
         // 物化）——这是**瞬态**，短退避重试而不是立刻报错。
         let mut last: Option<String> = None;
         for _ in 0..120 {
-            match client.bootstrap(seed).await {
+            match client.bootstrap(session_id).await {
                 Ok(bootstrap) => return Ok(bootstrap),
                 Err(error) if error.is_session_not_ready() => {
                     last = Some(error.to_string());
@@ -298,9 +307,9 @@ impl ApiCtx {
     }
 
     /// 显式声明 driver seat；holder 仍以随后的 reliable `DriverChanged` 为准。
-    pub async fn claim_driver(&self, seed: &str) -> Result<(), String> {
+    pub async fn claim_driver(&self, session_id: &str) -> Result<(), String> {
         self.client()?
-            .claim_driver(seed)
+            .claim_driver(session_id)
             .await
             .map(|_| ())
             .map_err(|error| error.to_string())
@@ -333,12 +342,12 @@ impl ApiCtx {
     /// 上传附件内容（multipart 组装在 client 侧）。
     pub async fn upload_content(
         &self,
-        seed: &str,
+        session_id: &str,
         media_type: &str,
         data: Vec<u8>,
     ) -> Result<qaqh_client::ContentRef, String> {
         self.client()?
-            .upload_content(seed, media_type, data)
+            .upload_content(session_id, media_type, data)
             .await
             .map_err(|e| e.to_string())
     }
@@ -483,7 +492,7 @@ pub enum ConfirmAction {
     DeleteSession(String),
     ArchiveSession(String),
     CloseTab(String),
-    UndoTurn { seed: String, turn_id: String },
+    UndoTurn { session_id: String, turn_id: String },
 }
 
 // Settings 变体内嵌完整编辑态，尺寸差较大；Box 化推迟到独立性能任务。
@@ -499,7 +508,7 @@ pub enum Overlay {
     AttachPath {
         input: Vec<char>,
         cursor: usize,
-        seed: String,
+        session_id: String,
     },
     Confirm {
         action: ConfirmAction,
@@ -527,46 +536,46 @@ pub enum Overlay {
     /// 思考回放浮层（§4.5）：当前活动回合的 reasoning body（内存零抓取）。
     /// 只读 + 滚动；Esc 关闭。body 在推入时快照（后续 delta 不刷新——回放语义）。
     Thinking {
-        seed: String,
+        session_id: String,
         scroll: usize,
         body: String,
     },
 }
 
 impl ConfirmAction {
-    /// 该确认动作最终作用的会话 seed。
-    pub fn seed(&self) -> &str {
+    /// 该确认动作最终作用的会话 session_id。
+    pub fn session_id(&self) -> &str {
         match self {
-            ConfirmAction::DeleteSession(seed)
-            | ConfirmAction::ArchiveSession(seed)
-            | ConfirmAction::CloseTab(seed) => seed,
-            ConfirmAction::UndoTurn { seed, .. } => seed,
+            ConfirmAction::DeleteSession(session_id)
+            | ConfirmAction::ArchiveSession(session_id)
+            | ConfirmAction::CloseTab(session_id) => session_id,
+            ConfirmAction::UndoTurn { session_id, .. } => session_id,
         }
     }
 }
 
 impl Overlay {
-    /// 该 overlay 绑定的会话 seed；`None` = 全局 overlay，与活动标签无关。
+    /// 该 overlay 绑定的会话 session_id；`None` = 全局 overlay，与活动标签无关。
     ///
-    /// 判据是「它的确认/提交动作会落到哪个 seed 上」，不是「它看起来像不像弹窗」：
+    /// 判据是「它的确认/提交动作会落到哪个 session_id 上」，不是「它看起来像不像弹窗」：
     ///
-    /// - **seed 绑定**：`Confirm`（三个动作都携带 seed，按 `y` 直接作用于那个
-    ///   seed）与 `AttachPath`（附件上传落在某个会话上）。切标签后它们就是过期
+    /// - **session_id 绑定**：`Confirm`（三个动作都携带 session_id，按 `y` 直接作用于那个
+    ///   session_id）与 `AttachPath`（附件上传落在某个会话上）。切标签后它们就是过期
     ///   指令——确认类 overlay 绝不能跨标签生效。
     /// - **全局**：`SessionList`（daemon 全局会话列表）、`Settings`（全局配置）、
-    ///   `Help`、`CwdInput`（`/new` 的 cwd，此时还没有 seed）。它们与当前标签
+    ///   `Help`、`CwdInput`（`/new` 的 cwd，此时还没有 session_id）。它们与当前标签
     ///   无关，切标签**不该**把它们关掉——一刀切清空会误伤设置页这类全局面板。
     ///
     /// `AttachPath` 的判据与执行必须同源：它的上传目标由
-    /// [`Overlay::attach_submit`] 给出，取的就是这里的 `seed`（不是提交那一刻的
-    /// 活动标签）。此前 `bound_seed()` 说「属于 seed X」而上传查 `active_seed()`，
-    /// 两条路径结论相反，`AttachPath.seed` 沦为死字段。
-    pub fn bound_seed(&self) -> Option<&str> {
+    /// [`Overlay::attach_submit`] 给出，取的就是这里的 `session_id`（不是提交那一刻的
+    /// 活动标签）。此前 `bound_session_id()` 说「属于 session_id X」而上传查 `active_session_id()`，
+    /// 两条路径结论相反，`AttachPath.session_id` 沦为死字段。
+    pub fn bound_session_id(&self) -> Option<&str> {
         match self {
-            Overlay::Confirm { action } => Some(action.seed()),
-            Overlay::AttachPath { seed, .. } => Some(seed),
-            Overlay::Thinking { seed, .. } => Some(seed),
-            // History 渲染的是**当前活动会话**的 timeline，自己不持有 seed：
+            Overlay::Confirm { action } => Some(action.session_id()),
+            Overlay::AttachPath { session_id, .. } => Some(session_id),
+            Overlay::Thinking { session_id, .. } => Some(session_id),
+            // History 渲染的是**当前活动会话**的 timeline，自己不持有 session_id：
             // 切标签时让它跟着走，不关掉（与 SessionList/Settings 同属全局面）。
             Overlay::SessionList { .. }
             | Overlay::Settings(_)
@@ -577,20 +586,20 @@ impl Overlay {
         }
     }
 
-    /// `AttachPath` 按 Enter 的提交动作：目标 seed + 去空白后的路径。
+    /// `AttachPath` 按 Enter 的提交动作：目标 session_id + 去空白后的路径。
     ///
     /// 取 `AttachPath` 的**字段**而不是 `&self`：只有 Enter 分支需要它，且只可能是
     /// `AttachPath`——放在 `overlay_key` 的 `match` 之前会让每次按键（包括输入路径
     /// 的每个字符）都白做一次 `String` 分配，也让「只有 AttachPath 有这个动作」
     /// 这件事变成运行期判断。
     ///
-    /// - 目标 seed **恒取 overlay 自己存的那个**——这是附件目标 seed 的单一事实源，
-    ///   与 [`Overlay::bound_seed`] 的判据一致（判据说属于谁，执行就落在谁身上）；
+    /// - 目标 session_id **恒取 overlay 自己存的那个**——这是附件目标 session_id 的单一事实源，
+    ///   与 [`Overlay::bound_session_id`] 的判据一致（判据说属于谁，执行就落在谁身上）；
     /// - 空路径（或纯空白）→ `None`：不提交。
-    pub fn attach_submit(input: &[char], seed: &str) -> Option<AttachSubmit> {
+    pub fn attach_submit(input: &[char], session_id: &str) -> Option<AttachSubmit> {
         let path = input.iter().collect::<String>().trim().to_owned();
         (!path.is_empty()).then(|| AttachSubmit {
-            target_seed: seed.to_owned(),
+            target_session_id: session_id.to_owned(),
             path,
         })
     }
@@ -600,27 +609,27 @@ impl Overlay {
 /// `AttachPath` Enter 分支是唯一调用点）。
 ///
 /// 这样「上传挂到哪个会话」不可能与 overlay 的身份漂移：上传入口拿不到
-/// `active_seed()`，只有一个来源。判据（`bound_seed()`）、剪枝（切标签即关闭）、
-/// 执行（用存量 seed 上传）三条路径由此自洽。
+/// `active_session_id()`，只有一个来源。判据（`bound_session_id()`）、剪枝（切标签即关闭）、
+/// 执行（用存量 session_id 上传）三条路径由此自洽。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AttachSubmit {
-    target_seed: String,
+    target_session_id: String,
     path: String,
 }
 
 impl AttachSubmit {
-    /// 拆成 `(目标 seed, 路径)`——上传入口只通过它取值。
+    /// 拆成 `(目标 session_id, 路径)`——上传入口只通过它取值。
     pub fn into_parts(self) -> (String, String) {
-        (self.target_seed, self.path)
+        (self.target_session_id, self.path)
     }
 }
 
-/// 清掉「不属于 `seed`」的 seed 绑定 overlay（纯函数，便于回归测试）。
+/// 清掉「不属于 `session_id`」的 session_id 绑定 overlay（纯函数，便于回归测试）。
 ///
-/// 全局 overlay（`bound_seed() == None`）原样保留且保持相对顺序；删掉的若是栈顶，
+/// 全局 overlay（`bound_session_id() == None`）原样保留且保持相对顺序；删掉的若是栈顶，
 /// 下面那层自然接管——渲染与按键路由都取 `overlays.last()`，两处一致。
-pub fn prune_seed_bound_overlays(overlays: &mut Vec<Overlay>, seed: Option<&str>) {
-    overlays.retain(|o| match (o.bound_seed(), seed) {
+pub fn prune_session_id_bound_overlays(overlays: &mut Vec<Overlay>, session_id: Option<&str>) {
+    overlays.retain(|o| match (o.bound_session_id(), session_id) {
         (None, _) => true,
         (Some(bound), Some(active)) => bound == active,
         (Some(_), None) => false,
@@ -675,7 +684,7 @@ pub struct App {
 
     pub tabs: Vec<String>,
     pub sessions: HashMap<String, SessionState>,
-    /// root seed → Team projection（roster / inbox）。
+    /// root session_id → Team projection（roster / inbox）。
     pub teams: HashMap<String, TeamState>,
     /// Child id → live status observed before the owning Team snapshot arrived.
     ///
@@ -726,7 +735,7 @@ pub struct App {
     pub settings_saving: bool,
     /// 右侧 workspace 面板开关（F4；窄终端自动隐藏）。
     pub show_workspace: bool,
-    pub tracked_seeds: HashSet<String>,
+    pub tracked_session_ids: HashSet<String>,
     /// todo 详情折叠（F6）。
     pub show_todo_detail: bool,
     pub last_tick: Instant,
@@ -741,10 +750,10 @@ pub struct App {
     pub slash_selected: usize,
     /// 启动时的进程 cwd（hybrid 回退 3），捕获后不再随 cd 变化
     pub initial_cwd: Option<String>,
-    /// 子代理观测视图栈：当前正在查看的子代理 seed（None = 正常标签视图）。
+    /// 子代理观测视图栈：当前正在查看的子代理 session_id（None = 正常标签视图）。
     pub inspect: Option<String>,
-    /// 正在跟踪 timeline 流的子代理 seed 集（attach 后建立，终态后移除）。
-    pub(crate) subagent_seeds: HashSet<String>,
+    /// 正在跟踪 timeline 流的子代理 session_id 集（attach 后建立，终态后移除）。
+    pub(crate) subagent_session_ids: HashSet<String>,
     /// M4（T15）：待交给 `$PAGER` 的文本——Ctrl+T 浮层按 `e` 置位；
     /// main.rs 主循环在帧间消费（挂起终端 → 分页器 → 恢复）。
     pub pending_pager: Option<String>,
@@ -763,7 +772,7 @@ pub(crate) enum TimelineLostEffect {
 
 /// `TimelineLost` 的判据（纯函数，便于回归）。
 ///
-/// 只有「seed 属于子代理」**且**「原因确为会话不存在（404）」才收口；任何
+/// 只有「session_id 属于子代理」**且**「原因确为会话不存在（404）」才收口；任何
 /// 网络抖动（401/超时/流结束）都不足以证明会话消失，误判会把仍在运行的子代理
 /// 标成 `Closed` 并停掉它的 timeline 流（issue #2 缺陷 1）。
 pub(crate) fn timeline_lost_effect(
@@ -791,7 +800,7 @@ impl App {
     /// **测试用构造**：没有连接的 `Runtime` 替身 + 一条可观察的 `AppMsg` 通道。
     ///
     /// 返回 `(App, rx)`：测试从 `rx` 读回后台任务投递的结果（例如
-    /// `ActionResult::Uploaded { seed, .. }` 里的归属 seed）。只用于 `App` 层
+    /// `ActionResult::Uploaded { session_id, .. }` 里的归属 session_id）。只用于 `App` 层
     /// 按键/事件路径的单测——`overlay_key`、`handle`、`upload_attachment` 这些
     /// 以前只能靠纯函数间接覆盖的路径。
     #[cfg(test)]
@@ -839,7 +848,7 @@ impl App {
             config: None,
             settings_saving: false,
             show_workspace: true,
-            tracked_seeds: HashSet::new(),
+            tracked_session_ids: HashSet::new(),
             show_todo_detail: true,
             last_tick: Instant::now(),
             paste_guard: PasteGuard::default(),
@@ -849,7 +858,7 @@ impl App {
             slash_selected: 0,
             initial_cwd,
             inspect: None,
-            subagent_seeds: HashSet::new(),
+            subagent_session_ids: HashSet::new(),
             pending_pager: None,
             force_redraw: false,
         }
@@ -966,30 +975,30 @@ impl App {
     fn handle_runtime(&mut self, msg: RuntimeMsg) {
         match msg {
             RuntimeMsg::Conn(ev) => self.handle_conn(ev),
-            RuntimeMsg::V2Event { seed, event } => self.handle_v2_event(seed, *event),
-            RuntimeMsg::V2StreamOpen { seed } => {
+            RuntimeMsg::V2Event { session_id, event } => self.handle_v2_event(session_id, *event),
+            RuntimeMsg::V2StreamOpen { session_id } => {
                 // 规范顺序 open -> bootstrap -> subscribe：流只从 bootstrap 的
                 // snapshot cursor 起放 replay，快照本身不进流。故每次流建立/重连
                 // 都重新 bootstrap，补齐「流未连上期间」写入的交互/状态。
-                self.spawn_bootstrap(seed);
+                self.spawn_bootstrap(session_id);
             }
-            RuntimeMsg::ResetRequired { seed, reset } => {
-                // 频道级 reset → reducer 标记 pending（旧 UI 保留），再重新
-                // bootstrap；只有新快照验证通过才原子替换状态。
-                let signal = ringing_v2::reset_from_client(&reset);
-                if let Some(sess) = self.sessions.get_mut(&seed) {
-                    sess.ringing_v2.begin_reset(signal);
+            RuntimeMsg::ResetRequired { session_id, reset } => {
+                // 频道级 reset → 状态机标记 pending（旧 UI 保留），再重新
+                // bootstrap；只有新快照验证通过才原子替换状态。存的是**权威原帧**，
+                // 新快照要逐字段（session_id / epoch / log / 基线）与它对齐。
+                if let Some(sess) = self.sessions.get_mut(&session_id) {
+                    sess.ringing_v2.begin_reset(&reset);
                 }
-                self.spawn_bootstrap(seed);
+                self.spawn_bootstrap(session_id);
             }
-            RuntimeMsg::Timeline { seed, entry } => {
+            RuntimeMsg::Timeline { session_id, entry } => {
                 // `TurnStarted` is an ephemeral control delta and can race the
                 // child timeline attach. The reliable timeline replay carries
                 // the same live-state signal; use it only as a status hint,
                 // never as roster identity.
                 if matches!(&entry.event, qaqh_client::TimelineEvent::TurnOpened { .. }) {
                     self.apply_child_activity_hint(
-                        &seed,
+                        &session_id,
                         qaqh_client::ClientV2ActivityState::Running,
                     );
                 }
@@ -998,7 +1007,7 @@ impl App {
                     qaqh_client::TimelineEvent::ToolUpdated { tool, .. }
                         if tool.name.starts_with("todo")
                 );
-                let Some(sess) = self.sessions.get_mut(&seed) else {
+                let Some(sess) = self.sessions.get_mut(&session_id) else {
                     return;
                 };
                 // TurnSealed 是 timeline 上的权威终态：立即收口 streaming，不等
@@ -1019,12 +1028,12 @@ impl App {
                 if todo_tool_touched {
                     // v2 投影没有 dashboard 增量；todo 工具的 timeline 更新是
                     // 前端可依赖的刷新触发点。
-                    self.fetch_dashboard(seed);
+                    self.fetch_dashboard(session_id);
                 }
             }
-            RuntimeMsg::TimelineRebaseline { seed, page } => {
+            RuntimeMsg::TimelineRebaseline { session_id, page } => {
                 let running = {
-                    let Some(sess) = self.sessions.get_mut(&seed) else {
+                    let Some(sess) = self.sessions.get_mut(&session_id) else {
                         return;
                     };
                     let was_follow = sess.scroll.follow;
@@ -1040,28 +1049,30 @@ impl App {
                 };
                 if running {
                     self.apply_child_activity_hint(
-                        &seed,
+                        &session_id,
                         qaqh_client::ClientV2ActivityState::Running,
                     );
                 }
             }
-            RuntimeMsg::TimelineLost { seed, reason } => self.handle_timeline_lost(&seed, &reason),
+            RuntimeMsg::TimelineLost { session_id, reason } => {
+                self.handle_timeline_lost(&session_id, &reason)
+            }
         }
     }
 
     /// timeline 流丢失：只有 404（会话不存在）才收口子代理，其余保留现状并提示。
-    fn handle_timeline_lost(&mut self, seed: &str, reason: &TimelineLostReason) {
-        match timeline_lost_effect(self.subagent_seeds.contains(seed), reason) {
+    fn handle_timeline_lost(&mut self, session_id: &str, reason: &TimelineLostReason) {
+        match timeline_lost_effect(self.subagent_session_ids.contains(session_id), reason) {
             TimelineLostEffect::UntrackSubagent => {
                 // 子代理会话已消失（404）：停止 live 订阅；Team projection
                 // 仍是 roster 权威，不能在这里伪造 completed/closed。
-                self.untrack_subagent(seed);
+                self.untrack_subagent(session_id);
             }
             TimelineLostEffect::Notice => {
                 // 401/超时/网络错/流结束：会话可能还活着——状态不动，但必须可见。
                 self.toast(
                     NoticeLevel::Error,
-                    format!("timeline 断开[{seed}]: {}", reason.describe()),
+                    format!("timeline 断开[{session_id}]: {}", reason.describe()),
                 );
             }
         }
@@ -1109,67 +1120,68 @@ impl App {
                 // client 作废，告警账本整体清空——否则旧代遗留的 timeline 告警
                 // 会永久挂在状态栏上（那条流再也不会发 `Open` 来撤自己）。
                 self.stream_issues = StreamIssues::default();
-                // 重 open（租约重建 / daemon 重启）：重新 attach 全部 open seeds
+                // 重 open（租约重建 / daemon 重启）：重新 attach 全部 open session_ids
                 // 并 re-baseline；epoch 变化时 timeline 流自行重放。
-                // 子代理 seed 走 SessionAttach（无 actor 副作用，运行中的子代理
+                // 子代理 session_id 走 SessionAttach（无 actor 副作用，运行中的子代理
                 // 不能被 resume）。
-                let seeds = self.tabs.clone();
-                let sub_seeds: Vec<String> = self.subagent_seeds.iter().cloned().collect();
-                if !seeds.is_empty() || !sub_seeds.is_empty() {
+                let session_ids = self.tabs.clone();
+                let sub_session_ids: Vec<String> =
+                    self.subagent_session_ids.iter().cloned().collect();
+                if !session_ids.is_empty() || !sub_session_ids.is_empty() {
                     self.spawn_api(move |api, tx| async move {
-                        for seed in seeds {
+                        for session_id in session_ids {
                             let attach = api
                                 .send_command(
-                                    Some(&seed),
+                                    Some(&session_id),
                                     RingingCommand::Control(ControlCommand::SessionResume {
-                                        session_id: seed.clone(),
+                                        session_id: session_id.clone(),
                                     }),
                                     Default::default(),
                                 )
                                 .await;
                             if let Err(e) = attach {
                                 let _ = tx.send(AppMsg::Action(ActionResult::CommandAck {
-                                    seed: Some(seed.clone()),
+                                    session_id: Some(session_id.clone()),
                                     label: "resume",
                                     result: Err(e),
                                 }));
                                 continue;
                             }
-                            let team = api.team_v2(&seed).await;
+                            let team = api.team_v2(&session_id).await;
                             let _ = tx.send(AppMsg::Action(ActionResult::Team {
-                                seed: seed.clone(),
+                                session_id: session_id.clone(),
                                 result: team,
                             }));
-                            let result = api.bootstrap(&seed).await;
+                            let result = api.bootstrap(&session_id).await;
                             let client_session_id = api.v2_client_session_id().await;
                             let _ = tx.send(AppMsg::Action(ActionResult::Bootstrap {
-                                seed,
+                                session_id,
                                 result,
                                 client_session_id,
                             }));
                         }
-                        for seed in sub_seeds {
+                        for session_id in sub_session_ids {
                             let attach = api
                                 .send_command(
-                                    Some(&seed),
+                                    Some(&session_id),
                                     RingingCommand::Control(ControlCommand::SessionAttach {
-                                        session_id: seed.clone(),
+                                        session_id: session_id.clone(),
                                     }),
                                     Default::default(),
                                 )
                                 .await;
                             if let Err(e) = attach {
                                 let _ = tx.send(AppMsg::Action(ActionResult::CommandAck {
-                                    seed: Some(seed.clone()),
+                                    session_id: Some(session_id.clone()),
                                     label: "attach",
                                     result: Err(e),
                                 }));
                                 continue;
                             }
-                            let result = api.bootstrap(&seed).await;
+                            let result = api.bootstrap(&session_id).await;
                             let client_session_id = api.v2_client_session_id().await;
                             let _ = tx.send(AppMsg::Action(ActionResult::Bootstrap {
-                                seed,
+                                session_id,
                                 result,
                                 client_session_id,
                             }));
@@ -1213,21 +1225,25 @@ impl App {
 
     /// 一条 canonical v2 投影事件。
     ///
-    /// 五个 payload family 各自分派；timeline 家族由独立的 per-seed timeline
+    /// 五个 payload family 各自分派；timeline 家族由独立的 per-session_id timeline
     /// 流承载（transcript 权威），这里忽略以免双写。
-    fn handle_v2_event(&mut self, seed: String, event: qaqh_client::ClientV2Event) {
-        let meta = ringing_v2::event_meta_from_client(&event);
+    ///
+    /// **信封本身就是权威元数据**：epoch / log / cursor / fact_seq /
+    /// projection_index / revision / delivery / `ts_ms` 全部直接读
+    /// `ClientV2Event`，不再过一层 TUI 自建的 `EventMeta` 镜像（那层镜像让后端
+    /// 新增的 `ts_ms` 静默丢掉）。
+    fn handle_v2_event(&mut self, session_id: String, event: qaqh_client::ClientV2Event) {
         let accepted = {
-            let Some(sess) = self.sessions.get_mut(&seed) else {
+            let Some(sess) = self.sessions.get_mut(&session_id) else {
                 return;
             };
-            match sess.ringing_v2.apply_event(meta) {
+            match sess.ringing_v2.apply_event(&event) {
                 ringing_v2::ApplyOutcome::ReliableApplied { .. }
                 | ringing_v2::ApplyOutcome::ReplaceableApplied { .. }
                 | ringing_v2::ApplyOutcome::Ephemeral => true,
                 ringing_v2::ApplyOutcome::Duplicate => false,
                 outcome => {
-                    log::warn!("drop v2 event for {seed}: {outcome:?}");
+                    log::warn!("drop v2 event for {session_id}: {outcome:?}");
                     false
                 }
             }
@@ -1236,18 +1252,25 @@ impl App {
             return;
         }
         let causation_id = event.causation_id.clone();
+        // 权威「源 fact 墙钟」（beta-readiness W1/C3）。缺席 = 合成 ephemeral
+        // 事件（协议如此声明），UI 侧一律当作「时间未知」，绝不补本地时钟。
+        let ts_ms = event.ts_ms;
         match event.payload {
             qaqh_client::ClientV2Payload::ControlDelta(delta) => {
-                self.handle_control_delta(seed, causation_id, delta)
+                self.handle_control_delta(session_id, causation_id, delta)
             }
             qaqh_client::ClientV2Payload::ConversationDelta(delta) => {
-                self.handle_conversation_delta(seed, delta)
+                self.handle_conversation_delta(session_id, ts_ms, delta)
             }
-            qaqh_client::ClientV2Payload::MetaDelta(delta) => self.handle_meta_delta(seed, delta),
+            qaqh_client::ClientV2Payload::MetaDelta(delta) => {
+                self.handle_meta_delta(session_id, delta)
+            }
             qaqh_client::ClientV2Payload::ResourceDelta(delta) => {
-                self.handle_resource_delta(seed, delta)
+                self.handle_resource_delta(session_id, delta)
             }
-            qaqh_client::ClientV2Payload::TeamDelta(delta) => self.handle_team_delta(seed, delta),
+            qaqh_client::ClientV2Payload::TeamDelta(delta) => {
+                self.handle_team_delta(session_id, delta)
+            }
             qaqh_client::ClientV2Payload::MailboxDelta(_)
             | qaqh_client::ClientV2Payload::TimelineDelta(_)
             | qaqh_client::ClientV2Payload::AuditRef(_)
@@ -1259,7 +1282,7 @@ impl App {
 
     fn handle_control_delta(
         &mut self,
-        seed: String,
+        session_id: String,
         causation_id: Option<String>,
         delta: qaqh_client::ClientV2ControlDelta,
     ) {
@@ -1270,20 +1293,20 @@ impl App {
                 if let Some(cid) = causation_id
                     && self.pending_creates.remove(&cid).is_some()
                 {
-                    self.open_session_tab(&seed);
+                    self.open_session_tab(&session_id);
                     self.transfer_pending_initial_prompt();
-                    self.toast(NoticeLevel::Info, format!("新会话已创建 {seed}"));
+                    self.toast(NoticeLevel::Info, format!("新会话已创建 {session_id}"));
                 }
             }
             D::Activity { state, .. } => {
-                self.apply_child_activity_hint(&seed, state);
+                self.apply_child_activity_hint(&session_id, state);
                 let state = activity_from_v2(state);
-                self.activity_cache.insert(seed.clone(), state);
-                if let Some(sess) = self.sessions.get_mut(&seed) {
+                self.activity_cache.insert(session_id.clone(), state);
+                if let Some(sess) = self.sessions.get_mut(&session_id) {
                     sess.activity = Some(state);
                 }
-                if state == ActivityState::WaitingUser && !self.tabs.contains(&seed) {
-                    self.toast(NoticeLevel::Warn, format!("会话 {seed} 等待输入"));
+                if state == ActivityState::WaitingUser && !self.tabs.contains(&session_id) {
+                    self.toast(NoticeLevel::Warn, format!("会话 {session_id} 等待输入"));
                 }
             }
             D::InteractionRequested {
@@ -1294,57 +1317,45 @@ impl App {
                 ..
             } => {
                 let interaction_id_string = interaction_id.as_str().to_string();
-                let call_id_string = call_id
-                    .as_ref()
-                    .map(|id| id.as_str().to_string())
-                    .unwrap_or_default();
-                let reducer_kind = match kind {
-                    qaqh_client::ClientV2DeltaInteractionKind::Permission => {
-                        ringing_v2::InteractionKind::Permission
-                    }
-                    qaqh_client::ClientV2DeltaInteractionKind::Ask => {
-                        ringing_v2::InteractionKind::Ask
-                    }
-                    qaqh_client::ClientV2DeltaInteractionKind::Plan => {
-                        ringing_v2::InteractionKind::PlanReview
-                    }
-                };
-                let requested = self.sessions.get_mut(&seed).is_some_and(|sess| {
+                // 状态机只记**交互身份**（第一答复胜出 / 不得重开），不再复制
+                // kind：权威 delta 的 kind 直接进 UI 层，中间没有 TUI 枚举映射。
+                let requested = self.sessions.get_mut(&session_id).is_some_and(|sess| {
                     sess.ringing_v2
-                        .apply_interaction_requested(ringing_v2::PendingInteraction {
-                            interaction_id: interaction_id_string.clone(),
-                            call_id: call_id_string,
-                            turn_id: String::new(),
-                            kind: reducer_kind,
-                        })
+                        .apply_interaction_requested(interaction_id.as_str())
                         == ringing_v2::InteractionOutcome::Requested
                 });
                 if requested {
-                    self.request_interaction(seed, interaction_id_string, call_id, kind, request);
+                    self.request_interaction(
+                        session_id,
+                        interaction_id_string,
+                        call_id,
+                        kind,
+                        request,
+                    );
                 }
             }
             D::InteractionResolved { interaction_id, .. } => {
-                let should_clear = self.sessions.get_mut(&seed).is_some_and(|sess| {
+                let should_clear = self.sessions.get_mut(&session_id).is_some_and(|sess| {
                     sess.ringing_v2
                         .apply_interaction_resolved(interaction_id.as_str())
                         != ringing_v2::InteractionOutcome::AlreadyTerminal
                 });
                 if should_clear {
-                    self.clear_interaction(&seed, interaction_id.as_str());
+                    self.clear_interaction(&session_id, interaction_id.as_str());
                 }
             }
             D::InteractionExpired { interaction_id, .. } => {
-                let should_clear = self.sessions.get_mut(&seed).is_some_and(|sess| {
+                let should_clear = self.sessions.get_mut(&session_id).is_some_and(|sess| {
                     sess.ringing_v2
                         .apply_interaction_expired(interaction_id.as_str())
                         != ringing_v2::InteractionOutcome::AlreadyTerminal
                 });
                 if should_clear {
-                    self.clear_interaction(&seed, interaction_id.as_str());
+                    self.clear_interaction(&session_id, interaction_id.as_str());
                 }
             }
             D::ToolFinished { call_id, .. } => {
-                if let Some(sess) = self.sessions.get_mut(&seed) {
+                if let Some(sess) = self.sessions.get_mut(&session_id) {
                     sess.resolve_permission(call_id.as_str());
                 }
             }
@@ -1354,7 +1365,7 @@ impl App {
                 // Control snapshot/delta is not roster authority, but it is a
                 // reliable early signal that the child session exists and should
                 // be attached before TeamDelta/tool-card UI catches up.
-                self.ensure_subagent_tracked(&seed, child_session_id.as_str());
+                self.ensure_subagent_tracked(&session_id, child_session_id.as_str());
             }
             D::SubagentFinished {
                 child_session_id, ..
@@ -1368,7 +1379,7 @@ impl App {
                 driver_epoch,
                 ..
             } => {
-                let Some(sess) = self.sessions.get_mut(&seed) else {
+                let Some(sess) = self.sessions.get_mut(&session_id) else {
                     return;
                 };
                 let can_claim = sess
@@ -1376,18 +1387,20 @@ impl App {
                     .driver()
                     .map(|driver| driver.can_claim)
                     .unwrap_or(false);
-                let outcome = sess.ringing_v2.apply_driver_state(ringing_v2::DriverState {
-                    holder,
-                    driver_epoch,
-                    can_claim,
-                });
+                let outcome =
+                    sess.ringing_v2
+                        .apply_driver_state(qaqh_client::ClientV2DriverState {
+                            holder,
+                            driver_epoch,
+                            can_claim,
+                        });
                 match outcome {
                     ringing_v2::DriverOutcome::Applied => {
                         self.force_redraw = true;
                     }
                     ringing_v2::DriverOutcome::Duplicate => {}
                     ringing_v2::DriverOutcome::Stale | ringing_v2::DriverOutcome::Conflict => {
-                        log::warn!("ignore driver delta for {seed}: {outcome:?}");
+                        log::warn!("ignore driver delta for {session_id}: {outcome:?}");
                     }
                 }
             }
@@ -1404,7 +1417,7 @@ impl App {
     /// 单点序列化）。permission 需要把 `call_id` 一并带到异步回调，供面板答复。
     fn request_interaction(
         &mut self,
-        seed: String,
+        session_id: String,
         interaction_id: String,
         call_id: Option<qaqh_client::ClientV2ToolCallId>,
         kind: qaqh_client::ClientV2DeltaInteractionKind,
@@ -1420,7 +1433,7 @@ impl App {
         match request {
             qaqh_client::ClientV2ContentValue::Inline { text } => {
                 self.apply_interaction_body(
-                    &seed,
+                    &session_id,
                     &interaction_id,
                     call_id.as_deref(),
                     text.as_bytes(),
@@ -1428,7 +1441,7 @@ impl App {
             }
             qaqh_client::ClientV2ContentValue::Ref { content_ref } => {
                 self.download_interaction_body(
-                    seed,
+                    session_id,
                     interaction_id,
                     call_id,
                     content_ref.hash().as_str(),
@@ -1446,7 +1459,7 @@ impl App {
     /// 取回；permission 的 canonical `call_id` 随异步结果一起回传。
     fn restore_pending_interaction(
         &mut self,
-        seed: String,
+        session_id: String,
         interaction: qaqh_client::ClientV2PendingInteraction,
     ) {
         use qaqh_client::ClientV2InteractionKind as K;
@@ -1462,14 +1475,18 @@ impl App {
             K::Permission if !interaction.call_id.is_empty() => Some(interaction.call_id.clone()),
             K::Permission | K::Ask | K::PlanReview => None,
         };
-        if self.has_pending_interaction(&seed, &interaction.interaction_id, call_id.as_deref()) {
+        if self.has_pending_interaction(
+            &session_id,
+            &interaction.interaction_id,
+            call_id.as_deref(),
+        ) {
             return;
         }
         match interaction.kind {
             K::Permission | K::Ask | K::PlanReview => match interaction.request {
                 Some(qaqh_client::ClientV2PendingContentValue::Inline { text }) => {
                     self.apply_interaction_body(
-                        &seed,
+                        &session_id,
                         &interaction.interaction_id,
                         call_id.as_deref(),
                         text.as_bytes(),
@@ -1477,7 +1494,7 @@ impl App {
                 }
                 Some(qaqh_client::ClientV2PendingContentValue::Ref { content_ref }) => {
                     self.download_interaction_body(
-                        seed,
+                        session_id,
                         interaction.interaction_id,
                         call_id,
                         &content_ref,
@@ -1490,11 +1507,11 @@ impl App {
 
     fn has_pending_interaction(
         &self,
-        seed: &str,
+        session_id: &str,
         interaction_id: &str,
         call_id: Option<&str>,
     ) -> bool {
-        self.sessions.get(seed).is_some_and(|sess| {
+        self.sessions.get(session_id).is_some_and(|sess| {
             sess.pending_ask
                 .as_ref()
                 .is_some_and(|panel| panel.interaction_id == interaction_id)
@@ -1512,7 +1529,7 @@ impl App {
 
     fn download_interaction_body(
         &mut self,
-        seed: String,
+        session_id: String,
         interaction_id: String,
         call_id: Option<String>,
         content_id: &str,
@@ -1524,7 +1541,7 @@ impl App {
                 Err(error) => Err(error.to_string()),
             };
             let _ = tx.send(AppMsg::Action(ActionResult::InteractionBody {
-                seed,
+                session_id,
                 interaction_id,
                 call_id,
                 result,
@@ -1535,7 +1552,7 @@ impl App {
     /// 交互正文（`qaqh-domain` 的 `interaction_body` JSON）→ 挂起面板。
     fn apply_interaction_body(
         &mut self,
-        seed: &str,
+        session_id: &str,
         interaction_id: &str,
         call_id: Option<&str>,
         bytes: &[u8],
@@ -1552,7 +1569,7 @@ impl App {
         {
             return;
         }
-        let Some(sess) = self.sessions.get_mut(seed) else {
+        let Some(sess) = self.sessions.get_mut(session_id) else {
             return;
         };
         match kind {
@@ -1611,8 +1628,8 @@ impl App {
     }
 
     /// 交互 resolved / expired：按 `interaction_id` 清对应挂起面板。
-    fn clear_interaction(&mut self, seed: &str, interaction_id: &str) {
-        let Some(sess) = self.sessions.get_mut(seed) else {
+    fn clear_interaction(&mut self, session_id: &str, interaction_id: &str) {
+        let Some(sess) = self.sessions.get_mut(session_id) else {
             return;
         };
         if sess
@@ -1635,16 +1652,20 @@ impl App {
 
     fn handle_conversation_delta(
         &mut self,
-        seed: String,
+        session_id: String,
+        ts_ms: Option<u64>,
         delta: qaqh_client::ClientV2ConversationDelta,
     ) {
         use qaqh_client::ClientV2ConversationDelta as D;
-        let Some(sess) = self.sessions.get_mut(&seed) else {
+        let Some(sess) = self.sessions.get_mut(&session_id) else {
             return;
         };
         let mut force_redraw = false;
         match delta {
             D::TurnStarted { turn_id, .. } => {
+                // 权威源 fact 墙钟随**信封**到达（timeline wire 根本没有时间
+                // 字段）：在这里回填，回合还没物化时由 timeline 侧暂存兑现。
+                sess.timeline.record_turn_time(turn_id.as_str(), ts_ms);
                 sess.streaming = Some(session::StreamingState {
                     turn_id: turn_id.as_str().to_string(),
                     phase: StreamPhase::Thinking,
@@ -1689,7 +1710,16 @@ impl App {
                 streaming_done(sess, Some(turn_id.as_str()));
                 force_redraw = true;
             }
-            D::CompactionApplied { .. } => {}
+            D::CompactionApplied {
+                context_revision, ..
+            } => {
+                // W3/D10：后端新增的 `CompactionApplied` 事实此前被本仓**丢弃**
+                // （`=> {}`）。压缩是服务端把历史折进摘要的分界，必须在
+                // transcript 上可见，否则用户看到的是「上下文凭空变短」。
+                // 锚定「事件到达时窗口最后一个回合之后」，与 webui 同口径。
+                sess.timeline.record_compaction(context_revision);
+                force_redraw = true;
+            }
             D::InputAccepted { .. } => {}
         }
         if force_redraw {
@@ -1699,20 +1729,20 @@ impl App {
 
     // ───────────────────────── meta / resource 投影 ─────────────────────────
 
-    fn handle_meta_delta(&mut self, seed: String, delta: qaqh_client::ClientV2MetaDelta) {
+    fn handle_meta_delta(&mut self, session_id: String, delta: qaqh_client::ClientV2MetaDelta) {
         use qaqh_client::ClientV2MetaDelta as D;
         match delta {
             D::TitleChanged { title, .. } => {
-                if let Some(sess) = self.sessions.get_mut(&seed) {
+                if let Some(sess) = self.sessions.get_mut(&session_id) {
                     sess.title = Some(title);
                 }
                 self.session_list_at = None;
             }
             D::Deleted { .. } => {
-                let was_tab = self.tabs.contains(&seed);
-                self.close_tab_by_seed(&seed);
+                let was_tab = self.tabs.contains(&session_id);
+                self.close_tab_by_session_id(&session_id);
                 if was_tab {
-                    self.toast(NoticeLevel::Info, format!("会话 {seed} 已删除"));
+                    self.toast(NoticeLevel::Info, format!("会话 {session_id} 已删除"));
                 }
                 self.session_list_at = None;
             }
@@ -1723,7 +1753,11 @@ impl App {
         }
     }
 
-    fn handle_resource_delta(&mut self, _seed: String, _delta: qaqh_client::ClientV2ResourceDelta) {
+    fn handle_resource_delta(
+        &mut self,
+        _session_id: String,
+        _delta: qaqh_client::ClientV2ResourceDelta,
+    ) {
         // workspace 面板由 `session.dashboard` RPC 拉取；resource 增量暂不驱动 UI。
     }
 
@@ -1732,33 +1766,26 @@ impl App {
     fn handle_action(&mut self, action: ActionResult) {
         match action {
             ActionResult::Bootstrap {
-                seed,
+                session_id,
                 result,
                 client_session_id,
             } => {
                 match result {
                     Ok(b) => {
-                        let bootstrap_seed = seed.clone();
+                        let bootstrap_session_id = session_id.clone();
                         let bootstrap_activity = b.control.state.activity;
-                        let Some(sess) = self.sessions.get_mut(&bootstrap_seed) else {
+                        let Some(sess) = self.sessions.get_mut(&bootstrap_session_id) else {
                             return;
                         };
                         // reducer 先接管 epoch/log/cursor/pending/driver，再由 UI
                         // 投影消费同一快照；后续事件只经 reducer 放行。被拒的旧响应
                         // 必须在这里终止，不能继续把旧 UI 状态盖到新模型上。
-                        let snapshot = match ringing_v2::bootstrap_from_client(&b) {
-                            Ok(snapshot) => snapshot,
-                            Err(error) => {
-                                log::warn!(
-                                    "bootstrap reducer mapping failed for {bootstrap_seed}: {error}"
-                                );
-                                return;
-                            }
-                        };
-                        let outcome = sess.ringing_v2.apply_bootstrap(snapshot);
+                        // **吃的是权威 typed bootstrap**：不再经过 TUI 自建的
+                        // `BootstrapSnapshot` 适配器（那层镜像会漏字段）。
+                        let outcome = sess.ringing_v2.apply_bootstrap(&b);
                         if outcome != ringing_v2::BootstrapOutcome::Applied {
                             log::warn!(
-                                "bootstrap reducer rejected for {bootstrap_seed}: {outcome:?}"
+                                "bootstrap reducer rejected for {bootstrap_session_id}: {outcome:?}"
                             );
                             return;
                         }
@@ -1789,7 +1816,7 @@ impl App {
                         sess.context_limit =
                             conv.context_limit.map(|v| v.min(u32::MAX as u64) as u32);
                         sess.conversation = Some(conv);
-                        self.apply_child_activity_hint(&bootstrap_seed, bootstrap_activity);
+                        self.apply_child_activity_hint(&bootstrap_session_id, bootstrap_activity);
                         // v2 bootstrap 的 `interactions` 已由 daemon 过滤为未决集合。
                         // 不能只恢复 permission：v2 流的 snapshot cursor 会跳过
                         // “快照中已经挂起”的事实，ask / plan 也必须从这里补面板。
@@ -1805,63 +1832,76 @@ impl App {
                             .collect();
 
                         for interaction in pending_interactions {
-                            self.restore_pending_interaction(bootstrap_seed.clone(), interaction);
+                            self.restore_pending_interaction(
+                                bootstrap_session_id.clone(),
+                                interaction,
+                            );
                         }
                         for child in bootstrap_subagents {
-                            self.ensure_subagent_tracked(&bootstrap_seed, &child);
+                            self.ensure_subagent_tracked(&bootstrap_session_id, &child);
                         }
                         // 空 seat / 本人已可接管时才显式 claim；有活跃 holder 时
                         // can_claim=false，UI 保持只读并等 reliable DriverChanged。
-                        let should_claim = self.sessions.get(&bootstrap_seed).is_some_and(|sess| {
-                            sess.v2_can_claim()
-                                && !sess.v2_is_driver(self.v2_client_session_id.as_deref())
-                        });
+                        let should_claim =
+                            self.sessions
+                                .get(&bootstrap_session_id)
+                                .is_some_and(|sess| {
+                                    sess.v2_can_claim()
+                                        && !sess.v2_is_driver(self.v2_client_session_id.as_deref())
+                                });
                         if should_claim {
-                            self.spawn_claim_driver(bootstrap_seed.clone());
+                            self.spawn_claim_driver(bootstrap_session_id.clone());
                         }
                         // v2 control 投影不携带 dashboard 快照（v1 领域 control state
                         // 才有），workspace 面板一律回退到 `session.dashboard` 拉取。
-                        self.fetch_dashboard(bootstrap_seed);
+                        self.fetch_dashboard(bootstrap_session_id);
                     }
-                    Err(e) => {
-                        self.toast(NoticeLevel::Error, format!("bootstrap 失败[{seed}]: {e}"))
-                    }
+                    Err(e) => self.toast(
+                        NoticeLevel::Error,
+                        format!("bootstrap 失败[{session_id}]: {e}"),
+                    ),
                 }
             }
-            ActionResult::DriverClaimed { seed, result } => {
+            ActionResult::DriverClaimed { session_id, result } => {
                 if let Err(error) = result {
                     self.toast(
                         NoticeLevel::Warn,
-                        format!("driver claim 失败[{seed}]: {error}"),
+                        format!("driver claim 失败[{session_id}]: {error}"),
                     );
                 }
             }
             ActionResult::InteractionBody {
-                seed,
+                session_id,
                 interaction_id,
                 call_id,
                 result,
             } => match result {
-                Ok(bytes) => {
-                    self.apply_interaction_body(&seed, &interaction_id, call_id.as_deref(), &bytes)
-                }
-                Err(e) => self.toast(NoticeLevel::Warn, format!("交互正文取回失败[{seed}]: {e}")),
+                Ok(bytes) => self.apply_interaction_body(
+                    &session_id,
+                    &interaction_id,
+                    call_id.as_deref(),
+                    &bytes,
+                ),
+                Err(e) => self.toast(
+                    NoticeLevel::Warn,
+                    format!("交互正文取回失败[{session_id}]: {e}"),
+                ),
             },
             ActionResult::CommandAck {
-                seed,
+                session_id,
                 label,
                 result,
             } => match result {
                 Ok(ack) => {
-                    let is_create = seed.is_none();
+                    let is_create = session_id.is_none();
                     if ack.status == qaqh_client::RingingCommandAckStatus::Rejected {
                         // 缺陷 1（CNB issue #4）：拒绝是终态，不会再有
                         // `causation_id == command_id` 的 `Created` 事件。不撤销
                         // pending create 的话，状态栏的 `· creating…` 会一直挂到
                         // 15s 过期（`handle_tick`），用户以为还在创建。
                         //
-                        // 是否 create 命令按 `seed.is_none()` 判：wire 层
-                        // `RingingCommandEnvelope::validate` 要求 seed 缺失时命令
+                        // 是否 create 命令按 `session_id.is_none()` 判：wire 层
+                        // `RingingCommandEnvelope::validate` 要求 session_id 缺失时命令
                         // 必须是 `SessionCreate`（`qaqh-ringing/src/envelope.rs:177`），
                         // 故这是权威判据，不靠 label 猜。
                         let msg = session_ops::apply_rejected_ack(
@@ -1874,8 +1914,8 @@ impl App {
                             self.draft_composer.insert_str(&text);
                         }
                         self.toast(NoticeLevel::Error, msg.clone());
-                        if let Some(seed) = seed
-                            && let Some(sess) = self.sessions.get_mut(&seed)
+                        if let Some(session_id) = session_id
+                            && let Some(sess) = self.sessions.get_mut(&session_id)
                         {
                             sess.composer.input = msg.chars().collect(); // 不丢内容
                             sess.composer.cursor = sess.composer.input.len();
@@ -1883,7 +1923,7 @@ impl App {
                     }
                 }
                 Err(e) => {
-                    if seed.is_none() {
+                    if session_id.is_none() {
                         self.abort_pending_create(format!("{label}: {e}"));
                         return;
                     }
@@ -1903,17 +1943,17 @@ impl App {
                 // 「按 Ctrl+N 什么都没发生、再按一次又多建一个会话」。
                 //
                 // 这里用列表兜底：有在途 create 时，把**最新建的那个**会话开出来。
-                // 判据取 `created_at` 最大者，且必须是本地还没有 tab 的 seed ——
+                // 判据取 `created_at` 最大者，且必须是本地还没有 tab 的 session_id ——
                 // 否则会去开一个用户没要求的旧会话。
                 if !self.pending_creates.is_empty()
                     && let Some(entry) = list.iter().max_by_key(|e| e.meta.created_at)
                 {
-                    let seed = entry.meta.session_id.clone();
-                    if !self.tabs.contains(&seed) {
-                        self.open_session_tab(&seed);
+                    let session_id = entry.meta.session_id.clone();
+                    if !self.tabs.contains(&session_id) {
+                        self.open_session_tab(&session_id);
                         self.pending_creates.clear();
                         self.transfer_pending_initial_prompt();
-                        self.toast(NoticeLevel::Info, format!("新会话已创建 {seed}"));
+                        self.toast(NoticeLevel::Info, format!("新会话已创建 {session_id}"));
                     }
                 }
                 self.session_list_cache = list;
@@ -1930,6 +1970,8 @@ impl App {
             // 权威类型 `SessionActivity`（生产者本就是 `Vec<SessionActivity>`）：
             // 此前这里是 `item.get("seed")` + `item.get("state")` 手取两个键，
             // 与 G2 删掉的那类手解同款。现在字段在类型上，改形状会编译报错。
+            // （引号里的 `"seed"` 是**当时的 wire 键名**，已随后端 identity 迁移
+            //   退场；这里保留原样，免得把历史读成现状。）
             ActionResult::SessionActivity(Ok(items)) => {
                 for item in items {
                     self.activity_cache
@@ -1964,9 +2006,13 @@ impl App {
                     self.toast(NoticeLevel::Error, format!("{label}: {e}"));
                 }
             },
-            ActionResult::Uploaded { seed, path, result } => match result {
+            ActionResult::Uploaded {
+                session_id,
+                path,
+                result,
+            } => match result {
                 Ok(content) => {
-                    if let Some(sess) = self.sessions.get_mut(&seed) {
+                    if let Some(sess) = self.sessions.get_mut(&session_id) {
                         sess.composer
                             .attachments
                             .push(session::Attachment { content });
@@ -1976,7 +2022,7 @@ impl App {
                         // 必须说出来而不是静默丢弃。
                         self.toast(
                             NoticeLevel::Error,
-                            format!("附件已上传但目标会话已关闭：{seed}"),
+                            format!("附件已上传但目标会话已关闭：{session_id}"),
                         );
                     }
                 }
@@ -1985,33 +2031,33 @@ impl App {
                     self.toast(NoticeLevel::Error, format!("附件上传失败 {path}: {e}"));
                 }
             },
-            ActionResult::Rebaseline { seed, result } => {
-                if let (Some(sess), Ok(page)) = (self.sessions.get_mut(&seed), result) {
+            ActionResult::Rebaseline { session_id, result } => {
+                if let (Some(sess), Ok(page)) = (self.sessions.get_mut(&session_id), result) {
                     sess.timeline.replace_from_page(&page);
                     sess.scroll.follow = true;
                     sess.scroll.offset = 0;
                 }
             }
-            ActionResult::LoadOlder { seed, result } => {
-                if let (Some(sess), Ok(page)) = (self.sessions.get_mut(&seed), result) {
+            ActionResult::LoadOlder { session_id, result } => {
+                if let (Some(sess), Ok(page)) = (self.sessions.get_mut(&session_id), result) {
                     sess.loading_older = false;
                     // prepend 而非 replace：已加载的窗口内容保留；
                     // offset（距底行数）不变，视口内容相对稳定。
                     sess.timeline.prepend_older(&page);
-                } else if let Some(sess) = self.sessions.get_mut(&seed) {
+                } else if let Some(sess) = self.sessions.get_mut(&session_id) {
                     sess.loading_older = false;
                 }
             }
             ActionResult::Receipt {
                 label,
-                seed,
+                session_id,
                 result,
                 ..
             } => match result {
                 Ok(status) if status.state == CommandState::Succeeded => {
                     self.toast(NoticeLevel::Info, format!("{label} 完成"));
-                    if let Some(seed) = seed {
-                        self.request_rebaseline(&seed);
+                    if let Some(session_id) = session_id {
+                        self.request_rebaseline(&session_id);
                     }
                 }
                 Ok(status) => {
@@ -2019,11 +2065,11 @@ impl App {
                 }
                 Err(e) => self.toast(NoticeLevel::Error, format!("{label}: {e}")),
             },
-            ActionResult::Dashboard { seed, result } => {
-                self.dashboard_fetching.remove(&seed);
+            ActionResult::Dashboard { session_id, result } => {
+                self.dashboard_fetching.remove(&session_id);
                 match result {
                     Ok(dash) => {
-                        if let Some(sess) = self.sessions.get_mut(&seed)
+                        if let Some(sess) = self.sessions.get_mut(&session_id)
                             && (!dash.tasks.is_empty()
                                 || !dash.recent_edits.is_empty()
                                 || !dash.documents.is_empty())
@@ -2035,19 +2081,19 @@ impl App {
                     Err(_e) => {}
                 }
             }
-            ActionResult::Team { seed, result } => match result {
+            ActionResult::Team { session_id, result } => match result {
                 Ok(response) => {
                     let snapshot = response.team;
                     self.teams
-                        .entry(seed.clone())
+                        .entry(session_id.clone())
                         .or_default()
                         .replace_from_snapshot(snapshot);
-                    self.reconcile_team_tracking(&seed);
+                    self.reconcile_team_tracking(&session_id);
                     self.flush_pending_team_status();
                     self.force_redraw = true;
                 }
                 Err(error) => {
-                    log::warn!("team snapshot for {seed} failed: {error}");
+                    log::warn!("team snapshot for {session_id} failed: {error}");
                 }
             },
         }
@@ -2056,15 +2102,15 @@ impl App {
     // ───────────────────────── 标签页 / 会话 ─────────────────────────
 
     fn sync_tracked(&mut self) {
-        // 打开的标签 + 正在跟踪的子代理 seed（各自独立 timeline 流）。
-        let mut seeds: Vec<String> = self.tabs.clone();
-        for s in &self.subagent_seeds {
-            if !seeds.contains(s) {
-                seeds.push(s.clone());
+        // 打开的标签 + 正在跟踪的子代理 session_id（各自独立 timeline 流）。
+        let mut session_ids: Vec<String> = self.tabs.clone();
+        for s in &self.subagent_session_ids {
+            if !session_ids.contains(s) {
+                session_ids.push(s.clone());
             }
         }
-        self.tracked_seeds = seeds.iter().cloned().collect();
-        self.runtime.set_tracked_seeds(seeds);
+        self.tracked_session_ids = session_ids.iter().cloned().collect();
+        self.runtime.set_tracked_session_ids(session_ids);
     }
 
     pub fn toast(&mut self, level: NoticeLevel, text: impl Into<String>) {
@@ -2084,14 +2130,14 @@ impl App {
     /// 今后如需统一超时/退避/取消/指标，只需叠加在此处。
     ///
     /// 没有连接（测试替身）时**任务照起**：取用连接的那一步会返回 `Err`，结果照常
-    /// 经 `AppMsg::Action` 回来——「上传目标是哪个 seed」这类归属信息因此仍可断言。
-    /// 后台重新 bootstrap 一个 seed（v2 流建立/重连、或 reset 后）。
-    fn spawn_bootstrap(&mut self, seed: String) {
+    /// 经 `AppMsg::Action` 回来——「上传目标是哪个 session_id」这类归属信息因此仍可断言。
+    /// 后台重新 bootstrap 一个 session_id（v2 流建立/重连、或 reset 后）。
+    fn spawn_bootstrap(&mut self, session_id: String) {
         self.spawn_api(move |api, tx| async move {
-            let result = api.bootstrap(&seed).await;
+            let result = api.bootstrap(&session_id).await;
             let client_session_id = api.v2_client_session_id().await;
             let _ = tx.send(AppMsg::Action(ActionResult::Bootstrap {
-                seed,
+                session_id,
                 result,
                 client_session_id,
             }));
@@ -2099,10 +2145,13 @@ impl App {
     }
 
     /// 显式声明 driver；本地 holder 不猜测，等 reliable `DriverChanged` 更新。
-    fn spawn_claim_driver(&mut self, seed: String) {
+    fn spawn_claim_driver(&mut self, session_id: String) {
         self.spawn_api(move |api, tx| async move {
-            let result = api.claim_driver(&seed).await;
-            let _ = tx.send(AppMsg::Action(ActionResult::DriverClaimed { seed, result }));
+            let result = api.claim_driver(&session_id).await;
+            let _ = tx.send(AppMsg::Action(ActionResult::DriverClaimed {
+                session_id,
+                result,
+            }));
         });
     }
 
@@ -2122,10 +2171,10 @@ impl App {
             return false;
         }
         if self.active_v2_can_claim()
-            && let Some(seed) = self.active_seed()
+            && let Some(session_id) = self.active_session_id()
         {
             self.toast(NoticeLevel::Info, "正在申请会话控制权，请稍后重试");
-            self.spawn_claim_driver(seed);
+            self.spawn_claim_driver(session_id);
         } else {
             self.toast(
                 NoticeLevel::Warn,
@@ -2196,9 +2245,9 @@ impl App {
                 return;
             }
             Some(GlobalKey::CloseTab) => {
-                if let Some(seed) = self.active_seed() {
+                if let Some(session_id) = self.active_session_id() {
                     self.overlays.push(Overlay::Confirm {
-                        action: ConfirmAction::CloseTab(seed),
+                        action: ConfirmAction::CloseTab(session_id),
                     });
                 }
                 return;
@@ -2226,8 +2275,8 @@ impl App {
             Some(GlobalKey::ToggleWorkspace) => {
                 let opening = !self.show_workspace;
                 self.show_workspace = !self.show_workspace;
-                if opening && let Some(seed) = self.active_seed() {
-                    self.fetch_dashboard(seed);
+                if opening && let Some(session_id) = self.active_session_id() {
+                    self.fetch_dashboard(session_id);
                 }
                 return;
             }
@@ -2251,10 +2300,10 @@ impl App {
             if self.inspecting() {
                 self.exit_inspect();
             }
-            // 上一条标签遗留的确认/附件 overlay 属于旧 seed：不能跟着切过来。
-            self.prune_overlays_for_active_seed();
-            if let Some(seed) = self.active_seed() {
-                self.fetch_team(seed);
+            // 上一条标签遗留的确认/附件 overlay 属于旧 session_id：不能跟着切过来。
+            self.prune_overlays_for_active_session_id();
+            if let Some(session_id) = self.active_session_id() {
+                self.fetch_team(session_id);
             }
             return;
         }
@@ -2349,10 +2398,10 @@ mod tests {
     use super::*;
     use qaqh_client::{ClientV2CommandAck, RingingCommandAckStatus, SessionMeta};
 
-    fn list_entry(seed: &str, created_at: u64) -> SessionListEntry {
+    fn list_entry(session_id: &str, created_at: u64) -> SessionListEntry {
         SessionListEntry {
             meta: SessionMeta {
-                session_id: seed.to_string(),
+                session_id: session_id.to_string(),
                 created_at,
                 ..SessionMeta::default()
             },
@@ -2361,10 +2410,10 @@ mod tests {
         }
     }
 
-    fn list_entry_with_cwd(seed: &str, cwd: Option<&str>) -> SessionListEntry {
+    fn list_entry_with_cwd(session_id: &str, cwd: Option<&str>) -> SessionListEntry {
         SessionListEntry {
             meta: SessionMeta {
-                session_id: seed.to_string(),
+                session_id: session_id.to_string(),
                 cwd: cwd.map(str::to_owned),
                 ..SessionMeta::default()
             },
@@ -2376,9 +2425,9 @@ mod tests {
     #[test]
     fn permission_interaction_body_restores_panel_without_timeline() {
         let (mut app, _rx) = App::new_for_test();
-        app.tabs.push("seed".into());
+        app.tabs.push("session".into());
         app.sessions
-            .insert("seed".into(), SessionState::new("seed".into()));
+            .insert("session".into(), SessionState::new("session".into()));
         let body = serde_json::to_vec(&serde_json::json!({
             "kind": "permission",
             "tool_name": "exec",
@@ -2392,9 +2441,9 @@ mod tests {
         }))
         .expect("body");
 
-        app.apply_interaction_body("seed", "int_1", Some("call_1"), &body);
+        app.apply_interaction_body("session", "int_1", Some("call_1"), &body);
 
-        let panel = app.sessions["seed"]
+        let panel = app.sessions["session"]
             .active_permission()
             .expect("permission panel");
         assert_eq!(panel.tool_call_id, "call_1");
@@ -2407,71 +2456,47 @@ mod tests {
     async fn bootstrap_restores_pending_ask_from_snapshot() {
         let (mut app, _rx) = App::new_for_test();
         app.sessions
-            .insert("seed".into(), SessionState::new("seed".into()));
+            .insert("session".into(), SessionState::new("session".into()));
 
-        let cursor = qaqh_client::ClientV2CursorToken::encode_snapshot(
-            &qaqh_client::ClientV2Cursor::snapshot("log-1", 1),
-        )
-        .expect("snapshot cursor");
-        let mut control = serde_json::to_value(qaqh_client::ClientV2ControlState::default())
-            .expect("control baseline");
-        control["interactions"] = serde_json::json!([{
-            "interaction_id": "int-ask-1",
-            "call_id": "call-ask-1",
-            "turn_id": "turn-1",
-            "kind": "ask",
-            "request": {
-                "kind": "inline",
-                "data": {
-                    "text": serde_json::json!({
-                        "kind": "ask",
-                        "mode": "single",
-                        "questions": [{
-                            "id": "q1",
-                            "question": "选哪个？",
-                            "options": ["甲", "乙"],
-                            "allow_custom": false
-                        }]
-                    }).to_string()
+        // 走权威 fixture：这份手抄件此前仍按 legacy `session_id` 键写快照，是下一处
+        // 「静默漂移」候选；改由 `v2_fixtures` 统一反序列化。
+        let bootstrap = v2_fixtures::bootstrap_with(
+            "session",
+            "epoch-1",
+            "log-1",
+            1,
+            1,
+            serde_json::json!([{
+                "interaction_id": "int-ask-1",
+                "call_id": "call-ask-1",
+                "turn_id": "turn-1",
+                "kind": "ask",
+                "request": {
+                    "kind": "inline",
+                    "data": {
+                        "text": serde_json::json!({
+                            "kind": "ask",
+                            "mode": "single",
+                            "questions": [{
+                                "id": "q1",
+                                "question": "选哪个？",
+                                "options": ["甲", "乙"],
+                                "allow_custom": false
+                            }]
+                        }).to_string()
+                    }
                 }
-            }
-        }]);
-        let bootstrap: qaqh_client::ClientV2Bootstrap = serde_json::from_value(serde_json::json!({
-            "schema": "qaqh.Ringing",
-            "version": 2,
-            "server_epoch": "epoch-1",
-            "seed": "seed",
-            "snapshot_cursor": cursor.as_str(),
-            "control": {
-                "channel": "control",
-                "state_revision": 1,
-                "snapshot_version": 1,
-                "state": control
-            },
-            "conversation": {
-                "channel": "conversation",
-                "state_revision": 1,
-                "snapshot_version": 1,
-                "state": serde_json::to_value(qaqh_client::ClientV2ConversationState::default())
-                    .expect("conversation baseline")
-            },
-            "tool": {
-                "channel": "tool",
-                "state_revision": 1,
-                "snapshot_version": 1,
-                "state": serde_json::to_value(qaqh_client::ClientV2ToolState::default())
-                    .expect("tool baseline")
-            }
-        }))
-        .expect("client bootstrap");
+            }]),
+            serde_json::Value::Null,
+        );
 
         app.handle(AppMsg::Action(ActionResult::Bootstrap {
-            seed: "seed".into(),
+            session_id: "session".into(),
             result: Ok(bootstrap),
             client_session_id: Some("cs-1".into()),
         }));
 
-        let ask = app.sessions["seed"]
+        let ask = app.sessions["session"]
             .pending_ask
             .as_ref()
             .expect("ask restored from bootstrap");
@@ -2483,11 +2508,11 @@ mod tests {
     fn turn_completed_requests_forced_redraw() {
         let (mut app, _rx) = App::new_for_test();
         app.sessions
-            .insert("seed".into(), SessionState::new("seed".into()));
-        init_v2_session(&mut app, "seed");
+            .insert("session".into(), SessionState::new("session".into()));
+        init_v2_session(&mut app, "session");
 
         app.handle(AppMsg::Runtime(v2_event(
-            "seed",
+            "session",
             qaqh_client::ClientV2Payload::ConversationDelta(
                 qaqh_client::ClientV2ConversationDelta::TurnFinished {
                     revision: 1,
@@ -2506,8 +2531,8 @@ mod tests {
     fn v2_reducer_drops_duplicate_event_before_dispatch() {
         let (mut app, _rx) = App::new_for_test();
         app.sessions
-            .insert("seed".into(), SessionState::new("seed".into()));
-        init_v2_session(&mut app, "seed");
+            .insert("session".into(), SessionState::new("session".into()));
+        init_v2_session(&mut app, "session");
 
         let payload = qaqh_client::ClientV2Payload::ConversationDelta(
             qaqh_client::ClientV2ConversationDelta::TurnFinished {
@@ -2519,14 +2544,14 @@ mod tests {
             },
         );
         app.handle(AppMsg::Runtime(v2_reliable_event(
-            "seed",
+            "session",
             1,
             0,
             payload.clone(),
         )));
         assert!(app.force_redraw, "first reliable event must dispatch");
         app.force_redraw = false;
-        app.handle(AppMsg::Runtime(v2_reliable_event("seed", 1, 0, payload)));
+        app.handle(AppMsg::Runtime(v2_reliable_event("session", 1, 0, payload)));
         assert!(
             !app.force_redraw,
             "duplicate (fact_seq, projection_index) must be dropped before dispatch"
@@ -2537,14 +2562,14 @@ mod tests {
     fn driver_changed_updates_read_only_and_rejects_stale_epoch() {
         let (mut app, _rx) = App::new_for_test();
         app.sessions
-            .insert("seed".into(), SessionState::new("seed".into()));
-        init_v2_session(&mut app, "seed");
-        app.tabs.push("seed".into());
+            .insert("session".into(), SessionState::new("session".into()));
+        init_v2_session(&mut app, "session");
+        app.tabs.push("session".into());
         app.v2_client_session_id = Some("cs-1".into());
         assert!(app.active_v2_read_only(), "vacant driver seat is read-only");
 
         app.handle(AppMsg::Runtime(v2_reliable_event(
-            "seed",
+            "session",
             1,
             0,
             qaqh_client::ClientV2Payload::ControlDelta(
@@ -2558,7 +2583,7 @@ mod tests {
         assert!(!app.active_v2_read_only(), "holder is now the driver");
 
         app.handle(AppMsg::Runtime(v2_reliable_event(
-            "seed",
+            "session",
             2,
             0,
             qaqh_client::ClientV2Payload::ControlDelta(
@@ -2579,13 +2604,13 @@ mod tests {
     fn non_driver_send_is_blocked_without_consuming_composer() {
         let (mut app, _rx) = App::new_for_test();
         app.sessions
-            .insert("seed".into(), SessionState::new("seed".into()));
-        init_v2_session(&mut app, "seed");
-        let session = app.sessions.get_mut("seed").expect("session");
+            .insert("session".into(), SessionState::new("session".into()));
+        init_v2_session(&mut app, "session");
+        let session = app.sessions.get_mut("session").expect("session");
         assert_eq!(
             session
                 .ringing_v2
-                .apply_driver_state(ringing_v2::DriverState {
+                .apply_driver_state(qaqh_client::ClientV2DriverState {
                     holder: Some("other-client".into()),
                     driver_epoch: 1,
                     can_claim: false,
@@ -2593,12 +2618,12 @@ mod tests {
             ringing_v2::DriverOutcome::Applied
         );
         session.composer.insert_str("hello");
-        app.tabs.push("seed".into());
+        app.tabs.push("session".into());
         app.v2_client_session_id = Some("cs-1".into());
 
         app.send_message();
 
-        assert_eq!(app.sessions["seed"].composer.value(), "hello");
+        assert_eq!(app.sessions["session"].composer.value(), "hello");
         assert!(
             app.toasts
                 .iter()
@@ -2611,26 +2636,26 @@ mod tests {
     async fn reset_blocks_events_until_new_bootstrap() {
         let (mut app, _rx) = App::new_for_test();
         app.sessions
-            .insert("seed".into(), SessionState::new("seed".into()));
-        init_v2_session(&mut app, "seed");
+            .insert("session".into(), SessionState::new("session".into()));
+        init_v2_session(&mut app, "session");
 
         app.handle_runtime(RuntimeMsg::ResetRequired {
-            seed: "seed".into(),
+            session_id: "session".into(),
             reset: Box::new(qaqh_client::ClientV2Reset {
                 schema: qaqh_client::RINGING_SCHEMA.into(),
                 version: qaqh_client::RINGING_V2_VERSION,
                 server_epoch: "e1".into(),
-                session_id: "seed".into(),
+                session_id: "session".into(),
                 log_id: Some("log-1".into()),
                 snapshot_cursor: None,
                 reason: qaqh_client::ClientV2ResetReason::SnapshotMissing,
             }),
         });
-        assert!(app.sessions["seed"].ringing_v2.is_reset_pending());
+        assert!(app.sessions["session"].ringing_v2.is_reset_pending());
 
         app.force_redraw = false;
         app.handle(AppMsg::Runtime(v2_reliable_event(
-            "seed",
+            "session",
             1,
             0,
             qaqh_client::ClientV2Payload::ConversationDelta(
@@ -2653,17 +2678,17 @@ mod tests {
     async fn v2_t2_old_bootstrap_response_and_frame_cannot_rollback_after_reset() {
         let (mut app, _rx) = App::new_for_test();
         app.sessions
-            .insert("seed".into(), SessionState::new("seed".into()));
-        init_v2_session(&mut app, "seed");
+            .insert("session".into(), SessionState::new("session".into()));
+        init_v2_session(&mut app, "session");
         app.v2_client_session_id = Some("current-client".into());
 
         app.handle_runtime(RuntimeMsg::ResetRequired {
-            seed: "seed".into(),
+            session_id: "session".into(),
             reset: Box::new(qaqh_client::ClientV2Reset {
                 schema: qaqh_client::RINGING_SCHEMA.into(),
                 version: qaqh_client::RINGING_V2_VERSION,
                 server_epoch: "e2".into(),
-                session_id: "seed".into(),
+                session_id: "session".into(),
                 log_id: Some("log-2".into()),
                 snapshot_cursor: Some(
                     qaqh_client::ClientV2CursorToken::encode_snapshot(
@@ -2676,13 +2701,13 @@ mod tests {
         });
 
         app.handle(AppMsg::Action(ActionResult::Bootstrap {
-            seed: "seed".into(),
-            result: Ok(v2_bootstrap("seed", "e1", "log-1", 1)),
+            session_id: "session".into(),
+            result: Ok(v2_bootstrap("session", "e1", "log-1", 1)),
             client_session_id: Some("cs-old".into()),
         }));
-        assert!(app.sessions["seed"].ringing_v2.is_reset_pending());
+        assert!(app.sessions["session"].ringing_v2.is_reset_pending());
         assert_eq!(
-            app.sessions["seed"].ringing_v2.server_epoch(),
+            app.sessions["session"].ringing_v2.server_epoch(),
             Some("e1"),
             "stale bootstrap must not replace the pre-reset model"
         );
@@ -2693,17 +2718,20 @@ mod tests {
         );
 
         app.handle(AppMsg::Action(ActionResult::Bootstrap {
-            seed: "seed".into(),
-            result: Ok(v2_bootstrap("seed", "e2", "log-2", 2)),
+            session_id: "session".into(),
+            result: Ok(v2_bootstrap("session", "e2", "log-2", 2)),
             client_session_id: Some("cs-1".into()),
         }));
-        assert!(!app.sessions["seed"].ringing_v2.is_reset_pending());
-        assert_eq!(app.sessions["seed"].ringing_v2.server_epoch(), Some("e2"));
+        assert!(!app.sessions["session"].ringing_v2.is_reset_pending());
+        assert_eq!(
+            app.sessions["session"].ringing_v2.server_epoch(),
+            Some("e2")
+        );
         assert_eq!(app.v2_client_session_id.as_deref(), Some("cs-1"));
 
         app.force_redraw = false;
         app.handle(AppMsg::Runtime(v2_reliable_event(
-            "seed",
+            "session",
             3,
             0,
             qaqh_client::ClientV2Payload::ConversationDelta(
@@ -2726,10 +2754,10 @@ mod tests {
     fn timeline_turn_sealed_requests_forced_redraw() {
         let (mut app, _rx) = App::new_for_test();
         app.sessions
-            .insert("seed".into(), SessionState::new("seed".into()));
+            .insert("session".into(), SessionState::new("session".into()));
 
         app.handle_runtime(RuntimeMsg::Timeline {
-            seed: "seed".into(),
+            session_id: "session".into(),
             entry: Box::new(qaqh_client::TimelineEntry {
                 timeline_seq: 1,
                 turn_id: "turn-1".into(),
@@ -2766,13 +2794,13 @@ mod tests {
             .insert("cmd-create".into(), Instant::now());
 
         app.handle(AppMsg::Action(ActionResult::SessionList(Ok(vec![
-            list_entry("new-seed", 200),
+            list_entry("new-session_id", 200),
         ]))));
 
-        assert_eq!(app.tabs, vec!["new-seed".to_string()]);
+        assert_eq!(app.tabs, vec!["new-session_id".to_string()]);
         assert!(app.pending_initial_prompt.is_none());
         assert_eq!(
-            app.sessions["new-seed"].composer.value(),
+            app.sessions["new-session_id"].composer.value(),
             "hello",
             "首条草稿应原样带入真实会话 composer"
         );
@@ -2786,7 +2814,7 @@ mod tests {
             .insert("cmd-create".into(), Instant::now());
 
         app.handle(AppMsg::Action(ActionResult::CommandAck {
-            seed: None,
+            session_id: None,
             label: "新会话",
             result: Err("连接 daemon 失败".into()),
         }));
@@ -2854,13 +2882,13 @@ mod tests {
             .insert("cmd-create-3".to_string(), Instant::now());
 
         app.handle(AppMsg::Action(ActionResult::SessionList(Ok(vec![
-            list_entry("old-seed", 100),
-            list_entry("new-seed", 200),
+            list_entry("old-session_id", 100),
+            list_entry("new-session_id", 200),
         ]))));
 
         assert_eq!(
             app.tabs,
-            vec!["new-seed".to_string()],
+            vec!["new-session_id".to_string()],
             "有在途 create 时必须打开**最新建**的那个会话（且不得顺手开旧会话）"
         );
         assert!(
@@ -2876,7 +2904,7 @@ mod tests {
         let (mut app, _rx) = App::new_for_test();
 
         app.handle(AppMsg::Action(ActionResult::SessionList(Ok(vec![
-            list_entry("old-seed", 100),
+            list_entry("old-session_id", 100),
         ]))));
 
         assert!(
@@ -2914,7 +2942,7 @@ mod tests {
             .insert("cmd-create-1".to_string(), Instant::now());
 
         app.handle(AppMsg::Action(ActionResult::CommandAck {
-            seed: None,
+            session_id: None,
             label: "新会话",
             result: Ok(create_ack(
                 "cmd-create-1",
@@ -2945,7 +2973,7 @@ mod tests {
             .insert("cmd-create-2".to_string(), Instant::now());
 
         app.handle(AppMsg::Action(ActionResult::CommandAck {
-            seed: None,
+            session_id: None,
             label: "新会话",
             result: Ok(create_ack(
                 "cmd-create-2",
@@ -2968,7 +2996,7 @@ mod tests {
             .insert("cmd-create-3".to_string(), Instant::now());
 
         app.handle(AppMsg::Action(ActionResult::CommandAck {
-            seed: Some("seed-x".into()),
+            session_id: Some("session-x".into()),
             label: "撤销回合",
             result: Ok(create_ack("cmd-other-9", RingingCommandAckStatus::Rejected)),
         }));
@@ -2981,141 +3009,75 @@ mod tests {
     }
 
     fn channel(c: qaqh_client::Channel) -> StreamKey {
-        // v2 使用每 seed 一条单流；测试里仍用频道名当不同的流身份。
+        // v2 使用每 session_id 一条单流；测试里仍用频道名当不同的流身份。
         StreamKey::V2(c.as_str().to_string())
     }
 
-    fn timeline(seed: &str) -> StreamKey {
-        StreamKey::Timeline(seed.into())
+    fn timeline(session_id: &str) -> StreamKey {
+        StreamKey::Timeline(session_id.into())
     }
 
     /// 构造一条最小可用的 canonical v2 投影事件（ephemeral，无 cursor）。
-    fn v2_event(seed: &str, payload: qaqh_client::ClientV2Payload) -> RuntimeMsg {
+    ///
+    /// **不再手抄信封字段**：走 `v2_fixtures` 的权威反序列化路径。历史教训：
+    /// 后端信封新增 `ts_ms`（W1/C3）时，正是这里的结构体字面量把 `cargo test`
+    /// 打红；而镜像漏字段时又是静默的。两条路都不留。
+    fn v2_event(session_id: &str, payload: qaqh_client::ClientV2Payload) -> RuntimeMsg {
         RuntimeMsg::V2Event {
-            seed: seed.into(),
-            event: Box::new(qaqh_client::ClientV2Event {
-                schema: qaqh_client::RINGING_SCHEMA.into(),
-                version: qaqh_client::RINGING_V2_VERSION,
-                server_epoch: "e1".into(),
-                session_id: seed.into(),
-                event_id: "ev-1".into(),
-                stream_key: qaqh_client::ClientV2StreamKey::Channel(
-                    qaqh_client::Channel::Conversation,
-                ),
-                delivery: qaqh_client::ClientV2Delivery::Ephemeral,
-                cursor: None,
-                log_id: None,
-                fact_seq: None,
-                projection_index: None,
-                revision: None,
-                causation_id: None,
-                correlation_id: None,
-                payload,
-            }),
+            session_id: session_id.into(),
+            event: Box::new(v2_fixtures::ephemeral_event(session_id, "e1", payload)),
         }
     }
 
     /// 构造最小 typed v2 bootstrap；用于 T2 旧响应防护等 App 级回归。
     fn v2_bootstrap(
-        seed: &str,
+        session_id: &str,
         server_epoch: &str,
         log_id: &str,
         snapshot_fact_seq: u64,
     ) -> qaqh_client::ClientV2Bootstrap {
-        let cursor = qaqh_client::ClientV2CursorToken::encode_snapshot(
-            &qaqh_client::ClientV2Cursor::snapshot(log_id, snapshot_fact_seq),
-        )
-        .expect("snapshot cursor");
-        serde_json::from_value(serde_json::json!({
-            "schema": "qaqh.Ringing",
-            "version": 2,
-            "server_epoch": server_epoch,
-            "session_id": seed,
-            "snapshot_cursor": cursor.as_str(),
-            "control": {
-                "channel": "control",
-                "state_revision": 1,
-                "snapshot_version": 1,
-                "state": serde_json::to_value(qaqh_client::ClientV2ControlState::default())
-                    .expect("control baseline")
-            },
-            "conversation": {
-                "channel": "conversation",
-                "state_revision": 1,
-                "snapshot_version": 1,
-                "state": serde_json::to_value(qaqh_client::ClientV2ConversationState::default())
-                    .expect("conversation baseline")
-            },
-            "tool": {
-                "channel": "tool",
-                "state_revision": 1,
-                "snapshot_version": 1,
-                "state": serde_json::to_value(qaqh_client::ClientV2ToolState::default())
-                    .expect("tool baseline")
-            }
-        }))
-        .expect("client bootstrap")
+        v2_fixtures::bootstrap(session_id, server_epoch, log_id, snapshot_fact_seq, 1)
     }
 
     /// 测试会话接入最小 v2 reducer baseline（生产由 bootstrap 建立）。
-    fn init_v2_session(app: &mut App, seed: &str) {
-        let session = app.sessions.get_mut(seed).expect("session");
+    ///
+    /// 用**权威** `ClientV2Bootstrap`（经 `v2_fixtures`），不再自建
+    /// `BootstrapSnapshot` 镜像。
+    fn init_v2_session(app: &mut App, session_id: &str) {
+        let bootstrap = v2_fixtures::bootstrap(session_id, "e1", "log-1", 1, 0);
+        let session = app.sessions.get_mut(session_id).expect("session");
         assert_eq!(
-            session
-                .ringing_v2
-                .apply_bootstrap(ringing_v2::BootstrapSnapshot {
-                    server_epoch: "e1".into(),
-                    seed: seed.into(),
-                    log_id: Some("log-1".into()),
-                    snapshot_cursor: "v2.snapshot".into(),
-                    snapshot_fact_seq: 0,
-                    state_revision: 0,
-                    pending_interactions: Vec::new(),
-                    driver: None,
-                }),
+            session.ringing_v2.apply_bootstrap(&bootstrap),
             ringing_v2::BootstrapOutcome::Applied
         );
     }
 
     /// 构造一条 reliable v2 事件（用于 reducer 门控回归）。
     fn v2_reliable_event(
-        seed: &str,
+        session_id: &str,
         fact_seq: u64,
         projection_index: u16,
         payload: qaqh_client::ClientV2Payload,
     ) -> RuntimeMsg {
         RuntimeMsg::V2Event {
-            seed: seed.into(),
-            event: Box::new(qaqh_client::ClientV2Event {
-                schema: qaqh_client::RINGING_SCHEMA.into(),
-                version: qaqh_client::RINGING_V2_VERSION,
-                server_epoch: "e1".into(),
-                session_id: seed.into(),
-                event_id: format!("ev-{fact_seq}-{projection_index}"),
-                stream_key: qaqh_client::ClientV2StreamKey::Channel(
-                    qaqh_client::Channel::Conversation,
-                ),
-                delivery: qaqh_client::ClientV2Delivery::Reliable,
-                cursor: Some(
-                    qaqh_client::ClientV2CursorToken::encode_snapshot(
-                        &qaqh_client::ClientV2Cursor::snapshot("log-1", fact_seq),
-                    )
-                    .expect("cursor token"),
-                ),
-                log_id: Some("log-1".into()),
-                fact_seq: Some(fact_seq),
-                projection_index: Some(projection_index),
-                revision: Some(fact_seq),
-                causation_id: None,
-                correlation_id: None,
-                payload,
-            }),
+            session_id: session_id.into(),
+            event: Box::new(
+                v2_fixtures::ReliableEvent::new(
+                    session_id,
+                    "e1",
+                    "log-1",
+                    fact_seq,
+                    projection_index,
+                    payload,
+                )
+                .build(),
+            ),
         }
     }
 
     /// 阻断项 1 的回归：告警必须**按流**记账。
     ///
-    /// 场景：seed A 的 timeline 流断开（告警），随后另一条流（session 频道）重连
+    /// 场景：session_id A 的 timeline 流断开（告警），随后另一条流（session 频道）重连
     /// 成功（恢复信号）——A 的告警必须还在、相位仍是 `ReadyWithIssue`，文案也不能
     /// 串成后者的。证伪方式：把账本退回「一个全局布尔 + 直接清 conn_error」（旧
     /// 行为），本测试会变成 `Ready` 且无文案。
@@ -3241,7 +3203,7 @@ mod tests {
     fn thinking_overlay_e_requests_pager() {
         let (mut app, _rx) = App::new_for_test();
         app.overlays.push(Overlay::Thinking {
-            seed: "s".into(),
+            session_id: "s".into(),
             scroll: 0,
             body: "第一段\n第二段".into(),
         });
@@ -3264,14 +3226,16 @@ mod tests {
     }
 
     fn app_with_tabs(
-        seeds: &[&str],
+        session_ids: &[&str],
         active: usize,
     ) -> (App, tokio::sync::mpsc::UnboundedReceiver<AppMsg>) {
         let (mut app, rx) = App::new_for_test();
-        for seed in seeds {
-            app.tabs.push((*seed).to_string());
-            app.sessions
-                .insert((*seed).to_string(), SessionState::new((*seed).to_string()));
+        for session_id in session_ids {
+            app.tabs.push((*session_id).to_string());
+            app.sessions.insert(
+                (*session_id).to_string(),
+                SessionState::new((*session_id).to_string()),
+            );
         }
         app.active = active;
         (app, rx)
@@ -3355,17 +3319,17 @@ mod tests {
         assert!(app.conn_error.is_none());
     }
 
-    /// **缺陷 2 的端到端版**：按 Alt+数字切标签时，绑旧 seed 的 `Confirm` 必须真的
-    /// 从栈里消失，全局层留下；随后按 `y` 不会作用到旧 seed。
+    /// **缺陷 2 的端到端版**：按 Alt+数字切标签时，绑旧 session_id 的 `Confirm` 必须真的
+    /// 从栈里消失，全局层留下；随后按 `y` 不会作用到旧 session_id。
     ///
-    /// 证伪方式：去掉 Alt+tab 分支里的 `prune_overlays_for_active_seed()`——确认框
+    /// 证伪方式：去掉 Alt+tab 分支里的 `prune_overlays_for_active_session_id()`——确认框
     /// 留在栈里，`y` 会把 `CloseTab("A")` 落到 A 上（A 从 tabs 消失）。
     ///
     /// 断言分工（避免高估本用例）：前两条（栈里没有确认框、全局层留下）是**不变量**，
     /// 同一个变异下先红；最后那条按 `y` 是**后果**断言，说明这个不变量坏了会怎样伤害
     /// 用户，它不会独立于前两条失败。
     #[test]
-    fn alt_tab_prunes_the_previous_seeds_confirm_overlay() {
+    fn alt_tab_prunes_the_previous_session_ids_confirm_overlay() {
         let (mut app, _rx) = app_with_tabs(&["A", "B"], 0);
         // Ctrl+W 的确认框（绑 A）+ 一个全局层（帮助）——全局层不许被误伤。
         app.overlays.push(Overlay::Confirm {
@@ -3380,7 +3344,7 @@ mod tests {
             !app.overlays
                 .iter()
                 .any(|o| matches!(o, Overlay::Confirm { .. })),
-            "旧 seed 的确认框必须被剪掉：{:?}",
+            "旧 session_id 的确认框必须被剪掉：{:?}",
             app.overlays
         );
         assert!(
@@ -3393,7 +3357,7 @@ mod tests {
         app.handle(key(KeyCode::Char('y'), KeyModifiers::NONE));
         assert!(
             app.tabs.iter().any(|t| t == "A"),
-            "切标签后按 y 不得作用到旧 seed 的确认动作（A 被关了）"
+            "切标签后按 y 不得作用到旧 session_id 的确认动作（A 被关了）"
         );
     }
 
@@ -3402,10 +3366,10 @@ mod tests {
     /// 父标签 + 一个正在跟踪的子代理。
     fn app_with_tracked_subagent() -> (App, String) {
         let (mut app, _rx) = App::new_for_test();
-        let sub = "seed-sub".to_string();
+        let sub = "session-sub".to_string();
         app.sessions
             .insert(sub.clone(), SessionState::new(sub.clone()));
-        app.subagent_seeds.insert(sub.clone());
+        app.subagent_session_ids.insert(sub.clone());
         (app, sub)
     }
 
@@ -3415,13 +3379,13 @@ mod tests {
     fn timeline_lost_keeps_subagent_on_non_404_and_warns() {
         let (mut app, sub) = app_with_tracked_subagent();
         app.handle_runtime(RuntimeMsg::TimelineLost {
-            seed: sub.clone(),
+            session_id: sub.clone(),
             reason: TimelineLostReason::Other(
-                "HTTP 401: /ringing/v1/sessions/seed-sub/timeline".into(),
+                "HTTP 401: /ringing/v1/sessions/session-sub/timeline".into(),
             ),
         });
         assert!(
-            app.subagent_seeds.contains(&sub),
+            app.subagent_session_ids.contains(&sub),
             "401/超时/网络错只说明这条流断了，会话可能还活着"
         );
         assert!(
@@ -3437,10 +3401,10 @@ mod tests {
     fn timeline_lost_untracks_subagent_on_404() {
         let (mut app, sub) = app_with_tracked_subagent();
         app.handle_runtime(RuntimeMsg::TimelineLost {
-            seed: sub.clone(),
+            session_id: sub.clone(),
             reason: TimelineLostReason::SessionMissing,
         });
-        assert!(!app.subagent_seeds.contains(&sub));
+        assert!(!app.subagent_session_ids.contains(&sub));
     }
 
     #[test]
@@ -3464,13 +3428,13 @@ mod tests {
     #[test]
     fn closed_event_for_non_tab_parent_reclaims_live_subscriptions() {
         let (mut app, _rx) = App::new_for_test();
-        for seed in ["root", "parent", "sub"] {
+        for session_id in ["root", "parent", "sub"] {
             app.sessions
-                .insert(seed.into(), SessionState::new(seed.into()));
+                .insert(session_id.into(), SessionState::new(session_id.into()));
         }
         init_v2_session(&mut app, "parent");
-        for seed in ["parent", "sub"] {
-            app.subagent_seeds.insert(seed.into());
+        for session_id in ["parent", "sub"] {
+            app.subagent_session_ids.insert(session_id.into());
         }
         let snapshot: qaqh_client::ClientV2TeamSnapshot =
             serde_json::from_value(serde_json::json!({
@@ -3518,7 +3482,8 @@ mod tests {
         )));
 
         assert!(
-            !app.subagent_seeds.contains("sub") && !app.subagent_seeds.contains("parent"),
+            !app.subagent_session_ids.contains("sub")
+                && !app.subagent_session_ids.contains("parent"),
             "daemon 主动关父时必须回收它自己与它的子代理的 live 订阅"
         );
         assert!(!app.sessions.contains_key("sub"));
@@ -3531,9 +3496,9 @@ mod tests {
     #[tokio::test]
     async fn opening_todo_workspace_refreshes_dashboard() {
         let (mut app, _rx) = App::new_for_test();
-        app.tabs.push("seed".into());
+        app.tabs.push("session".into());
         app.sessions
-            .insert("seed".into(), SessionState::new("seed".into()));
+            .insert("session".into(), SessionState::new("session".into()));
         app.show_workspace = false;
 
         app.handle(AppMsg::Key(ratatui::crossterm::event::KeyEvent::new(
@@ -3542,15 +3507,15 @@ mod tests {
         )));
 
         assert!(app.show_workspace);
-        assert!(app.dashboard_fetching.contains("seed"));
+        assert!(app.dashboard_fetching.contains("session"));
     }
 
     #[tokio::test]
     async fn todo_tool_update_refreshes_dashboard() {
         let (mut app, _rx) = App::new_for_test();
-        app.tabs.push("seed".into());
+        app.tabs.push("session".into());
         app.sessions
-            .insert("seed".into(), SessionState::new("seed".into()));
+            .insert("session".into(), SessionState::new("session".into()));
         let tool: qaqh_client::TimelineTool = serde_json::from_value(serde_json::json!({
             "tool_call_id": "call-todo-1",
             "name": "todo_write",
@@ -3568,10 +3533,10 @@ mod tests {
         };
 
         app.handle(AppMsg::Runtime(RuntimeMsg::Timeline {
-            seed: "seed".into(),
+            session_id: "session".into(),
             entry: Box::new(entry),
         }));
 
-        assert!(app.dashboard_fetching.contains("seed"));
+        assert!(app.dashboard_fetching.contains("session"));
     }
 }

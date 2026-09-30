@@ -3,52 +3,54 @@
 use super::*;
 
 impl App {
-    pub fn open_session_tab(&mut self, seed: &str) {
-        if self.tabs.iter().any(|s| s == seed) {
-            self.active = self.tabs.iter().position(|s| s == seed).unwrap_or(0);
-            self.prune_overlays_for_active_seed();
-            self.fetch_team(seed.to_owned());
+    pub fn open_session_tab(&mut self, session_id: &str) {
+        if self.tabs.iter().any(|s| s == session_id) {
+            self.active = self.tabs.iter().position(|s| s == session_id).unwrap_or(0);
+            self.prune_overlays_for_active_session_id();
+            self.fetch_team(session_id.to_owned());
             return;
         }
-        self.tabs.push(seed.to_owned());
-        self.sessions
-            .insert(seed.to_owned(), SessionState::new(seed.to_owned()));
+        self.tabs.push(session_id.to_owned());
+        self.sessions.insert(
+            session_id.to_owned(),
+            SessionState::new(session_id.to_owned()),
+        );
         self.active = self.tabs.len() - 1;
-        self.prune_overlays_for_active_seed();
+        self.prune_overlays_for_active_session_id();
         self.sync_tracked();
         // attach + bootstrap（timeline 流由 runtime 自动建立）。
-        self.attach_and_bootstrap(seed.to_owned());
+        self.attach_and_bootstrap(session_id.to_owned());
     }
 
-    pub(super) fn attach_and_bootstrap(&mut self, seed: String) {
+    pub(super) fn attach_and_bootstrap(&mut self, session_id: String) {
         self.spawn_api(move |api, tx| async move {
             let ack = api
                 .send_command(
-                    Some(&seed),
+                    Some(&session_id),
                     RingingCommand::Control(ControlCommand::SessionResume {
-                        session_id: seed.clone(),
+                        session_id: session_id.clone(),
                     }),
                     Default::default(),
                 )
                 .await;
             if let Err(e) = ack {
                 let _ = tx.send(AppMsg::Action(ActionResult::CommandAck {
-                    seed: Some(seed.clone()),
+                    session_id: Some(session_id.clone()),
                     label: "resume",
                     result: Err(e),
                 }));
                 return;
             }
             // Snapshot first: TeamDelta is ephemeral and is not replayed.
-            let team = api.team_v2(&seed).await;
+            let team = api.team_v2(&session_id).await;
             let _ = tx.send(AppMsg::Action(ActionResult::Team {
-                seed: seed.clone(),
+                session_id: session_id.clone(),
                 result: team,
             }));
-            let result = api.bootstrap(&seed).await;
+            let result = api.bootstrap(&session_id).await;
             let client_session_id = api.v2_client_session_id().await;
             let _ = tx.send(AppMsg::Action(ActionResult::Bootstrap {
-                seed,
+                session_id,
                 result,
                 client_session_id,
             }));
@@ -59,7 +61,7 @@ impl App {
         self.new_session_with_cwd(None);
     }
 
-    /// 品牌首屏提交：先把输入暂存，等新会话 seed 落成后带进真实 composer。
+    /// 品牌首屏提交：先把输入暂存，等新会话 session_id 落成后带进真实 composer。
     ///
     /// 空输入仍创建一个空会话，行为对齐原来的 Ctrl+N；有输入时不在前端预造
     /// timeline，避免出现“本地临时消息 + 后端回放”双份正文。首条消息不自动发送，
@@ -80,11 +82,11 @@ impl App {
         let Some(text) = self.pending_initial_prompt.take() else {
             return;
         };
-        let Some(seed) = self.active_seed() else {
+        let Some(session_id) = self.active_session_id() else {
             self.pending_initial_prompt = Some(text);
             return;
         };
-        if let Some(session) = self.sessions.get_mut(&seed) {
+        if let Some(session) = self.sessions.get_mut(&session_id) {
             session.composer.input = text.chars().collect();
             session.composer.cursor = session.composer.input.len();
         } else {
@@ -100,8 +102,8 @@ impl App {
         if let Some(text) = self.pending_initial_prompt.take() {
             if self.tabs.is_empty() {
                 self.draft_composer.insert_str(&text);
-            } else if let Some(seed) = self.active_seed()
-                && let Some(session) = self.sessions.get_mut(&seed)
+            } else if let Some(session_id) = self.active_session_id()
+                && let Some(session) = self.sessions.get_mut(&session_id)
             {
                 session.composer.input = text.chars().collect();
                 session.composer.cursor = session.composer.input.len();
@@ -166,46 +168,46 @@ impl App {
                 )
                 .await;
             let _ = tx.send(AppMsg::Action(ActionResult::CommandAck {
-                seed: None,
+                session_id: None,
                 label: "新会话",
                 result,
             }));
         });
     }
 
-    pub(super) fn close_tab_by_seed(&mut self, seed: &str) {
-        // 子代理回收**不依赖** seed 是否在本地 `tabs`：daemon 主动关父会话、
-        // 或父本身就是子代理时，父 seed 从来不在 tabs 里——旧实现把整段回收罩在
+    pub(super) fn close_tab_by_session_id(&mut self, session_id: &str) {
+        // 子代理回收**不依赖** session_id 是否在本地 `tabs`：daemon 主动关父会话、
+        // 或父本身就是子代理时，父 session_id 从来不在 tabs 里——旧实现把整段回收罩在
         // `tabs` 命中内，这些子代理的 timeline 流与本地快照就永远留在跟踪集里。
-        self.reclaim_subagents(seed);
-        if let Some(pos) = self.tabs.iter().position(|s| s == seed) {
+        self.reclaim_subagents(session_id);
+        if let Some(pos) = self.tabs.iter().position(|s| s == session_id) {
             self.tabs.remove(pos);
-            self.sessions.remove(seed);
-            self.teams.remove(seed);
-            self.tracked_seeds.remove(seed);
+            self.sessions.remove(session_id);
+            self.teams.remove(session_id);
+            self.tracked_session_ids.remove(session_id);
             if self.active >= self.tabs.len() && self.active > 0 {
                 self.active = self.tabs.len() - 1;
             }
-            // 活动标签可能已经换成别的 seed：旧 seed 的确认/附件 overlay 作废。
-            self.prune_overlays_for_active_seed();
+            // 活动标签可能已经换成别的 session_id：旧 session_id 的确认/附件 overlay 作废。
+            self.prune_overlays_for_active_session_id();
             self.sync_tracked();
             return;
         }
         // 不在 tabs：没有标签栈可调。会话确实已消失 → 停止 live timeline；
         // roster 条目与本地快照保留，终态仍可查看。
-        self.untrack_subagent(seed);
-        self.tracked_seeds.remove(seed);
+        self.untrack_subagent(session_id);
+        self.tracked_session_ids.remove(session_id);
         self.sync_tracked();
     }
 
-    /// 按父子关系回收 `seed` 名下的全部子代理（含多层嵌套）：停止 timeline
+    /// 按父子关系回收 `session_id` 名下的全部子代理（含多层嵌套）：停止 timeline
     /// 跟踪并移除本地快照（子代理视图无宿主；daemon 侧 ephemeral 会话自会回收）。
     ///
     /// 先收集整个后代集合再统一删除——边删边找会把孙代一起弄丢（父条目随
     /// 快照删除后，父子关系就无从查起）。
-    fn reclaim_subagents(&mut self, seed: &str) {
+    fn reclaim_subagents(&mut self, session_id: &str) {
         let mut descendants: Vec<String> = Vec::new();
-        let mut frontier = vec![seed.to_owned()];
+        let mut frontier = vec![session_id.to_owned()];
         while let Some(parent) = frontier.pop() {
             let children: Vec<String> = self.child_agent_ids(&parent);
             for child in children {
@@ -225,7 +227,7 @@ impl App {
         }
     }
 
-    pub fn active_seed(&self) -> Option<String> {
+    pub fn active_session_id(&self) -> Option<String> {
         self.tabs.get(self.active).cloned()
     }
 
@@ -236,8 +238,8 @@ impl App {
     }
 
     pub(crate) fn active_session_mut(&mut self) -> Option<&mut SessionState> {
-        let seed = self.tabs.get(self.active)?.clone();
-        self.sessions.get_mut(&seed)
+        let session_id = self.tabs.get(self.active)?.clone();
+        self.sessions.get_mut(&session_id)
     }
 
     // ───────────────────────── 命令发送 ─────────────────────────
@@ -278,39 +280,39 @@ impl App {
         });
     }
 
-    pub fn archive_session(&mut self, seed: String) {
+    pub fn archive_session(&mut self, session_id: String) {
         self.send_control_command(
-            seed.clone(),
-            ControlCommand::SessionArchive { session_id: seed },
+            session_id.clone(),
+            ControlCommand::SessionArchive { session_id },
             "归档",
         );
     }
 
-    pub fn unarchive_session(&mut self, seed: String) {
+    pub fn unarchive_session(&mut self, session_id: String) {
         self.send_control_command(
-            seed.clone(),
-            ControlCommand::SessionUnarchive { session_id: seed },
+            session_id.clone(),
+            ControlCommand::SessionUnarchive { session_id },
             "取消归档",
         );
     }
 
-    pub fn delete_session(&mut self, seed: String) {
+    pub fn delete_session(&mut self, session_id: String) {
         self.send_control_command(
-            seed.clone(),
-            ControlCommand::SessionDelete { session_id: seed },
+            session_id.clone(),
+            ControlCommand::SessionDelete { session_id },
             "删除",
         );
     }
 
-    pub(super) fn fetch_dashboard(&mut self, seed: String) {
-        if seed.is_empty() || self.dashboard_fetching.contains(&seed) {
+    pub(super) fn fetch_dashboard(&mut self, session_id: String) {
+        if session_id.is_empty() || self.dashboard_fetching.contains(&session_id) {
             return;
         }
-        self.dashboard_fetching.insert(seed.clone());
+        self.dashboard_fetching.insert(session_id.clone());
         self.spawn_api(move |api, tx| async move {
             let value = api
                 .query(QueryRequest::SessionDashboard {
-                    session_id: seed.clone(),
+                    session_id: session_id.clone(),
                 })
                 .await;
             let parsed: Result<qaqh_client::DomainDashboardSnapshot, String> = match value {
@@ -352,13 +354,13 @@ impl App {
                                 .collect()
                         })
                         .unwrap_or_default();
-                    let seed_out = v
+                    let session_id_out = v
                         .get("session_id")
                         .and_then(|x| x.as_str())
-                        .unwrap_or(&seed)
+                        .unwrap_or(&session_id)
                         .to_owned();
                     Ok(qaqh_client::DomainDashboardSnapshot {
-                        session_id: seed_out,
+                        session_id: session_id_out,
                         documents: Vec::new(),
                         recent_edits,
                         tasks,
@@ -373,7 +375,7 @@ impl App {
                     // fallback: todo.status 是同一数据源的另一视图
                     let v2 = api
                         .query(QueryRequest::TodoStatus {
-                            session_id: seed.clone(),
+                            session_id: session_id.clone(),
                         })
                         .await;
                     match v2 {
@@ -414,7 +416,7 @@ impl App {
                                 Err(msg)
                             } else {
                                 Ok(qaqh_client::DomainDashboardSnapshot {
-                                    session_id: seed.clone(),
+                                    session_id: session_id.clone(),
                                     documents: Vec::new(),
                                     recent_edits: Vec::new(),
                                     tasks,
@@ -430,7 +432,7 @@ impl App {
                 }
             };
             let _ = tx.send(AppMsg::Action(ActionResult::Dashboard {
-                seed,
+                session_id,
                 result: parsed,
             }));
         });
@@ -449,8 +451,8 @@ impl App {
 /// 判据是**精确关联**，不是猜：`ack.command_id` 就是本侧为 `SessionCreate`
 /// 生成并透传的那个 id（见 `App::new_session_with_cwd`），且 `qaqh-client` 的
 /// `send_command` 会校验 ack 的 `command_id` 与提交时一致
-/// （`qaqh-client/src/client.rs:381`），不符即返回 `Err`。故无需按 `seed`
-/// 或 label 反查——create 的 `seed` 恒为 `None`，label 也不是唯一键。
+/// （`qaqh-client/src/client.rs:381`），不符即返回 `Err`。故无需按 `session_id`
+/// 或 label 反查——create 的 `session_id` 恒为 `None`，label 也不是唯一键。
 ///
 /// 注意 `Err` 分支**不适用**本函数：传输失败（超时/HTTP 非 2xx）是**结果未知**，
 /// 命令可能已在后端执行，晚到的 `Created` 仍会经 `causation_id` 回来；提前撤销
@@ -478,9 +480,9 @@ impl App {
 /// create 命令**判断，与本地 pending 是否还在无关。
 ///
 /// 判据的权威来源是 wire 层不变式：`RingingCommandEnvelope::validate` 要求
-/// **seed 缺失时命令必须是 `SessionCreate`**（`qaqh-ringing/src/envelope.rs:177-186`，
-/// 否则报 `missing_seed`），而 `send_command` 发前必过 `validate`。故调用方用
-/// `seed.is_none()` 即可判定，无需猜 label。
+/// **session_id 缺失时命令必须是 `SessionCreate`**（`qaqh-ringing/src/envelope.rs:177-186`，
+/// 否则报 `missing_session_id`），而 `send_command` 发前必过 `validate`。故调用方用
+/// `session_id.is_none()` 即可判定，无需猜 label。
 pub(super) fn apply_rejected_ack(
     pending_creates: &mut HashMap<String, Instant>,
     label: &str,
@@ -668,29 +670,30 @@ mod tests {
         .expect("team snapshot")
     }
 
-    /// issue #2 缺陷 3：父 seed **不在**本地 tabs（daemon 主动关父 / 父本身是
+    /// issue #2 缺陷 3：父 session_id **不在**本地 tabs（daemon 主动关父 / 父本身是
     /// 子代理）时，也必须按 Team projection 的 parent_agent_path 回收后代。
     #[test]
-    fn close_tab_by_seed_reclaims_children_of_non_tab_parent() {
+    fn close_tab_by_session_id_reclaims_children_of_non_tab_parent() {
         let (mut app, _rx) = App::new_for_test();
 
-        for seed in ["root", "parent", "sub", "grand"] {
+        for session_id in ["root", "parent", "sub", "grand"] {
             app.sessions
-                .insert(seed.into(), SessionState::new(seed.into()));
+                .insert(session_id.into(), SessionState::new(session_id.into()));
         }
         install_team(&mut app, "root", nested_snapshot());
-        for seed in ["sub", "grand"] {
-            app.subagent_seeds.insert(seed.into());
+        for session_id in ["sub", "grand"] {
+            app.subagent_session_ids.insert(session_id.into());
         }
         assert!(
             !app.tabs.contains(&"parent".to_string()),
             "前提：父不是本地标签"
         );
 
-        app.close_tab_by_seed("parent");
+        app.close_tab_by_session_id("parent");
 
         assert!(
-            !app.subagent_seeds.contains("sub") && !app.subagent_seeds.contains("grand"),
+            !app.subagent_session_ids.contains("sub")
+                && !app.subagent_session_ids.contains("grand"),
             "父不在 tabs 时子代理/孙代同样必须停止 timeline 跟踪"
         );
         assert!(
@@ -698,7 +701,7 @@ mod tests {
             "子代理/孙代的本地快照随父一起回收"
         );
         assert!(
-            app.tracked_seeds.is_empty(),
+            app.tracked_session_ids.is_empty(),
             "跟踪集必须只剩真正打开的标签（此处没有标签）"
         );
         assert!(
@@ -709,7 +712,7 @@ mod tests {
 
     /// 回归护栏：父在 tabs 时行为不变（回收子代理 + 关标签）。
     #[test]
-    fn close_tab_by_seed_still_closes_tab_and_children() {
+    fn close_tab_by_session_id_still_closes_tab_and_children() {
         let (mut app, _rx) = App::new_for_test();
         app.tabs.push("parent".into());
         app.sessions
@@ -742,14 +745,14 @@ mod tests {
             }))
             .expect("team snapshot"),
         );
-        app.subagent_seeds.insert("sub".into());
+        app.subagent_session_ids.insert("sub".into());
 
-        app.close_tab_by_seed("parent");
+        app.close_tab_by_session_id("parent");
 
         assert!(app.tabs.is_empty());
         assert!(!app.sessions.contains_key("parent"));
         assert!(!app.teams.contains_key("parent"));
-        assert!(!app.subagent_seeds.contains("sub"));
+        assert!(!app.subagent_session_ids.contains("sub"));
         assert!(!app.sessions.contains_key("sub"));
     }
 }

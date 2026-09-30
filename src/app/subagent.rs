@@ -12,9 +12,9 @@ use super::*;
 impl App {
     // ── 视图栈 ──
 
-    /// 当前正在查看的会话 seed：inspect 优先，否则活动标签。
-    pub fn view_seed(&self) -> Option<String> {
-        self.inspect.clone().or_else(|| self.active_seed())
+    /// 当前正在查看的会话 session_id：inspect 优先，否则活动标签。
+    pub fn view_session_id(&self) -> Option<String> {
+        self.inspect.clone().or_else(|| self.active_session_id())
     }
 
     pub fn inspecting(&self) -> bool {
@@ -30,45 +30,47 @@ impl App {
     /// 确保子代理 `SessionState` 存在并进入 timeline 跟踪集。
     ///
     /// `parent` 只用于防止把会话自己当成自己的子代理；身份不来自该参数。
-    pub(super) fn ensure_subagent_tracked(&mut self, parent: &str, seed: &str) {
-        if seed.is_empty() || parent == seed {
+    pub(super) fn ensure_subagent_tracked(&mut self, parent: &str, session_id: &str) {
+        if session_id.is_empty() || parent == session_id {
             return;
         }
-        if !self.sessions.contains_key(seed) {
-            self.sessions
-                .insert(seed.to_owned(), SessionState::new(seed.to_owned()));
+        if !self.sessions.contains_key(session_id) {
+            self.sessions.insert(
+                session_id.to_owned(),
+                SessionState::new(session_id.to_owned()),
+            );
         }
-        if self.subagent_seeds.insert(seed.to_owned()) {
+        if self.subagent_session_ids.insert(session_id.to_owned()) {
             self.sync_tracked();
-            self.attach_subagent_seed(seed.to_owned());
+            self.attach_subagent_session_id(session_id.to_owned());
         }
     }
 
     /// `SessionAttach`（无 actor 副作用）→ bootstrap。timeline 流由 runtime
-    /// 在 seed 进入跟踪集后自动建立。
-    fn attach_subagent_seed(&mut self, seed: String) {
+    /// 在 session_id 进入跟踪集后自动建立。
+    fn attach_subagent_session_id(&mut self, session_id: String) {
         self.spawn_api(move |api, tx| async move {
             let attach = api
                 .send_command(
-                    Some(&seed),
+                    Some(&session_id),
                     RingingCommand::Control(ControlCommand::SessionAttach {
-                        session_id: seed.clone(),
+                        session_id: session_id.clone(),
                     }),
                     Default::default(),
                 )
                 .await;
             if let Err(e) = attach {
                 let _ = tx.send(AppMsg::Action(ActionResult::CommandAck {
-                    seed: Some(seed.clone()),
+                    session_id: Some(session_id.clone()),
                     label: "attach",
                     result: Err(e),
                 }));
                 return;
             }
-            let result = api.bootstrap(&seed).await;
+            let result = api.bootstrap(&session_id).await;
             let client_session_id = api.v2_client_session_id().await;
             let _ = tx.send(AppMsg::Action(ActionResult::Bootstrap {
-                seed,
+                session_id,
                 result,
                 client_session_id,
             }));
@@ -76,8 +78,8 @@ impl App {
     }
 
     /// 终态/卸载：停止 live timeline，但保留本地快照与 roster 条目。
-    pub(super) fn untrack_subagent(&mut self, seed: &str) {
-        if self.subagent_seeds.remove(seed) {
+    pub(super) fn untrack_subagent(&mut self, session_id: &str) {
+        if self.subagent_session_ids.remove(session_id) {
             self.sync_tracked();
         }
     }
@@ -89,7 +91,7 @@ impl App {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         match key.code {
             KeyCode::Up if ctrl => {
-                let Some(base) = self.view_seed() else {
+                let Some(base) = self.view_session_id() else {
                     return false;
                 };
                 if self.child_agent_ids(&base).is_empty() {
@@ -117,7 +119,7 @@ impl App {
     /// 在活动 agent 的子代理间循环切换：未观测时取最后一个 running，
     /// 否则取最后一个 child；已观测时顺序前进并回绕。
     fn cycle_subagent(&mut self) {
-        let Some(base) = self.view_seed() else {
+        let Some(base) = self.view_session_id() else {
             return;
         };
         let viewable = self.child_agent_ids(&base);
@@ -128,7 +130,7 @@ impl App {
             Some(cur) => {
                 let idx = viewable
                     .iter()
-                    .position(|seed| seed == cur)
+                    .position(|session_id| session_id == cur)
                     .map(|index| (index + 1) % viewable.len())
                     .unwrap_or(0);
                 viewable[idx].clone()
@@ -149,12 +151,12 @@ impl App {
         self.inspect = Some(next);
     }
 
-    /// 查找某子代理 seed 的直属父会话 seed（Ctrl+↓ 逐层上溯用）。
-    /// 直属父是标签会话 → None（回到标签视图）；直属父也是子代理 → 返回父 seed。
-    pub(crate) fn subagent_parent(&self, sub_seed: &str) -> Option<String> {
+    /// 查找某子代理 session_id 的直属父会话 session_id（Ctrl+↓ 逐层上溯用）。
+    /// 直属父是标签会话 → None（回到标签视图）；直属父也是子代理 → 返回父 session_id。
+    pub(crate) fn subagent_parent(&self, sub_session_id: &str) -> Option<String> {
         let parent = self
-            .team_for_agent(sub_seed)
-            .and_then(|(_, team)| team.parent_agent_id(sub_seed))?;
+            .team_for_agent(sub_session_id)
+            .and_then(|(_, team)| team.parent_agent_id(sub_session_id))?;
         (!self.tabs.contains(&parent)).then_some(parent)
     }
 
@@ -232,7 +234,7 @@ mod tests {
     async fn unloaded_child_does_not_create_a_live_subscription() {
         let mut app = app_with_team();
         app.reconcile_team_tracking("root");
-        assert!(app.subagent_seeds.contains("child"));
-        assert!(!app.subagent_seeds.contains("grand"));
+        assert!(app.subagent_session_ids.contains("child"));
+        assert!(!app.subagent_session_ids.contains("grand"));
     }
 }
