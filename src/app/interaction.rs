@@ -247,6 +247,7 @@ impl App {
             Approve,
             Deny,
             ToggleTrust,
+            Scroll(i32),
             None,
         }
         let decision = {
@@ -264,6 +265,11 @@ impl App {
                 {
                     D::ToggleTrust
                 }
+                // 滚动（审计 F1）：正文可超视口，必须能滚到头再决定。
+                KeyCode::Up | KeyCode::Char('k') if key.modifiers.is_empty() => D::Scroll(-1),
+                KeyCode::Down | KeyCode::Char('j') if key.modifiers.is_empty() => D::Scroll(1),
+                KeyCode::PageUp => D::Scroll(-10),
+                KeyCode::PageDown => D::Scroll(10),
                 _ => D::None,
             }
         };
@@ -275,6 +281,17 @@ impl App {
                     && let Some(p) = s.pending_permissions.first_mut()
                 {
                     p.trust_folder = !p.trust_folder;
+                }
+            }
+            D::Scroll(delta) => {
+                if let Some(s) = self.sessions.get_mut(session_id)
+                    && let Some(p) = s.pending_permissions.first_mut()
+                {
+                    if delta > 0 {
+                        p.scroll = p.scroll.saturating_add(delta as usize);
+                    } else {
+                        p.scroll = p.scroll.saturating_sub((-delta) as usize);
+                    }
                 }
             }
             D::None => {}
@@ -625,7 +642,7 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::session::{AskPanel, SessionState};
+    use crate::app::session::{AskPanel, PermissionPanel, SessionState};
     use qaqh_client::{AskMode, DomainAskQuestion as AskQuestion};
     use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
@@ -655,6 +672,59 @@ mod tests {
         app.tabs.push(session_id.clone());
         app.sessions.insert(session_id, session);
         app
+    }
+
+    fn app_with_permission() -> App {
+        use qaqh_client::{PermissionCategory, PermissionRisk};
+        let (mut app, _rx) = App::new_for_test();
+        let session_id = "session-permission".to_string();
+        let mut session = SessionState::new(session_id.clone());
+        session.pending_permissions.push(PermissionPanel {
+            tool_call_id: "tool-1".into(),
+            tool_name: "bash".into(),
+            action_summary: None,
+            reason: String::new(),
+            paths: Vec::new(),
+            category: PermissionCategory::Read,
+            level: 0,
+            risk: PermissionRisk::Medium,
+            consequence: String::new(),
+            trust_folder: false,
+            scroll: 0,
+        });
+        app.tabs.push(session_id.clone());
+        app.sessions.insert(session_id, session);
+        app
+    }
+
+    /// 审计 F1 回归：权限弹窗正文可滚动（j/k/↑↓ 单行，PgUp/PgDn 十行）。
+    #[test]
+    fn permission_key_scrolls_pending_panel() {
+        let mut app = app_with_permission();
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        let scroll_of = |app: &App| {
+            app.sessions["session-permission"]
+                .pending_permissions
+                .first()
+                .expect("permission panel")
+                .scroll
+        };
+
+        app.permission_key("session-permission", key(KeyCode::Down));
+        app.permission_key("session-permission", key(KeyCode::Char('j')));
+        assert_eq!(scroll_of(&app), 2, "Down/j 各滚一行");
+
+        app.permission_key("session-permission", key(KeyCode::PageDown));
+        assert_eq!(scroll_of(&app), 12, "PgDown 滚十行");
+
+        app.permission_key("session-permission", key(KeyCode::Up));
+        app.permission_key("session-permission", key(KeyCode::Char('k')));
+        assert_eq!(scroll_of(&app), 10, "Up/k 各滚一行");
+
+        for _ in 0..3 {
+            app.permission_key("session-permission", key(KeyCode::PageUp));
+        }
+        assert_eq!(scroll_of(&app), 0, "PgUp 滚十行且饱和到 0");
     }
 
     #[test]

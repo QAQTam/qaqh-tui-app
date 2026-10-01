@@ -202,20 +202,42 @@ impl App {
     /// `/export`：当前会话 → Markdown 文件 + toast 反馈（M4）。
     ///
     /// 无活动会话 / 写文件失败 → Error toast，不静默。
+    /// 审计 F4：显式路径是 TUI 少有的任意文件写原语，而导出正文里的
+    /// assistant 文本块逐字来自模型——模型可以引导用户把会话写到
+    /// `~/.bashrc`、`~/.ssh/authorized_keys` 这类敏感位置。覆盖已有文件
+    /// 或路径含隐藏组件时先弹二次确认；确认层绑定发起时的会话。
     fn export_active_session(&mut self, path: Option<String>) {
-        let Some(sess) = self.active_session() else {
+        let Some(session_id) = self.active_session_id() else {
+            self.toast(NoticeLevel::Error, "无活动会话，无法导出");
+            return;
+        };
+        let explicit = path.as_deref().map(str::trim).filter(|p| !p.is_empty());
+        let target = match explicit {
+            Some(p) => std::path::PathBuf::from(crate::app::slash::expand_tilde(p)),
+            None => crate::app::export::default_export_path(&session_id),
+        };
+        if explicit.is_some() && export_path_needs_confirm(&target) {
+            self.overlays.push(Overlay::Confirm {
+                action: ConfirmAction::ExportOverwrite {
+                    session_id: session_id.clone(),
+                    path: target,
+                },
+            });
+            return;
+        }
+        self.export_session_to(&session_id, &target);
+    }
+
+    /// 实际写盘 + toast。`/export` 直写路径与 `Confirm(ExportOverwrite)` 的
+    /// 确认回调共用这里；导出内容取 `session_id` 指定的会话，不是当下的
+    /// 活动标签——与 `ConfirmAction::session_id()` 的判据同源。
+    pub(super) fn export_session_to(&mut self, session_id: &str, target: &std::path::Path) {
+        let Some(sess) = self.sessions.get(session_id) else {
             self.toast(NoticeLevel::Error, "无活动会话，无法导出");
             return;
         };
         let md = crate::app::export::export_markdown(sess);
-        let target = match path.as_deref().map(str::trim).filter(|p| !p.is_empty()) {
-            Some(p) => {
-                let expanded = crate::app::slash::expand_tilde(p);
-                std::path::PathBuf::from(expanded)
-            }
-            None => crate::app::export::default_export_path(&sess.session_id),
-        };
-        match std::fs::write(&target, md) {
+        match std::fs::write(target, md) {
             Ok(()) => self.toast(NoticeLevel::Info, format!("已导出：{}", target.display())),
             Err(e) => self.toast(NoticeLevel::Error, format!("导出失败：{e}")),
         }
@@ -626,4 +648,121 @@ impl App {
     }
 
     // ───────────────────────── toast / 滚动 ─────────────────────────
+}
+
+/// 审计 F4：导出目标是否需要二次确认。
+///
+/// 两条规则：① 覆盖任何**已存在**的文件（不可恢复的破坏）；
+/// ② 路径含隐藏组件——`~/.bashrc`、`~/.ssh/authorized_keys` 是模型引导
+/// 社工的最常见落点。`./x.md` 的 `CurDir` 不算隐藏，常规导出不受影响。
+fn export_path_needs_confirm(target: &std::path::Path) -> bool {
+    if target.exists() {
+        return true;
+    }
+    target
+        .components()
+        .filter_map(|component| match component {
+            std::path::Component::Normal(name) => name.to_str(),
+            _ => None,
+        })
+        .any(|name| name.starts_with('.'))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::session::SessionState;
+    use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    /// 审计 F4 回归：已存在文件与隐藏路径必须走确认；常规路径不拦截。
+    #[test]
+    fn export_confirm_targets_existing_or_hidden_paths() {
+        let dir = std::env::temp_dir().join(format!(
+            "qaqh-export-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(dir.join(".ssh")).expect("mkdir");
+        let existing = dir.join("notes.md");
+        std::fs::write(&existing, "old").expect("seed");
+
+        assert!(export_path_needs_confirm(&existing), "覆盖已存在文件需确认");
+        assert!(
+            export_path_needs_confirm(&dir.join(".bashrc")),
+            "隐藏文件需确认"
+        );
+        assert!(
+            export_path_needs_confirm(&dir.join(".ssh").join("authorized_keys")),
+            "隐藏目录下的文件需确认"
+        );
+        assert!(
+            !export_path_needs_confirm(&dir.join("qaqh-export-新.md")),
+            "常规新路径不拦截"
+        );
+        assert!(
+            !export_path_needs_confirm(&dir.join("./notes-2.md")),
+            "相对路径的 ./ 前缀不算隐藏"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    fn app_with_session() -> App {
+        let (mut app, _rx) = App::new_for_test();
+        let session_id = "session-export".to_string();
+        let session = SessionState::new(session_id.clone());
+        app.tabs.push(session_id.clone());
+        app.sessions.insert(session_id, session);
+        app
+    }
+
+    /// 审计 F4 回归：`/export` 指向已存在文件时先弹确认且不写盘；
+    /// 按 `y` 后才写入；确认层绑定发起会话。
+    #[test]
+    fn export_to_existing_path_asks_before_writing() {
+        let dir = std::env::temp_dir().join(format!(
+            "qaqh-export-flow-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let target = dir.join("transcript.md");
+        std::fs::write(&target, "old-content").expect("seed");
+
+        let mut app = app_with_session();
+        let command = format!("/export {}", target.display());
+        assert!(app.execute_slash_text(&command), "命令应被消费");
+
+        let Some(Overlay::Confirm {
+            action: ConfirmAction::ExportOverwrite { session_id, path },
+        }) = app.overlays.last()
+        else {
+            panic!("应弹出导出确认：{:?}", app.overlays.last());
+        };
+        assert_eq!(session_id, "session-export", "确认层绑定发起会话");
+        assert_eq!(path, &target);
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "old-content",
+            "确认前不得写盘"
+        );
+
+        // `y` = 确认写入；确认层同时出栈。
+        app.handle(AppMsg::Key(KeyEvent::new(
+            KeyCode::Char('y'),
+            KeyModifiers::NONE,
+        )));
+        assert!(app.overlays.is_empty(), "确认后弹层应出栈");
+        let written = std::fs::read_to_string(&target).unwrap();
+        assert_ne!(written, "old-content", "确认后应写盘");
+        assert!(written.contains("# "), "导出内容应为 Markdown：{written}");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }

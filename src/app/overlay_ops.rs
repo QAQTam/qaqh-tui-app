@@ -604,6 +604,10 @@ impl App {
                         } => {
                             self.undo_turn_from(session_id.clone(), turn_id.clone());
                         }
+                        ConfirmAction::ExportOverwrite { session_id, path } => {
+                            let (session_id, path) = (session_id.clone(), path.clone());
+                            self.export_session_to(&session_id, &path);
+                        }
                     },
                     _ => {}
                 }

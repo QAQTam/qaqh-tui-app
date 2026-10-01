@@ -869,11 +869,17 @@ impl TerminalHost {
     }
 
     /// Suspend TUI for `$PAGER`, then restore the fullscreen shell.
+    ///
+    /// 正文先剥离全部转义序列再落盘（审计 F2）：`less -R` 直通 SGR、`sh`
+    /// 缺失时的 `cat` 回退原样输出，模型 thinking 里的 OSC/CSI 序列会被
+    /// 真实终端解释。临时文件走独占创建（CWE-377），不覆盖既有文件/符号链接。
     fn run_pager(&mut self, text: &str) -> Result<()> {
-        let path = std::env::temp_dir().join(format!("qaqh-pager-{}.md", std::process::id()));
-        if std::fs::write(&path, text).is_err() {
-            return Ok(());
-        }
+        let body = crate::app::pager::sanitize_body(text);
+        let path = match crate::app::pager::write_temp_file(&std::env::temp_dir(), &body) {
+            Ok(path) => path,
+            // 与旧实现一致：写不出来就跳过 pager，不中断主循环。
+            Err(_) => return Ok(()),
+        };
 
         self.disable_capture();
         ratatui::restore();
@@ -2328,6 +2334,7 @@ mod tests {
             risk: PermissionRisk::High,
             consequence: "会执行本地命令".into(),
             trust_folder: false,
+            scroll: 0,
         }
     }
 

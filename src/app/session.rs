@@ -247,6 +247,8 @@ pub struct PermissionPanel {
     pub risk: PermissionRisk,
     pub consequence: String,
     pub trust_folder: bool,
+    /// 正文滚动偏移（审计 F1：弹窗加滚动，内容超视口时不再静默裁剪）。
+    pub scroll: usize,
 }
 
 /// 「已经解决掉」的权限请求 id 历史（有界 FIFO）。
@@ -752,6 +754,7 @@ impl PermissionPanel {
             risk: permission_risk_from_tag(&body.risk),
             consequence: body.consequence,
             trust_folder: false,
+            scroll: 0,
         })
     }
 }
@@ -1081,6 +1084,7 @@ mod tests {
             risk: PermissionRisk::Medium,
             consequence: String::new(),
             trust_folder: false,
+            scroll: 0,
         }
     }
 

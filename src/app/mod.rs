@@ -492,7 +492,16 @@ pub enum ConfirmAction {
     DeleteSession(String),
     ArchiveSession(String),
     CloseTab(String),
-    UndoTurn { session_id: String, turn_id: String },
+    UndoTurn {
+        session_id: String,
+        turn_id: String,
+    },
+    /// `/export` 指向已存在文件或隐藏路径（审计 F4）：写入前二次确认。
+    /// 导出内容取 `session_id` 那个会话——判据说属于谁，执行就落在谁身上。
+    ExportOverwrite {
+        session_id: String,
+        path: std::path::PathBuf,
+    },
 }
 
 // Settings 变体内嵌完整编辑态，尺寸差较大；Box 化推迟到独立性能任务。
@@ -550,6 +559,7 @@ impl ConfirmAction {
             | ConfirmAction::ArchiveSession(session_id)
             | ConfirmAction::CloseTab(session_id) => session_id,
             ConfirmAction::UndoTurn { session_id, .. } => session_id,
+            ConfirmAction::ExportOverwrite { session_id, .. } => session_id,
         }
     }
 }

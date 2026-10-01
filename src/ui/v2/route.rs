@@ -149,6 +149,7 @@ mod tests {
             risk: PermissionRisk::Medium,
             consequence: String::new(),
             trust_folder: false,
+            scroll: 0,
         }
     }
 

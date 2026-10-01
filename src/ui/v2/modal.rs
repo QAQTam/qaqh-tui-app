@@ -370,7 +370,10 @@ fn permission_rows(
             Style::new().fg(theme.text.secondary),
         );
     }
-    for path in panel.paths.iter().take(6) {
+    // 路径全量展示：滚动（审计 F1）出现前这里 `take(6)`，第 7 条起的路径
+    // 永不显示——用户在信息不完整时按 `a` 盲批。现在超出视口的行由
+    // `draw_permission` 的滚动 + 「还有 N 行未显示」提示兜底。
+    for path in &panel.paths {
         push(
             &mut rows,
             "路径: ",
@@ -431,19 +434,21 @@ fn draw_permission(
     let [content_area, footer_area] =
         Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(inner);
     let rows = permission_rows(panel, usize::from(inner.width), theme, mouse);
-    // 正文行没有滚动，第 `index` 行就落在 `content_area.y + index`；超出可见高度的
-    // 行会被 Paragraph 裁掉，所以只登记真正画出来的那一段。
-    for (index, row) in rows
-        .iter()
-        .take(usize::from(content_area.height))
-        .enumerate()
-    {
+    // 滚动（审计 F1）：permission 面板的内容（命令摘要、路径、后果说明）全部
+    // 来自模型侧，**看到的不等于批准的**，所以超出视口的行不许静默裁剪——
+    // 键盘可滚（j/k/↑↓/PgUp/PgDn），footer 常驻「还有 N 行未显示」警示。
+    let total = rows.len();
+    let visible = usize::from(content_area.height);
+    let max_scroll = total.saturating_sub(visible);
+    let scroll = panel.scroll.min(max_scroll);
+    let hidden_below = total.saturating_sub(scroll + visible);
+    for (offset, row) in rows.iter().skip(scroll).take(visible).enumerate() {
         let Some(target) = row.target else {
             continue;
         };
         let row_rect = Rect {
             x: content_area.x,
-            y: content_area.y.saturating_add(index as u16),
+            y: content_area.y.saturating_add(offset as u16),
             width: content_area.width,
             height: 1,
         };
@@ -456,23 +461,50 @@ fn draw_permission(
             &row.line,
         );
     }
+    let lines: Vec<Line<'static>> = rows
+        .into_iter()
+        .skip(scroll)
+        .take(visible)
+        .map(|row| row.line)
+        .collect();
     f.render_widget(
-        Paragraph::new(rows.into_iter().map(|row| row.line).collect::<Vec<_>>())
-            .wrap(Wrap { trim: false }),
+        Paragraph::new(lines).wrap(Wrap { trim: false }),
         content_area,
     );
-    draw_button_row(
-        f,
-        &[
-            ("a 批准", ModalHit::PermissionApprove),
-            ("d/Esc 拒绝", ModalHit::PermissionDeny),
-        ],
-        footer_area,
-        inner,
-        theme,
-        mouse,
-        hit_map,
-    );
+    let specs = [
+        ("a 批准", ModalHit::PermissionApprove),
+        ("d/Esc 拒绝", ModalHit::PermissionDeny),
+    ];
+    let rects = button_row_rects(&specs, footer_area);
+    draw_button_row(f, &specs, footer_area, inner, theme, mouse, hit_map);
+    // 滚动提示留在按钮右边（不可点）。有内容被裁掉时用警示色 + 加粗——
+    // 这是「别急着批」的信号；滚到底后降级为普通滚动提示。
+    let used_end = rects
+        .last()
+        .map(|(rect, _)| rect.x.saturating_add(rect.width).saturating_add(1))
+        .unwrap_or(footer_area.x);
+    let right = footer_area.x.saturating_add(footer_area.width);
+    if used_end < right {
+        let hint_area = Rect {
+            x: used_end,
+            y: footer_area.y,
+            width: right.saturating_sub(used_end),
+            height: 1,
+        };
+        let hint = if hidden_below > 0 {
+            Line::from(Span::styled(
+                format!(" ⚠ 还有 {hidden_below} 行未显示 · ↑↓/PgDn 滚动"),
+                Style::new()
+                    .fg(theme.semantic.warning)
+                    .add_modifier(Modifier::BOLD),
+            ))
+        } else if max_scroll > 0 {
+            footer(&[("↑↓/PgUp/PgDn", "滚动")], theme)
+        } else {
+            return;
+        };
+        f.render_widget(Paragraph::new(hint), hint_area);
+    }
 }
 
 fn draw_plan(
@@ -615,6 +647,13 @@ fn draw_confirm(
         ConfirmAction::UndoTurn { turn_id, .. } => (
             "确认撤销",
             format!("撤销回合 {turn_id} 及其后的全部对话？工具副作用不会回滚。"),
+        ),
+        ConfirmAction::ExportOverwrite { path, .. } => (
+            "确认导出",
+            format!(
+                "写入 {}？目标已存在或位于隐藏路径，且导出内容包含模型输出（模型可能正引导你写到这里）。覆盖不可恢复。",
+                path.display()
+            ),
         ),
     };
     let rect = centered_rect(64u16.min(area.width.saturating_sub(4)), 8, area);
@@ -1297,6 +1336,7 @@ mod tests {
             risk: PermissionRisk::High,
             consequence: "会执行本地命令".into(),
             trust_folder: false,
+            scroll: 0,
         }
     }
 
@@ -1582,6 +1622,59 @@ mod tests {
         assert!(!text.contains("第一题"), "{text}");
     }
 
+    /// 审计 F1 回归：内容超出视口时不得静默裁剪——必须出现「还有 N 行未显示」
+    /// 警示，且滚动后尾部（信任开关、最后一条路径）可达。
+    #[test]
+    fn permission_modal_overflow_warns_and_scrolls() {
+        let theme = Theme::resolve(ThemeKind::QaqhNight, ColorSupport::TrueColor);
+        let mut panel = permission_panel();
+        panel.paths = (1..=16).map(|index| format!("/tmp/p{index:02}")).collect();
+
+        let draw_once = |panel: &PermissionPanel| {
+            let backend = TestBackend::new(100, 30);
+            let mut terminal = Terminal::new(backend).expect("terminal");
+            let mut hit_map = scratch_map(ModalRoute::Permission, 100, 30);
+            terminal
+                .draw(|frame| {
+                    draw_permission(
+                        frame,
+                        panel,
+                        frame.area(),
+                        &theme,
+                        MouseState::default(),
+                        &mut hit_map,
+                    )
+                })
+                .expect("draw permission");
+            terminal
+        };
+
+        // 23 行内容（5 概要 + 16 路径 + 空行 + 信任开关）在 19 行视口里：
+        // 顶部可见、尾部不可见、警示行出现。
+        let terminal = draw_once(&panel);
+        let text: String = buffer_text(&terminal)
+            .chars()
+            .filter(|ch| !ch.is_whitespace())
+            .collect();
+        assert!(text.contains("还有4行未显示"), "{text}");
+        assert!(text.contains("/tmp/p01"), "{text}");
+        assert!(
+            !text.contains("信任此目录"),
+            "视口外的信任开关不该被画出（旧实现直接裁掉且无提示）：{text}"
+        );
+
+        // 滚到底：尾部可达，溢出警示退场、降级为普通滚动提示。
+        panel.scroll = 4;
+        let terminal = draw_once(&panel);
+        let text: String = buffer_text(&terminal)
+            .chars()
+            .filter(|ch| !ch.is_whitespace())
+            .collect();
+        assert!(text.contains("信任此目录"), "{text}");
+        assert!(text.contains("/tmp/p16"), "{text}");
+        assert!(!text.contains("还有4行未显示"), "{text}");
+    }
+
     #[test]
     fn permission_modal_renders_action_and_risk() {
         let theme = Theme::resolve(ThemeKind::QaqhNight, ColorSupport::TrueColor);
@@ -1596,6 +1689,7 @@ mod tests {
             risk: PermissionRisk::High,
             consequence: "会执行本地命令".into(),
             trust_folder: false,
+            scroll: 0,
         };
         let backend = TestBackend::new(100, 30);
         let mut terminal = Terminal::new(backend).expect("terminal");

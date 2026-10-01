@@ -546,7 +546,10 @@ fn draw_settings(f: &mut Frame, app: &App, area: Rect, theme: &Theme, hit_map: &
         area,
     );
 
-    if let Some(buffer) = &state.editing {
+    if let Some(buffer) = &state.editing
+        // Secret 编辑态整个值都是掩码，硬件光标定位反而泄漏输入长度（审计 F5）。
+        && ROWS.get(focus).map(|row| row.kind) != Some(FieldKind::Secret)
+    {
         let line = row_lines.get(focus).copied().unwrap_or(0);
         if line >= scroll && line < scroll.saturating_add(height) {
             let value_x = area.x.saturating_add(22);
@@ -593,13 +596,25 @@ fn settings_lines(
         let label = pad_width(row.label, 18);
         let (value, value_style) = if focused {
             if let Some(buffer) = &state.editing {
-                let (window, _) = edit_window(&buffer.buf, buffer.cursor, value_width);
-                (
-                    window,
-                    Style::new()
-                        .fg(theme.text.primary)
-                        .add_modifier(Modifier::REVERSED),
-                )
+                if row.kind == FieldKind::Secret {
+                    // 审计 F5：密钥编辑态不得明文回显（肩窥/录屏即泄露）。
+                    // 已保存值的掩码在 `app::settings`，这里补上输入过程；
+                    // 超宽截断即可，长度本身就是低敏信息。
+                    (
+                        "*".repeat(buffer.buf.len().min(value_width)),
+                        Style::new()
+                            .fg(theme.text.primary)
+                            .add_modifier(Modifier::REVERSED),
+                    )
+                } else {
+                    let (window, _) = edit_window(&buffer.buf, buffer.cursor, value_width);
+                    (
+                        window,
+                        Style::new()
+                            .fg(theme.text.primary)
+                            .add_modifier(Modifier::REVERSED),
+                    )
+                }
             } else {
                 settings_value(state, loaded, row.id, value_width, theme)
             }
@@ -1150,6 +1165,50 @@ mod tests {
 
     fn theme() -> Theme {
         Theme::resolve(ThemeKind::QaqhNight, ColorSupport::TrueColor)
+    }
+
+    /// 审计 F5 回归：密钥编辑态只回显掩码，不回显明文（已保存值本有掩码，
+    /// 这里锁住的是**输入过程**）；普通 Text 字段仍明文可编辑。
+    #[test]
+    fn secret_edit_buffer_is_masked_in_settings_lines() {
+        use crate::app::settings::{EditBuffer, FieldId};
+        let api_key_row = ROWS
+            .iter()
+            .position(|row| row.id == FieldId::ApiKey)
+            .expect("ROWS 必须包含 API Key");
+
+        let state = SettingsState {
+            focus: api_key_row,
+            editing: Some(EditBuffer {
+                buf: "sk-super-secret".chars().collect(),
+                cursor: 15,
+            }),
+            ..SettingsState::default()
+        };
+        let (lines, row_lines) = settings_lines(&state, None, 80, &theme());
+        let text: String = lines[row_lines[api_key_row]]
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert!(!text.contains("sk-super-secret"), "明文泄漏：{text}");
+        assert!(text.contains("***************"), "应显示掩码：{text}");
+
+        let state = SettingsState {
+            focus: 0, // 模型（Text）
+            editing: Some(EditBuffer {
+                buf: "glm-5".chars().collect(),
+                cursor: 5,
+            }),
+            ..SettingsState::default()
+        };
+        let (lines, row_lines) = settings_lines(&state, None, 80, &theme());
+        let text: String = lines[row_lines[0]]
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert!(text.contains("glm-5"), "Text 字段编辑态应保持明文：{text}");
     }
 
     /// 造一个空 HitMapBuilder；测试直接调 `draw` 时用它吸收登记结果。
