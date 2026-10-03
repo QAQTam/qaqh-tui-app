@@ -312,6 +312,8 @@ mod tests {
 
     fn card(name: &str, state: TimelineToolState) -> ToolCard {
         ToolCard {
+exit_code: None,
+            completed_at_ms: None,
             tool_call_id: format!("{name}-1"),
             name: name.into(),
             state,

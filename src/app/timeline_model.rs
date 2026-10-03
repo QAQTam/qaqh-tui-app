@@ -186,6 +186,11 @@ pub struct ToolCard {
     pub permission: Option<qaqh_client::TimelineToolPermission>,
     /// 类型化展示投影（09-18 跨仓契约 §3.3）；None → H16 完整回退旧字段。
     pub display: Option<qaqh_client::TimelineToolDisplay>,
+    /// 顶层退出码（契约切片 2026-10-03）：runtime 从 display body 提取，
+    /// 新数据无需拆 body/JSON 即可拿到。
+    pub exit_code: Option<i32>,
+    /// 调用完成墙钟（epoch ms，runtime 终态发射时盖戳）；缺席不画。
+    pub completed_at_ms: Option<u64>,
 }
 
 impl From<TimelineTool> for ToolCard {
@@ -221,6 +226,8 @@ impl From<TimelineTool> for ToolCard {
             failure: t.failure,
             permission: t.permission,
             display: t.display,
+            exit_code: t.exit_code,
+            completed_at_ms: t.completed_at_ms,
         }
     }
 }
@@ -1441,6 +1448,8 @@ mod tests {
                     state: TimelineBlockState::Open,
                     text: String::new(),
                     tool: Some(TimelineTool {
+exit_code: None,
+                        completed_at_ms: None,
                         display: None,
                         progress_bytes_total: 0,
                         progress_stream: None,
@@ -1792,6 +1801,8 @@ mod tests {
                     state: TimelineBlockState::Open,
                     text: String::new(),
                     tool: Some(TimelineTool {
+exit_code: None,
+                        completed_at_ms: None,
                         display: None,
                         progress_bytes_total: 0,
                         progress_stream: None,
@@ -1849,6 +1860,8 @@ mod tests {
                     state: TimelineBlockState::Open,
                     text: String::new(),
                     tool: Some(TimelineTool {
+exit_code: None,
+                        completed_at_ms: None,
                         display: None,
                         progress_bytes_total: 0,
                         progress_stream: None,
@@ -1944,6 +1957,8 @@ mod tests {
                         state: TimelineBlockState::Open,
                         text: String::new(),
                         tool: Some(TimelineTool {
+exit_code: None,
+                            completed_at_ms: None,
                             display: None,
                             progress_bytes_total: 0,
                             progress_stream: None,
@@ -2041,6 +2056,8 @@ mod tests {
                             state: TimelineBlockState::Sealed,
                             text: String::new(),
                             tool: Some(TimelineTool {
+exit_code: None,
+                                completed_at_ms: None,
                                 display: None,
                                 progress_bytes_total: 0,
                                 progress_stream: None,
@@ -2513,6 +2530,205 @@ mod tests {
             serde_json::from_str(raw).expect("wire fixture 必须可解析");
         ToolCard::from(tool)
     }
+
+    // ── mock 端点管线测试（2026-10-03 双重显示事故回归锁）──────────────
+    // 载荷 = daemon `TimelineIntent::ToolUpdated` 端点在**新数据形状**下发出
+    // 的 wire JSON（失败槽由 qaqh_domain::tool_failure_of 投影，与 output 不
+    // 再互为复制）。全链路：wire JSON → ToolCard → Turn → adapter → 渲染层，
+    // 断言：① 渲染层不再重复显示错误；② 传输数据（output=模型可见文本）
+    // 原样穿透，TUI 侧不得改动。
+
+    fn rendered_text_of(turn: &Turn, width: usize) -> String {
+        let theme = crate::theme::Theme::resolve(
+            crate::theme::ThemeKind::QaqhNight,
+            crate::theme::ColorSupport::TrueColor,
+        );
+        let mut out = String::new();
+        for block in crate::ui::v2::adapter::from_turn(turn) {
+            for line in crate::ui::v2::transcript::render_block(&block, width, &theme) {
+                for span in line.spans {
+                    out.push_str(&span.content);
+                }
+                out.push('\n');
+            }
+        }
+        out
+    }
+
+    fn turn_with_tool(raw_tool: &str) -> Turn {
+        let tool: qaqh_client::TimelineTool =
+            serde_json::from_str(raw_tool).expect("mock 端点载荷必须可解析");
+        let card = ToolCard::from(tool);
+        Turn {
+            turn_id: "turn-1".into(),
+            turn_index: Some(1),
+            started_at_ms: None,
+            user_text: "run it".into(),
+            state: TimelineTurnState::Failed,
+            failure: None,
+            sealed: true,
+            offloaded: false,
+            thinking: Default::default(),
+            rounds: vec![Round {
+                round_num: 0,
+                sealed: true,
+                is_final: true,
+                blocks: vec![Block {
+                    block_id: "tool:c1".into(),
+                    block_order: 0,
+                    kind: TimelineBlockKind::Tool,
+                    state: TimelineBlockState::Sealed,
+                    text: String::new(),
+                    tool: Some(card),
+                    last_fragment: 0,
+                    rev: 1,
+                }],
+            }],
+        }
+    }
+
+    #[test]
+    fn mock_endpoint_exec_failure_renders_error_once() {
+        // exec 非零退出：typed display（Shell 头 + Streams 体 + exit_code），
+        // 失败槽 = {execution, "exit 101"}；output 是模型向 canonical JSON
+        // （与 TUI 渲染无关，但必须原样穿透）。
+        let raw = r#"{
+            "tool_call_id": "c1",
+            "name": "exec",
+            "state": "failed",
+            "summary": null,
+            "args_json": "{}",
+            "output": "{\"status\":\"failed\",\"exit_code\":101,\"output\":\"could not compile\"}",
+            "progress": "",
+            "progress_truncated": false,
+            "progress_bytes_total": 0,
+            "display": {
+                "header": {"kind": "shell", "command": "cargo build"},
+                "body": {"kind": "streams", "stdout": "compiling", "stderr": "error: could not compile", "exit_code": 101, "truncated": false, "interleaved": false}
+            },
+            "failure": {"code": "execution", "message": "exit 101"},
+            "exit_code": 101,
+            "completed_at_ms": 1759488000000
+        }"#;
+        let turn = turn_with_tool(raw);
+        let card = turn.rounds[0].blocks[0].tool.as_ref().expect("card");
+        assert_eq!(
+            card.output.as_deref(),
+            Some(r#"{"status":"failed","exit_code":101,"output":"could not compile"}"#),
+            "传输层数据（模型可见文本）必须原样穿透"
+        );
+        assert_eq!(card.exit_code, Some(101), "顶层退出码槽随 wire 到达");
+        assert_eq!(
+            card.completed_at_ms,
+            Some(1_759_488_000_000),
+            "终态墙钟随 wire 到达"
+        );
+        let text = rendered_text_of(&turn, 100);
+        assert_eq!(
+            text.matches("could not compile").count(),
+            1,
+            "错误文本只能出现一次（stderr 正文）：
+{text}"
+        );
+        assert!(text.contains("exit 101"), "状态行 = exit code：
+{text}");
+        assert!(text.contains("cargo build"), "头部保留命令真相字段：
+{text}");
+        let stamp = crate::ui::v2::transcript::format_wall_clock(1_759_488_000_000)
+            .expect("固定 epoch 必须可格式化");
+        assert!(
+            text.contains(&format!(" · {stamp}")),
+            "状态行带权威墙钟尾缀：
+{text}"
+        );
+    }
+
+    #[test]
+    fn mock_endpoint_plain_text_failure_renders_reason_once() {
+        // edit 纯文本失败（无 typed display）：legacy summary = output 首行 =
+        // 失败理由；失败槽与 output 不再复制。头部抑制 rest，状态行裸 code，
+        // 正文完整承载理由。
+        let raw = r#"{
+            "tool_call_id": "c2",
+            "name": "edit",
+            "state": "failed",
+            "summary": "file changed since read",
+            "args_json": "{}",
+            "output": "file changed since read\nHint: re-read the file",
+            "progress": "",
+            "progress_truncated": false,
+            "progress_bytes_total": 0,
+            "failure": {"code": "stale_file", "message": "file changed since read"}
+        }"#;
+        let turn = turn_with_tool(raw);
+        let text = rendered_text_of(&turn, 100);
+        assert_eq!(
+            text.matches("file changed since read").count(),
+            1,
+            "理由只能出现一次（正文）：
+{text}"
+        );
+        assert!(text.contains("stale_file"), "状态行 = 分类 code：
+{text}");
+        assert!(
+            text.contains("Hint: re-read the file"),
+            "正文证据完整：
+{text}"
+        );
+    }
+
+    #[test]
+    fn mock_endpoint_mcp_failure_renders_message_once() {
+        // MCP 失败：模型面仍是 §7 信封 JSON（output 原样穿透），但展示面走
+        // typed display（2026-10-03 契约补全：MCP 是最后一个挂 display 的工
+        // 具族）——正文 = 上游 content + hint，信封 JSON 不上屏。
+        let raw = r#"{
+            "tool_call_id": "c3",
+            "name": "mcp__srv__tool",
+            "state": "failed",
+            "summary": null,
+            "args_json": "{}",
+            "output": "{\"timeis\":\"2026-10-03 12:00:00\",\"status\":\"error\",\"code\":\"mcp_tool_error\",\"message\":\"tool reported failure:\\nboom: unknown tool\",\"hint\":\"Check the server config.\"}",
+            "progress": "",
+            "progress_truncated": false,
+            "progress_bytes_total": 0,
+            "display": {
+                "header": {"kind": "other", "label": ""},
+                "body": {"kind": "text", "text": "boom: unknown tool\nHint: Check the server config.", "truncated": false},
+                "outcome": {"state": "failed"}
+            },
+            "failure": {"code": "mcp_tool_error", "message": "boom: unknown tool"}
+        }"#;
+        let turn = turn_with_tool(raw);
+        let text = rendered_text_of(&turn, 100);
+        assert_eq!(
+            text.matches("boom: unknown tool").count(),
+            1,
+            "message 只能出现一次：
+{text}"
+        );
+        assert!(text.contains("mcp_tool_error"), "状态行 = 真实 code：
+{text}");
+        assert!(text.contains("Check the server config."), "hint 随正文：
+{text}");
+        assert!(
+            !text.contains(r#""status":"error""#),
+            "信封 JSON 不再整坨上屏：
+{text}"
+        );
+        let header = text.lines().nth(1).unwrap_or_default();
+        let theme = crate::theme::Theme::resolve(
+            crate::theme::ThemeKind::QaqhNight,
+            crate::theme::ColorSupport::TrueColor,
+        );
+        assert_eq!(
+            header.trim(),
+            format!("{} Mcp Srv Tool", theme.glyph.tool),
+            "MCP 卡头部只留工具名真相字段：
+{header}"
+        );
+    }
+
 
     #[test]
     fn wire_fixture_exec_success_with_progress() {

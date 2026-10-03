@@ -12,6 +12,7 @@ use crate::ui::v2::hit::{
     line_region, z,
 };
 use crate::ui::v2::scrollbar::ScrollbarMetrics;
+use crate::ui::v2::sidebar;
 use ratatui::crossterm::event::MouseButton;
 
 const NARROW_VIEWPORT_WIDTH: u16 = 40;
@@ -117,9 +118,26 @@ pub(super) fn draw_fullscreen_agent(
     view: &mut FullscreenView,
     hit_map: &mut HitMapBuilder,
 ) {
-    let area = frame.area();
+    let full = frame.area();
+    // 左侧常驻会话栏：有 active session 且终端够宽时才占位；
+    // 其余渲染全部收缩到右侧剩余区域，命中几何随之一致。
+    let rail = if app.active_session().is_some() {
+        sidebar::rail_width(full.width)
+    } else {
+        0
+    };
+    let rail_area = Rect::new(full.x, full.y, rail, full.height);
+    let area = Rect::new(
+        full.x.saturating_add(rail),
+        full.y,
+        full.width.saturating_sub(rail),
+        full.height,
+    );
     let rendered = render_fullscreen_agent(app, area.width, area.height, theme, view);
     frame.render_widget(Paragraph::new(rendered.lines), area);
+    if rail > 0 {
+        sidebar::draw(frame, app, rail_area, theme, &view.pointer, &mut view.sidebar_anim, hit_map);
+    }
     if let Some(cursor) = rendered.cursor {
         frame.set_cursor_position((
             area.x.saturating_add(cursor.x),
@@ -131,10 +149,11 @@ pub(super) fn draw_fullscreen_agent(
     if !body.is_empty()
         && let Some(session) = app.active_session()
     {
+        let transcript_len = view.transcripts.len_for(&session.session_id);
         ui_fullscreen::draw_scrollbar(
             frame,
             body,
-            view.transcript.lines.len(),
+            transcript_len,
             usize::from(view.body_height),
             session.scroll.follow,
             session.scroll.offset,
@@ -148,7 +167,7 @@ pub(super) fn draw_fullscreen_agent(
         );
         if let Some(metrics) = ScrollbarMetrics::new(
             track,
-            view.transcript.lines.len(),
+            transcript_len,
             usize::from(view.body_height),
             session.scroll.follow,
             session.scroll.offset,
@@ -179,8 +198,9 @@ pub(super) fn draw_fullscreen_agent(
     }
     // 消息行与浮层都按**刚画完的这一帧**登记：行窗口来自 render 写回的
     // `visible_start`，按钮/菜单矩形复用 ui_fullscreen 的渲染几何。
-    register_agent_messages(hit_map, body, view);
-    let show_back_to_latest = view.can_scroll()
+    let active_session_id = app.active_session_id();
+    register_agent_messages(hit_map, body, view, active_session_id.as_deref().unwrap_or(""));
+    let show_back_to_latest = view.can_scroll(app)
         && app
             .active_session()
             .is_some_and(|session| !session.scroll.follow);
@@ -240,10 +260,18 @@ pub(super) fn draw_fullscreen_agent(
 ///
 /// 行窗口就是 `render_fullscreen_agent` 写回 `view.visible_start` 的那一份；
 /// 行宽避开最右侧的滚动条列，所以 P2 接滚动条时不会和消息行抢同一列。
-fn register_agent_messages(hit_map: &mut HitMapBuilder, body: Rect, view: &FullscreenView) {
+fn register_agent_messages(
+    hit_map: &mut HitMapBuilder,
+    body: Rect,
+    view: &FullscreenView,
+    session_id: &str,
+) {
     if body.is_empty() || view.body_height == 0 {
         return;
     }
+    let Some(cache) = view.transcripts.entries.get(session_id) else {
+        return;
+    };
     let clip = Rect::new(
         body.x,
         body.y,
@@ -253,13 +281,13 @@ fn register_agent_messages(hit_map: &mut HitMapBuilder, body: Rect, view: &Fulls
     let visible_end = view
         .visible_start
         .saturating_add(usize::from(view.body_height));
-    for span in &view.transcript.spans {
+    for span in &cache.spans {
         let start = span.start.max(view.visible_start);
         let end = span.end.min(visible_end);
         if start >= end {
             continue;
         }
-        let Some(line) = view.transcript.lines.get(start) else {
+        let Some(line) = cache.lines.get(start) else {
             continue;
         };
         let target = match span.kind {
@@ -344,7 +372,7 @@ fn render_fullscreen_agent(
     view: &mut FullscreenView,
 ) -> AgentRender {
     if app.active_session().is_none() {
-        view.transcript.clear();
+        view.transcripts.clear();
         view.body_area = Rect::new(0, 0, width, height);
         view.visible_start = 0;
         view.body_height = height;
@@ -363,7 +391,7 @@ fn render_fullscreen_agent(
         history_width,
         body_area.height,
         theme,
-        &mut view.transcript,
+        &mut view.transcripts,
     );
     view.visible_start = visible_start;
     while lines.len() < usize::from(body_area.height) {
@@ -512,7 +540,10 @@ pub(super) struct FullscreenView {
     pub(super) pointer_state: super::pointer::PointerState,
     /// Rendering mirror derived from `pointer_state` after every event batch.
     pub(super) pointer: FullscreenState,
-    pub(super) transcript: FullscreenTranscriptCache,
+    /// 每会话独立的 transcript 渲染缓存（切 tab 零重渲染）。
+    pub(super) transcripts: TranscriptCaches,
+    /// 侧栏余晖动画状态。
+    pub(super) sidebar_anim: sidebar::SidebarAnim,
     pub(super) body_area: Rect,
     pub(super) visible_start: usize,
     pub(super) body_height: u16,
@@ -542,19 +573,22 @@ impl FullscreenView {
 }
 
 impl FullscreenView {
-    fn can_scroll(&self) -> bool {
-        self.transcript.lines.len() > usize::from(self.body_height)
+    fn can_scroll(&self, app: &App) -> bool {
+        app.active_session_id()
+            .is_some_and(|id| self.transcripts.len_for(&id) > usize::from(self.body_height))
     }
 
-    pub(super) fn max_offset(&self) -> usize {
-        self.transcript
-            .lines
-            .len()
-            .saturating_sub(usize::from(self.body_height))
+    pub(super) fn max_offset(&self, app: &App) -> usize {
+        app.active_session_id()
+            .map_or(0, |id| {
+                self.transcripts
+                    .len_for(&id)
+                    .saturating_sub(usize::from(self.body_height))
+            })
     }
 
     pub(super) fn scroll_up(&mut self, app: &mut App, lines: usize) {
-        if !self.can_scroll() {
+        if !self.can_scroll(app) {
             app.scroll_bottom();
             return;
         }
@@ -570,7 +604,7 @@ impl FullscreenView {
     pub(super) fn page_up(&mut self, app: &mut App) {
         let at_limit = app
             .active_session()
-            .is_some_and(|session| session.scroll.offset >= self.max_offset());
+            .is_some_and(|session| session.scroll.offset >= self.max_offset(app));
         let (has_more, loading) = app.active_session().map_or((false, false), |session| {
             (session.timeline.has_more, session.loading_older)
         });
@@ -581,7 +615,7 @@ impl FullscreenView {
     }
 
     pub(super) fn clamp_scroll(&mut self, app: &mut App) {
-        let max_offset = self.max_offset();
+        let max_offset = self.max_offset(app);
         let Some(session_id) = app.active_session_id() else {
             return;
         };
@@ -644,22 +678,7 @@ struct FullscreenBlockKey {
 }
 
 impl FullscreenTranscriptCache {
-    pub(super) fn line_count(&self) -> usize {
-        self.lines.len()
-    }
-
-    fn clear(&mut self) {
-        self.key = None;
-        self.blocks.clear();
-        self.spans.clear();
-        self.lines.clear();
-    }
-
-    pub(super) fn sync(&mut self, app: &App, width: u16, theme: &Theme) {
-        let Some(session) = app.active_session() else {
-            self.clear();
-            return;
-        };
+    pub(super) fn sync(&mut self, session: &SessionState, width: u16, theme: &Theme) {
         let key = FullscreenTranscriptKey {
             session_id: session.session_id.clone(),
             version: session.timeline.version,
@@ -747,10 +766,10 @@ fn render_fullscreen_history(
     width: u16,
     height: u16,
     theme: &Theme,
-    cache: &mut FullscreenTranscriptCache,
+    caches: &mut TranscriptCaches,
 ) -> (Vec<Line<'static>>, usize) {
     let Some(session) = app.active_session() else {
-        cache.clear();
+        caches.clear();
         return (Vec::new(), 0);
     };
     let height = usize::from(height);
@@ -758,11 +777,62 @@ fn render_fullscreen_history(
         return (Vec::new(), 0);
     }
 
-    cache.sync(app, width, theme);
+    let cache = caches.touch(&session.session_id);
+    cache.sync(session, width, theme);
     let total = cache.lines.len();
     let top = crate::ui::viewport_top(total, height, session.scroll.follow, session.scroll.offset);
     let end = top.saturating_add(height).min(total);
     (cache.lines[top.min(total)..end].to_vec(), top)
+}
+
+/// 每会话独立的 transcript 渲染缓存（秒切的核心）。
+///
+/// 单例缓存时代：一切 tab，`retain` 把旧会话的全部已渲染块逐出，
+/// 切回要重走 markdown + syntect 高亮整个会话——这就是切换卡顿的根源。
+/// 现在切走只挪 LRU 顺位，切回直接命中已渲染行，零重渲染。
+#[derive(Debug, Default)]
+pub(super) struct TranscriptCaches {
+    entries: HashMap<String, FullscreenTranscriptCache>,
+    /// LRU 顺位；尾部 = 最近使用。
+    lru: Vec<String>,
+}
+
+impl TranscriptCaches {
+    /// active + 最近切走的 3 个。
+    const CAP: usize = 4;
+
+    /// 取该会话的缓存并刷新 LRU 顺位；超出容量时逐出最久未用的。
+    pub(super) fn touch(&mut self, session_id: &str) -> &mut FullscreenTranscriptCache {
+        if let Some(pos) = self.lru.iter().position(|id| id == session_id) {
+            let id = self.lru.remove(pos);
+            self.lru.push(id);
+        } else {
+            self.lru.push(session_id.to_string());
+            self.entries.insert(
+                session_id.to_string(),
+                FullscreenTranscriptCache::default(),
+            );
+            while self.lru.len() > Self::CAP {
+                let evicted = self.lru.remove(0);
+                self.entries.remove(&evicted);
+            }
+        }
+        self.entries
+            .get_mut(session_id)
+            .expect("entry inserted above")
+    }
+
+    fn clear(&mut self) {
+        self.entries.clear();
+        self.lru.clear();
+    }
+
+    pub(super) fn len_for(&self, session_id: &str) -> usize {
+        self.entries
+            .get(session_id)
+            .map(|cache| cache.lines.len())
+            .unwrap_or(0)
+    }
 }
 
 /// 普通启动的品牌首屏：品牌标识 + 输入框 + 一行状态提示。

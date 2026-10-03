@@ -2,12 +2,71 @@
 
 use super::*;
 
+/// 左侧会话栏的一行（渲染与点击共用同一份数据事实源）。
+#[derive(Debug)]
+pub struct SidebarRow {
+    pub session_id: String,
+    pub title: String,
+    /// 领域活动状态；`None` = daemon 本生命周期内从未激活过（仅 running 兜底）。
+    pub activity: Option<ActivityState>,
+    /// daemon registry 实时查询：该会话当前是否有 worker 在跑。
+    pub running: bool,
+    /// 已在当前 tab 集里。
+    pub is_open: bool,
+    /// 当前 active tab。
+    pub is_active: bool,
+}
+
 impl App {
+    /// 侧栏数据源：daemon 启动后**被激活过**的会话（activity tracker 有快照）
+    /// 加上 registry 里仍在跑的会话，归档的永不出现。
+    ///
+    /// 顺序沿用 `session_list_cache`（daemon 侧已按 updated_at 排序），打开的
+    /// tab 不重排——侧栏是"监控位"，不是 tab 栏镜像。
+    pub fn sidebar_rows(&self) -> Vec<SidebarRow> {
+        self.session_list_cache
+            .iter()
+            .filter(|entry| !entry.meta.archived)
+            .filter(|entry| {
+                entry.running
+                    || self.activity_cache.contains_key(&entry.meta.session_id)
+                    || self.tabs.contains(&entry.meta.session_id)
+            })
+            .map(|entry| {
+                let session_id = entry.meta.session_id.clone();
+                SidebarRow {
+                    is_open: self.tabs.contains(&session_id),
+                    is_active: self
+                        .tabs
+                        .get(self.active)
+                        .is_some_and(|active| active == &session_id),
+                    title: entry.meta.display_title(),
+                    activity: self.activity_cache.get(&session_id).copied(),
+                    running: entry.running,
+                    session_id,
+                }
+            })
+            .collect()
+    }
+
+    /// 侧栏行点击：已打开的 tab 直接聚焦，未打开的走既有 open（attach+bootstrap）。
+    /// 全部复用 [`App::open_session_tab`]，不另开语义。
+    pub fn sidebar_open(&mut self, index: usize) {
+        let Some(session_id) = self.sidebar_rows().get(index).map(|row| row.session_id.clone())
+        else {
+            return;
+        };
+        self.open_session_tab(&session_id);
+    }
+
     pub fn open_session_tab(&mut self, session_id: &str) {
         if self.tabs.iter().any(|s| s == session_id) {
             self.active = self.tabs.iter().position(|s| s == session_id).unwrap_or(0);
             self.prune_overlays_for_active_session_id();
             self.fetch_team(session_id.to_owned());
+            // 目标 tab 可能一直挂在后台（停流状态）：重新挂流，
+            // 停流期间错过的 delta 由 activate 快照重基线补齐。
+            self.sync_tracked();
             return;
         }
         self.tabs.push(session_id.to_owned());

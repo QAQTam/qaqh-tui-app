@@ -931,6 +931,16 @@ impl App {
             if count > 0 && self.home_selected >= count {
                 self.home_selected = count - 1;
             }
+        } else {
+            // 侧栏低速刷新（会话进行中）：实时状态由 D::Activity 推送覆盖，
+            // 这里兜底捕获推送表达不了的语义（Failed / running 翻转 / 新激活）。
+            let stale = self
+                .session_list_at
+                .map(|t| t.elapsed() > Duration::from_secs(8))
+                .unwrap_or(true);
+            if stale {
+                self.fetch_session_list();
+            }
         }
     }
 
@@ -1317,6 +1327,12 @@ impl App {
                 }
                 if state == ActivityState::WaitingUser && !self.tabs.contains(&session_id) {
                     self.toast(NoticeLevel::Warn, format!("会话 {session_id} 等待输入"));
+                }
+                if state == ActivityState::Disconnected {
+                    // v2 增量的 Interrupted 不区分「用户取消」与「回合失败」；
+                    // 回拉一次权威 activity（领域 tracker 区分 Failed），
+                    // 顺带刷新侧栏的 running 事实。
+                    self.fetch_session_list();
                 }
             }
             D::InteractionRequested {
@@ -1984,8 +2000,21 @@ impl App {
             //   退场；这里保留原样，免得把历史读成现状。）
             ActionResult::SessionActivity(Ok(items)) => {
                 for item in items {
-                    self.activity_cache
+                    let previous = self
+                        .activity_cache
                         .insert(item.session_id.clone(), item.state);
+                    // 拉取路径是错误态的**唯一**送达通道（v2 推送词汇没有
+                    // failed）：非 active 会话转入 Failed 必须在这里告警，
+                    // 否则后台会话出错在 TUI 里完全不可见。
+                    if item.state == ActivityState::Failed
+                        && previous.is_some_and(|prev| prev != ActivityState::Failed)
+                        && self.active_session_id().as_ref() != Some(&item.session_id)
+                    {
+                        self.toast(
+                            NoticeLevel::Error,
+                            format!("会话 {} 出错", item.session_id),
+                        );
+                    }
                 }
             }
             ActionResult::SessionActivity(Err(_)) => {}
@@ -2112,11 +2141,27 @@ impl App {
     // ───────────────────────── 标签页 / 会话 ─────────────────────────
 
     fn sync_tracked(&mut self) {
-        // 打开的标签 + 正在跟踪的子代理 session_id（各自独立 timeline 流）。
-        let mut session_ids: Vec<String> = self.tabs.clone();
+        // 只有**可见** tab + 正在跟踪的子代理 session_id 挂 timeline 流
+        // （各自独立）。后台 tab 停流：省掉无人观看的逐字 delta 处理，
+        // 活动状态仍经 control 通道 `D::Activity` 推送（侧栏依赖它）；
+        // 切回时 activate_timeline 的初始快照自动重基线，模型无需手工修复。
+        //
+        // 内存上界交给既有机制（见模块头注释）：backend 对 seal 回合 offload
+        // 壳化（实测 140KB→10KB/回合），前端缓存由 TranscriptCaches LRU 兜底；
+        // 客户端不再做回合数切片（TURNS_CAP 的教训见模块头）。
+        let mut session_ids: Vec<String> = Vec::new();
+        if let Some(active_id) = self.tabs.get(self.active) {
+            session_ids.push(active_id.clone());
+        }
         for s in &self.subagent_session_ids {
             if !session_ids.contains(s) {
                 session_ids.push(s.clone());
+            }
+        }
+        for id in &self.tabs {
+            let suspended = !session_ids.contains(id);
+            if let Some(session) = self.sessions.get_mut(id) {
+                session.suspended = suspended;
             }
         }
         self.tracked_session_ids = session_ids.iter().cloned().collect();
@@ -2315,6 +2360,9 @@ impl App {
             if let Some(session_id) = self.active_session_id() {
                 self.fetch_team(session_id);
             }
+            // 流跟随焦点：旧 active 停流挂起，新 active 重新挂流并经初始
+            // 快照重基线（停流期间错过的 delta 由快照补齐）。
+            self.sync_tracked();
             return;
         }
 
@@ -2430,6 +2478,97 @@ mod tests {
             running: false,
             workspace_id: None,
         }
+    }
+
+    #[test]
+    fn sidebar_rows_filter_to_activated_sessions() {
+        let (mut app, _rx) = App::new_for_test();
+        let mut archived = list_entry("s-archived", 1);
+        archived.running = true;
+        archived.meta.archived = true;
+        let mut running = list_entry("s-running", 2);
+        running.running = true;
+        let idle_known = list_entry("s-idle-known", 3);
+        let never_active = list_entry("s-never", 4);
+        app.session_list_cache = vec![archived, running, idle_known, never_active];
+        app.activity_cache
+            .insert("s-idle-known".into(), ActivityState::Idle);
+
+        let rows = app.sidebar_rows();
+        let ids: Vec<&str> = rows.iter().map(|row| row.session_id.as_str()).collect();
+        // 归档永不出现；从未激活（running=false 且无活动记录）不出现。
+        assert_eq!(ids, ["s-running", "s-idle-known"]);
+    }
+
+    #[test]
+    fn sidebar_rows_mark_open_and_active_tabs() {
+        let (mut app, _rx) = App::new_for_test();
+        app.session_list_cache = vec![list_entry("s-1", 1), list_entry("s-2", 2)];
+        app.tabs.push("s-1".into());
+        app.tabs.push("s-2".into());
+        app.active = 1;
+
+        let rows = app.sidebar_rows();
+        assert!(rows.iter().all(|row| row.is_open));
+        let active = rows
+            .iter()
+            .find(|row| row.is_active)
+            .expect("exactly one active tab");
+        assert_eq!(active.session_id, "s-2");
+    }
+
+    #[tokio::test]
+    async fn sidebar_open_switches_within_tabs_and_opens_new() {
+        let (mut app, _rx) = App::new_for_test();
+        let mut s2 = list_entry("s-2", 2);
+        // 侧栏只列"daemon 激活过/在跑"的会话：s-2 靠 running 入列。
+        s2.running = true;
+        app.session_list_cache = vec![list_entry("s-1", 1), s2];
+        app.open_session_tab("s-1");
+        app.active = 0;
+
+        // 未打开的会话：点击开新 tab 并聚焦。
+        app.sidebar_open(1);
+        assert_eq!(app.tabs, vec!["s-1".to_string(), "s-2".to_string()]);
+        assert_eq!(app.tabs[app.active], "s-2");
+
+        // 已打开的会话：点击只聚焦，不重复开 tab。
+        app.sidebar_open(0);
+        assert_eq!(app.tabs.len(), 2);
+        assert_eq!(app.tabs[app.active], "s-1");
+    }
+
+    #[test]
+    fn activity_pull_toasts_failed_background_sessions() {
+        let (mut app, _rx) = App::new_for_test();
+        app.tabs.push("s-active".into());
+        app.sessions
+            .insert("s-active".into(), SessionState::new("s-active".into()));
+        app.active = 0;
+        app.activity_cache.insert("s-bg".into(), ActivityState::Working);
+        app.activity_cache
+            .insert("s-active".into(), ActivityState::Working);
+
+        let activity = |id: &str, state: ActivityState| SessionActivity {
+            session_id: id.into(),
+            state,
+            turn_id: None,
+            seq: 1,
+            updated_at: 0,
+        };
+        app.handle(AppMsg::Action(ActionResult::SessionActivity(Ok(vec![
+            activity("s-bg", ActivityState::Failed),
+            activity("s-active", ActivityState::Failed),
+            activity("s-new", ActivityState::Failed),
+        ]))));
+
+        // 后台会话出错 → 告警；active tab 的错误在 transcript 可见，不重复；
+        // 首次拉取即 Failed 的会话不告警（防 daemon 重启后的 toast 风暴）。
+        assert!(app.toasts.iter().any(|t| t.text.contains("s-bg")));
+        assert!(app.toasts.iter().all(|t| !t.text.contains("s-active")));
+        assert!(app.toasts.iter().all(|t| !t.text.contains("s-new")));
+        // activity_cache 已更新（侧栏红 ✖ 的数据源）。
+        assert_eq!(app.activity_cache["s-bg"], ActivityState::Failed);
     }
 
     #[test]

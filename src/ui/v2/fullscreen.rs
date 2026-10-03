@@ -24,6 +24,9 @@ pub struct FullscreenState {
     pub back_to_latest_pressed: bool,
     pub load_older_hover: bool,
     pub load_older_pressed: bool,
+    /// 左侧会话栏的悬停/按下行（语义下标，与命中目标同源）。
+    pub sidebar_hover: Option<usize>,
+    pub sidebar_pressed: Option<usize>,
 }
 
 /// 助手消息上的上下文动作。

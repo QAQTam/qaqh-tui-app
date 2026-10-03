@@ -499,6 +499,11 @@ pub struct SessionState {
     pub ready: bool,
     /// 加载更早：in-flight 去重。
     pub loading_older: bool,
+    /// 后台 tab 停流标记：非可见 tab 的 timeline 流被退订以省事件处理，
+    /// 本地模型保持"切走时"的快照；切回由 activate_timeline 的初始快照
+    /// 自动重基线（TimelineRebaseline），无需显式 bootstrap。
+    /// 由 [`App::sync_tracked`] 单点维护，不要手工赋值。
+    pub suspended: bool,
 }
 
 impl SessionState {
@@ -533,6 +538,7 @@ impl SessionState {
             expanded_thinking_revision: 0,
             ready: false,
             loading_older: false,
+            suspended: false,
         }
     }
 
@@ -657,6 +663,7 @@ impl SessionState {
             Some(ActivityState::Working) => "working".into(),
             Some(ActivityState::WaitingUser) => "waiting_user".into(),
             Some(ActivityState::Disconnected) => "disconnected".into(),
+            Some(ActivityState::Failed) => "failed".into(),
             _ => "idle".into(),
         }
     }
@@ -916,6 +923,8 @@ mod tests {
                 state: TimelineBlockState::Sealed,
                 text: String::new(),
                 tool: Some(ToolCard {
+exit_code: None,
+                    completed_at_ms: None,
                     tool_call_id: "call".into(),
                     name: "exec".into(),
                     state: TimelineToolState::Succeeded,

@@ -4,12 +4,15 @@
 //! renderer 保持纯输入，便于快照和主题矩阵测试。
 
 use std::collections::HashSet;
+use std::time::Duration;
 
 use crate::app::timeline_model::{Block, CompactionMark, TimelineModel, ToolCard, Turn};
 use crate::ui::v2::transcript::{
-    BlockId, BlockKind, BlockState, ToolBlock, ToolState, TranscriptBlock,
+    BlockId, BlockKind, BlockState, ToolBlock, ToolHeader, ToolState, ToolStreams, TranscriptBlock,
 };
-use qaqh_client::{TimelineBlockKind, TimelineBlockState, TimelineToolState};
+use qaqh_client::{
+    TimelineBlockKind, TimelineBlockState, TimelineToolBody, TimelineToolHeader, TimelineToolState,
+};
 
 pub fn from_turns(turns: &[Turn]) -> Vec<TranscriptBlock> {
     from_turns_with_expanded(turns, &HashSet::new())
@@ -160,6 +163,11 @@ fn from_block(turn_id: &str, turn_sealed: bool, block: &Block) -> Option<Transcr
             TimelineBlockState::Sealed => BlockState::Sealed,
         }
     };
+    // 工具块带终态墙钟（runtime 盖戳）；其余块缺席保持 None。
+    let tool_at_ms = match block.kind {
+        TimelineBlockKind::Tool => block.tool.as_ref().and_then(|tool| tool.completed_at_ms),
+        _ => None,
+    };
     let kind = match block.kind {
         TimelineBlockKind::Reasoning => {
             if block.text.is_empty() && state == BlockState::Sealed {
@@ -176,7 +184,7 @@ fn from_block(turn_id: &str, turn_sealed: bool, block: &Block) -> Option<Transcr
         },
         TimelineBlockKind::Tool => {
             let tool = block.tool.as_ref()?;
-            BlockKind::Tool(from_tool(tool))
+            BlockKind::Tool(Box::new(from_tool(tool)))
         }
         TimelineBlockKind::Notice => BlockKind::System {
             text: block.text.clone(),
@@ -188,29 +196,267 @@ fn from_block(turn_id: &str, turn_sealed: bool, block: &Block) -> Option<Transcr
         revision: block.rev,
         state,
         kind,
-        at_ms: None,
+        at_ms: tool_at_ms,
     })
 }
 
 fn from_tool(tool: &ToolCard) -> ToolBlock {
+    let display = tool.display.as_ref();
+    let header = display.and_then(|display| typed_header(display.header.as_ref()));
+    let body = display.map(|display| typed_body(display.body.as_ref()));
+    let outcome = display.and_then(|display| display.outcome.as_ref());
+    let metrics = display.and_then(|display| display.metrics.as_ref());
+
+    // 正文两级来源：类型化 body → legacy `output` 原样透出（display 缺席的
+    // 自定义工具兜底；不再做任何 JSON 拆包——全部内置工具均已挂 typed
+    // display，旧会话兼容臂已删，2026-10-03）。
+    let typed_has_content = body.as_ref().is_some_and(|body| body.has_content());
+    let (raw_output, streams) = if typed_has_content {
+        let body = body.as_ref().expect("typed_has_content");
+        (body.output.clone(), body.streams.clone())
+    } else {
+        (non_empty(tool.output.as_deref().unwrap_or_default()), None)
+    };
+    // 退出码优先级：typed body → 顶层槽 → outcome。前两者互为同一事实的
+    // 投影，取先到者。
+    let exit_code = body
+        .as_ref()
+        .and_then(|body| body.exit_code)
+        .or(tool.exit_code)
+        .or_else(|| outcome.and_then(|outcome| outcome.exit_code));
+    let truncated = body.as_ref().is_some_and(|body| body.truncated)
+        || outcome
+            .and_then(|outcome| outcome.truncated)
+            .unwrap_or(false);
+    let output = raw_output.map(|text| normalize_cr(&text));
+    let streams = streams.map(|streams| ToolStreams {
+        stdout: normalize_cr(&streams.stdout),
+        stderr: normalize_cr(&streams.stderr),
+    });
+    let diff = body
+        .as_ref()
+        .and_then(|body| body.diff.clone())
+        .or_else(|| tool.diff.clone().filter(|diff| !diff.is_empty()))
+        .map(|diff| normalize_cr(&diff));
+    // 进度的 `\r` 覆盖折叠放宽到所有工具：bash 家族在 ToolCard 已归一（幂等），
+    // 其余工具（MCP / 自定义）在此处得到同样的终屏语义。
+    let progress = (!tool.progress.is_empty()).then(|| normalize_cr(&tool.progress));
+
+    let state = tool_state(tool.state);
+    let summary = if header.is_some() {
+        // 头部已有命令/路径真相字段：display.summary（`exit 0 · cargo check`）
+        // 会与头部、状态行三处重复——结论收敛到状态行，头部只说「做了什么」。
+        None
+    } else {
+        display
+            .and_then(|display| display.summary.as_deref())
+            .filter(|summary| !summary.is_empty())
+            .map(str::to_owned)
+            .or_else(|| tool.summary.clone())
+    };
+
+    // 失败标签的证据判断用**解析后的正文**（typed body 优先于 legacy）：
+    // 正文非空 → 状态行只放分类 code，理由留给正文，不重复。
+    let has_terminal_body = diff.is_some()
+        || streams.is_some()
+        || output.as_deref().is_some_and(|out| !out.trim().is_empty());
+
     ToolBlock {
         name: tool.name.clone(),
-        summary: tool.summary.clone(),
-        state: tool_state(tool.state),
-        output: tool.output.clone(),
-        diff: tool.diff.clone(),
-        progress: (!tool.progress.is_empty()).then(|| tool.progress.clone()),
-        failure: tool.failure.as_ref().map(|failure| {
-            if failure.message.is_empty() {
-                failure.code.clone()
-            } else {
-                format!("{}: {}", failure.code, failure.message)
-            }
-        }),
-        duration: None,
-        bytes: (tool.progress_bytes_total > 0).then_some(tool.progress_bytes_total),
+        summary,
+        state,
+        output,
+        diff,
+        progress,
+        failure: failure_label(tool, state, exit_code, has_terminal_body),
+        duration: metrics
+            .map(|metrics| Duration::from_millis(metrics.elapsed_ms))
+            .or_else(|| {
+                outcome
+                    .and_then(|outcome| outcome.duration_ms)
+                    .map(Duration::from_millis)
+            }),
+        bytes: metrics
+            .map(|metrics| metrics.output_bytes)
+            .filter(|bytes| *bytes > 0)
+            .or_else(|| {
+                outcome
+                    .and_then(|outcome| outcome.output_bytes)
+                    .filter(|bytes| *bytes > 0)
+            })
+            .or_else(|| (tool.progress_bytes_total > 0).then_some(tool.progress_bytes_total)),
         expanded: false,
+        header,
+        streams,
+        exit_code,
+        truncated,
     }
+}
+
+/// 类型化头部（09-18 契约 §3.3）→ view 头部。Path 的 op 略去：工具名
+/// （Read/Write/Edit/…）已经说了操作，路径才是要紧信息。
+fn typed_header(header: Option<&TimelineToolHeader>) -> Option<ToolHeader> {
+    match header? {
+        TimelineToolHeader::Shell { command } => Some(ToolHeader::Shell {
+            command: command.clone(),
+        }),
+        TimelineToolHeader::Path { path, .. } => Some(ToolHeader::Path { path: path.clone() }),
+        TimelineToolHeader::Query { query, scope } => Some(ToolHeader::Query {
+            query: query.clone(),
+            scope: scope.clone(),
+        }),
+        TimelineToolHeader::Other { label } => Some(ToolHeader::Other {
+            label: label.clone(),
+        }),
+        TimelineToolHeader::Unknown => None,
+    }
+}
+
+/// 类型化 body 的展开视图。`Subagent` / `None` / 未知变体不在此投影，
+/// 调用方回退 legacy 字段（H16）。
+#[derive(Clone, Default)]
+struct TypedBody {
+    output: Option<String>,
+    streams: Option<ToolStreams>,
+    diff: Option<String>,
+    exit_code: Option<i32>,
+    truncated: bool,
+}
+
+impl TypedBody {
+    /// body 是否携带了任何可见正文；否则回退 legacy / JSON 拆包。
+    fn has_content(&self) -> bool {
+        self.diff.is_some()
+            || self.streams.is_some()
+            || self
+                .output
+                .as_deref()
+                .is_some_and(|output| !output.is_empty())
+    }
+}
+
+fn typed_body(body: Option<&TimelineToolBody>) -> TypedBody {
+    match body {
+        None | Some(TimelineToolBody::None | TimelineToolBody::Unknown) => TypedBody::default(),
+        Some(TimelineToolBody::Subagent { .. }) => TypedBody::default(),
+        Some(TimelineToolBody::Text { text, truncated }) => TypedBody {
+            output: non_empty(text),
+            truncated: *truncated,
+            ..TypedBody::default()
+        },
+        Some(TimelineToolBody::Diff { unified, .. }) => TypedBody {
+            diff: non_empty(unified),
+            ..TypedBody::default()
+        },
+        Some(TimelineToolBody::Shell {
+            output,
+            exit_code,
+            truncated,
+        }) => TypedBody {
+            output: non_empty(output),
+            exit_code: *exit_code,
+            truncated: *truncated,
+            ..TypedBody::default()
+        },
+        Some(TimelineToolBody::Streams {
+            stdout,
+            stderr,
+            exit_code,
+            truncated,
+            ..
+        }) => TypedBody {
+            streams: (!stdout.is_empty() || !stderr.is_empty()).then(|| ToolStreams {
+                stdout: stdout.clone(),
+                stderr: stderr.clone(),
+            }),
+            exit_code: *exit_code,
+            truncated: *truncated,
+            ..TypedBody::default()
+        },
+    }
+}
+
+/// 失败标签的状态行上界：状态行只放「为什么失败」的一句话，整段证据在
+/// 正文——超界就不再是摘要，是复制。
+const FAILURE_LABEL_MAX_CHARS: usize = 80;
+
+/// 失败标签（状态行）：分工是**状态行说分类（结果如何）、正文说证据**，
+/// 两者不互相复制。
+///
+/// 优先级：非零退出码 → `exit N`；正文（output/diff）已有证据 → 裸 code
+/// （理由就在正文里，拼进标签必是重复）；正文缺席时理由没有别的落点，
+/// 状态行承担 `code: 首行理由`（单行有界，不让多行文本挤进单行 Span）。
+fn failure_label(
+    tool: &ToolCard,
+    state: ToolState,
+    exit_code: Option<i32>,
+    body_has_evidence: bool,
+) -> Option<String> {
+    if state != ToolState::Failed {
+        return None;
+    }
+    if let Some(code) = exit_code.filter(|code| *code != 0) {
+        return Some(format!("exit {code}"));
+    }
+    let failure = tool.failure.as_ref()?;
+    let code = {
+        let code = failure.code.trim();
+        if code.is_empty() {
+            "tool_execution_failed"
+        } else {
+            code
+        }
+    };
+    if body_has_evidence {
+        return Some(code.to_owned());
+    }
+    let message = first_line_bounded(&failure.message, FAILURE_LABEL_MAX_CHARS);
+    if message.is_empty() || message.eq_ignore_ascii_case(code) {
+        return Some(code.to_owned());
+    }
+    Some(format!("{code}: {message}"))
+}
+
+/// 首个非空行压平为单行并按字符数有界（UTF-8 边界安全）。与后端
+/// `qaqh_domain::timeline::one_line_bounded` 同语义，是旧数据回放的防御副本
+/// （新数据在后端已收敛，此函数只在 TUI 侧兜底）。
+fn first_line_bounded(text: &str, max_chars: usize) -> String {
+    let line = text
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or_default()
+        .chars()
+        .map(|ch| if ch == '\r' || ch == '\t' { ' ' } else { ch })
+        .collect::<String>();
+    let trimmed = line.trim();
+    if trimmed.chars().count() <= max_chars {
+        return trimmed.to_owned();
+    }
+    let mut bounded: String = trimmed.chars().take(max_chars).collect();
+    bounded.push('…');
+    bounded
+}
+
+
+/// 终屏归一（与后端 exec display 的 `normalize_carriage_returns` 同语义）：
+/// CRLF → LF；行内 `\r` 覆盖只留最后一个非空段（apt/spinner 进度行）；
+/// 纯 `\r` 行丢弃。对已归一的文本幂等。
+fn normalize_cr(text: &str) -> String {
+    let normalized = text.replace("\r\n", "\n");
+    let mut lines: Vec<&str> = Vec::new();
+    for line in normalized.split('\n') {
+        if let Some(segment) = line.rsplit('\r').find(|segment| !segment.is_empty()) {
+            lines.push(segment);
+        } else if !line.contains('\r') {
+            lines.push(line);
+        }
+    }
+    lines.join("\n")
+}
+
+fn non_empty(value: &str) -> Option<String> {
+    (!value.is_empty()).then(|| value.to_owned())
 }
 
 const fn tool_state(state: TimelineToolState) -> ToolState {
@@ -227,7 +473,7 @@ const fn tool_state(state: TimelineToolState) -> ToolState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use qaqh_client::{TimelineFailure, TimelineTurnState};
+    use qaqh_client::{TimelineFailure, TimelineToolDisplay, TimelineTurnState};
 
     fn block(id: &str, kind: TimelineBlockKind, state: TimelineBlockState, text: &str) -> Block {
         Block {
@@ -325,6 +571,8 @@ mod tests {
             "",
         );
         tool_block.tool = Some(ToolCard {
+exit_code: None,
+            completed_at_ms: None,
             tool_call_id: "call".to_string(),
             name: "exec".to_string(),
             state: TimelineToolState::Succeeded,
@@ -362,6 +610,8 @@ mod tests {
             "",
         );
         tool_block.tool = Some(ToolCard {
+exit_code: None,
+            completed_at_ms: None,
             tool_call_id: "call".to_string(),
             name: "exec".to_string(),
             state: TimelineToolState::Failed,
@@ -496,5 +746,168 @@ mod tests {
             panic!("divider missing");
         };
         assert!(text.contains("此前已压缩"), "{text}");
+    }
+
+    /// display 契约的 exec 卡：头部是 Shell 命令、正文是 `\r` 归一后的输出，
+    /// 模型向 JSON（legacy output）彻底不上屏；summary 收敛进状态行。
+    #[test]
+    fn display_shell_card_renders_body_not_model_json() {
+        let mut card = tool_card("exec", TimelineToolState::Succeeded);
+        card.output = Some(
+            r#"{"status":"completed","exit_code":0,"output":"hello\r\nworld\r\n"}"#.to_string(),
+        );
+        card.display = Some(TimelineToolDisplay {
+            summary: Some("exit 0 · cargo check".to_string()),
+            diff: None,
+            header: Some(TimelineToolHeader::Shell {
+                command: "cargo check".to_string(),
+            }),
+            body: Some(TimelineToolBody::Shell {
+                output: "hello\r\nworld\r\n".to_string(),
+                exit_code: Some(0),
+                truncated: false,
+            }),
+            metrics: None,
+            outcome: None,
+        });
+        let tool = from_tool(&card);
+        assert_eq!(
+            tool.header,
+            Some(ToolHeader::Shell {
+                command: "cargo check".to_string()
+            })
+        );
+        assert_eq!(tool.summary, None, "头部在时 summary 全量去重");
+        assert_eq!(tool.output.as_deref(), Some("hello\nworld\n"));
+        assert_eq!(tool.streams, None);
+        assert_eq!(tool.exit_code, Some(0));
+    }
+
+    /// H16 兜底（无 display）：output 原样透出——JSON 拆包考古层已删
+    /// （2026-10-03），全部内置工具挂 typed display 后不再有 JSON 模型向
+    /// 正文需要拆解。
+    #[test]
+    fn json_output_passes_through_without_display() {
+        let json = r#"{"status":"failed","exit_code":2,"output":"boom"}"#;
+        let mut card = tool_card("exec", TimelineToolState::Failed);
+        card.output = Some(json.to_string());
+        let tool = from_tool(&card);
+        assert_eq!(tool.streams, None, "不再拆流");
+        assert_eq!(tool.output.as_deref(), Some(json), "正文原样透出");
+    }
+
+    /// 无 display 且 output 不是 exec 形 JSON：正文原样透出，但 `\r` 覆盖行
+    /// 折叠成终屏语义（CRLF → LF、行内覆盖只留最后一段）。
+    #[test]
+    fn plain_output_passes_through_with_cr_normalized() {
+        let mut card = tool_card("exec", TimelineToolState::Succeeded);
+        card.output = Some("50%\r100%\r\nprogress done\n".to_string());
+        let tool = from_tool(&card);
+        assert_eq!(tool.streams, None);
+        assert_eq!(tool.output.as_deref(), Some("100%\nprogress done\n"));
+    }
+
+    /// 非 JSON 的失败 message 照旧完整透出（`code: message`），不受 JSON 拆包影响。
+    #[test]
+    fn plain_failure_message_is_kept() {
+        let mut card = tool_card("exec", TimelineToolState::Failed);
+        card.failure = Some(TimelineFailure {
+            code: "spawn_failed".to_string(),
+            message: "no supported shell found".to_string(),
+        });
+        let tool = from_tool(&card);
+        assert_eq!(
+            tool.failure.as_deref(),
+            Some("spawn_failed: no supported shell found")
+        );
+    }
+
+    /// 失败标签硬化：多行 / 超长 message 压成单行有界，不挤爆状态行 Span。
+    #[test]
+    fn failure_label_bounds_messages_to_one_line() {
+        // 多行 message：首行。
+        let mut card = tool_card("edit", TimelineToolState::Failed);
+        card.failure = Some(TimelineFailure {
+            code: "stale_file".to_string(),
+            message: "file changed since read
+Hint: re-read the file".to_string(),
+        });
+        assert_eq!(
+            from_tool(&card).failure.as_deref(),
+            Some("stale_file: file changed since read")
+        );
+
+        // 无换行的超长单行：有界 + `…`。
+        let mut card = tool_card("exec", TimelineToolState::Failed);
+        card.failure = Some(TimelineFailure {
+            code: "execution".to_string(),
+            message: "x".repeat(FAILURE_LABEL_MAX_CHARS + 40),
+        });
+        let label = from_tool(&card).failure.expect("label");
+        assert_eq!(label.chars().count(), "execution: ".len() + FAILURE_LABEL_MAX_CHARS + 1);
+        assert!(label.ends_with('…'));
+        assert!(!label.contains('\n'), "标签必须是单行");
+    }
+
+    /// message 与 code 同义（exec timeout：`timeout`/`timeout`）时不再拼第二遍。
+    #[test]
+    fn failure_label_deduplicates_message_that_repeats_the_code() {
+        let mut card = tool_card("exec", TimelineToolState::Failed);
+        card.failure = Some(TimelineFailure {
+            code: "timeout".to_string(),
+            message: "timeout".to_string(),
+        });
+        assert_eq!(from_tool(&card).failure.as_deref(), Some("timeout"));
+    }
+
+    /// 契约切片：顶层 exit_code/completed_at_ms 进入 ToolCard，并参与退出码
+    /// 优先级——display 缺席时标签仍能给出 `exit N`，无需 JSON 考古。
+    #[test]
+    fn terminal_slots_flow_through_and_feed_the_exit_label() {
+        let mut card = tool_card("exec", TimelineToolState::Failed);
+        card.output = Some("boom".to_string());
+        card.exit_code = Some(101);
+        card.completed_at_ms = Some(1_759_488_000_000);
+        let tool = from_tool(&card);
+        assert_eq!(tool.exit_code, Some(101));
+        assert_eq!(tool.failure.as_deref(), Some("exit 101"));
+
+        // typed body 优先于顶层槽（同一事实的两个投影，先到者胜）。
+        let mut card = tool_card("exec", TimelineToolState::Failed);
+        card.exit_code = Some(1);
+        card.display = Some(TimelineToolDisplay {
+            summary: None,
+            diff: None,
+            header: None,
+            body: Some(qaqh_client::TimelineToolBody::Shell {
+                output: String::new(),
+                exit_code: Some(7),
+                truncated: false,
+            }),
+            metrics: None,
+            outcome: None,
+        });
+        assert_eq!(from_tool(&card).exit_code, Some(7));
+    }
+
+    fn tool_card(name: &str, state: TimelineToolState) -> ToolCard {
+        ToolCard {
+exit_code: None,
+            completed_at_ms: None,
+            tool_call_id: "c1".to_string(),
+            name: name.to_string(),
+            state,
+            summary: None,
+            args_json: None,
+            output: None,
+            diff: None,
+            progress: String::new(),
+            progress_truncated: false,
+            progress_bytes_total: 0,
+            progress_stream: None,
+            failure: None,
+            permission: None,
+            display: None,
+        }
     }
 }

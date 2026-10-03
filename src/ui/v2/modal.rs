@@ -337,7 +337,7 @@ fn permission_rows(
     push(
         &mut rows,
         "工具: ",
-        &panel.tool_name,
+        &super::display_tool_name(&panel.tool_name),
         Style::new().fg(theme.accent.tool),
     );
     if let Some(action) = panel.action_summary.as_deref() {

@@ -479,6 +479,13 @@ fn sync_pointer_visual(app: &mut App, fullscreen_view: &mut FullscreenView) {
     fullscreen_view.pointer.load_older_hover = visual.hovered.as_ref() == Some(&load_older);
     fullscreen_view.pointer.load_older_pressed = visual.pressed.as_ref() == Some(&load_older);
 
+    let sidebar_index = |target: &PointerTarget| match target {
+        PointerTarget::Agent(AgentTarget::SidebarRow(index)) => Some(*index),
+        _ => None,
+    };
+    fullscreen_view.pointer.sidebar_hover = visual.hovered.as_ref().and_then(sidebar_index);
+    fullscreen_view.pointer.sidebar_pressed = visual.pressed.as_ref().and_then(sidebar_index);
+
     let menu_hover = visual
         .hovered
         .as_ref()
@@ -647,6 +654,11 @@ fn dispatch_pointer_action(
                 app.load_older();
                 frames.invalidate();
             }
+            PointerTarget::Agent(AgentTarget::SidebarRow(index)) => {
+                app.sidebar_open(index);
+                fullscreen_view.pointer_state.clear();
+                frames.invalidate();
+            }
             PointerTarget::Agent(AgentTarget::MenuAction(action)) => {
                 if action.enabled() {
                     activate_message_action(app, fullscreen_view, action);
@@ -724,7 +736,7 @@ fn scrollbar_metrics(app: &App, view: &FullscreenView) -> Option<ScrollbarMetric
     );
     ScrollbarMetrics::new(
         track,
-        view.transcript.line_count(),
+        view.transcripts.len_for(&session.session_id),
         usize::from(view.body_height),
         session.scroll.follow,
         session.scroll.offset,
@@ -732,7 +744,7 @@ fn scrollbar_metrics(app: &App, view: &FullscreenView) -> Option<ScrollbarMetric
 }
 
 fn set_scroll_offset(app: &mut App, view: &FullscreenView, offset: usize) {
-    let max = view.max_offset();
+    let max = view.max_offset(app);
     if let Some(session) = app.active_session_mut() {
         session.scroll.follow = false;
         session.scroll.offset = offset.min(max);
@@ -1403,7 +1415,7 @@ mod tests {
     };
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
-    use ratatui::crossterm::event::{KeyEvent, KeyModifiers, MouseButton};
+    use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton};
     use ratatui::layout::Rect;
 
     fn test_theme() -> Theme {
@@ -1528,6 +1540,8 @@ mod tests {
                     state: TimelineBlockState::Sealed,
                     text: String::new(),
                     tool: Some(qaqh_client::TimelineTool {
+exit_code: None,
+                        completed_at_ms: None,
                         tool_call_id: "call-1".to_string(),
                         name: "exec".to_string(),
                         state: qaqh_client::TimelineToolState::Succeeded,
@@ -1622,7 +1636,7 @@ mod tests {
         let route = route::resolve(&app);
         let mut view = FullscreenView::default();
 
-        for (width, height) in [(80, 24), (40, 20), (20, 8), (120, 40)] {
+        for (width, height) in [(80, 24), (40, 20), (20, 8), (10, 6), (120, 40)] {
             terminal
                 .resize(Rect::new(0, 0, width, height))
                 .expect("resize");
@@ -1681,13 +1695,15 @@ mod tests {
         app.show_workspace = false;
         let theme = test_theme();
         let mut view = FullscreenView::default();
-        view.transcript.sync(&app, 79, &theme);
+        view.transcripts
+            .touch("session-1")
+            .sync(&app.sessions["session-1"], 79, &theme);
         view.body_height = 10;
 
         view.scroll_up(&mut app, usize::MAX / 2);
         let session = app.active_session().expect("session");
         assert!(!session.scroll.follow);
-        assert_eq!(session.scroll.offset, view.max_offset());
+        assert_eq!(session.scroll.offset, view.max_offset(&app));
 
         view.scroll_down(&mut app, usize::MAX / 2);
         assert!(app.active_session().expect("session").scroll.follow);
@@ -1699,13 +1715,16 @@ mod tests {
         app.show_workspace = false;
         let theme = test_theme();
         let mut view = FullscreenView::default();
-        view.transcript.sync(&app, 79, &theme);
+        view.transcripts
+            .touch("session-1")
+            .sync(&app.sessions["session-1"], 79, &theme);
         view.body_height = 10;
 
+        let max_offset = view.max_offset(&app);
         let session = app.sessions.get_mut("session-1").expect("session");
         session.timeline.has_more = true;
         session.timeline.turns[0].turn_index = Some(1);
-        session.scroll.offset = view.max_offset();
+        session.scroll.offset = max_offset;
 
         view.page_up(&mut app);
 
@@ -1718,11 +1737,11 @@ mod tests {
         let theme = test_theme();
         let mut cache = FullscreenTranscriptCache::default();
 
-        cache.sync(&app, 79, &theme);
+        cache.sync(&app.sessions["session-1"], 79, &theme);
         assert_eq!(cache.render_misses, 6);
         let before = cache.render_misses;
 
-        cache.sync(&app, 79, &theme);
+        cache.sync(&app.sessions["session-1"], 79, &theme);
         assert_eq!(cache.render_misses, before, "same version must be a no-op");
 
         let session = app.sessions.get_mut("session-1").expect("session");
@@ -1736,7 +1755,7 @@ mod tests {
             .expect("text block");
         block.text.push_str(" updated");
 
-        cache.sync(&app, 79, &theme);
+        cache.sync(&app.sessions["session-1"], 79, &theme);
         assert_eq!(
             cache.render_misses,
             before + 1,
@@ -1966,6 +1985,242 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn agent_rail_lists_activated_sessions_and_opens_on_click() {
+        let mut app = app_with_model(model_with_sealed_answer());
+        app.session_list_cache = vec![
+            SessionListEntry {
+                meta: SessionMeta {
+                    session_id: "session-1".into(),
+                    ..SessionMeta::default()
+                },
+                running: true,
+                workspace_id: None,
+            },
+            SessionListEntry {
+                meta: SessionMeta {
+                    session_id: "session-2".into(),
+                    ..SessionMeta::default()
+                },
+                running: true,
+                workspace_id: None,
+            },
+        ];
+        app.activity_cache
+            .insert("session-2".into(), qaqh_client::DomainActivityState::Working);
+        app.show_workspace = false;
+
+        let mut view = FullscreenView::default();
+        let mut frames = publish_frame(&app, &mut view, 100, 24);
+        let rail_rect = |index: usize| {
+            frames
+                .current()
+                .expect("published frame")
+                .regions
+                .iter()
+                .find_map(|region| match &region.target {
+                    PointerTarget::Agent(AgentTarget::SidebarRow(index_)) if *index_ == index => {
+                        Some(region.rect)
+                    }
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("rail row {index} must be registered"))
+        };
+        let (rect0, rect1) = (rail_rect(0), rail_rect(1));
+        assert_eq!(rect0.x, 0, "rail occupies the left edge");
+        assert!(rect1.y > rect0.y, "rail rows stack vertically");
+        assert_eq!(rect1.x, 0, "rail rows span the rail column");
+
+        // 悬停：只改视觉状态，不触发动作。
+        handle_message(
+            &mut app,
+            AppMsg::Mouse(left_mouse(MouseEventKind::Moved, rect1.x + 1, rect1.y)),
+            &mut frames,
+            &mut view,
+        );
+        assert_eq!(view.pointer.sidebar_hover, Some(1));
+
+        // 点击未打开的 session-2 → 开新 tab 并聚焦（同 workspace 开会话语义）。
+        handle_message(
+            &mut app,
+            AppMsg::Mouse(left_mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                rect1.x + 1,
+                rect1.y,
+            )),
+            &mut frames,
+            &mut view,
+        );
+        handle_message(
+            &mut app,
+            AppMsg::Mouse(left_mouse(
+                MouseEventKind::Up(MouseButton::Left),
+                rect1.x + 1,
+                rect1.y,
+            )),
+            &mut frames,
+            &mut view,
+        );
+        assert!(
+            app.tabs.contains(&"session-2".to_string()),
+            "click must open the session tab"
+        );
+        assert_eq!(app.tabs[app.active], "session-2");
+    }
+
+    #[test]
+    fn agent_rail_hidden_below_min_width() {
+        let mut app = app_with_model(model_with_sealed_answer());
+        app.session_list_cache = vec![SessionListEntry {
+            meta: SessionMeta {
+                session_id: "session-1".into(),
+                ..SessionMeta::default()
+            },
+            running: true,
+            workspace_id: None,
+        }];
+        app.show_workspace = false;
+        let mut view = FullscreenView::default();
+        let (map, _backend) = draw_agent_to_map(&app, &mut view, 80, 24);
+        assert!(
+            !map
+                .regions
+                .iter()
+                .any(|region| matches!(region.target, PointerTarget::Agent(AgentTarget::SidebarRow(_)))),
+            "narrow terminal must not register rail rows"
+        );
+    }
+
+    #[test]
+    fn fullscreen_switch_back_reuses_cached_blocks_without_rerender() {
+        let mut app = app_with_model(model_with_many_sealed_turns(3));
+        let mut session2 = SessionState::new("session-2".into());
+        session2.timeline = model_with_many_sealed_turns(2);
+        app.tabs.push("session-2".into());
+        app.sessions.insert("session-2".into(), session2);
+        let theme = test_theme();
+        let mut view = FullscreenView::default();
+
+        let synced_misses = |view: &mut FullscreenView, id: &str| {
+            let cache = view.transcripts.touch(id);
+            cache.sync(&app.sessions[id], 79, &theme);
+            cache.render_misses
+        };
+
+        // 渲染 session-1（active）→ 切到 session-2 渲染 → 切回 session-1：
+        // per-session 缓存必须原样命中，块级零重渲染。
+        let misses_1 = synced_misses(&mut view, "session-1");
+        synced_misses(&mut view, "session-2");
+        let misses_1_back = synced_misses(&mut view, "session-1");
+        assert_eq!(
+            misses_1_back, misses_1,
+            "switching back must hit the resident cache, not re-render blocks"
+        );
+    }
+
+    #[test]
+    fn transcript_cache_evicts_least_recently_used_beyond_capacity() {
+        let mut app = app_with_model(model_with_many_sealed_turns(1));
+        for index in 2..=5 {
+            let session_id = format!("session-{index}");
+            let mut session = SessionState::new(session_id.clone());
+            session.timeline = model_with_many_sealed_turns(1);
+            app.tabs.push(session_id.clone());
+            app.sessions.insert(session_id, session);
+        }
+        let theme = test_theme();
+        let mut view = FullscreenView::default();
+
+        let synced_misses = |view: &mut FullscreenView, id: &str| {
+            let cache = view.transcripts.touch(id);
+            cache.sync(&app.sessions[id], 79, &theme);
+            cache.render_misses
+        };
+
+        for index in 1..=4 {
+            synced_misses(&mut view, format!("session-{index}").as_str());
+        }
+        // 复摸 session-1：LRU 顺位刷新，容量内零重渲染。
+        let misses_1_first = synced_misses(&mut view, "session-1");
+        // 第 5 个会话挤掉的是 session-2（最久未用），不是 session-1。
+        synced_misses(&mut view, "session-5");
+        assert_eq!(
+            view.transcripts.len_for("session-2"),
+            0,
+            "least recently used cache must be evicted"
+        );
+        assert!(
+            view.transcripts.len_for("session-1") > 0,
+            "recently touched cache must survive the eviction"
+        );
+        // 逐出后复摸 session-2：全新缓存，从零重新计 miss。
+        let misses_2_fresh = synced_misses(&mut view, "session-2");
+        assert_eq!(misses_2_fresh, misses_1_first, "fresh cache re-renders everything");
+    }
+
+    #[tokio::test]
+    async fn switching_tabs_suspends_background_tabs() {
+        let mut app = app_with_model(model_with_sealed_answer());
+        let mut entry2 = SessionListEntry {
+            meta: SessionMeta {
+                session_id: "session-2".into(),
+                ..SessionMeta::default()
+            },
+            running: true,
+            workspace_id: None,
+        };
+        entry2.meta.title = Some("第二个会话".into());
+        app.session_list_cache = vec![SessionListEntry {
+            meta: SessionMeta {
+                session_id: "session-1".into(),
+                ..SessionMeta::default()
+            },
+            running: true,
+            workspace_id: None,
+        }, entry2];
+
+        // 开第二个 tab：它成为 active，只有它挂流。
+        app.open_session_tab("session-2");
+        fn ids(app: &App) -> Vec<&str> {
+            let mut ids: Vec<&str> = app.tracked_session_ids.iter().map(String::as_str).collect();
+            ids.sort_unstable();
+            ids
+        }
+        assert_eq!(ids(&app), ["session-2"]);
+        assert!(app.sessions["session-1"].suspended);
+        assert!(!app.sessions["session-2"].suspended);
+
+        // 侧栏点击切回 session-1（open_session_tab 已打开分支）：流跟随焦点。
+        app.sidebar_open(0);
+        assert_eq!(ids(&app), ["session-1"]);
+        assert!(!app.sessions["session-1"].suspended);
+        assert!(app.sessions["session-2"].suspended);
+    }
+
+    #[tokio::test]
+    async fn alt_tab_key_swaps_tracked_stream() {
+        let mut app = app_with_model(model_with_sealed_answer());
+        app.tabs.push("session-2".into());
+        app.sessions
+            .insert("session-2".into(), SessionState::new("session-2".into()));
+        app.active = 1;
+        let mut view = FullscreenView::default();
+        let mut frames = FramePublisher::default();
+
+        // Alt+Left 切回 session-1：tracked 集合与挂起标记必须跟着焦点走。
+        let key = KeyEvent::new(KeyCode::Left, KeyModifiers::ALT);
+        handle_message(&mut app, AppMsg::Key(key), &mut frames, &mut view);
+
+        let ids: Vec<&str> = app.tracked_session_ids.iter().map(String::as_str).collect();
+        assert!(
+            ids.contains(&"session-1") && !ids.contains(&"session-2"),
+            "tracked set must follow focus, got {ids:?}"
+        );
+        assert!(!app.sessions["session-1"].suspended);
+        assert!(app.sessions["session-2"].suspended);
+    }
+
+
     #[test]
     fn tool_card_click_toggles_expansion_via_presented_frame() {
         let mut app = app_with_model(model_with_tool_card());
@@ -2119,7 +2374,7 @@ mod tests {
             app.sessions["session-1"].scroll.offset,
             metrics
                 .offset_for_track_row(track_row)
-                .min(view.max_offset())
+                .min(view.max_offset(&app))
         );
 
         let mut frames = publish_frame(&app, &mut view, 80, 24);
@@ -2162,7 +2417,7 @@ mod tests {
             app.sessions["session-1"].scroll.offset,
             metrics
                 .offset_for_drag_row(drag_row, 0)
-                .min(view.max_offset())
+                .min(view.max_offset(&app))
         );
     }
 

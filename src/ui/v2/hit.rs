@@ -75,6 +75,8 @@ pub enum AgentTarget {
     /// 菜单外框（阻断层）：命中它表示"点在菜单里但不在可执行行上"，
     /// 不得穿透到底下的消息行。
     MenuRoot,
+    /// 左侧会话栏的第 `index` 行（语义下标，与 `App::sidebar_rows` 同源）。
+    SidebarRow(usize),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -356,6 +358,7 @@ impl HitMapBuilder {
 /// z 层级基线；局部子层只能在对应区间内细分。
 pub mod z {
     pub const AGENT_MESSAGE: u16 = 10;
+    pub const AGENT_SIDEBAR_ROW: u16 = 12;
     pub const AGENT_SCROLLBAR: u16 = 30;
     /// Thumb is a higher-z sub-target inside the scrollbar track.
     pub const AGENT_SCROLLBAR_THUMB: u16 = 31;

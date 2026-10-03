@@ -15,6 +15,8 @@ use crate::app::render_line::wrap_text;
 use crate::app::timeline_model::strip_ansi_escapes;
 use crate::theme::Theme;
 
+use super::display_tool_name;
+
 const MIN_WIDTH: usize = 20;
 const TOOL_BODY_EDGE: usize = 3;
 const TOOL_BODY_RUNNING_TAIL: usize = 6;
@@ -70,6 +72,35 @@ impl ToolState {
     }
 }
 
+/// 类型化工具头部（09-18 展示契约 §3.3 的 view 侧镜像）。
+///
+/// adapter 从 `ToolCard.display` 投影而来；`None` → 走 legacy summary 兜底。
+/// 头部正文（命令/路径/查询）由后端声明为「真相字段」，渲染层不再从
+/// 模型向 JSON 里考古。
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum ToolHeader {
+    Shell {
+        command: String,
+    },
+    Path {
+        path: String,
+    },
+    Query {
+        query: String,
+        scope: Option<String>,
+    },
+    Other {
+        label: String,
+    },
+}
+
+/// stdout / stderr 分离的流正文（`ToolBody::Streams` 的 view 侧镜像）。
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ToolStreams {
+    pub stdout: String,
+    pub stderr: String,
+}
+
 /// ToolBlock 的 V2 view model。
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ToolBlock {
@@ -84,6 +115,14 @@ pub struct ToolBlock {
     pub bytes: Option<u64>,
     /// 用户显式展开后显示完整正文；默认仍保持终态卡的前后文折叠。
     pub expanded: bool,
+    /// 类型化头部；有值时头部正文以它为准，summary 仅作 legacy 兜底。
+    pub header: Option<ToolHeader>,
+    /// 分离流正文；有值时优先于 `output`（exec 的 stdout/stderr 不再混排）。
+    pub streams: Option<ToolStreams>,
+    /// 终态退出码（display body/outcome）。`0` 不上屏（成功无需报数）。
+    pub exit_code: Option<i32>,
+    /// 后端明确告知正文被截断。
+    pub truncated: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -99,7 +138,7 @@ pub enum BlockKind {
         duration: Option<Duration>,
         expanded: bool,
     },
-    Tool(ToolBlock),
+    Tool(Box<ToolBlock>),
     System {
         text: String,
     },
@@ -208,17 +247,25 @@ pub fn render_block(block: &TranscriptBlock, width: usize, theme: &Theme) -> Vec
             width,
             theme,
         ),
-        BlockKind::Tool(tool) => render_tool(tool, width, theme),
+        BlockKind::Tool(tool) => render_tool(tool, block.at_ms, width, theme),
         BlockKind::System { text } => render_system(text, width, theme),
     };
     if block.state == BlockState::Live
         && matches!(block.kind, BlockKind::Assistant { .. })
-        && let Some(line) = lines.last_mut()
     {
-        line.spans.push(Span::styled(
+        use unicode_width::UnicodeWidthStr;
+        let cursor = Span::styled(
             theme.glyph.cursor.to_string(),
             fg(theme.accent.assistant),
-        ));
+        );
+        let cursor_width = theme.glyph.cursor.width();
+        // 流式光标不能突破宽度预算：最后一行已满宽时（表格边框/代码围栏
+        // 恰好收敛）另起一行，否则会被 Paragraph 截断成不可见。
+        match lines.last_mut() {
+            Some(line) if line.width() + cursor_width <= width => line.spans.push(cursor),
+            Some(_) => lines.push(Line::from(vec![cursor])),
+            None => {}
+        }
     }
     lines
 }
@@ -247,7 +294,7 @@ fn render_user(at_ms: Option<u64>, text: &str, width: usize, theme: &Theme) -> V
 /// 权威墙钟（epoch ms）→ 本地 `MM-DD HH:MM`。
 ///
 /// **纯函数**：只依赖入参、不含 `now()`，所以渲染缓存键与快照测试都稳定。
-fn format_wall_clock(ts_ms: u64) -> Option<String> {
+pub(crate) fn format_wall_clock(ts_ms: u64) -> Option<String> {
     let utc = chrono::DateTime::from_timestamp_millis(i64::try_from(ts_ms).ok()?)?;
     Some(
         utc.with_timezone(&chrono::Local)
@@ -335,31 +382,49 @@ fn render_thinking(
     lines
 }
 
-fn render_tool(tool: &ToolBlock, width: usize, theme: &Theme) -> Vec<Line<'static>> {
-    let name = sanitize_text(&tool.name);
+fn render_tool(
+    tool: &ToolBlock,
+    at_ms: Option<u64>,
+    width: usize,
+    theme: &Theme,
+) -> Vec<Line<'static>> {
+    // wire 名是模型向标识符（`exec`/`todo_write`），对人一律标题式（`Exec`）。
+    let name = display_tool_name(&tool.name);
     let summary = tool
         .summary
         .as_deref()
         .map(sanitize_text)
         .filter(|summary| !summary.is_empty());
 
-    // 头统一成 `⚙ {工具名} [{标记}] {正文}`：后端的 display summary 有两种风格
-    // （`[OK] edit /p` 与 `edit /p`），这里先拆再拼，避免出现 "edit [OK] edit /p"
-    // 这种工具名说两遍、成功说两遍的样子。
-    let (marker, rest) = split_summary_marker(summary.as_deref().unwrap_or_default());
-    let (rest, _had_name) = strip_tool_prefix(rest, &name);
-    let marker_text = marker
-        .map(|marker| format!(" [{marker}]"))
-        .unwrap_or_default();
-    // 缩短的预算要扣掉前面已经占掉的列（`⚙ name [OK]`），否则头部仍会折行。
-    let budget = width
-        .saturating_sub(theme.glyph.tool.width() + name.width() + marker_text.width() + 3)
-        .max(24);
-    let rest = shorten_header_paths(rest, budget);
-    let header = if rest.is_empty() {
-        format!("{} {name}{marker_text}", theme.glyph.tool)
+    // 头统一成 `⚙ {工具名} {正文}`。正文两级来源：
+    // ① 类型化头部（display 契约）——命令/路径是后端声明的真相字段；
+    // ② legacy summary——display 缺席的 H16 兜底（`[OK]` 标记拆解与工具名
+    //    去重已随旧会话兼容臂一并删除，2026-10-03）。
+    let rest = match tool.header.as_ref() {
+        Some(header) => typed_header_rest(header),
+        None => summary.as_deref().unwrap_or_default().to_owned(),
+    };
+    // 失败态的 legacy 摘要首行就是失败理由（`project_tool_summary` 取 output
+    // 首行的投影），状态行已承载同一条理由——头里再放一遍即双重显示。
+    // typed header 是命令/路径等「做了什么」的真相字段，不在此列。summary
+    // 本身仍传给正文做逐字去重，信息不丢失。
+    let rest = if tool.state == ToolState::Failed
+        && tool.header.is_none()
+        && tool.failure.is_some()
+    {
+        String::new()
     } else {
-        format!("{} {name}{marker_text} {rest}", theme.glyph.tool)
+        rest
+    };
+    // 缩短的预算要扣掉前面已经占掉的列，否则头部仍会折行。
+    let budget = width
+        .saturating_sub(theme.glyph.tool.width() + name.width() + 3)
+        .max(24);
+    let rest = shorten_header_paths(&rest, budget);
+    let header = if rest.is_empty() {
+        format!("{} {name}", theme.glyph.tool)
+    } else {
+        format!("{} {name} {rest}", theme.glyph.tool)
     };
     let mut lines = render_prefixed_text(
         &header,
@@ -369,50 +434,34 @@ fn render_tool(tool: &ToolBlock, width: usize, theme: &Theme) -> Vec<Line<'stati
         fg(theme.accent.tool),
         fg(theme.accent.tool),
     );
-    lines.extend(render_tool_state(tool, marker, theme));
-    lines.extend(render_tool_body(tool, width, theme, summary.as_deref()));
+    lines.extend(render_tool_state(tool, at_ms, theme));
+    // 失败态的正文去重键置空：legacy summary（已从头部抑制）与失败理由常是
+    // 同一行，逐字去重会把**证据**从正文里吃掉——状态行只放分类 code，正文
+    // 必须完整承载理由。成功态的摘要去重照旧。
+    let body_dedup_key = if tool.state == ToolState::Failed {
+        None
+    } else {
+        summary.as_deref()
+    };
+    lines.extend(render_tool_body(tool, width, theme, body_dedup_key));
     lines
 }
 
-/// 把后端 summary 拆成 `(终态标记, 正文)`：`[OK] edit /p` → `(Some("OK"), "edit /p")`。
-///
-/// 标记是后端 display 投影给的（`[OK]` / `[ERR]` / `[FAIL]`），拆出来是为了：
-/// ① 头里能重新排成"名字在前、标记居中"；② 状态行据此判断"成功是不是已经说过了"。
-fn split_summary_marker(summary: &str) -> (Option<&str>, &str) {
-    let trimmed = summary.trim();
-    if let Some(rest) = trimmed.strip_prefix('[')
-        && let Some((marker, tail)) = rest.split_once(']')
-    {
-        return (Some(marker), tail.trim_start());
-    }
-    (None, trimmed)
-}
-
-/// 去掉正文开头的工具名（`edit /p` → `/p`），返回 `(剩余, 是否真的去掉过)`。
-fn strip_tool_prefix<'a>(text: &'a str, name: &str) -> (&'a str, bool) {
-    if name.is_empty() {
-        return (text, false);
-    }
-    match text.get(..name.len()) {
-        Some(head)
-            if head.eq_ignore_ascii_case(name)
-                && text[name.len()..]
-                    .chars()
-                    .next()
-                    .is_none_or(|ch| ch == ' ' || ch == ':' || ch == '/') =>
-        {
-            (text[name.len()..].trim_start(), true)
+/// 类型化头部 → 头部正文。Shell 带 `$` 前缀点明「经 shell 执行」；
+/// 命令/路径本身不再拆标记、去重名（它们不含工具名，也不含终态结论）。
+fn typed_header_rest(header: &ToolHeader) -> String {
+    match header {
+        ToolHeader::Shell { command } => format!("$ {}", sanitize_text(command)),
+        ToolHeader::Path { path } => sanitize_text(path),
+        ToolHeader::Query { query, scope } => {
+            let query = sanitize_text(query);
+            match scope.as_deref().filter(|scope| !scope.is_empty()) {
+                Some(scope) => format!("{query} · {}", sanitize_text(scope)),
+                None => query,
+            }
         }
-        _ => (text, false),
+        ToolHeader::Other { label } => sanitize_text(label),
     }
-}
-
-/// summary 的标记是否已经说明了成功。
-fn marker_states_success(marker: Option<&str>) -> bool {
-    marker.is_some_and(|marker| {
-        let upper = marker.to_ascii_uppercase();
-        upper == "OK" || upper == "DONE"
-    })
 }
 
 /// 头部里的长路径缩短：home 前缀换 `~`，仍然过长的路径中段省略。
@@ -471,7 +520,7 @@ fn elide_middle(text: &str, max: usize) -> String {
     format!("{head}…{}", tail_chars.into_iter().collect::<String>())
 }
 
-fn render_tool_state(tool: &ToolBlock, marker: Option<&str>, theme: &Theme) -> Vec<Line<'static>> {
+fn render_tool_state(tool: &ToolBlock, at_ms: Option<u64>, theme: &Theme) -> Vec<Line<'static>> {
     let (glyph, label, style) = match tool.state {
         ToolState::Prepared => (
             theme.glyph.running,
@@ -519,26 +568,25 @@ fn render_tool_state(tool: &ToolBlock, marker: Option<&str>, theme: &Theme) -> V
         metrics.push(format_bytes(bytes));
     }
 
-    // 分工：**summary 说"做了什么"，状态行说"结果如何"**。summary 已经自带终态
-    // 时（后端给的 `[OK]`），成功态就不再重复一遍 `✓ done`；失败/取消**保留**
-    // 标签——那里的 label 是原因（`exit 1`），不是重复的结论。
-    let label_is_redundant =
-        matches!(tool.state, ToolState::Success) && marker_states_success(marker);
+    // 分工：**summary 说"做了什么"，状态行说"结果如何"**（状态行永远渲染，
+    // 成功态 `✓ done` 也不再被 `[OK]` 标记抑制——标记机制已随旧会话兼容臂删除）。
     let mut spans = vec![Span::styled("  ".to_string(), fg(theme.text.dim))];
-    if !label_is_redundant {
-        spans.push(Span::styled(format!("{glyph} "), style));
-        spans.push(Span::styled(label, style));
-    }
+    spans.push(Span::styled(format!("{glyph} "), style));
+    spans.push(Span::styled(label, style));
     if !metrics.is_empty() {
-        let sep = if label_is_redundant { "" } else { " · " };
         spans.push(Span::styled(
-            format!("{sep}{}", metrics.join(" · ")),
+            format!(" · {}", metrics.join(" · ")),
             fg(theme.text.dim),
         ));
     }
-    // 结论与度量都没有 → 整行不画（空行也是噪声）。
-    if label_is_redundant && metrics.is_empty() {
-        return Vec::new();
+    // 终态墙钟（runtime 盖戳，MM-DD HH:MM）：dim 尾缀；缺席不画——不用本地
+    // 时钟兜底，与用户行同纪律。
+    let stamp = at_ms
+        .and_then(format_wall_clock)
+        .map(|stamp| format!(" · {stamp}"))
+        .unwrap_or_default();
+    if !stamp.is_empty() {
+        spans.push(Span::styled(stamp, fg(theme.text.dim)));
     }
     vec![Line::from(spans)]
 }
@@ -549,17 +597,34 @@ fn render_tool_body(
     theme: &Theme,
     summary: Option<&str>,
 ) -> Vec<Line<'static>> {
-    let (text, diff) = if let Some(diff) = tool.diff.as_deref() {
-        (diff, true)
-    } else if let Some(output) = tool.output.as_deref() {
-        (output, false)
-    } else if let Some(progress) = tool.progress.as_deref() {
-        (progress, false)
-    } else {
-        return Vec::new();
-    };
-    let text = sanitize_text(text);
-    let mut source: Vec<&str> = text.lines().collect();
+    // 正文行统一成 `(文本, 是否 stderr)`：diff 优先（edit/write），其次分离流
+    // （exec 的 stdout/stderr 不混排、stderr 用警示色另加段标签），最后 legacy 文本。
+    let mut source: Vec<(String, bool)> = Vec::new();
+    let mut is_diff = false;
+    if let Some(diff) = tool.diff.as_deref().filter(|diff| !diff.is_empty()) {
+        is_diff = true;
+        source.extend(
+            sanitize_text(diff)
+                .lines()
+                .map(|line| (line.to_owned(), false)),
+        );
+    } else if let Some(streams) = tool.streams.as_ref() {
+        let stdout = sanitize_text(&streams.stdout);
+        let stderr = sanitize_text(&streams.stderr);
+        source.extend(stdout.lines().map(|line| (line.to_owned(), false)));
+        source.extend(stderr.lines().map(|line| (line.to_owned(), true)));
+    } else if let Some(text) = tool
+        .output
+        .as_deref()
+        .filter(|text| !text.is_empty())
+        .or_else(|| tool.progress.as_deref().filter(|text| !text.is_empty()))
+    {
+        source.extend(
+            sanitize_text(text)
+                .lines()
+                .map(|line| (line.to_owned(), false)),
+        );
+    }
     if source.is_empty() {
         return Vec::new();
     }
@@ -569,7 +634,7 @@ fn render_tool_body(
         .map(|summary| {
             source
                 .iter()
-                .take_while(|line| line.trim() == summary.trim())
+                .take_while(|(line, _)| line.trim() == summary.trim())
                 .count()
         })
         .unwrap_or(0);
@@ -589,15 +654,23 @@ fn render_tool_body(
     } else if source.len() <= TOOL_BODY_EDGE * 2 {
         (source.clone(), 0)
     } else {
-        let mut selected: Vec<&str> = source.iter().take(TOOL_BODY_EDGE).copied().collect();
+        let mut selected: Vec<(String, bool)> =
+            source.iter().take(TOOL_BODY_EDGE).cloned().collect();
         let folded = source.len() - TOOL_BODY_EDGE * 2;
-        selected.extend(source.iter().skip(source.len() - TOOL_BODY_EDGE).copied());
+        selected.extend(
+            source
+                .iter()
+                .skip(source.len() - TOOL_BODY_EDGE)
+                .cloned()
+                .collect::<Vec<_>>(),
+        );
         (selected, folded)
     };
 
     let body_width = width.saturating_sub(4).max(1);
     let mut out = Vec::new();
-    for (idx, line) in selected.into_iter().enumerate() {
+    let mut stderr_label_pending = selected.iter().any(|(_, is_stderr)| *is_stderr);
+    for (idx, (line, is_stderr)) in selected.into_iter().enumerate() {
         if folded > 0 && idx == TOOL_BODY_EDGE {
             out.push(Line::from(vec![
                 Span::styled("    ".to_string(), fg(theme.text.dim)),
@@ -610,13 +683,30 @@ fn render_tool_body(
                 ),
             ]));
         }
-        let style = tool_body_style(line, diff, theme);
-        for seg in wrap_text(line, body_width) {
+        if is_stderr && stderr_label_pending {
+            stderr_label_pending = false;
+            out.push(Line::from(vec![
+                Span::styled("    ".to_string(), fg(theme.text.dim)),
+                Span::styled("⚠ stderr", fg(theme.semantic.warning)),
+            ]));
+        }
+        let style = if is_stderr {
+            fg(theme.semantic.warning)
+        } else {
+            tool_body_style(&line, is_diff, theme)
+        };
+        for seg in wrap_text(&line, body_width) {
             out.push(Line::from(vec![
                 Span::styled("    ".to_string(), fg(theme.text.dim)),
                 Span::styled(seg, style),
             ]));
         }
+    }
+    if tool.truncated {
+        out.push(Line::from(vec![
+            Span::styled("    ".to_string(), fg(theme.text.dim)),
+            Span::styled("… 已截断", fg(theme.text.dim)),
+        ]));
     }
     out
 }
@@ -734,6 +824,26 @@ mod tests {
     use super::*;
     use crate::theme::{ColorSupport, ThemeKind};
 
+    /// 工具块测试构造器：默认无类型化头部/流/截断（legacy summary 路径）。
+    fn tool_block(name: &str, summary: Option<&str>, state: ToolState) -> ToolBlock {
+        ToolBlock {
+            name: name.to_string(),
+            summary: summary.map(str::to_string),
+            state,
+            output: None,
+            diff: None,
+            progress: None,
+            failure: None,
+            duration: None,
+            bytes: None,
+            expanded: false,
+            header: None,
+            streams: None,
+            exit_code: None,
+            truncated: false,
+        }
+    }
+
     fn theme() -> Theme {
         Theme::resolve(ThemeKind::QaqhNight, ColorSupport::TrueColor)
     }
@@ -763,6 +873,75 @@ mod tests {
         assert!(lines.len() > 1);
         assert!(text_of(&lines).contains("❯"));
         assert!(lines.iter().all(|line| line.width() <= 24));
+    }
+
+    /// 全宽度扫描：1..=60 列逐列渲染各块型，断言不 panic 且不超出预算。
+    ///
+    /// `MIN_WIDTH=20` 钳制的契约：终端窄于 20 列时仍按 20 列渲染，横向超出
+    /// 由 Paragraph 截断兜底（极窄下降级为横截而不是版面破碎/panic）；
+    /// ≥20 列时必须完整收敛在给定宽度内。中文宽字符在每个宽度档都不能被切裂。
+    #[test]
+    fn render_block_sweeps_widths_without_overflow() {
+        let theme = theme();
+        let blocks = [
+            TranscriptBlock::new(
+                "u1",
+                BlockKind::User {
+                    text: "中文宽度扫描：解释终端渲染设计的边界条件与 CJK 宽字符处理。".into(),
+                },
+            ),
+            TranscriptBlock::new(
+                "a1",
+                BlockKind::Assistant {
+                    text: "# 标题\n\n正文段落，中英 mixed words、`inline code`。\n\n```rust\nfn main() { println!(\"你好世界\"); }\n```\n\n| 列一 | 列二 |\n| --- | --- |\n| 甲 | 乙 |\n"
+                        .into(),
+                },
+            ),
+            TranscriptBlock::new(
+                "t1",
+                BlockKind::Thinking {
+                    text: "思考链第一行\n第二行更长的思考内容".into(),
+                    duration: None,
+                    expanded: true,
+                },
+            ),
+            TranscriptBlock::new(
+                "s1",
+                BlockKind::System {
+                    text: "系统提示：压缩完成".into(),
+                },
+            ),
+            TranscriptBlock::new(
+                "tool1",
+                BlockKind::Tool(Box::new(tool_block(
+                    "exec",
+                    Some("cargo test --workspace"),
+                    ToolState::Running,
+                ))),
+            ),
+            TranscriptBlock::new(
+                "tool2",
+                BlockKind::Tool(Box::new({
+                    let mut tool =
+                        tool_block("exec", Some("cargo test --workspace"), ToolState::Success);
+                    tool.output = Some("stdout 全文正文，很长的一段工具输出用来压测换行……".into());
+                    tool
+                })),
+            ),
+        ];
+        for width in 1..=60 {
+            for block in &blocks {
+                let lines = render_block(block, width, &theme);
+                let budget = width.max(MIN_WIDTH);
+                for line in &lines {
+                    assert!(
+                        line.width() <= budget,
+                        "width {width}（budget {budget}）溢出：{:?}",
+                        text_of(std::slice::from_ref(line))
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -821,86 +1000,161 @@ mod tests {
         assert!(text.contains("点击收起"), "{text}");
     }
 
-    /// 工具卡的**去冗余**回归锁。四条都来自真机实拍：
-    /// `⚙ edit [OK] edit /path`（工具名两次）、`✓ done`（成功两次说）、
-    /// `read` 摘要与正文逐字重复、`0.0s`（亚 100ms 的无信息量度量）。
+    /// 工具卡的**去冗余**回归锁。`[OK]` 标记拆解已随旧会话兼容臂删除
+    /// （2026-10-03），这里保留仍然成立的两条。
     #[test]
     fn tool_card_does_not_repeat_what_summary_already_says() {
         let theme = theme();
 
-        // ① 后端 summary 自带工具名 + `[OK]`：头不重复名字，状态行不再说 done。
-        let tool = ToolBlock {
-            name: "edit".into(),
-            summary: Some("[OK] edit /tmp/a.txt".into()),
-            state: ToolState::Success,
-            output: None,
-            diff: None,
-            progress: None,
-            failure: None,
-            duration: Some(Duration::from_millis(40)),
-            bytes: Some(96),
-            expanded: false,
-        };
+        // ① wire 名展示为大写形（Edit）；摘要与正文逐字相同时不重复正文。
+        let mut tool = tool_block("read", Some("L1: timeout = 30"), ToolState::Success);
+        tool.output = Some("L1: timeout = 30".into());
+        tool.duration = Some(Duration::from_millis(500));
         let text = text_of(&render_block(
-            &TranscriptBlock::new("t1", BlockKind::Tool(tool)),
+            &TranscriptBlock::new("t1", BlockKind::Tool(Box::new(tool))),
             100,
             &theme,
         ));
         assert_eq!(
-            text.matches("edit").count(),
+            text.matches("Read").count(),
             1,
             "工具名只能说一次：\n{text}"
         );
-        assert!(
-            !text.contains("done"),
-            "summary 已有 [OK]，不该再说 done：\n{text}"
-        );
-        assert!(text.contains("96 B"), "度量要保留：\n{text}");
-        assert!(!text.contains("0.0s"), "亚 100ms 不显示耗时：\n{text}");
-
-        // ② summary 与正文逐字相同时不重复正文。
-        let tool = ToolBlock {
-            name: "read".into(),
-            summary: Some("L1: timeout = 30".into()),
-            state: ToolState::Success,
-            output: Some("L1: timeout = 30".into()),
-            diff: None,
-            progress: None,
-            failure: None,
-            duration: Some(Duration::from_millis(500)),
-            bytes: None,
-            expanded: false,
-        };
-        let text = text_of(&render_block(
-            &TranscriptBlock::new("t2", BlockKind::Tool(tool)),
-            100,
-            &theme,
-        ));
+        assert!(!text.contains("read "), "wire 名不应以小写形上屏：\n{text}");
         assert_eq!(
             text.matches("L1: timeout = 30").count(),
             1,
             "摘要与正文重复时应只留一处：\n{text}"
         );
 
-        // ③ 失败态**保留**原因（`exit 1` 不是重复的结论，是信息）。
-        let tool = ToolBlock {
-            name: "bash".into(),
-            summary: Some("cargo clippy".into()),
-            state: ToolState::Failed,
-            output: Some("error: unused import".into()),
-            diff: None,
-            progress: None,
-            failure: Some("exit 1".into()),
-            duration: Some(Duration::from_millis(900)),
-            bytes: None,
-            expanded: false,
-        };
+        // ② 失败态**保留**原因（`exit 1` 不是重复的结论，是信息）。
+        let mut tool = tool_block("bash", Some("cargo clippy"), ToolState::Failed);
+        tool.output = Some("error: unused import".into());
+        tool.failure = Some("exit 1".into());
+        tool.duration = Some(Duration::from_millis(900));
         let text = text_of(&render_block(
-            &TranscriptBlock::new("t3", BlockKind::Tool(tool)),
+            &TranscriptBlock::new("t2", BlockKind::Tool(Box::new(tool))),
             100,
             &theme,
         ));
         assert!(text.contains("exit 1"), "失败原因不能被去重吃掉：\n{text}");
+    }
+
+    /// 契约切片：终态墙钟 dim 尾缀；缺席不画（不用本地时钟兜底）。
+    #[test]
+    fn tool_state_line_carries_authoritative_wall_clock_when_known() {
+        let theme = theme();
+        let ts: u64 = 1_759_488_000_000;
+        let expected = format!(
+            " · {}",
+            format_wall_clock(ts).expect("固定 epoch 必须可格式化")
+        );
+
+        let mut tool = tool_block("exec", None, ToolState::Success);
+        let with_ts = TranscriptBlock {
+            at_ms: Some(ts),
+            ..TranscriptBlock::new("w1", BlockKind::Tool(Box::new(tool.clone())))
+        };
+        let text = text_of(&render_block(&with_ts, 90, &theme));
+        assert!(text.contains(&expected), "状态行带墙钟尾缀：
+{text}");
+
+        tool.duration = Some(Duration::from_millis(40)); // 亚 100ms 不显示耗时
+        let no_ts = TranscriptBlock::new("w2", BlockKind::Tool(Box::new(tool)));
+        let text = text_of(&render_block(&no_ts, 90, &theme));
+        assert!(
+            !text.contains(" · "),
+            "墙钟缺席时状态行不画时间：
+{text}"
+        );
+    }
+
+    /// 失败态**单显示**回归锁（2026-10-03 双重显示事故）：legacy 摘要首行 =
+    /// 失败理由，状态行已承载同一条理由——头里再放一遍就是重复。新数据下
+    /// 错误文本只出现在状态行，正文只留证据（Hint/后续行）。
+    #[test]
+    fn failed_tool_shows_the_reason_exactly_once() {
+        let theme = theme();
+        let reason = "file changed since read";
+        let mut tool = tool_block("edit", Some(reason), ToolState::Failed);
+        tool.output = Some(format!("{reason}
+Hint: re-read the file"));
+        // 适配器最终产出：正文有证据 → 状态行只放分类 code。
+        tool.failure = Some("stale_file".into());
+        let text = text_of(&render_block(
+            &TranscriptBlock::new("f1", BlockKind::Tool(Box::new(tool))),
+            100,
+            &theme,
+        ));
+        let header = text.lines().next().unwrap_or_default();
+        assert_eq!(
+            header,
+            format!("{} Edit", theme.glyph.tool),
+            "失败态头部不再重复理由，只留工具名：
+{text}"
+        );
+        assert_eq!(
+            text.matches(reason).count(),
+            1,
+            "错误理由只能出现一次（状态行）：
+{text}"
+        );
+        assert!(text.contains("Hint: re-read the file"), "正文证据保留：
+{text}");
+    }
+
+    /// 旧 journal 回放（failure.message 曾是整段 output）：标签已由 adapter
+    /// 压成单行，渲染层靠「正文逐字去重 + 头部抑制」保证首行不再三处出现。
+    #[test]
+    fn replayed_failure_reason_appears_once_not_thrice() {
+        let theme = theme();
+        let reason = "error: could not compile";
+        let mut tool = tool_block("bash", Some(reason), ToolState::Failed);
+        tool.output = Some(format!("{reason}
+more context follows"));
+        // 旧 journal 回放 + 适配器产出：正文有证据 → 裸 code。
+        tool.failure = Some("tool_execution_failed".into());
+        let text = text_of(&render_block(
+            &TranscriptBlock::new("f2", BlockKind::Tool(Box::new(tool))),
+            100,
+            &theme,
+        ));
+        assert_eq!(
+            text.matches(reason).count(),
+            1,
+            "旧数据回放也不得三重显示：
+{text}"
+        );
+        assert!(text.contains("more context follows"), "证据后续行保留：
+{text}");
+    }
+
+    /// typed header 是「做了什么」的真相字段：失败态照常保留命令，错误只在
+    /// 正文（stderr）出现一次。
+    #[test]
+    fn typed_header_failure_keeps_command_and_single_error_display() {
+        let theme = theme();
+        let mut tool = tool_block("exec", None, ToolState::Failed);
+        tool.header = Some(ToolHeader::Shell {
+            command: "cargo build".into(),
+        });
+        tool.streams = Some(ToolStreams {
+            stdout: String::new(),
+            stderr: "error: could not compile".into(),
+        });
+        tool.exit_code = Some(101);
+        tool.failure = Some("exit 101".into());
+        let text = text_of(&render_block(
+            &TranscriptBlock::new("f3", BlockKind::Tool(Box::new(tool))),
+            90,
+            &theme,
+        ));
+        let header = text.lines().next().unwrap_or_default();
+        assert!(
+            header.contains("cargo build"),
+            "typed 头部保留命令真相字段：{header}"
+        );
+        assert_eq!(text.matches("could not compile").count(), 1, "{text}");
     }
 
     /// 头部路径缩短：home 前缀换 `~`，过长中段省略；**正文不动**（正文是证据）。
@@ -909,20 +1163,12 @@ mod tests {
         let theme = theme();
         let home = std::env::var("HOME").unwrap_or_else(|_| "/home/u".into());
         let long = format!("{home}/projects/very/deep/tree/with/many/segments/file.txt");
-        let tool = ToolBlock {
-            name: "write".into(),
-            summary: Some(format!("[OK] {long}")),
-            state: ToolState::Success,
-            output: Some(long.clone()),
-            diff: None,
-            progress: None,
-            failure: None,
-            duration: None,
-            bytes: None,
-            expanded: false,
-        };
+        // 现行 wire：write 走 typed Path 头；summary 为 None → 正文无逐字去重。
+        let mut tool = tool_block("write", None, ToolState::Success);
+        tool.header = Some(ToolHeader::Path { path: long.clone() });
+        tool.output = Some(long.clone());
         let text = text_of(&render_block(
-            &TranscriptBlock::new("t1", BlockKind::Tool(tool)),
+            &TranscriptBlock::new("t1", BlockKind::Tool(Box::new(tool))),
             60,
             &theme,
         ));
@@ -934,33 +1180,25 @@ mod tests {
         );
         assert!(header.contains('…'), "头部过长路径应中段省略：{header}");
         // 正文照旧完整（它是对齐/复制的依据，不能被缩写出错）。正文按宽度折行，
-        // 所以分头尾两段判，而不是整串比对。
+        // 折行位置随终端宽度与 HOME 长度变化，所以剥掉空白后再比对。
+        let unwrapped: String = text.chars().filter(|ch| !ch.is_whitespace()).collect();
         assert!(
-            text.contains(&format!("{home}/projects/very")),
+            unwrapped.contains(&format!("{home}/projects/very")),
             "正文不得被缩短（home 前缀应原样保留）：\n{text}"
         );
         assert!(
-            text.contains("file.txt"),
+            unwrapped.contains("file.txt"),
             "正文不得被缩短（尾部应原样保留）：\n{text}"
         );
     }
 
     #[test]
     fn expanded_tool_body_reveals_the_folded_middle() {
-        let tool = ToolBlock {
-            name: "exec".to_string(),
-            summary: Some("cargo test".to_string()),
-            state: ToolState::Success,
-            output: Some("one\ntwo\nthree\nfour\nfive\nsix\nseven\neight".to_string()),
-            diff: None,
-            progress: None,
-            failure: None,
-            duration: None,
-            bytes: None,
-            expanded: true,
-        };
+        let mut tool = tool_block("exec", Some("cargo test"), ToolState::Success);
+        tool.output = Some("one\ntwo\nthree\nfour\nfive\nsix\nseven\neight".into());
+        tool.expanded = true;
         let text = text_of(&render_block(
-            &TranscriptBlock::new("tool-expanded", BlockKind::Tool(tool)),
+            &TranscriptBlock::new("tool-expanded", BlockKind::Tool(Box::new(tool))),
             60,
             &theme(),
         ));
@@ -970,23 +1208,92 @@ mod tests {
 
     #[test]
     fn tool_failure_is_inline_and_fold_is_visible() {
-        let tool = ToolBlock {
-            name: "exec".to_string(),
-            summary: Some("cargo test".to_string()),
-            state: ToolState::Failed,
-            output: Some("one\ntwo\nthree\nfour\nfive\nsix\nseven\neight".to_string()),
-            diff: None,
-            progress: None,
-            failure: Some("exit 1".to_string()),
-            duration: Some(Duration::from_millis(1200)),
-            bytes: Some(18 * 1024),
-            expanded: false,
-        };
-        let block = TranscriptBlock::new("tool1", BlockKind::Tool(tool));
+        let mut tool = tool_block("exec", Some("cargo test"), ToolState::Failed);
+        tool.output = Some("one\ntwo\nthree\nfour\nfive\nsix\nseven\neight".into());
+        tool.failure = Some("exit 1".into());
+        tool.duration = Some(Duration::from_millis(1200));
+        tool.bytes = Some(18 * 1024);
+        let block = TranscriptBlock::new("tool1", BlockKind::Tool(Box::new(tool)));
         let text = text_of(&render_block(&block, 60, &theme()));
-        assert!(text.contains("exec cargo test"));
+        // 失败态头部不再带 legacy 摘要（它与状态行理由重复，见
+        // failed_tool_shows_the_reason_exactly_once）；标签与折叠提示照旧。
+        let header = text.lines().next().unwrap_or_default();
+        assert_eq!(header, format!("{} Exec", theme().glyph.tool), "{text}");
         assert!(text.contains("exit 1"));
         assert!(text.contains("折叠 2 行"));
+    }
+
+    /// display 契约的 Shell 头部：头部只有命令真相字段（`$` 前缀），名字大写，
+    /// summary（`exit 0 · …`）不再和头部/状态行重复。
+    #[test]
+    fn shell_header_shows_command_and_capitalized_name() {
+        let mut tool = tool_block("exec", None, ToolState::Success);
+        tool.header = Some(ToolHeader::Shell {
+            command: "cargo check --tests".into(),
+        });
+        tool.output = Some("warning: unused import".into());
+        tool.duration = Some(Duration::from_millis(800));
+        let text = text_of(&render_block(
+            &TranscriptBlock::new("t1", BlockKind::Tool(Box::new(tool))),
+            90,
+            &theme(),
+        ));
+        let header = text.lines().next().unwrap_or_default();
+        assert_eq!(header, "⚙ Exec $ cargo check --tests", "{text}");
+        assert!(text.contains("done"), "{text}");
+        assert!(text.contains("0.8s"), "{text}");
+        assert!(
+            !text.contains("exit 0"),
+            "成功退出码是噪声，不该上屏：\n{text}"
+        );
+        assert!(!text.contains("exec"), "wire 名不上屏：\n{text}");
+    }
+
+    /// 分离流正文：stdout 原样，stderr 有警示段标签，不再把模型向 JSON 当正文。
+    #[test]
+    fn streams_body_labels_stderr() {
+        let mut tool = tool_block("exec", None, ToolState::Failed);
+        tool.streams = Some(ToolStreams {
+            stdout: "compiling qaqh-tui".into(),
+            stderr: "error: could not compile".into(),
+        });
+        tool.failure = Some("exit 101".into());
+        let text = text_of(&render_block(
+            &TranscriptBlock::new("t1", BlockKind::Tool(Box::new(tool))),
+            80,
+            &theme(),
+        ));
+        assert!(text.contains("compiling qaqh-tui"), "{text}");
+        assert!(text.contains("⚠ stderr"), "{text}");
+        assert!(text.contains("error: could not compile"), "{text}");
+        assert!(text.contains("exit 101"), "{text}");
+        assert!(
+            !text.contains("{\"status\""),
+            "模型向 JSON 不得上屏：\n{text}"
+        );
+    }
+
+    #[test]
+    fn truncated_body_announces_itself() {
+        let mut tool = tool_block("read", Some("plan.md"), ToolState::Success);
+        tool.output = Some("L1\nL2\nL3\nL4\nL5\nL6\nL7".into());
+        tool.truncated = true;
+        let text = text_of(&render_block(
+            &TranscriptBlock::new("t1", BlockKind::Tool(Box::new(tool))),
+            60,
+            &theme(),
+        ));
+        assert!(text.contains("已截断"), "{text}");
+    }
+
+    #[test]
+    fn tool_names_display_in_title_case() {
+        assert_eq!(display_tool_name("exec"), "Exec");
+        assert_eq!(display_tool_name("read"), "Read");
+        assert_eq!(display_tool_name("write"), "Write");
+        assert_eq!(display_tool_name("todo_write"), "Todo Write");
+        assert_eq!(display_tool_name(""), "");
+        assert_eq!(display_tool_name("_a"), "A");
     }
 
     #[test]
@@ -1086,18 +1393,13 @@ mod tests {
             .with_state(BlockState::Sealed),
             TranscriptBlock::new(
                 "tool",
-                BlockKind::Tool(ToolBlock {
-                    name: "read".to_string(),
-                    summary: Some("plan.md".to_string()),
-                    state: ToolState::Success,
-                    output: Some("line one\nline two".to_string()),
-                    diff: None,
-                    progress: None,
-                    failure: None,
-                    duration: Some(Duration::from_millis(800)),
-                    bytes: Some(1024),
-                    expanded: false,
-                }),
+                BlockKind::Tool(Box::new({
+                    let mut tool = tool_block("read", Some("plan.md"), ToolState::Success);
+                    tool.output = Some("line one\nline two".into());
+                    tool.duration = Some(Duration::from_millis(800));
+                    tool.bytes = Some(1024);
+                    tool
+                })),
             ),
             TranscriptBlock::new(
                 "s",
@@ -1109,7 +1411,7 @@ mod tests {
         assert_eq!(
             text_of(&render_transcript(&blocks, 40, &theme())),
             "  ❯ hello 世界\n\n◆ Title\n  \n  body\n\n◇ Thought for 1.2s\n\n\
-             ⚙ read plan.md\n  ✓ done · 0.8s · 1.0 KB\n    line one\n    line two\n\n· note"
+             ⚙ Read plan.md\n  ✓ done · 0.8s · 1.0 KB\n    line one\n    line two\n\n· note"
         );
     }
 }
