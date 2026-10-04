@@ -19,8 +19,8 @@ use ratatui::widgets::Paragraph;
 
 use qaqh_client::DomainActivityState;
 
-use crate::app::anim;
 use crate::app::App;
+use crate::app::anim;
 use crate::theme::Theme;
 use crate::ui::v2::button::ButtonVisual;
 use crate::ui::v2::fullscreen::FullscreenState;
@@ -59,7 +59,9 @@ fn status_glyph(
         (Some(DomainActivityState::Working | DomainActivityState::Starting), _) => {
             (anim::claude_spinner_glyph(frame), running_style)
         }
-        (Some(DomainActivityState::WaitingUser), _) => ("◆", Style::new().fg(theme.semantic.warning)),
+        (Some(DomainActivityState::WaitingUser), _) => {
+            ("◆", Style::new().fg(theme.semantic.warning))
+        }
         (Some(DomainActivityState::Failed), _) => ("✖", Style::new().fg(theme.accent.error)),
         (Some(DomainActivityState::Idle), _) => ("●", Style::new().fg(theme.accent.success)),
         (Some(DomainActivityState::Disconnected), _) => ("○", Style::new().fg(theme.text.dim)),
@@ -354,8 +356,7 @@ mod tests {
         let (mut app, _rx) = crate::app::App::new_for_test();
         for id in ["s-1", "s-2"] {
             app.tabs.push(id.into());
-            app.sessions
-                .insert(id.into(), SessionState::new(id.into()));
+            app.sessions.insert(id.into(), SessionState::new(id.into()));
             let mut entry = SessionListEntry {
                 meta: SessionMeta {
                     session_id: id.into(),
@@ -383,7 +384,17 @@ mod tests {
 
         // 帧一：s-1 选中，无动画。
         terminal
-            .draw(|frame| draw(frame, &app, rail_area, &theme, &pointer, &mut anim, &mut hit_map))
+            .draw(|frame| {
+                draw(
+                    frame,
+                    &app,
+                    rail_area,
+                    &theme,
+                    &pointer,
+                    &mut anim,
+                    &mut hit_map,
+                )
+            })
             .unwrap();
         assert_eq!(anim.active_row, Some(0));
         assert!(anim.slide_from.is_none());
@@ -391,7 +402,17 @@ mod tests {
         // 帧二：切到 s-2 → 旧行 s-1 保留余晖底色，新行点亮 selection。
         app.active = 1;
         terminal
-            .draw(|frame| draw(frame, &app, rail_area, &theme, &pointer, &mut anim, &mut hit_map))
+            .draw(|frame| {
+                draw(
+                    frame,
+                    &app,
+                    rail_area,
+                    &theme,
+                    &pointer,
+                    &mut anim,
+                    &mut hit_map,
+                )
+            })
             .unwrap();
         assert_eq!(anim.active_row, Some(1));
         assert_eq!(anim.slide_from.map(|(from, _)| from), Some(0));

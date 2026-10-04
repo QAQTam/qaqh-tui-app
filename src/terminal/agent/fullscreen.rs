@@ -172,7 +172,15 @@ pub(super) fn draw_fullscreen_agent(
         }
     }
     if rail > 0 {
-        sidebar::draw(frame, app, rail_area, theme, &view.pointer, &mut view.sidebar_anim, hit_map);
+        sidebar::draw(
+            frame,
+            app,
+            rail_area,
+            theme,
+            &view.pointer,
+            &mut view.sidebar_anim,
+            hit_map,
+        );
     }
     if let Some(cursor) = rendered.cursor {
         frame.set_cursor_position((
@@ -235,7 +243,12 @@ pub(super) fn draw_fullscreen_agent(
     // 消息行与浮层都按**刚画完的这一帧**登记：行窗口来自 render 写回的
     // `visible_start`，按钮/菜单矩形复用 ui_fullscreen 的渲染几何。
     let active_session_id = app.active_session_id();
-    register_agent_messages(hit_map, body, view, active_session_id.as_deref().unwrap_or(""));
+    register_agent_messages(
+        hit_map,
+        body,
+        view,
+        active_session_id.as_deref().unwrap_or(""),
+    );
     let show_back_to_latest = view.can_scroll(app)
         && app
             .active_session()
@@ -753,12 +766,11 @@ impl FullscreenView {
     }
 
     pub(super) fn max_offset(&self, app: &App) -> usize {
-        app.active_session_id()
-            .map_or(0, |id| {
-                self.transcripts
-                    .len_for(&id)
-                    .saturating_sub(usize::from(self.body_height))
-            })
+        app.active_session_id().map_or(0, |id| {
+            self.transcripts
+                .len_for(&id)
+                .saturating_sub(usize::from(self.body_height))
+        })
     }
 
     pub(super) fn scroll_up(&mut self, app: &mut App, lines: usize) {
@@ -1068,10 +1080,8 @@ impl TranscriptCaches {
             self.lru.push(id);
         } else {
             self.lru.push(session_id.to_string());
-            self.entries.insert(
-                session_id.to_string(),
-                FullscreenTranscriptCache::default(),
-            );
+            self.entries
+                .insert(session_id.to_string(), FullscreenTranscriptCache::default());
             while self.lru.len() > Self::CAP {
                 let evicted = self.lru.remove(0);
                 self.entries.remove(&evicted);

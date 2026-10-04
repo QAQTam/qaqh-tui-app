@@ -1398,7 +1398,7 @@ mod tests {
                             state: TimelineBlockState::Sealed,
                             text: String::new(),
                             tool: Some(ToolCard {
-exit_code: None,
+                                exit_code: None,
                                 completed_at_ms: None,
                                 tool_call_id: "tc2".into(),
                                 name: "bash".into(),

@@ -931,7 +931,7 @@ mod tests {
                 state: TimelineBlockState::Sealed,
                 text: String::new(),
                 tool: Some(ToolCard {
-exit_code: None,
+                    exit_code: None,
                     completed_at_ms: None,
                     tool_call_id: "call".into(),
                     name: "exec".into(),

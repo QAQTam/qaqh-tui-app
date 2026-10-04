@@ -417,14 +417,9 @@ pub fn render_block(block: &TranscriptBlock, width: usize, theme: &Theme) -> Vec
         BlockKind::Tool(tool) => render_tool(tool, width, theme),
         BlockKind::System { text } => render_system(text, width, theme),
     };
-    if block.state == BlockState::Live
-        && matches!(block.kind, BlockKind::Assistant { .. })
-    {
+    if block.state == BlockState::Live && matches!(block.kind, BlockKind::Assistant { .. }) {
         use unicode_width::UnicodeWidthStr;
-        let cursor = Span::styled(
-            theme.glyph.cursor.to_string(),
-            fg(theme.accent.assistant),
-        );
+        let cursor = Span::styled(theme.glyph.cursor.to_string(), fg(theme.accent.assistant));
         let cursor_width = theme.glyph.cursor.width();
         // 流式光标不能突破宽度预算：最后一行已满宽时（表格边框/代码围栏
         // 恰好收敛）另起一行，否则会被 Paragraph 截断成不可见。
@@ -2053,8 +2048,10 @@ mod tests {
         let theme = theme();
         let reason = "file changed since read";
         let mut tool = tool_block("edit", Some(reason), ToolState::Failed);
-        tool.output = Some(format!("{reason}
-Hint: re-read the file"));
+        tool.output = Some(format!(
+            "{reason}
+Hint: re-read the file"
+        ));
         // 适配器最终产出：正文有证据 → 状态行只放分类 code。
         tool.failure = Some("stale_file".into());
         let text = text_of(&render_block(
@@ -2074,8 +2071,11 @@ Hint: re-read the file"));
             "错误理由只能出现一次（状态行）：
 {text}"
         );
-        assert!(text.contains("Hint: re-read the file"), "正文证据保留：
-{text}");
+        assert!(
+            text.contains("Hint: re-read the file"),
+            "正文证据保留：
+{text}"
+        );
     }
 
     /// 旧 journal 回放（failure.message 曾是整段 output）：标签已由 adapter
@@ -2085,8 +2085,10 @@ Hint: re-read the file"));
         let theme = theme();
         let reason = "error: could not compile";
         let mut tool = tool_block("bash", Some(reason), ToolState::Failed);
-        tool.output = Some(format!("{reason}
-more context follows"));
+        tool.output = Some(format!(
+            "{reason}
+more context follows"
+        ));
         // 旧 journal 回放 + 适配器产出：正文有证据 → 裸 code。
         tool.failure = Some("tool_execution_failed".into());
         let text = text_of(&render_block(
@@ -2100,8 +2102,11 @@ more context follows"));
             "旧数据回放也不得三重显示：
 {text}"
         );
-        assert!(text.contains("more context follows"), "证据后续行保留：
-{text}");
+        assert!(
+            text.contains("more context follows"),
+            "证据后续行保留：
+{text}"
+        );
     }
 
     /// typed header 是「做了什么」的真相字段：失败态照常保留命令，错误只在

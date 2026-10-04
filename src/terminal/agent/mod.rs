@@ -1703,7 +1703,7 @@ mod tests {
                     state: TimelineBlockState::Sealed,
                     text: String::new(),
                     tool: Some(qaqh_client::TimelineTool {
-exit_code: None,
+                        exit_code: None,
                         completed_at_ms: None,
                         tool_call_id: "call-1".to_string(),
                         name: "exec".to_string(),
@@ -2705,8 +2705,10 @@ exit_code: None,
                 workspace_id: None,
             },
         ];
-        app.activity_cache
-            .insert("session-2".into(), qaqh_client::DomainActivityState::Working);
+        app.activity_cache.insert(
+            "session-2".into(),
+            qaqh_client::DomainActivityState::Working,
+        );
         app.show_workspace = false;
 
         let mut view = FullscreenView::default();
@@ -2782,10 +2784,10 @@ exit_code: None,
         let mut view = FullscreenView::default();
         let (map, _backend) = draw_agent_to_map(&app, &mut view, 80, 24);
         assert!(
-            !map
-                .regions
-                .iter()
-                .any(|region| matches!(region.target, PointerTarget::Agent(AgentTarget::SidebarRow(_)))),
+            !map.regions.iter().any(|region| matches!(
+                region.target,
+                PointerTarget::Agent(AgentTarget::SidebarRow(_))
+            )),
             "narrow terminal must not register rail rows"
         );
     }
@@ -2854,7 +2856,10 @@ exit_code: None,
         );
         // 逐出后复摸 session-2：全新缓存，从零重新计 miss。
         let misses_2_fresh = synced_misses(&mut view, "session-2");
-        assert_eq!(misses_2_fresh, misses_1_first, "fresh cache re-renders everything");
+        assert_eq!(
+            misses_2_fresh, misses_1_first,
+            "fresh cache re-renders everything"
+        );
     }
 
     #[tokio::test]
@@ -2869,14 +2874,17 @@ exit_code: None,
             workspace_id: None,
         };
         entry2.meta.title = Some("第二个会话".into());
-        app.session_list_cache = vec![SessionListEntry {
-            meta: SessionMeta {
-                session_id: "session-1".into(),
-                ..SessionMeta::default()
+        app.session_list_cache = vec![
+            SessionListEntry {
+                meta: SessionMeta {
+                    session_id: "session-1".into(),
+                    ..SessionMeta::default()
+                },
+                running: true,
+                workspace_id: None,
             },
-            running: true,
-            workspace_id: None,
-        }, entry2];
+            entry2,
+        ];
 
         // 开第二个 tab：它成为 active，只有它挂流。
         app.open_session_tab("session-2");
@@ -2918,7 +2926,6 @@ exit_code: None,
         assert!(!app.sessions["session-1"].suspended);
         assert!(app.sessions["session-2"].suspended);
     }
-
 
     #[test]
     fn tool_card_click_toggles_expansion_via_presented_frame() {

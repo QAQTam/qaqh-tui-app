@@ -2053,10 +2053,7 @@ impl App {
                         && previous.is_some_and(|prev| prev != ActivityState::Failed)
                         && self.active_session_id().as_ref() != Some(&item.session_id)
                     {
-                        self.toast(
-                            NoticeLevel::Error,
-                            format!("会话 {} 出错", item.session_id),
-                        );
+                        self.toast(NoticeLevel::Error, format!("会话 {} 出错", item.session_id));
                     }
                 }
             }
@@ -2694,7 +2691,8 @@ mod tests {
         app.sessions
             .insert("s-active".into(), SessionState::new("s-active".into()));
         app.active = 0;
-        app.activity_cache.insert("s-bg".into(), ActivityState::Working);
+        app.activity_cache
+            .insert("s-bg".into(), ActivityState::Working);
         app.activity_cache
             .insert("s-active".into(), ActivityState::Working);
 

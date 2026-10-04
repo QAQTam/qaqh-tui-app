@@ -91,7 +91,10 @@ impl App {
     /// 侧栏行点击：已打开的 tab 直接聚焦，未打开的走既有 open（attach+bootstrap）。
     /// 全部复用 [`App::open_session_tab`]，不另开语义。
     pub fn sidebar_open(&mut self, index: usize) {
-        let Some(session_id) = self.sidebar_rows().get(index).map(|row| row.session_id.clone())
+        let Some(session_id) = self
+            .sidebar_rows()
+            .get(index)
+            .map(|row| row.session_id.clone())
         else {
             return;
         };

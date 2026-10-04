@@ -554,7 +554,6 @@ fn first_line_bounded(text: &str, max_chars: usize) -> String {
     bounded
 }
 
-
 /// 终屏归一（与后端 exec display 的 `normalize_carriage_returns` 同语义）：
 /// CRLF → LF；行内 `\r` 覆盖只留最后一个非空段（apt/spinner 进度行）；
 /// 纯 `\r` 行丢弃。对已归一的文本幂等。
@@ -830,7 +829,7 @@ mod tests {
             "",
         );
         tool_block.tool = Some(ToolCard {
-exit_code: None,
+            exit_code: None,
             completed_at_ms: None,
             tool_call_id: "call".to_string(),
             name: "exec".to_string(),
@@ -870,7 +869,7 @@ exit_code: None,
             "",
         );
         tool_block.tool = Some(ToolCard {
-exit_code: None,
+            exit_code: None,
             completed_at_ms: None,
             tool_call_id: "call".to_string(),
             name: "exec".to_string(),
@@ -1093,7 +1092,8 @@ exit_code: None,
         card.failure = Some(TimelineFailure {
             code: "stale_file".to_string(),
             message: "file changed since read
-Hint: re-read the file".to_string(),
+Hint: re-read the file"
+                .to_string(),
         });
         assert_eq!(
             from_tool(&card).failure.as_deref(),
@@ -1107,7 +1107,10 @@ Hint: re-read the file".to_string(),
             message: "x".repeat(FAILURE_LABEL_MAX_CHARS + 40),
         });
         let label = from_tool(&card).failure.expect("label");
-        assert_eq!(label.chars().count(), "execution: ".len() + FAILURE_LABEL_MAX_CHARS + 1);
+        assert_eq!(
+            label.chars().count(),
+            "execution: ".len() + FAILURE_LABEL_MAX_CHARS + 1
+        );
         assert!(label.ends_with('…'));
         assert!(!label.contains('\n'), "标签必须是单行");
     }
@@ -1216,7 +1219,7 @@ Hint: re-read the file".to_string(),
 
     fn tool_card(name: &str, state: TimelineToolState) -> ToolCard {
         ToolCard {
-exit_code: None,
+            exit_code: None,
             completed_at_ms: None,
             tool_call_id: "c1".to_string(),
             name: name.to_string(),

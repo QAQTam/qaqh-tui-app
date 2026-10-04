@@ -725,7 +725,12 @@ impl TimelineModel {
                     // 旁边（webui `reducer.ts:296-298` 同口径）。非终态替换
                     // （运行中快照）保留已收到的估算——整卡重建会把它冲掉。
                     let prior = (!tool_state_is_terminal(tool.state))
-                        .then(|| block.tool.as_ref().and_then(|existing| existing.stream_estimate))
+                        .then(|| {
+                            block
+                                .tool
+                                .as_ref()
+                                .and_then(|existing| existing.stream_estimate)
+                        })
                         .flatten();
                     let mut card = ToolCard::from(tool.clone());
                     card.stream_estimate = prior;
@@ -1576,7 +1581,7 @@ mod tests {
                     state: TimelineBlockState::Open,
                     text: String::new(),
                     tool: Some(TimelineTool {
-exit_code: None,
+                        exit_code: None,
                         completed_at_ms: None,
                         display: None,
                         progress_bytes_total: 0,
@@ -1929,7 +1934,7 @@ exit_code: None,
                     state: TimelineBlockState::Open,
                     text: String::new(),
                     tool: Some(TimelineTool {
-exit_code: None,
+                        exit_code: None,
                         completed_at_ms: None,
                         display: None,
                         progress_bytes_total: 0,
@@ -1988,7 +1993,7 @@ exit_code: None,
                     state: TimelineBlockState::Open,
                     text: String::new(),
                     tool: Some(TimelineTool {
-exit_code: None,
+                        exit_code: None,
                         completed_at_ms: None,
                         display: None,
                         progress_bytes_total: 0,
@@ -2167,7 +2172,10 @@ exit_code: None,
         let text = rendered_text_of(&m.turns[0], 80);
         assert!(text.contains("+5"), "text={text}");
         assert!(text.contains("−1"), "text={text}");
-        assert!(text.contains("估算"), "参数没走完的数字必须自报家门: text={text}");
+        assert!(
+            text.contains("估算"),
+            "参数没走完的数字必须自报家门: text={text}"
+        );
     }
 
     #[test]
@@ -2230,7 +2238,7 @@ exit_code: None,
                         state: TimelineBlockState::Open,
                         text: String::new(),
                         tool: Some(TimelineTool {
-exit_code: None,
+                            exit_code: None,
                             completed_at_ms: None,
                             display: None,
                             progress_bytes_total: 0,
@@ -2329,7 +2337,7 @@ exit_code: None,
                             state: TimelineBlockState::Sealed,
                             text: String::new(),
                             tool: Some(TimelineTool {
-exit_code: None,
+                                exit_code: None,
                                 completed_at_ms: None,
                                 display: None,
                                 progress_bytes_total: 0,
@@ -3016,10 +3024,16 @@ exit_code: None,
             "错误文本只能出现一次（stderr 正文）：
 {text}"
         );
-        assert!(text.contains("exit 101"), "状态行 = exit code：
-{text}");
-        assert!(text.contains("cargo build"), "头部保留命令真相字段：
-{text}");
+        assert!(
+            text.contains("exit 101"),
+            "状态行 = exit code：
+{text}"
+        );
+        assert!(
+            text.contains("cargo build"),
+            "头部保留命令真相字段：
+{text}"
+        );
         let stamp = crate::ui::v2::transcript::format_wall_clock(1_759_488_000_000)
             .expect("固定 epoch 必须可格式化");
         assert!(
@@ -3054,8 +3068,11 @@ exit_code: None,
             "理由只能出现一次（正文）：
 {text}"
         );
-        assert!(text.contains("stale_file"), "状态行 = 分类 code：
-{text}");
+        assert!(
+            text.contains("stale_file"),
+            "状态行 = 分类 code：
+{text}"
+        );
         assert!(
             text.contains("Hint: re-read the file"),
             "正文证据完整：
@@ -3093,10 +3110,16 @@ exit_code: None,
             "message 只能出现一次：
 {text}"
         );
-        assert!(text.contains("mcp_tool_error"), "状态行 = 真实 code：
-{text}");
-        assert!(text.contains("Check the server config."), "hint 随正文：
-{text}");
+        assert!(
+            text.contains("mcp_tool_error"),
+            "状态行 = 真实 code：
+{text}"
+        );
+        assert!(
+            text.contains("Check the server config."),
+            "hint 随正文：
+{text}"
+        );
         assert!(
             !text.contains(r#""status":"error""#),
             "信封 JSON 不再整坨上屏：
@@ -3117,7 +3140,6 @@ exit_code: None,
 {header}"
         );
     }
-
 
     #[test]
     fn wire_fixture_exec_success_with_progress() {
