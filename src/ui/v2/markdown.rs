@@ -1,113 +1,30 @@
-//! V2 Markdown → ratatui 渲染。
+//! Markdown 渲染。
 //!
-//! 这一层只负责把 `pulldown-cmark` 事件投影成 V2 主题下的 [`Line`]：
-//! - 颜色全部来自 [`Theme`]；
-//! - 代码高亮只取 syntect 前景与字形，不搬背景，保持终端底色；
-//! - 输出仍然是可逐行提交的普通 `Line`，方便流式稳定边界接管。
-//!
-//! 完整块用于 sealed/history 渲染；流式路径只把已经稳定的源码行交给
-//! [`render`] 输出主题化 Markdown 行。
+//! 模块划分对齐 codex `tui/src/markdown_render.rs` + `markdown_render/`：事件状态机
+//! 留在本文件，代码高亮（`code`）、表格（`table`）、行内折行（`text`）、列表（`list`）
+//! 各自独立成子模块。表格列宽与单元格折行的算法取自 grok `xai-grok-markdown`。
 
-use std::sync::OnceLock;
+mod code;
+mod list;
+mod table;
+#[cfg(test)]
+mod tests;
+mod text;
 
-use pulldown_cmark::{Alignment, CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
+use pulldown_cmark::{BlockQuoteKind, CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use syntect::easy::HighlightLines;
-use syntect::highlighting::{FontStyle, ThemeSet};
-use syntect::parsing::SyntaxSet;
-use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+use unicode_width::UnicodeWidthStr;
 
 use crate::theme::Theme;
 
+use code::{CodeState, render_code_block};
+use list::{ItemState, ListState};
+use table::{TableState, render_table};
+use text::{StyledSpan, wrap_styled};
+
 const CODE_INDENT: &str = "  ";
 const QUOTE_PREFIX: &str = "▎ ";
-const MAX_TABLE_ROWS: usize = 32;
-
-static SYNTAX_SET: OnceLock<SyntaxSet> = OnceLock::new();
-static THEME_SET: OnceLock<ThemeSet> = OnceLock::new();
-
-fn syntax_set() -> &'static SyntaxSet {
-    SYNTAX_SET.get_or_init(SyntaxSet::load_defaults_newlines)
-}
-
-fn theme_set() -> &'static ThemeSet {
-    THEME_SET.get_or_init(ThemeSet::load_defaults)
-}
-
-#[derive(Clone)]
-struct StyledSpan {
-    text: String,
-    style: Style,
-}
-
-impl StyledSpan {
-    fn new(text: impl Into<String>, style: Style) -> Self {
-        Self {
-            text: text.into(),
-            style,
-        }
-    }
-
-    fn into_span(self) -> Span<'static> {
-        Span::styled(self.text, self.style)
-    }
-}
-
-struct ListState {
-    ordered: bool,
-    next: u64,
-}
-
-struct ItemState {
-    prefix: String,
-    continuation: String,
-    prefix_style: Style,
-    spans: Vec<StyledSpan>,
-}
-
-struct CodeState {
-    lang: Option<String>,
-    text: String,
-}
-
-struct TableState {
-    alignments: Vec<Alignment>,
-    headers: Vec<String>,
-    rows: Vec<Vec<String>>,
-    row: Vec<String>,
-    cell: String,
-    in_head: bool,
-}
-
-impl TableState {
-    fn new(alignments: Vec<Alignment>) -> Self {
-        Self {
-            alignments,
-            headers: Vec::new(),
-            rows: Vec::new(),
-            row: Vec::new(),
-            cell: String::new(),
-            in_head: false,
-        }
-    }
-
-    fn flush_cell(&mut self) {
-        self.row.push(std::mem::take(&mut self.cell));
-    }
-
-    fn flush_row(&mut self) {
-        if self.row.is_empty() {
-            return;
-        }
-        let row = std::mem::take(&mut self.row);
-        if self.in_head && self.headers.is_empty() {
-            self.headers = row;
-        } else {
-            self.rows.push(row);
-        }
-    }
-}
 
 struct RenderState<'a> {
     theme: &'a Theme,
@@ -120,6 +37,8 @@ struct RenderState<'a> {
     link: bool,
     heading: Option<u8>,
     quote_depth: usize,
+    /// GFM alert 类型（`> [!NOTE]` 等）；无标签引用块为 `None`。
+    quote_kind: Option<BlockQuoteKind>,
     lists: Vec<ListState>,
     item: Option<ItemState>,
     code: Option<CodeState>,
@@ -139,6 +58,7 @@ impl<'a> RenderState<'a> {
             link: false,
             heading: None,
             quote_depth: 0,
+            quote_kind: None,
             lists: Vec::new(),
             item: None,
             code: None,
@@ -245,6 +165,15 @@ impl<'a> RenderState<'a> {
                     table.cell.push(' ');
                 }
             }
+            // `<br>` 是单元格内的换行。其余内联 HTML 直接丢弃：留下原文会在表格里
+            // 漏出标签（codex `test_table_inline_html_no_raw_text_leak`）。
+            Event::Html(html) | Event::InlineHtml(html) => {
+                if is_line_break_tag(html)
+                    && let Some(table) = self.table.as_mut()
+                {
+                    table.cell.push('\n');
+                }
+            }
             Event::End(TagEnd::Table) => {
                 if let Some(table) = self.table.take() {
                     self.flush_table(table);
@@ -265,9 +194,22 @@ impl<'a> RenderState<'a> {
             Tag::Emphasis => self.italic = true,
             Tag::Strikethrough => self.strike = true,
             Tag::Link { .. } => self.link = true,
-            Tag::BlockQuote(_) => {
+            Tag::BlockQuote(kind) => {
                 self.flush_paragraph();
                 self.quote_depth += 1;
+                self.quote_kind = kind;
+                // GFM alert（`> [!NOTE]`）：在第一行给一个带标签的抬头；正文沿用
+                // 引用块配色，只有标签用各类型自己的颜色。
+                if let Some(kind) = kind {
+                    let prefix = self.quote_prefix();
+                    self.out.push(Line::from(vec![
+                        Span::styled(prefix, fg(self.theme.markdown.quote)),
+                        Span::styled(
+                            alert_label(kind).to_string(),
+                            fg(alert_color(kind, self.theme)).add_modifier(Modifier::BOLD),
+                        ),
+                    ]));
+                }
             }
             Tag::List(start) => {
                 self.flush_paragraph();
@@ -330,6 +272,9 @@ impl<'a> RenderState<'a> {
                 self.flush_paragraph();
                 self.flush_item();
                 self.quote_depth = self.quote_depth.saturating_sub(1);
+                if self.quote_depth == 0 {
+                    self.quote_kind = None;
+                }
                 self.push_blank();
             }
             _ => {}
@@ -524,6 +469,9 @@ pub fn render(text: &str, width: usize, theme: &Theme) -> Vec<Line<'static>> {
     options.insert(Options::ENABLE_TASKLISTS);
     options.insert(Options::ENABLE_FOOTNOTES);
     options.insert(Options::ENABLE_MATH);
+    // GFM 的 blockquote tags（`> [!NOTE]` / `[!TIP]` / `[!IMPORTANT]` /
+    // `[!WARNING]` / `[!CAUTION]`）。
+    options.insert(Options::ENABLE_GFM);
 
     let mut state = RenderState::new(theme, width);
     for event in Parser::new_ext(text, options) {
@@ -555,411 +503,35 @@ fn heading_style(level: u8, theme: &Theme) -> Style {
     fg(color).add_modifier(Modifier::BOLD)
 }
 
-fn render_code_block(
-    text: &str,
-    lang: Option<&str>,
-    width: usize,
-    theme: &Theme,
-) -> Vec<Line<'static>> {
-    let content_width = width.saturating_sub(CODE_INDENT.width()).max(1);
-    let mut out = Vec::new();
-    for raw in text.lines() {
-        if raw.is_empty() {
-            out.push(Line::from(Span::styled(
-                CODE_INDENT.to_string(),
-                Style::default(),
-            )));
-            continue;
-        }
-        let spans = highlighted_spans(raw, lang, theme);
-        let rows = wrap_styled(&spans, content_width);
-        for row in rows {
-            let mut line = Vec::with_capacity(row.len() + 1);
-            line.push(Span::styled(CODE_INDENT.to_string(), Style::default()));
-            line.extend(row.into_iter().map(StyledSpan::into_span));
-            out.push(Line::from(line));
-        }
-    }
-    if out.is_empty() {
-        out.push(Line::from(Span::styled(
-            CODE_INDENT.to_string(),
-            Style::default(),
-        )));
-    }
-    out
-}
-
-fn highlighted_spans(line: &str, lang: Option<&str>, theme: &Theme) -> Vec<StyledSpan> {
-    let syntax_set = syntax_set();
-    let syntax = lang
-        .and_then(|lang| syntax_set.find_syntax_by_token(lang))
-        .or_else(|| lang.and_then(|lang| syntax_set.find_syntax_by_extension(lang)))
-        .unwrap_or_else(|| syntax_set.find_syntax_plain_text());
-    let syntax_theme = &theme_set().themes["base16-ocean.dark"];
-    let mut highlighter = HighlightLines::new(syntax, syntax_theme);
-    match highlighter.highlight_line(line, syntax_set) {
-        Ok(ranges) => ranges
-            .into_iter()
-            .filter(|(_, text)| !text.is_empty())
-            .map(|(style, text)| StyledSpan::new(text.to_string(), syntect_style(style)))
-            .collect(),
-        Err(_) => vec![StyledSpan::new(line.to_string(), fg(theme.markdown.code))],
-    }
-}
-
-fn syntect_style(style: syntect::highlighting::Style) -> Style {
-    let mut out = fg(Color::Rgb(
-        style.foreground.r,
-        style.foreground.g,
-        style.foreground.b,
-    ));
-    if style.font_style.contains(FontStyle::BOLD) {
-        out = out.add_modifier(Modifier::BOLD);
-    }
-    if style.font_style.contains(FontStyle::ITALIC) {
-        out = out.add_modifier(Modifier::ITALIC);
-    }
-    if style.font_style.contains(FontStyle::UNDERLINE) {
-        out = out.add_modifier(Modifier::UNDERLINED);
-    }
-    out
-}
-
-fn render_table(table: TableState, width: usize, theme: &Theme) -> Vec<Line<'static>> {
-    if table.headers.is_empty() && table.rows.is_empty() {
-        return Vec::new();
-    }
-
-    let requested_cols = table
-        .headers
-        .len()
-        .max(table.rows.iter().map(Vec::len).max().unwrap_or(0));
-    let max_cols = width.saturating_sub(1).saturating_div(4).max(1);
-    let cols = requested_cols.min(max_cols);
-    if cols == 0 {
-        return Vec::new();
-    }
-
-    let border_w = cols + 1;
-    let avail = width.saturating_sub(border_w).max(cols * 3);
-    let base = (avail / cols).max(3);
-    let mut col_widths = vec![base; cols];
-    let rem = avail.saturating_sub(base * cols);
-    for width in col_widths.iter_mut().take(rem.min(cols)) {
-        *width += 1;
-    }
-
-    let top = table_border(&col_widths, '┌', '┬', '┐');
-    let middle = table_border(&col_widths, '├', '┼', '┤');
-    let bottom = table_border(&col_widths, '└', '┴', '┘');
-    let mut out = Vec::new();
-    out.push(Line::from(Span::styled(top, fg(theme.markdown.rule))));
-
-    if !table.headers.is_empty() {
-        out.push(table_row(
-            &table.headers,
-            &col_widths,
-            &table.alignments,
-            fg(theme.markdown.table_head).add_modifier(Modifier::BOLD),
-            fg(theme.markdown.rule),
-        ));
-        out.push(Line::from(Span::styled(middle, fg(theme.markdown.rule))));
-    }
-
-    let omitted = table.rows.len().saturating_sub(MAX_TABLE_ROWS);
-    for row in table.rows.iter().take(MAX_TABLE_ROWS) {
-        out.push(table_row(
-            row,
-            &col_widths,
-            &table.alignments,
-            fg(theme.markdown.text),
-            fg(theme.markdown.rule),
-        ));
-    }
-    if omitted > 0 {
-        out.push(Line::from(Span::styled(
-            format!("  （表格省略 {omitted} 行）"),
-            fg(theme.text.dim),
-        )));
-    }
-    out.push(Line::from(Span::styled(bottom, fg(theme.markdown.rule))));
-    out
-}
-
-fn table_border(widths: &[usize], left: char, middle: char, right: char) -> String {
-    let mut out = String::from(left);
-    for (idx, width) in widths.iter().enumerate() {
-        out.push_str(&"─".repeat(*width));
-        if idx + 1 < widths.len() {
-            out.push(middle);
-        } else {
-            out.push(right);
-        }
-    }
-    out
-}
-
-fn table_row(
-    cells: &[String],
-    widths: &[usize],
-    alignments: &[Alignment],
-    cell_style: Style,
-    border_style: Style,
-) -> Line<'static> {
-    let mut spans = Vec::with_capacity(widths.len() * 2 + 1);
-    spans.push(Span::styled("│".to_string(), border_style));
-    for (idx, width) in widths.iter().enumerate() {
-        let raw = cells.get(idx).map(String::as_str).unwrap_or("");
-        spans.push(Span::styled(
-            format_cell(raw, *width, alignments.get(idx).copied()),
-            cell_style,
-        ));
-        spans.push(Span::styled("│".to_string(), border_style));
-    }
-    Line::from(spans)
-}
-
-fn format_cell(raw: &str, width: usize, align: Option<Alignment>) -> String {
-    let raw = raw.replace('\n', " ");
-    let display_width = raw.width();
-    if display_width >= width {
-        let mut out = String::new();
-        let mut used = 0usize;
-        for ch in raw.chars() {
-            let ch_width = ch.width().unwrap_or(0);
-            if used + ch_width + 1 > width {
-                break;
-            }
-            out.push(ch);
-            used += ch_width;
-        }
-        let pad = width.saturating_sub(out.width() + 1);
-        return format!("{out}…{}", " ".repeat(pad));
-    }
-
-    let pad = width.saturating_sub(display_width);
-    match align {
-        Some(Alignment::Right) => format!("{}{raw}", " ".repeat(pad)),
-        Some(Alignment::Center) => {
-            let left = pad / 2;
-            let right = pad - left;
-            format!("{}{raw}{}", " ".repeat(left), " ".repeat(right))
-        }
-        _ => format!("{raw}{}", " ".repeat(pad)),
-    }
-}
-
-fn wrap_styled(spans: &[StyledSpan], width: usize) -> Vec<Vec<StyledSpan>> {
-    if width == 0 {
-        return vec![spans.to_vec()];
-    }
-
-    let mut chars: Vec<(char, Style)> = Vec::new();
-    for span in spans {
-        chars.reserve(span.text.chars().count());
-        for ch in span.text.chars() {
-            chars.push((ch, span.style));
-        }
-    }
-
-    let mut out: Vec<Vec<StyledSpan>> = Vec::new();
-    let mut start = 0usize;
-    let mut line_width = 0usize;
-    let mut last_space: Option<usize> = None;
-    let mut idx = 0usize;
-    while idx < chars.len() {
-        let (ch, _) = chars[idx];
-        if ch == '\n' {
-            push_wrapped_line(&mut out, &chars[start..idx]);
-            start = idx + 1;
-            line_width = 0;
-            last_space = None;
-            idx += 1;
-            continue;
-        }
-
-        let ch_width = ch.width().unwrap_or(0);
-        if line_width + ch_width > width {
-            if ch == ' ' {
-                push_wrapped_line(&mut out, &chars[start..idx]);
-                start = idx + 1;
-                line_width = 0;
-                last_space = None;
-                idx += 1;
-                continue;
-            }
-            if let Some(boundary) = last_space {
-                if start < boundary {
-                    push_wrapped_line(&mut out, &chars[start..boundary]);
-                }
-                start = boundary + 1;
-                line_width = chars[start..idx]
-                    .iter()
-                    .map(|(ch, _)| ch.width().unwrap_or(0))
-                    .sum();
-                last_space = None;
-            } else {
-                let end = if start == idx { idx + 1 } else { idx };
-                push_wrapped_line(&mut out, &chars[start..end]);
-                start = end;
-                line_width = 0;
-                last_space = None;
-                idx = end;
-                continue;
-            }
-            continue;
-        }
-
-        if ch == ' ' {
-            last_space = Some(idx);
-        }
-        line_width += ch_width;
-        idx += 1;
-    }
-
-    if start < chars.len() {
-        push_wrapped_line(&mut out, &chars[start..]);
-    }
-    if out.is_empty() {
-        out.push(Vec::new());
-    }
-    out
-}
-
-fn push_wrapped_line(out: &mut Vec<Vec<StyledSpan>>, chars: &[(char, Style)]) {
-    let mut spans: Vec<StyledSpan> = Vec::new();
-    for (ch, style) in chars {
-        if let Some(last) = spans.last_mut()
-            && last.style == *style
-        {
-            last.text.push(*ch);
-        } else {
-            spans.push(StyledSpan::new(ch.to_string(), *style));
-        }
-    }
-    out.push(spans);
-}
-
 fn fg(color: Color) -> Style {
     Style::new().fg(color)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::theme::{ColorSupport, ThemeKind};
-
-    fn theme() -> Theme {
-        Theme::resolve(ThemeKind::QaqhNight, ColorSupport::TrueColor)
+/// GFM alert（`> [!NOTE]` 等）的抬头文字。
+fn alert_label(kind: BlockQuoteKind) -> &'static str {
+    match kind {
+        BlockQuoteKind::Note => "NOTE",
+        BlockQuoteKind::Tip => "TIP",
+        BlockQuoteKind::Important => "IMPORTANT",
+        BlockQuoteKind::Warning => "WARNING",
+        BlockQuoteKind::Caution => "CAUTION",
     }
+}
 
-    fn text_of(lines: &[Line<'static>]) -> String {
-        lines
-            .iter()
-            .map(|line| {
-                line.spans
-                    .iter()
-                    .map(|span| span.content.as_ref())
-                    .collect::<String>()
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
+/// GFM alert 的抬头配色。
+fn alert_color(kind: BlockQuoteKind, theme: &Theme) -> Color {
+    match kind {
+        BlockQuoteKind::Note => theme.accent.system,
+        BlockQuoteKind::Tip => theme.accent.success,
+        BlockQuoteKind::Important => theme.semantic.plan,
+        BlockQuoteKind::Warning => theme.semantic.warning,
+        BlockQuoteKind::Caution => theme.accent.error,
     }
+}
 
-    #[test]
-    fn renders_inline_emphasis_without_markers() {
-        let lines = render("**bold** and *italic* and ~~gone~~", 60, &theme());
-        let text = text_of(&lines);
-        assert_eq!(text, "bold and italic and gone");
-        let spans: Vec<&Span<'_>> = lines.iter().flat_map(|line| line.spans.iter()).collect();
-        assert!(
-            spans
-                .iter()
-                .any(|span| span.style.add_modifier.contains(Modifier::BOLD))
-        );
-        assert!(
-            spans
-                .iter()
-                .any(|span| span.style.add_modifier.contains(Modifier::ITALIC))
-        );
-        assert!(
-            spans
-                .iter()
-                .any(|span| span.style.add_modifier.contains(Modifier::CROSSED_OUT))
-        );
-    }
-
-    #[test]
-    fn renders_heading_levels_and_theme_colors() {
-        let lines = render("# one\n\n#### four", 40, &theme());
-        let heading_one = lines
-            .iter()
-            .flat_map(|line| line.spans.iter())
-            .find(|span| span.content.as_ref() == "one")
-            .expect("h1");
-        let heading_four = lines
-            .iter()
-            .flat_map(|line| line.spans.iter())
-            .find(|span| span.content.as_ref() == "four")
-            .expect("h4");
-        assert_eq!(heading_one.style.fg, Some(theme().markdown.h1));
-        assert_eq!(heading_four.style.fg, Some(theme().markdown.h4));
-    }
-
-    #[test]
-    fn renders_links_with_link_style() {
-        let lines = render("[OpenAI](https://openai.com)", 60, &theme());
-        let text = text_of(&lines);
-        assert_eq!(text, "OpenAI");
-        let span = lines
-            .iter()
-            .flat_map(|line| line.spans.iter())
-            .find(|span| span.content.as_ref() == "OpenAI")
-            .expect("link text");
-        assert_eq!(span.style.fg, Some(theme().markdown.link));
-        assert!(span.style.add_modifier.contains(Modifier::UNDERLINED));
-    }
-
-    #[test]
-    fn renders_tables_and_keeps_rows() {
-        let lines = render(
-            "| name | value |\n|---|---|\n| a | 1 |\n| b | 2 |",
-            40,
-            &theme(),
-        );
-        let text = text_of(&lines);
-        assert!(text.contains("name"));
-        assert!(text.contains("value"));
-        assert!(text.contains("a"));
-        assert!(text.contains("1"));
-        assert!(text.contains("b"));
-        assert!(text.contains("2"));
-        assert!(lines.len() >= 6);
-    }
-
-    #[test]
-    fn code_block_has_no_background_and_keeps_indent() {
-        let lines = render("```rust\nfn main() {}\n```", 50, &theme());
-        let text = text_of(&lines);
-        assert!(text.contains("fn main() {}"));
-        for line in &lines {
-            for span in &line.spans {
-                assert_eq!(span.style.bg, None, "code span must not paint background");
-            }
-        }
-    }
-
-    #[test]
-    fn wraps_cjk_without_splitting_wide_chars() {
-        let lines = render("这是一段需要折行的中文文本，用于验证宽度。", 14, &theme());
-        assert!(lines.iter().all(|line| line.width() <= 14));
-        assert!(text_of(&lines).contains("中文文本"));
-    }
-
-    #[test]
-    fn empty_input_still_returns_one_line() {
-        let lines = render("", 20, &theme());
-        assert_eq!(lines.len(), 1);
-        assert!(lines[0].spans.is_empty());
-    }
+/// `<br>` / `<br/>` / `<br />` / `<BR>` 都算换行标签。
+fn is_line_break_tag(html: &str) -> bool {
+    let mut tag = html.trim().to_ascii_lowercase();
+    tag.retain(|ch| !ch.is_whitespace());
+    tag.trim_end_matches('/') == "<br>"
 }
