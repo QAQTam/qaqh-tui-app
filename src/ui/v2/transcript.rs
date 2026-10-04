@@ -12,7 +12,7 @@ use ratatui::text::{Line, Span};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::app::render_line::wrap_text;
-use crate::app::timeline_model::strip_ansi_escapes;
+use crate::app::timeline_model::{LineStats, strip_ansi_escapes};
 use crate::theme::Theme;
 
 use super::display_tool_name;
@@ -123,6 +123,8 @@ pub struct ToolBlock {
     pub exit_code: Option<i32>,
     /// 后端明确告知正文被截断。
     pub truncated: bool,
+    /// 行差数字（渲染唯一出口）：终态权威值，或运行中的流式估算。
+    pub line_stats: Option<LineStats>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -579,6 +581,22 @@ fn render_tool_state(tool: &ToolBlock, at_ms: Option<u64>, theme: &Theme) -> Vec
             fg(theme.text.dim),
         ));
     }
+    // 行差数字（唯一出口）：终态权威值直接画；运行中的流式估算加「估算」角标，
+    // 明说它不是结果。与正文 diff 同源着色（add/del token）。
+    if let Some(stats) = tool.line_stats {
+        spans.push(Span::styled(" · ", fg(theme.text.dim)));
+        spans.push(Span::styled(
+            format!("+{}", stats.add),
+            fg(theme.diff.add_fg),
+        ));
+        spans.push(Span::styled(
+            format!(" −{}", stats.del),
+            fg(theme.diff.del_fg),
+        ));
+        if stats.estimating {
+            spans.push(Span::styled(" 估算", fg(theme.text.dim)));
+        }
+    }
     // 终态墙钟（runtime 盖戳，MM-DD HH:MM）：dim 尾缀；缺席不画——不用本地
     // 时钟兜底，与用户行同纪律。
     let stamp = at_ms
@@ -841,7 +859,30 @@ mod tests {
             streams: None,
             exit_code: None,
             truncated: false,
+            line_stats: None,
         }
+    }
+
+    #[test]
+    fn line_stats_render_terminal_without_estimate_flag() {
+        let mut tool = tool_block("edit", None, ToolState::Success);
+        tool.line_stats = Some(LineStats {
+            add: 4,
+            del: 2,
+            estimating: false,
+        });
+        let text = text_of(&render_tool_state(&tool, None, &theme()));
+        assert!(text.contains("+4"), "{text}");
+        assert!(text.contains("−2"), "{text}");
+        assert!(!text.contains("估算"), "终态权威值不得带估算角标: {text}");
+
+        tool.line_stats = Some(LineStats {
+            add: 4,
+            del: 2,
+            estimating: true,
+        });
+        let text = text_of(&render_tool_state(&tool, None, &theme()));
+        assert!(text.contains("估算"), "流式估算必须自报家门: {text}");
     }
 
     fn theme() -> Theme {

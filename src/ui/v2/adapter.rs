@@ -6,7 +6,7 @@
 use std::collections::HashSet;
 use std::time::Duration;
 
-use crate::app::timeline_model::{Block, CompactionMark, TimelineModel, ToolCard, Turn};
+use crate::app::timeline_model::{Block, CompactionMark, LineStats, TimelineModel, ToolCard, Turn};
 use crate::ui::v2::transcript::{
     BlockId, BlockKind, BlockState, ToolBlock, ToolHeader, ToolState, ToolStreams, TranscriptBlock,
 };
@@ -261,6 +261,24 @@ fn from_tool(tool: &ToolCard) -> ToolBlock {
         || streams.is_some()
         || output.as_deref().is_some_and(|out| !out.trim().is_empty());
 
+    // 行差数字（渲染唯一出口）：后端终态权威值（`display.lines_*`）优先；运行中
+    // 退到 `ToolEstimated` 旁路估算。两者都缺席则不画（含「无变更」0/0）。
+    let line_stats = display
+        .map(|display| (display.lines_added, display.lines_removed))
+        .filter(|(add, del)| *add > 0 || *del > 0)
+        .map(|(add, del)| LineStats {
+            add,
+            del,
+            estimating: false,
+        })
+        .or_else(|| {
+            tool.stream_estimate.map(|estimate| LineStats {
+                add: estimate.add,
+                del: estimate.del,
+                estimating: true,
+            })
+        });
+
     ToolBlock {
         name: tool.name.clone(),
         summary,
@@ -290,6 +308,7 @@ fn from_tool(tool: &ToolCard) -> ToolBlock {
         streams,
         exit_code,
         truncated,
+        line_stats,
     }
 }
 
@@ -587,6 +606,7 @@ exit_code: None,
             failure: None,
             permission: None,
             display: None,
+            stream_estimate: None,
         });
         let turns = vec![turn(vec![tool_block])];
         let expanded = HashSet::from(["tool".to_string()]);
@@ -629,6 +649,7 @@ exit_code: None,
             }),
             permission: None,
             display: None,
+            stream_estimate: None,
         });
         let blocks = from_turn(&turn(vec![tool_block]));
         let Some(TranscriptBlock {
@@ -759,6 +780,8 @@ exit_code: None,
         card.display = Some(TimelineToolDisplay {
             summary: Some("exit 0 · cargo check".to_string()),
             diff: None,
+            lines_added: 0,
+            lines_removed: 0,
             header: Some(TimelineToolHeader::Shell {
                 command: "cargo check".to_string(),
             }),
@@ -878,6 +901,8 @@ Hint: re-read the file".to_string(),
         card.display = Some(TimelineToolDisplay {
             summary: None,
             diff: None,
+            lines_added: 0,
+            lines_removed: 0,
             header: None,
             body: Some(qaqh_client::TimelineToolBody::Shell {
                 output: String::new(),
@@ -888,6 +913,65 @@ Hint: re-read the file".to_string(),
             outcome: None,
         });
         assert_eq!(from_tool(&card).exit_code, Some(7));
+    }
+
+    #[test]
+    fn terminal_display_lines_become_authoritative_line_stats() {
+        let mut card = tool_card("edit", TimelineToolState::Succeeded);
+        card.display = Some(TimelineToolDisplay {
+            summary: None,
+            diff: None,
+            lines_added: 3,
+            lines_removed: 1,
+            header: None,
+            body: None,
+            metrics: None,
+            outcome: None,
+        });
+        assert_eq!(
+            from_tool(&card).line_stats,
+            Some(LineStats {
+                add: 3,
+                del: 1,
+                estimating: false
+            })
+        );
+    }
+
+    #[test]
+    fn streaming_estimate_is_flagged_estimating_and_loses_to_terminal() {
+        use crate::app::timeline_model::StreamEstimate;
+
+        let mut card = tool_card("edit", TimelineToolState::Running);
+        card.stream_estimate = Some(StreamEstimate { add: 5, del: 2 });
+        assert_eq!(
+            from_tool(&card).line_stats,
+            Some(LineStats {
+                add: 5,
+                del: 2,
+                estimating: true
+            })
+        );
+
+        // 终态权威值一到，估算让位。
+        card.display = Some(TimelineToolDisplay {
+            summary: None,
+            diff: None,
+            lines_added: 5,
+            lines_removed: 4,
+            header: None,
+            body: None,
+            metrics: None,
+            outcome: None,
+        });
+        assert_eq!(
+            from_tool(&card).line_stats,
+            Some(LineStats {
+                add: 5,
+                del: 4,
+                estimating: false
+            })
+        );
     }
 
     fn tool_card(name: &str, state: TimelineToolState) -> ToolCard {
@@ -908,6 +992,7 @@ exit_code: None,
             failure: None,
             permission: None,
             display: None,
+            stream_estimate: None,
         }
     }
 }

@@ -165,6 +165,26 @@ pub fn normalize_progress_history(chunks: &[&str]) -> String {
     buf
 }
 
+/// 参数流式行数估算（`TimelineEvent::ToolEstimated` 旁路）：口径是「已吐出的
+/// 参数里能数出多少行」，**不是**实际改动行。瞬态值——不进快照，终态
+/// `ToolUpdated` 一到即清，故只在工具卡非终态时非 None。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct StreamEstimate {
+    pub add: u32,
+    pub del: u32,
+}
+
+/// 工具卡行差数字（渲染唯一出口）。
+///
+/// `estimating = false` → 终态权威值（后端 `display.lines_added/removed`）；
+/// `true` → 参数流式估算（`ToolEstimated` 旁路，数字还会涨）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct LineStats {
+    pub add: u32,
+    pub del: u32,
+    pub estimating: bool,
+}
+
 /// 工具卡（timeline tool 的展示镜像，progress 独立可追加）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolCard {
@@ -191,6 +211,8 @@ pub struct ToolCard {
     pub exit_code: Option<i32>,
     /// 调用完成墙钟（epoch ms，runtime 终态发射时盖戳）；缺席不画。
     pub completed_at_ms: Option<u64>,
+    /// 参数流式行数估算；None = 无（未接线 / 已终态 / 历史快照）。
+    pub stream_estimate: Option<StreamEstimate>,
 }
 
 impl From<TimelineTool> for ToolCard {
@@ -228,8 +250,18 @@ impl From<TimelineTool> for ToolCard {
             display: t.display,
             exit_code: t.exit_code,
             completed_at_ms: t.completed_at_ms,
+            stream_estimate: None,
         }
     }
+}
+
+/// 工具是否已到终态（权威数字已就位）。对应 webui `isTerminalToolStatus`
+/// （`webui/src/tools/StepRow.tsx:155`）：终态一到，估算槽必须让位给真值。
+fn tool_state_is_terminal(state: TimelineToolState) -> bool {
+    matches!(
+        state,
+        TimelineToolState::Succeeded | TimelineToolState::Failed | TimelineToolState::Cancelled
+    )
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -689,8 +721,15 @@ impl TimelineModel {
             E::ToolUpdated { block_id, tool } => {
                 let round_num = entry.round_num.unwrap_or(0);
                 let round = Self::find_round_mut(turn, round_num);
-                let card = ToolCard::from(tool.clone());
                 if let Some(block) = Self::find_block_mut(round, block_id) {
+                    // 终态一到就换权威数字：估算槽清零，不留一个「约等于」在真值
+                    // 旁边（webui `reducer.ts:296-298` 同口径）。非终态替换
+                    // （运行中快照）保留已收到的估算——整卡重建会把它冲掉。
+                    let prior = (!tool_state_is_terminal(tool.state))
+                        .then(|| block.tool.as_ref().and_then(|existing| existing.stream_estimate))
+                        .flatten();
+                    let mut card = ToolCard::from(tool.clone());
+                    card.stream_estimate = prior;
                     block.tool = Some(card);
                     block.touch();
                 } else {
@@ -724,6 +763,41 @@ impl TimelineModel {
                         block.touch();
                     } else {
                         missing_block_drops += 1;
+                        changed = false;
+                    }
+                } else {
+                    missing_block_drops += 1;
+                    changed = false;
+                }
+            }
+            // 参数流式行数估算（后端旁路）：不改块状态，只把瞬态数字挂到工具卡；
+            // 终态已有权威数字时丢弃迟到帧（webui `reducer.ts:322-328` 同口径）。
+            E::ToolEstimated {
+                block_id,
+                lines_added,
+                lines_removed,
+            } => {
+                let round_num = entry.round_num.unwrap_or(0);
+                let round = Self::find_round_mut(turn, round_num);
+                if let Some(block) = Self::find_block_mut(round, block_id) {
+                    let applied = match block.tool.as_mut() {
+                        Some(tool) if !tool_state_is_terminal(tool.state) => {
+                            tool.stream_estimate = Some(StreamEstimate {
+                                add: *lines_added,
+                                del: *lines_removed,
+                            });
+                            true
+                        }
+                        // 终态：估算不许改写真值，也不触发重绘。
+                        Some(_) => false,
+                        None => {
+                            missing_block_drops += 1;
+                            false
+                        }
+                    };
+                    if applied {
+                        block.touch();
+                    } else {
                         changed = false;
                     }
                 } else {
@@ -1895,6 +1969,151 @@ exit_code: None,
         let tool = m.turns[0].rounds[0].blocks[0].tool.as_ref().unwrap();
         assert_eq!(tool.progress, "tail");
         assert!(tool.progress_truncated);
+    }
+
+    // ── 参数流式行数估算（`ToolEstimated`，webui `reducer.test.ts:470-522` 同族）──
+
+    /// 打开一个含「写工具」块的回合；`state` 控制起手态（running / succeeded…）。
+    fn model_with_tool(state: &str) -> TimelineModel {
+        let mut m = TimelineModel::default();
+        m.apply(&entry(
+            1,
+            "t1",
+            TimelineEvent::TurnOpened {
+                user_text: "改代码".into(),
+            },
+        ));
+        let tool: TimelineTool = serde_json::from_value(serde_json::json!({
+            "tool_call_id": "c1",
+            "name": "edit",
+            "state": state,
+        }))
+        .unwrap();
+        m.apply(&entry(
+            2,
+            "t1",
+            TimelineEvent::BlockOpened {
+                block: TimelineBlock {
+                    block_id: "b1".into(),
+                    block_order: 0,
+                    kind: TimelineBlockKind::Tool,
+                    state: TimelineBlockState::Open,
+                    text: String::new(),
+                    tool: Some(tool),
+                },
+            },
+        ));
+        m
+    }
+
+    fn tool_card_of(m: &TimelineModel) -> &ToolCard {
+        m.turns[0].rounds[0].blocks[0]
+            .tool
+            .as_ref()
+            .expect("expect tool block")
+    }
+
+    fn estimated(seq: u64, add: u32, del: u32) -> TimelineEntry {
+        entry(
+            seq,
+            "t1",
+            TimelineEvent::ToolEstimated {
+                block_id: "b1".into(),
+                lines_added: add,
+                lines_removed: del,
+            },
+        )
+    }
+
+    fn tool_update(seq: u64, raw: serde_json::Value) -> TimelineEntry {
+        let tool: TimelineTool = serde_json::from_value(raw).unwrap();
+        entry(
+            seq,
+            "t1",
+            TimelineEvent::ToolUpdated {
+                block_id: "b1".into(),
+                tool,
+            },
+        )
+    }
+
+    #[test]
+    fn tool_estimated_attaches_to_running_card() {
+        let mut m = model_with_tool("running");
+        m.apply(&estimated(3, 7, 2));
+        assert_eq!(
+            tool_card_of(&m).stream_estimate,
+            Some(StreamEstimate { add: 7, del: 2 })
+        );
+    }
+
+    #[test]
+    fn tool_estimated_updates_in_place() {
+        let mut m = model_with_tool("running");
+        m.apply(&estimated(3, 1, 0));
+        m.apply(&estimated(4, 9, 4));
+        assert_eq!(
+            tool_card_of(&m).stream_estimate,
+            Some(StreamEstimate { add: 9, del: 4 })
+        );
+        assert_eq!(m.turns[0].rounds[0].blocks.len(), 1, "不得新增块");
+    }
+
+    #[test]
+    fn non_terminal_tool_update_preserves_estimate() {
+        let mut m = model_with_tool("running");
+        m.apply(&estimated(3, 7, 2));
+        // 运行中的快照更新整卡重建，估算不能被冲掉。
+        m.apply(&tool_update(
+            4,
+            serde_json::json!({
+                "tool_call_id": "c1",
+                "name": "edit",
+                "state": "running",
+                "args_json": "{\"path\":\"a.rs\"}",
+            }),
+        ));
+        assert_eq!(
+            tool_card_of(&m).stream_estimate,
+            Some(StreamEstimate { add: 7, del: 2 })
+        );
+    }
+
+    #[test]
+    fn tool_estimated_cleared_by_terminal_update() {
+        let mut m = model_with_tool("running");
+        m.apply(&estimated(3, 9, 4));
+        m.apply(&tool_update(
+            4,
+            serde_json::json!({
+                "tool_call_id": "c1",
+                "name": "edit",
+                "state": "succeeded",
+                "diff": "--- a\n+++ b\n+x\n",
+            }),
+        ));
+        assert_eq!(
+            tool_card_of(&m).stream_estimate,
+            None,
+            "终态一到即清空：约等于不许活在真值旁边"
+        );
+    }
+
+    #[test]
+    fn late_tool_estimated_cannot_rewrite_terminal() {
+        let mut m = model_with_tool("succeeded");
+        m.apply(&estimated(3, 9, 4));
+        assert_eq!(tool_card_of(&m).stream_estimate, None, "终态卡拒收迟到估算");
+    }
+
+    #[test]
+    fn running_tool_renders_estimate_with_flag() {
+        let mut m = model_with_tool("running");
+        m.apply(&estimated(3, 5, 1));
+        let text = rendered_text_of(&m.turns[0], 80);
+        assert!(text.contains("+5"), "text={text}");
+        assert!(text.contains("−1"), "text={text}");
+        assert!(text.contains("估算"), "参数没走完的数字必须自报家门: text={text}");
     }
 
     #[test]
