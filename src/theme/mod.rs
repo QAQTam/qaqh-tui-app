@@ -148,6 +148,8 @@ pub struct ChromeTokens {
     pub border_active: Color,
     pub selection: Color,
     pub scrollbar: Color,
+    /// composer 输入带底色：通栏三行色块，把消息区与输入区分开。
+    pub composer_bg: Color,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -243,7 +245,9 @@ impl Default for SpacingTokens {
             block_pad_left: 2,
             block_pad_right: 2,
             outer_pad: 2,
-            composer_min_height: 1,
+            // composer 输入带（通栏底色块）的最低高度：上下各留一行空白，
+            // 输入行居中，形成与消息区的视觉分界。
+            composer_min_height: 3,
             composer_max_height: 8,
             status_height: 1,
             shortcuts_height: 1,
@@ -387,6 +391,7 @@ mod tests {
             theme.chrome.border_active,
             theme.chrome.selection,
             theme.chrome.scrollbar,
+            theme.chrome.composer_bg,
             theme.diff.add_fg,
             theme.diff.add_bg,
             theme.diff.del_fg,
@@ -491,6 +496,19 @@ mod tests {
         let theme = Theme::resolve(ThemeKind::QaqhDay, ColorSupport::TrueColor);
         let ratio = contrast_ratio(theme.text.primary, theme.surface.base);
         assert!(ratio >= 7.0, "day contrast ratio was {ratio:.2}");
+    }
+
+    /// composer 输入带是带底色的色块，正文直接铺在上面，必须保持 7:1。
+    #[test]
+    fn composer_band_keeps_semantic_contrast() {
+        for kind in [ThemeKind::QaqhNight, ThemeKind::QaqhDay] {
+            let theme = Theme::resolve(kind, ColorSupport::TrueColor);
+            let ratio = contrast_ratio(theme.text.primary, theme.chrome.composer_bg);
+            assert!(
+                ratio >= 7.0,
+                "{kind:?} composer band contrast ratio was {ratio:.2}"
+            );
+        }
     }
 
     #[test]

@@ -50,6 +50,8 @@ pub(super) fn theme(support: ColorSupport) -> Theme {
             border_active: derived(support, Color::Rgb(156, 163, 175)),
             selection: derived(support, Color::Rgb(219, 234, 254)),
             scrollbar: derived(support, Color::Rgb(199, 205, 214)),
+            // 浅土金（麦金）：亮色底上暗字，对比度 ≥ 7:1。
+            composer_bg: derived(support, Color::Rgb(222, 205, 160)),
         },
         diff: DiffTokens {
             add_fg: derived(support, Color::Rgb(21, 128, 61)),

@@ -3,12 +3,13 @@
 //! 适配层是唯一允许同时看到 `timeline_model` 与 V2 block 类型的地方；
 //! renderer 保持纯输入，便于快照和主题矩阵测试。
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use crate::app::timeline_model::{Block, CompactionMark, LineStats, TimelineModel, ToolCard, Turn};
 use crate::ui::v2::transcript::{
-    BlockId, BlockKind, BlockState, ToolBlock, ToolHeader, ToolState, ToolStreams, TranscriptBlock,
+    BlockId, BlockKind, BlockState, TODO_TOOL_NAME, TodoBlock, ToolBlock, ToolHeader, ToolState,
+    ToolStreams, TranscriptBlock,
 };
 use qaqh_client::{
     TimelineBlockKind, TimelineBlockState, TimelineToolBody, TimelineToolHeader, TimelineToolState,
@@ -200,6 +201,101 @@ fn from_block(turn_id: &str, turn_sealed: bool, block: &Block) -> Option<Transcr
     })
 }
 
+/// `todo_write` 的清单解析；其余工具恒为 `None`。
+///
+/// 参数取自 `TimelineTool.args_json`（"Original structured arguments as supplied
+/// by the tool producer"）：服务端输出里**没有**清单，只有
+/// `replaced`/`total`/`assigned`/`current_id` 这几个记账字段，所以清单必须从入参取。
+fn todo_block(name: &str, args_json: Option<&str>) -> Option<TodoBlock> {
+    if name != TODO_TOOL_NAME {
+        return None;
+    }
+    TodoBlock::parse(args_json?)
+}
+
+/// 当前生效的待办清单 = timeline 里**最后一次成功**的 `todo_write` 入参。
+///
+/// 与 bugent `currentTodoList` 同思路：只认**成功**的调用——被拒的清单不能当成
+/// 生效的（实测 `items[0] references unknown id T1` 那次就是硬失败，参数本身还
+/// 能解析，只有状态能区分）。`todo_write` 是整表替换，所以最后一次成功的入参
+/// 就是全量。
+///
+/// 走**前向**扫而不是倒扫，是为了补标题：入参里 `title` 省略时后端沿用同 id 的
+/// 旧标题，而最后一次入参里看不到那个旧标题——必须带着 id→标题的历史往前走。
+/// 代价是丢掉倒扫的提前退出，但每帧只按 timeline 版本算一次（见
+/// `FullscreenView::sync_todo`），与 transcript 缓存同阶。
+pub fn current_todo(model: &TimelineModel) -> Option<TodoBlock> {
+    let mut titles: HashMap<String, String> = HashMap::new();
+    let mut current: Option<TodoBlock> = None;
+    for turn in &model.turns {
+        for round in &turn.rounds {
+            for block in &round.blocks {
+                let Some(tool) = block.tool.as_ref() else {
+                    continue;
+                };
+                if tool.name != TODO_TOOL_NAME || tool_state(tool.state) != ToolState::Success {
+                    continue;
+                }
+                let Some(mut todo) = todo_block(&tool.name, tool.args_json.as_deref()) else {
+                    continue;
+                };
+                // 入参省略 `id` 的条目由服务端按顺序分配，成功回执里的 `assigned`
+                // 就是那份编号——不读回执的话，本轮**新建**的条目在后续轮次里
+                // 永远认不出自己的 id，继承必然落空。
+                //
+                // 数量对不上说明这次混进了「未知 id 被重编」（后端把它们也塞进
+                // `assigned`），一一对应不再成立：那就不记这次，宁可少继承也
+                // 不错继承。
+                let assigned = assigned_ids(tool);
+                let anonymous = todo.items.iter().filter(|item| item.id.is_none()).count();
+                let resolvable = assigned.len() == anonymous;
+                let mut pending = assigned.iter();
+                for item in &mut todo.items {
+                    let id = match item.id.clone() {
+                        Some(id) => Some(id),
+                        None if resolvable => pending.next().cloned(),
+                        None => None,
+                    };
+                    let Some(id) = id else {
+                        continue;
+                    };
+                    if item.title.is_empty() {
+                        if let Some(title) = titles.get(&id) {
+                            item.title = title.clone();
+                        }
+                    } else {
+                        titles.insert(id, item.title.clone());
+                    }
+                }
+                current = Some(todo);
+            }
+        }
+    }
+    current
+}
+
+/// 成功回执里的 `assigned`：本轮新分配的 ID，按条目顺序排列。
+///
+/// 拿不到（老会话没落 `output`、回放、回执被截断）就返回空——调用方据此放弃
+/// 这一轮的 id 映射，不会误配。
+fn assigned_ids(tool: &ToolCard) -> Vec<String> {
+    let Some(output) = tool.output.as_deref() else {
+        return Vec::new();
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(output) else {
+        return Vec::new();
+    };
+    value
+        .get("assigned")
+        .and_then(serde_json::Value::as_array)
+        .map(|ids| {
+            ids.iter()
+                .filter_map(|id| id.as_str().map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 fn from_tool(tool: &ToolCard) -> ToolBlock {
     let display = tool.display.as_ref();
     let header = display.and_then(|display| typed_header(display.header.as_ref()));
@@ -282,6 +378,7 @@ fn from_tool(tool: &ToolCard) -> ToolBlock {
     ToolBlock {
         name: tool.name.clone(),
         summary,
+        todo: todo_block(&tool.name, tool.args_json.as_deref()),
         state,
         output,
         diff,
@@ -493,6 +590,149 @@ const fn tool_state(state: TimelineToolState) -> ToolState {
 mod tests {
     use super::*;
     use qaqh_client::{TimelineFailure, TimelineToolDisplay, TimelineTurnState};
+
+    /// `todo_write` 的清单来自入参 `args_json`——服务端输出里只有
+    /// `replaced`/`total`/`assigned`/`current_id` 记账，没有清单本身。
+    #[test]
+    fn todo_block_only_parses_todo_write() {
+        let args = r#"{"items":[{"title":"a","status":"pending"}]}"#;
+        assert!(todo_block("todo_write", Some(args)).is_some());
+        assert!(todo_block("exec", Some(args)).is_none());
+        assert!(todo_block("todo_write", None).is_none());
+        assert!(todo_block("todo_write", Some("not json")).is_none());
+    }
+
+    /// 当前清单 = **最后一次成功**的 `todo_write`。
+    ///
+    /// 失败的那次参数本身可解析（真实日志里 `id` 引用了不存在的项），只有状态
+    /// 能区分——所以扫的时候必须带状态过滤，否则面板会显示一份根本没落地的计划；
+    /// 同理运行中的那次也不能算数（参数可能还没到齐）。
+    #[test]
+    fn current_todo_takes_the_last_successful_write() {
+        let model = model(vec![
+            turn(vec![todo_tool_block(
+                "old",
+                TimelineToolState::Succeeded,
+                r#"{"items":[{"title":"旧计划","status":"pending"}]}"#,
+            )]),
+            turn(vec![
+                todo_tool_block(
+                    "rejected",
+                    TimelineToolState::Failed,
+                    r#"{"items":[{"id":"T9","title":"被拒的计划","status":"pending"}]}"#,
+                ),
+                todo_tool_block(
+                    "running",
+                    TimelineToolState::Running,
+                    r#"{"items":[{"title":"运行中的计划","status":"pending"}]}"#,
+                ),
+            ]),
+        ]);
+
+        let todo = current_todo(&model).expect("todo");
+        assert_eq!(todo.items.len(), 1);
+        assert_eq!(todo.items[0].title, "旧计划");
+    }
+
+    /// 没有任何成功的 `todo_write` 时返回 `None`（面板不显示），而不是 panic
+    /// 或退回最后一条失败参数。
+    #[test]
+    fn current_todo_is_none_without_a_successful_write() {
+        assert!(current_todo(&TimelineModel::default()).is_none());
+
+        let model = model(vec![
+            turn(vec![tool_block_of(
+                "other",
+                "exec",
+                TimelineToolState::Succeeded,
+            )]),
+            turn(vec![todo_tool_block(
+                "cancelled",
+                TimelineToolState::Cancelled,
+                r#"{"items":[{"title":"取消的计划","status":"pending"}]}"#,
+            )]),
+        ]);
+        assert!(current_todo(&model).is_none());
+    }
+
+    /// `TimelineModel` 有私有字段，测试里不能直接写字面量。
+    fn model(turns: Vec<Turn>) -> TimelineModel {
+        let mut model = TimelineModel::default();
+        model.turns = turns;
+        model
+    }
+
+    /// 入参省略 `title` 时，面板要显示**上一版**的标题（后端沿用同 id 的旧标题），
+    /// 而不是空串或光秃秃的 id。
+    ///
+    /// 这里必须带上成功回执：第一轮建 T1 时入参里没有 id，只有回执的
+    /// `assigned` 才说得清「那条就是 T1」。
+    #[test]
+    fn current_todo_inherits_titles_across_writes() {
+        let model = model(vec![
+            turn(vec![todo_tool_block_with(
+                "first",
+                TimelineToolState::Succeeded,
+                r#"{"items":[{"title":"跑通后端契约","status":"in_progress"}]}"#,
+                Some(
+                    r#"{"replaced":0,"total":1,"assigned":["T1"],"current_id":"T1","message":"Plan updated: 1 item(s) (1 new).","status":"ok"}"#,
+                ),
+            )]),
+            turn(vec![todo_tool_block(
+                "second",
+                TimelineToolState::Succeeded,
+                r#"{"items":[{"id":"T1","status":"completed"},{"id":"T2","status":"pending"}]}"#,
+            )]),
+        ]);
+        let todo = current_todo(&model).expect("todo");
+        assert_eq!(todo.items.len(), 2);
+        assert_eq!(todo.items[0].title, "跑通后端契约");
+        // T2 从没出现过：继承不到就保持空，由渲染层退回显示 id。
+        assert_eq!(todo.items[1].title, "");
+    }
+
+    /// 回执缺失（老会话 / 回放）时不能瞎猜 id：宁可继承不到，也不能把 T1 的
+    /// 标题安到 T2 头上。
+    #[test]
+    fn current_todo_skips_title_inheritance_without_an_assigned_receipt() {
+        let model = model(vec![
+            turn(vec![todo_tool_block(
+                "first",
+                TimelineToolState::Succeeded,
+                r#"{"items":[{"title":"跑通后端契约","status":"in_progress"}]}"#,
+            )]),
+            turn(vec![todo_tool_block(
+                "second",
+                TimelineToolState::Succeeded,
+                r#"{"items":[{"id":"T1","status":"completed"}]}"#,
+            )]),
+        ]);
+        let todo = current_todo(&model).expect("todo");
+        assert_eq!(todo.items[0].title, "");
+    }
+
+    fn todo_tool_block(id: &str, state: TimelineToolState, args: &str) -> Block {
+        todo_tool_block_with(id, state, args, None)
+    }
+
+    fn todo_tool_block_with(
+        id: &str,
+        state: TimelineToolState,
+        args: &str,
+        output: Option<&str>,
+    ) -> Block {
+        let mut block = tool_block_of(id, "todo_write", state);
+        let tool = block.tool.as_mut().expect("tool");
+        tool.args_json = Some(args.to_string());
+        tool.output = output.map(str::to_owned);
+        block
+    }
+
+    fn tool_block_of(id: &str, name: &str, state: TimelineToolState) -> Block {
+        let mut block = block(id, TimelineBlockKind::Tool, TimelineBlockState::Sealed, "");
+        block.tool = Some(tool_card(name, state));
+        block
+    }
 
     fn block(id: &str, kind: TimelineBlockKind, state: TimelineBlockState, text: &str) -> Block {
         Block {

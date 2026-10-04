@@ -31,7 +31,6 @@ use crate::app::session::SessionState;
 use crate::app::{App, AppMsg, ConnPhase, ModalHit, StartupIntent, WorkspaceHit};
 use crate::runtime::{Runtime, RuntimeMsg};
 use crate::theme::Theme;
-use crate::ui::v2::adapter;
 use crate::ui::v2::hit::{
     AgentTarget, FrameHitMap, FrameId, HitMapBuilder, HitProbe, PointerTarget, ProbeFailure,
     ScrollbarPart,
@@ -682,6 +681,10 @@ fn dispatch_pointer_action(
                     frames.invalidate();
                 }
             }
+            PointerTarget::Agent(AgentTarget::Subagents) => {
+                app.cycle_subagent();
+                frames.invalidate();
+            }
             PointerTarget::Agent(AgentTarget::Message { .. }) => {
                 // Message rows open their menu on press; a stale release is a no-op.
             }
@@ -960,6 +963,9 @@ fn clear_screen(frame: &mut Frame, theme: &Theme) {
 struct AgentRender {
     lines: Vec<Line<'static>>,
     cursor: Option<Position>,
+    /// 子代理预览条的命中矩形（**相对本块左上角**，高度恒为 1）；`None` = 这一帧
+    /// 没画。渲染与命中登记共用这一份几何——各算一次就迟早错位。
+    subagent_strip: Option<Rect>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -969,8 +975,12 @@ struct AgentLayout {
     stream_rows: usize,
     thinking_rows: usize,
     composer_rows: usize,
+    /// 状态行（已并入快捷键提示）。
     status_rows: usize,
-    shortcuts_rows: usize,
+    /// 子代理预览条（0 = 没有运行中的子代理）。
+    subagent_rows: usize,
+    /// sticky 待办面板占的行数（0 = 不显示）。
+    todo_rows: usize,
 }
 
 impl AgentLayout {
@@ -981,7 +991,8 @@ impl AgentLayout {
             .saturating_add(self.thinking_rows)
             .saturating_add(self.composer_rows)
             .saturating_add(self.status_rows)
-            .saturating_add(self.shortcuts_rows)
+            .saturating_add(self.subagent_rows)
+            .saturating_add(self.todo_rows)
     }
 }
 
@@ -1267,19 +1278,23 @@ fn status_line(app: &App, width: u16, theme: &Theme) -> Line<'static> {
     // 这里给 toast 最高优先级：有 toast 时让位掉 model / cwd / usage 这些常驻项，
     // 保证瞬时的错误提示一定画得出来。
     let toast = app.toasts.back();
+    // 常驻可选项：**放得下才画**（额度在末尾统一分配）。底部两行合并成一行之后，
+    // 这些项和快捷键提示抢同一行的空间，所以不再按终端宽度拍几个固定门槛——
+    // 门槛看不出 `cwd` 比 `model` 长多少，合并行又没有第二行可以溢出。
+    let mut optional: Vec<Span<'static>> = Vec::new();
     if let Some(session) = app.active_session() {
         spans.push(Span::styled(
             format!(" · {}", session.activity_label()),
             Style::new().fg(theme.text.secondary),
         ));
-        if toast.is_none() && width >= 40 {
+        if toast.is_none() {
             if let Some(model) = session.display_model() {
-                spans.push(Span::styled(
+                optional.push(Span::styled(
                     format!(" · {model}"),
                     Style::new().fg(theme.text.dim),
                 ));
             }
-            spans.push(Span::styled(
+            optional.push(Span::styled(
                 format!(
                     " · {}",
                     match session.mode {
@@ -1289,49 +1304,60 @@ fn status_line(app: &App, width: u16, theme: &Theme) -> Line<'static> {
                 ),
                 Style::new().fg(theme.text.dim),
             ));
-        }
-        if toast.is_none()
-            && width >= 70
-            && let Some(cwd) = app.effective_cwd(None)
-        {
-            spans.push(Span::styled(
-                format!(" · {}", crate::app::truncate_str(&cwd, 28)),
-                Style::new().fg(theme.text.dim),
-            ));
-        }
-        if toast.is_none() && width >= 50 {
-            if let Some(usage) = &session.usage {
-                spans.push(Span::styled(
-                    format!(
-                        " · ↑{}k ↓{}k",
-                        usage.prompt_tokens / 1000,
-                        usage.completion_tokens / 1000
-                    ),
+            for span in usage_segments(session, theme) {
+                optional.push(span);
+            }
+            // cwd 排在使用量之后：三项指标比"我在哪个目录"更需要看见（目录在
+            // workspace 面板里另有出处）。
+            if let Some(cwd) = app.effective_cwd(None) {
+                optional.push(Span::styled(
+                    format!(" · {}", crate::app::truncate_str(&cwd, 28)),
                     Style::new().fg(theme.text.dim),
                 ));
             }
             if !session.composer.attachments.is_empty() {
-                spans.push(Span::styled(
+                optional.push(Span::styled(
                     format!(" · ✎{}", session.composer.attachments.len()),
                     Style::new().fg(theme.semantic.warning),
                 ));
             }
         }
-        if width >= 70
-            && let Some(error) = app.conn_error.as_deref()
-        {
-            // 连接诊断（含 `reconnect_message` 的 lagged/终止流文案）此前写死
-            // 截断 28 列，恰好把**原因**切掉：实测
-            // `timeline[0ea0909d]服务端终止流（l…`——连 "lagged" 都看不到，
-            // U-07 的 e2e 因此断言不到。改为按剩余宽度给额度（至少 28 列，
-            // 保住原来窄屏时的下限）。
-            let used: usize = spans.iter().map(|span| span.content.width()).sum();
-            let budget = (width as usize).saturating_sub(used + 8).max(28);
-            spans.push(Span::styled(
-                format!(" · {}", crate::app::truncate_str(error, budget)),
-                Style::new().fg(theme.semantic.warning),
-            ));
+    }
+    // 组装：必需项（连接相位 + 活动状态）与行尾时钟是底线，快捷键提示先占额度
+    // （最多吃半行），剩下的才轮到 model / mode / cwd / usage 这些常驻项——放不下
+    // 就整块丢弃，不截半个词。连接诊断 / toast 出现时提示整块让路：它们比提示
+    // 重要，而且各自都有按剩余宽度算的截断额度。
+    let clock = Span::styled(
+        format!(" {}", chrono::Local::now().format("%H:%M")),
+        Style::new().fg(theme.text.dim),
+    );
+    let used =
+        |spans: &[Span<'static>]| -> usize { spans.iter().map(|span| span.content.width()).sum() };
+    let urgent = toast.is_some() || app.conn_error.is_some();
+    let room = (width as usize).saturating_sub(used(&spans) + clock.content.width());
+    let hint = (!urgent).then(|| shortcuts_hint(app, room)).flatten();
+    let mut budget = room.saturating_sub(hint.map_or(0, |hint| hint.width() + 1));
+    for span in optional {
+        let span_width = span.content.width();
+        if span_width <= budget {
+            budget -= span_width;
+            spans.push(span);
         }
+    }
+    if width >= 70
+        && let Some(error) = app.conn_error.as_deref()
+    {
+        // 连接诊断（含 `reconnect_message` 的 lagged/终止流文案）此前写死
+        // 截断 28 列，恰好把**原因**切掉：实测
+        // `timeline[0ea0909d]服务端终止流（l…`——连 "lagged" 都看不到，
+        // U-07 的 e2e 因此断言不到。改为按剩余宽度给额度（至少 28 列，
+        // 保住原来窄屏时的下限）。
+        let rest = (width as usize).saturating_sub(used(&spans) + clock.content.width());
+        let budget = rest.saturating_sub(8).max(28);
+        spans.push(Span::styled(
+            format!(" · {}", crate::app::truncate_str(error, budget)),
+            Style::new().fg(theme.semantic.warning),
+        ));
     }
     if let Some(toast) = toast {
         let color = match toast.level {
@@ -1339,26 +1365,101 @@ fn status_line(app: &App, width: u16, theme: &Theme) -> Line<'static> {
             NoticeLevel::Warn => theme.semantic.warning,
             NoticeLevel::Error => theme.accent.error,
         };
-        // 宽度感知的截断。此前写死 44 列，在 130 列的终端上白白切掉诊断的
-        // **关键部分**：实测 `timeline[0ea0909d] 服务端终止流（lagged，…`
-        // 被切成 `…服务端终止流（l…`——连 "lagged" 都看不到，e2e 因此断言不到
-        // （U-07）。这里按「已用宽度 + 时间戳」算剩余额度，并留 8 列余量；
-        // 至少给 24 列，避免窄屏时把提示压成一个词。
-        let used: usize = spans.iter().map(|span| span.content.width()).sum();
-        let budget = (width as usize).saturating_sub(used + 8).max(24);
+        // 宽度感知的截断（理由同诊断）：至少给 24 列，避免窄屏时把提示压成一个词。
+        let rest = (width as usize).saturating_sub(used(&spans) + clock.content.width());
+        let budget = rest.saturating_sub(8).max(24);
         spans.push(Span::styled(
             format!(" · {}", crate::app::truncate_str(&toast.text, budget)),
             Style::new().fg(color),
         ));
     }
-    spans.push(Span::styled(
-        format!(" {}", chrono::Local::now().format("%H:%M")),
-        Style::new().fg(theme.text.dim),
-    ));
+    // 提示右对齐到时钟**之前**：时钟保持行尾锚点。
+    if let Some(hint) = hint {
+        let rest = (width as usize).saturating_sub(used(&spans) + clock.content.width());
+        let gap = rest.saturating_sub(hint.width());
+        if gap > 0 {
+            spans.push(Span::styled(" ".repeat(gap), Style::new()));
+            spans.push(Span::styled(hint, Style::new().fg(theme.text.dim)));
+        }
+    }
+    spans.push(clock);
     Line::from(spans)
 }
 
-fn shortcuts_line(app: &App, width: u16, theme: &Theme) -> Line<'static> {
+/// 用量三件套（v1 回归）：`↑12k ↓3k (6%) · 41 tok/s · cache 87%`。
+///
+/// 每一项都**只在数据存在时**出现——三个来源的可得性各不相同：
+/// - **上下文占比**要 `context_limit`（daemon 没给就不猜比例）；
+/// - **输出速率**要两端权威墙钟（`TurnStarted` / `TurnFinished` 的信封时间）；
+/// - **缓存命中率**要 `cache_usage_reported == Some(true)`：真 0% 与「没上报」
+///   必须可区分（协议里专门留了这个字段），不能把不上报画成 0%。
+fn usage_segments(session: &SessionState, theme: &Theme) -> Vec<Span<'static>> {
+    let dim = Style::new().fg(theme.text.dim);
+    let Some(usage) = session.usage.as_ref() else {
+        return Vec::new();
+    };
+    let mut spans = vec![Span::styled(
+        format!(
+            " · ↑{}k ↓{}k",
+            usage.prompt_tokens / 1000,
+            usage.completion_tokens / 1000
+        ),
+        dim,
+    )];
+    // 上下文占用：`prompt_tokens` 是本次请求的输入（≈ 当前上下文），除以 daemon
+    // 给的窗口上限。v1 就是 `↑xk ↓yk (pct%)`，v2 移植时把手动百分比弄丢了。
+    if let Some(limit) = session.context_limit.filter(|limit| *limit > 0) {
+        let pct = (u64::from(usage.prompt_tokens) * 100 / u64::from(limit)).min(999);
+        spans.push(Span::styled(format!(" ({pct}%)"), dim));
+    }
+    if let Some(rate) = token_rate(session) {
+        spans.push(Span::styled(format!(" · {rate:.0} tok/s"), dim));
+    }
+    // 缓存命中率取**会话累计**（`usage_totals`）：单次请求的命中率抖动过大。
+    if let Some(totals) = session.usage_totals.as_ref()
+        && totals.cache_usage_reported == Some(true)
+    {
+        let hit = u64::from(totals.prompt_cache_hit_tokens);
+        let miss = u64::from(totals.prompt_cache_miss_tokens);
+        // `checked_div` 顺手把 `hit + miss == 0`（没有可比的请求）挡掉。
+        if let Some(pct) = (hit * 100).checked_div(hit + miss) {
+            spans.push(Span::styled(format!(" · cache {pct}%"), dim));
+        }
+    }
+    spans
+}
+
+/// 输出速率（tok/s）= 本次请求的 `completion_tokens` / 回合墙钟时长。
+///
+/// 只在**回合已结束**时给数：流式途中 `usage` 还是上一轮请求的结果，拿它配本轮
+/// 已用时长会得到一个虚高且随时间衰减的假数。两端都取信封 `ts_ms`（同源），不用
+/// 本地时钟兜底——本仓对「猜出来的时间」一贯是这个纪律。
+///
+/// 多轮回合（中间夹工具调用）分母含工具执行时间，所以这是**端到端**速率：只会
+/// 比模型瞬时生成速度低，不会虚高。
+fn token_rate(session: &SessionState) -> Option<f64> {
+    if session.streaming.is_some() {
+        return None;
+    }
+    let (turn_id, finished_at_ms) = session.last_turn_finished.as_ref()?;
+    let usage = session.usage.as_ref()?;
+    if usage.completion_tokens == 0 {
+        return None;
+    }
+    let started_at_ms = session.timeline.turn_started_at_ms(turn_id)?;
+    let elapsed_ms = finished_at_ms.saturating_sub(started_at_ms);
+    // 亚秒回合除出来全是噪声。
+    if elapsed_ms < 500 {
+        return None;
+    }
+    Some(f64::from(usage.completion_tokens) * 1000.0 / elapsed_ms as f64)
+}
+
+/// 底部快捷键提示的两个版本（完整 / 紧凑）。
+///
+/// 合并进状态行之后，给它的宽度是**算出来的剩余列**而不是固定的终端宽度阈值，
+/// 所以这里只产出候选文本，选哪一个由 [`shortcuts_hint`] 按剩余空间决定。
+fn shortcuts_variants(app: &App) -> (&'static str, &'static str) {
     let slash_open = app.overlays.is_empty() && !app.slash_candidates().is_empty();
     let waiting = app
         .active_session()
@@ -1370,33 +1471,95 @@ fn shortcuts_line(app: &App, width: u16, theme: &Theme) -> Line<'static> {
         .active_session()
         .is_some_and(|session| !session.composer.attachments.is_empty());
     let text = if waiting {
-        " Enter 应答 · Esc 取消 · F1 帮助"
+        "Enter 应答 · Esc 取消 · F1 帮助"
     } else if slash_open {
-        " ↑↓ 选择 · Tab/Enter 补全 · Esc 关闭 · F1 帮助"
+        "↑↓ 选择 · Tab/Enter 补全 · Esc 关闭 · F1 帮助"
     } else if streaming {
-        " Esc 中止 · Ctrl+Y 撤销 · Ctrl+E 压缩 · F1 帮助"
+        "Esc 中止 · Ctrl+Y 撤销 · Ctrl+E 压缩 · F1 帮助"
     } else if has_attachment {
-        " Enter 发送 · Ctrl+A 附件 · Ctrl+Y 撤销 · F1 帮助"
+        "Enter 发送 · Ctrl+A 附件 · Ctrl+Y 撤销 · F1 帮助"
     } else if app.active_session().is_some() {
-        " Enter 发送 · Alt+T 展开思考 · Alt+E 展开工具 · Ctrl+P 模式 · F1 帮助"
+        "Enter 发送 · Alt+T 展开思考 · Alt+E 展开工具 · Ctrl+P 模式 · F1 帮助"
     } else {
-        " Ctrl+N 新建 · Ctrl+L 会话 · F1 帮助 · Ctrl+Q 退出"
+        "Ctrl+N 新建 · Ctrl+L 会话 · F1 帮助 · Ctrl+Q 退出"
     };
     let compact = if waiting {
-        " Enter 应答 · Esc 取消"
+        "Enter 应答 · Esc 取消"
     } else if slash_open {
-        " ↑↓ 选择 · Enter 补全"
+        "↑↓ 选择 · Enter 补全"
     } else if streaming {
-        " Esc 中止 · Ctrl+E 压缩"
+        "Esc 中止 · Ctrl+E 压缩"
     } else if has_attachment {
-        " Enter 发送 · Ctrl+A 附件"
+        "Enter 发送 · Ctrl+A 附件"
     } else if app.active_session().is_some() {
-        " Enter 发送 · Alt+Enter 换行"
+        "Enter 发送 · Alt+Enter 换行"
     } else {
-        " Ctrl+N 新建 · Ctrl+L 会话"
+        "Ctrl+N 新建 · Ctrl+L 会话"
     };
-    let text = if width < 60 { compact } else { text };
-    Line::from(Span::styled(text, Style::new().fg(theme.text.dim)))
+    (text, compact)
+}
+
+/// 这一行还能给的列数 → 画哪一版快捷键提示（都放不下就不画）。
+///
+/// 优先**紧凑版**：完整版约 60 列，在 80~120 列的终端上会把 model / mode / cwd /
+/// usage 全挤掉——那些是状态，提示只是提示。只有剩余空间明显富余（完整版 +
+/// 一屏常驻项）时才升级到完整版。提示是不可丢弃的吗？不是：宁可让它消失，也不
+/// 让它把 `ready` / 模型 / 上下文挤没。
+fn shortcuts_hint(app: &App, room: usize) -> Option<&'static str> {
+    /// 升级到完整版需要额外富余的列数（留给常驻项）。
+    const FULL_HINT_SLACK: usize = 30;
+    let (full, compact) = shortcuts_variants(app);
+    if room >= full.width() + FULL_HINT_SLACK {
+        Some(full)
+    } else if room > compact.width() {
+        Some(compact)
+    } else {
+        None
+    }
+}
+
+/// 子代理预览条的左缩进（与转录区正文同一档）。
+const SUBAGENT_STRIP_INDENT: usize = 2;
+/// 方框总宽（含左右竖边）。
+///
+/// 「大概 15 列」：`子代理 N ›` 加两侧内边距正好收在这个宽度里，再宽就是空白。
+const SUBAGENT_STRIP_WIDTH: u16 = 14;
+
+/// 子代理预览条：一个固定宽度的单行方框，**只画运行中的子代理**。
+///
+/// 子代理是会话内部的协作方，不是顶层会话——`session.list` 不区分父子（daemon
+/// 侧 `list_sessions` 原样列出所有会话），所以它此前会作为一条独立会话混进侧栏
+/// 对话列表。过滤在前端做（见 `sidebar_rows`），而它的存在感收敛到这一格：
+/// 跑着的时候在，done 之后自然消失（数据源就是 roster 的 `Running` 状态，不需要
+/// 额外的清理时机）。点它 = `Ctrl+↑`（进入 / 循环子代理视图）。
+///
+/// 单行方框只画左右两条竖边：上下边在单行里没有位置，画了反而像坏掉的框（与
+/// `render_brand` 的多行框不同，那是真的占了三行）。
+fn subagent_strip_line(app: &App, width: u16, theme: &Theme) -> Option<Line<'static>> {
+    let running = app.running_child_agent_ids();
+    if running.is_empty() {
+        return None;
+    }
+    let total = usize::from(SUBAGENT_STRIP_WIDTH);
+    if usize::from(width) < SUBAGENT_STRIP_INDENT + total {
+        return None;
+    }
+    let label = format!("子代理 {} ›", running.len());
+    let inner = total.saturating_sub(2);
+    let label = crate::app::truncate_str(&label, inner.saturating_sub(1).max(1));
+    let pad = inner.saturating_sub(1 + label.width());
+    Some(Line::from(vec![
+        Span::styled(" ".repeat(SUBAGENT_STRIP_INDENT), Style::new()),
+        Span::styled("│".to_string(), Style::new().fg(theme.chrome.border)),
+        Span::styled(format!(" {label}"), Style::new().fg(theme.text.secondary)),
+        Span::styled(" ".repeat(pad), Style::new()),
+        Span::styled("│".to_string(), Style::new().fg(theme.chrome.border)),
+    ]))
+}
+
+/// 子代理预览条的命中宽度（与 [`subagent_strip_line`] 画的框同宽）。
+fn subagent_strip_width() -> u16 {
+    SUBAGENT_STRIP_WIDTH
 }
 
 #[cfg(test)]
@@ -1563,6 +1726,479 @@ exit_code: None,
         model
     }
 
+    fn model_with_todo_write() -> TimelineModel {
+        let mut model = model_with_sealed_answer();
+        model.apply(&entry(
+            3,
+            "turn-1",
+            TimelineEvent::BlockOpened {
+                block: TimelineBlock {
+                    block_id: "todo-1".to_string(),
+                    block_order: 1,
+                    kind: TimelineBlockKind::Tool,
+                    state: TimelineBlockState::Sealed,
+                    text: String::new(),
+                    tool: Some(qaqh_client::TimelineTool {
+                        exit_code: None,
+                        completed_at_ms: None,
+                        tool_call_id: "call-todo".to_string(),
+                        name: "todo_write".to_string(),
+                        state: qaqh_client::TimelineToolState::Succeeded,
+                        summary: None,
+                        args_json: Some(
+                            r#"{"items":[
+                                {"title":"已完成甲","status":"completed"},
+                                {"title":"进行中丙","status":"in_progress"},
+                                {"title":"待办丁","status":"pending"}
+                            ]}"#
+                            .to_string(),
+                        ),
+                        output: None,
+                        diff: None,
+                        progress: String::new(),
+                        progress_truncated: false,
+                        progress_stream: None,
+                        progress_bytes_total: 0,
+                        display: None,
+                        failure: None,
+                        permission: None,
+                    }),
+                },
+            },
+        ));
+        model
+    }
+
+    /// sticky 面板贴在输入带上沿，进行中的那项在第一行。
+    ///
+    /// 面板吃的是**转录区**的行：色带位置不变（19..=21），面板挤在它上面。
+    #[test]
+    fn todo_panel_sits_above_the_composer_band() {
+        let mut app = app_with_model(model_with_todo_write());
+        app.show_workspace = false;
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).expect("fullscreen terminal");
+        let route = route::resolve(&app);
+        let mut view = FullscreenView::default();
+
+        draw_agent_frame(&mut terminal, &app, &route, &mut view);
+
+        let band = test_theme().chrome.composer_bg;
+        assert_eq!(
+            composer_band_rows(&terminal, 80, 24, band),
+            vec![20, 21, 22],
+            "面板不该顶掉输入带"
+        );
+
+        let buffer = terminal.backend().buffer();
+        let row = |y: u16| -> String {
+            (0..80u16)
+                .filter_map(|x| buffer.cell((x, y)).map(|cell| cell.symbol()))
+                .collect::<String>()
+                .chars()
+                .filter(|ch| !ch.is_whitespace())
+                .collect()
+        };
+        // 面板 4 行（标题 + 3 项）落在转录区末尾，紧贴色带。
+        assert!(row(16).contains("待办·1/3完成"), "{}", row(16));
+        assert!(row(17).contains("进行中丙"), "{}", row(17));
+        assert!(row(18).contains("待办丁"), "{}", row(18));
+        assert!(row(19).contains("已完成甲"), "{}", row(19));
+    }
+
+    fn model_with_consecutive_reads() -> TimelineModel {
+        let mut model = TimelineModel::default();
+        model.apply(&entry(
+            1,
+            "turn-reads",
+            TimelineEvent::TurnOpened {
+                user_text: "读三个文件".to_string(),
+            },
+        ));
+        for (index, path) in ["src/a.rs", "src/b.rs", "src/c.rs"].iter().enumerate() {
+            model.apply(&entry(
+                (index + 2) as u64,
+                "turn-reads",
+                TimelineEvent::BlockOpened {
+                    block: TimelineBlock {
+                        block_id: format!("read-{}", index + 1),
+                        block_order: index as u32,
+                        kind: TimelineBlockKind::Tool,
+                        state: TimelineBlockState::Sealed,
+                        text: String::new(),
+                        tool: Some(qaqh_client::TimelineTool {
+                            exit_code: None,
+                            completed_at_ms: None,
+                            tool_call_id: format!("call-{}", index + 1),
+                            name: "read".to_string(),
+                            state: qaqh_client::TimelineToolState::Succeeded,
+                            summary: None,
+                            args_json: None,
+                            output: Some(format!("L1: {path}")),
+                            diff: None,
+                            progress: String::new(),
+                            progress_truncated: false,
+                            progress_stream: None,
+                            progress_bytes_total: 0,
+                            display: Some(qaqh_client::TimelineToolDisplay {
+                                summary: None,
+                                diff: None,
+                                lines_added: 0,
+                                lines_removed: 0,
+                                header: Some(qaqh_client::TimelineToolHeader::Path {
+                                    path: path.to_string(),
+                                    op: qaqh_client::TimelinePathOp::Read,
+                                }),
+                                body: None,
+                                metrics: None,
+                                outcome: None,
+                            }),
+                            failure: None,
+                            permission: None,
+                        }),
+                    },
+                },
+            ));
+        }
+        model
+    }
+
+    /// 全屏侧：连续 read 合成**一张**卡，命中区域也只有一块（指向首成员）。
+    #[test]
+    fn fullscreen_collapses_consecutive_lookups_into_one_card() {
+        let app = app_with_model(model_with_consecutive_reads());
+        let theme = test_theme();
+        let mut cache = FullscreenTranscriptCache::default();
+        cache.sync(&app.sessions["session-1"], 79, &theme);
+
+        let text: Vec<String> = cache
+            .rendered_lines()
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect();
+        let joined = text.join("\n");
+        assert!(joined.contains("Read 3 files"), "{joined}");
+        assert!(
+            !joined.contains("Read src/a.rs"),
+            "合并后不再逐张画头：{joined}"
+        );
+        assert!(joined.contains("src/a.rs"), "{joined}");
+
+        let tool_spans = cache.tool_spans();
+        assert_eq!(tool_spans.len(), 1, "三张卡只留一个命中区域");
+        assert_eq!(tool_spans[0].0, "read-1", "命中区域指向首成员");
+        assert_eq!(tool_spans[0].2 - tool_spans[0].1, 4, "1 行头 + 3 行清单");
+    }
+
+    /// 展开首成员即拆组：`expanded_tools` 里放 read-1，卡片回到逐张画。
+    #[test]
+    fn fullscreen_group_splits_once_a_member_is_expanded() {
+        let mut app = app_with_model(model_with_consecutive_reads());
+        let session = app.sessions.get_mut("session-1").expect("session");
+        assert!(session.toggle_tool_expanded("read-1"));
+        let theme = test_theme();
+        let mut cache = FullscreenTranscriptCache::default();
+        cache.sync(&app.sessions["session-1"], 79, &theme);
+
+        let joined: String = cache
+            .rendered_lines()
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(joined.contains("Read src/a.rs"), "{joined}");
+        assert!(
+            joined.contains("Read 2 files"),
+            "其余连续项照常合并：{joined}"
+        );
+    }
+
+    /// 回归（长会话 spinner 卡死）：窗口里留下一个**终态条目丢失**的旧 running
+    /// 回合时，「正在工作」必须仍然为假——否则输入框上方会常驻一行思考动画、
+    /// 状态栏常驻 `answering · r0`。
+    #[test]
+    fn ghost_running_turn_does_not_keep_the_session_working() {
+        let mut model = TimelineModel::default();
+        model.apply(&entry(
+            1,
+            "t1",
+            TimelineEvent::TurnOpened {
+                user_text: "第一轮".into(),
+            },
+        ));
+        model.apply(&entry(
+            2,
+            "t2",
+            TimelineEvent::TurnOpened {
+                user_text: "第二轮".into(),
+            },
+        ));
+        // t1 的 TurnSealed 丢失（旧实现里它会一直留在窗口当幽灵）；t2 正常封口。
+        model.apply(&entry(
+            3,
+            "t2",
+            TimelineEvent::TurnSealed {
+                state: qaqh_client::TimelineTurnState::Completed,
+                failure: None,
+            },
+        ));
+
+        let mut session = SessionState::new("s".into());
+        session.timeline = model;
+        assert!(
+            session.timeline.turns[0].is_streaming(),
+            "夹具前提：t1 仍是幽灵"
+        );
+        assert!(
+            !session_is_working(&session),
+            "幽灵不得让 spinner 常驻：{}",
+            session.activity_label()
+        );
+    }
+
+    /// root（会话）+ 一个指定状态的子代理：预览条的数据源是 **roster status**。
+    fn subagent_team_snapshot(status: &str) -> qaqh_client::ClientV2TeamSnapshot {
+        serde_json::from_value(serde_json::json!({
+            "root_session_id": "session-1",
+            "agents": [
+                {
+                    "agent_id": "session-1",
+                    "agent_path": "/root",
+                    "role": "root",
+                    "status": "running",
+                    "residency": "loaded"
+                },
+                {
+                    "agent_id": "child",
+                    "agent_path": "/root/child",
+                    "nickname": "child",
+                    "status": status,
+                    "residency": "loaded",
+                    "parent_agent_path": "/root"
+                }
+            ],
+            "unread_messages": [],
+            "revision": 1,
+            "last_fact_seq": 1
+        }))
+        .expect("team snapshot")
+    }
+
+    fn subagent_running_app() -> App {
+        let mut app = app_with_model(model_with_sealed_answer());
+        app.show_workspace = false;
+        app.teams
+            .entry("session-1".into())
+            .or_default()
+            .replace_from_snapshot(subagent_team_snapshot("running"));
+        app
+    }
+
+    fn drawn_row(terminal: &Terminal<TestBackend>, y: u16) -> String {
+        let buffer = terminal.backend().buffer();
+        // 读**整行**：全屏布局左侧还有会话栏，写死 0..80 会把右侧右对齐的
+        // 内容（快捷键提示）切掉。
+        (0..buffer.area.width)
+            .filter_map(|x| buffer.cell((x, y)).map(|cell| cell.symbol()))
+            .collect()
+    }
+
+    /// 子代理预览条：**跑着的时候**占一行，done 之后连那一行一起消失。
+    ///
+    /// 行为契约来自数据源本身（roster 的 `Running`），没有额外的清理时机——
+    /// 「下一个对话开始时置空」这种时序约束因此不需要额外实现。
+    #[test]
+    fn subagent_strip_appears_only_while_a_subagent_runs() {
+        let mut app = subagent_running_app();
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).expect("fullscreen terminal");
+        let route = route::resolve(&app);
+        let mut view = FullscreenView::default();
+        draw_agent_frame(&mut terminal, &app, &route, &mut view);
+
+        let band = test_theme().chrome.composer_bg;
+        assert_eq!(
+            composer_band_rows(&terminal, 80, 24, band),
+            vec![19, 20, 21],
+            "预览条占走底部一行，输入带上移"
+        );
+        // 宽字符的续格在 buffer 里是空格（ratatui 的 `Cell::default()`），比对前先
+        // 去掉空白——与 `fullscreen_agent_draw_survives_resize` 同一套路。
+        let last_row = |terminal: &Terminal<TestBackend>| -> String {
+            drawn_row(terminal, 23)
+                .chars()
+                .filter(|ch| !ch.is_whitespace())
+                .collect()
+        };
+        assert!(
+            last_row(&terminal).contains("子代理1"),
+            "预览条贴在最后一行：{:?}",
+            drawn_row(&terminal, 23)
+        );
+
+        // 子代理 done → 预览条消失，输入带落回最下面。
+        app.teams
+            .get_mut("session-1")
+            .expect("team")
+            .replace_from_snapshot(subagent_team_snapshot("completed"));
+        let mut view = FullscreenView::default();
+        draw_agent_frame(&mut terminal, &app, &route, &mut view);
+        assert_eq!(
+            composer_band_rows(&terminal, 80, 24, band),
+            vec![20, 21, 22]
+        );
+        assert!(
+            !last_row(&terminal).contains("子代理"),
+            "done 之后预览条必须消失：{:?}",
+            drawn_row(&terminal, 23)
+        );
+    }
+
+    /// 底部两行（状态 + 快捷键）合并成**一行**：省下的那一行留给子代理预览条。
+    ///
+    /// 没有子代理在跑时，这一行就是整个底部行——比原来少占一行。
+    #[test]
+    fn status_row_carries_status_and_shortcuts_on_one_line() {
+        let mut app = app_with_model(model_with_sealed_answer());
+        app.show_workspace = false;
+        app.conn_phase = ConnPhase::Ready;
+        let backend = TestBackend::new(100, 24);
+        let mut terminal = Terminal::new(backend).expect("fullscreen terminal");
+        let route = route::resolve(&app);
+        let mut view = FullscreenView::default();
+        draw_agent_frame(&mut terminal, &app, &route, &mut view);
+
+        let compact: String = drawn_row(&terminal, 23)
+            .chars()
+            .filter(|ch| !ch.is_whitespace())
+            .collect();
+        assert!(compact.contains("ready"), "状态仍在：{compact:?}");
+        assert!(
+            compact.contains("Enter发送"),
+            "快捷键提示同排右对齐：{compact:?}"
+        );
+    }
+
+    /// 预览条是**按钮**：点它 = `Ctrl+↑`，进入子代理视图。
+    #[tokio::test]
+    async fn subagent_strip_click_enters_the_child_view() {
+        let mut app = subagent_running_app();
+        let mut view = FullscreenView::default();
+        let mut frames = publish_frame(&app, &mut view, 80, 24);
+        let rect = frames
+            .current()
+            .expect("published frame")
+            .regions
+            .iter()
+            .find_map(|region| match &region.target {
+                PointerTarget::Agent(AgentTarget::Subagents) => Some(region.rect),
+                _ => None,
+            })
+            .expect("预览条必须登记命中矩形");
+        assert_eq!(rect.height, 1, "预览条是单行方框");
+
+        for kind in [
+            MouseEventKind::Down(MouseButton::Left),
+            MouseEventKind::Up(MouseButton::Left),
+        ] {
+            handle_message(
+                &mut app,
+                AppMsg::Mouse(left_mouse(kind, rect.x + 1, rect.y)),
+                &mut frames,
+                &mut view,
+            );
+        }
+        assert_eq!(
+            app.inspect.as_deref(),
+            Some("child"),
+            "点击预览条要进入子代理视图"
+        );
+    }
+
+    /// 用量三件套（v1 回归）：上下文占比 / 输出速率 / 缓存命中率。
+    #[test]
+    fn usage_segments_render_context_rate_and_cache_hit() {
+        let theme = test_theme();
+        let mut session = SessionState::new("s".into());
+        // 无 usage → 一项都不画。
+        assert!(
+            usage_segments(&session, &theme).is_empty(),
+            "无 usage 就不画"
+        );
+
+        session.usage = Some(usage_info(12_000, 3_000));
+        session.usage_totals = Some(usage_info(100, 10));
+        let text = spans_text(&usage_segments(&session, &theme));
+        assert!(text.contains("↑12k ↓3k"), "{text}");
+        assert!(!text.contains('%'), "没有 context_limit 就不画占比：{text}");
+        assert!(!text.contains("cache"), "没上报缓存就不画命中率：{text}");
+
+        // context_limit + 缓存上报 → 占比与命中率都出来。
+        session.context_limit = Some(200_000);
+        session.usage_totals = Some(qaqh_client::UsageInfo {
+            prompt_cache_hit_tokens: 870,
+            prompt_cache_miss_tokens: 130,
+            cache_usage_reported: Some(true),
+            ..usage_info(0, 0)
+        });
+        let text = spans_text(&usage_segments(&session, &theme));
+        assert!(text.contains("(6%)"), "12000/200000 = 6%：{text}");
+        assert!(text.contains("cache 87%"), "{text}");
+        assert!(!text.contains("tok/s"), "回合没结束就没有速率：{text}");
+    }
+
+    /// 输出速率要**两端权威墙钟**：缺任一端都不给数（不拿本地时钟兜底）。
+    #[test]
+    fn token_rate_needs_both_ends_of_the_turn() {
+        let mut session = SessionState::new("s".into());
+        session.usage = Some(usage_info(100, 2_000));
+        session.last_turn_finished = Some(("t1".into(), 12_000));
+        assert!(token_rate(&session).is_none(), "缺 started_at_ms → 不给数");
+
+        session.timeline.apply(&entry(
+            1,
+            "t1",
+            TimelineEvent::TurnOpened {
+                user_text: "q".into(),
+            },
+        ));
+        session.timeline.record_turn_time("t1", Some(2_000));
+        // 10 秒里产出 2000 token = 200 tok/s。
+        assert_eq!(token_rate(&session).map(|rate| rate.round()), Some(200.0));
+
+        // 流式途中不给数（`usage` 可能还是上一轮的）。
+        session.streaming = Some(crate::app::session::StreamingState {
+            turn_id: "t2".into(),
+            phase: crate::app::session::StreamPhase::Answering,
+            round_num: 0,
+            tool_name: None,
+            armed_at: std::time::Instant::now(),
+        });
+        assert!(token_rate(&session).is_none());
+    }
+
+    fn usage_info(prompt_tokens: u32, completion_tokens: u32) -> qaqh_client::UsageInfo {
+        qaqh_client::UsageInfo {
+            prompt_tokens,
+            completion_tokens,
+            ..qaqh_client::UsageInfo::default()
+        }
+    }
+
+    fn spans_text(spans: &[Span<'static>]) -> String {
+        spans.iter().map(|span| span.content.as_ref()).collect()
+    }
+
     fn model_with_many_sealed_turns(count: usize) -> TimelineModel {
         let mut model = TimelineModel::default();
         for index in 0..count {
@@ -1625,6 +2261,69 @@ exit_code: None,
         let compact: String = text.chars().filter(|ch| !ch.is_whitespace()).collect();
         assert!(compact.contains("answer-29"), "{text}");
         assert!(compact.contains("回到最新消息"), "{text}");
+    }
+
+    /// 收集整行都铺着 composer 输入带底色的行号（跳过左侧会话栏占位列）。
+    fn composer_band_rows(
+        terminal: &Terminal<TestBackend>,
+        width: u16,
+        height: u16,
+        band: ratatui::style::Color,
+    ) -> Vec<usize> {
+        let rail = usize::from(crate::ui::v2::sidebar::rail_width(width));
+        let buffer = terminal.backend().buffer();
+        (0..usize::from(height))
+            .filter(|y| {
+                (rail..usize::from(width)).all(|x| {
+                    buffer
+                        .cell((x as u16, *y as u16))
+                        .is_some_and(|cell| cell.bg == band)
+                })
+            })
+            .collect()
+    }
+
+    #[test]
+    fn composer_band_paints_three_contiguous_rows_above_status() {
+        let mut app = app_with_model(model_with_sealed_answer());
+        app.show_workspace = false;
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).expect("fullscreen terminal");
+        let route = route::resolve(&app);
+        let mut view = FullscreenView::default();
+
+        draw_agent_frame(&mut terminal, &app, &route, &mut view);
+
+        let band = test_theme().chrome.composer_bg;
+        let rows = composer_band_rows(&terminal, 80, 24, band);
+        assert_eq!(rows, vec![20, 21, 22], "composer band rows");
+    }
+
+    #[test]
+    fn composer_band_centers_single_line_input() {
+        let mut app = app_with_model(model_with_sealed_answer());
+        app.show_workspace = false;
+        app.sessions
+            .get_mut("session-1")
+            .expect("session")
+            .composer
+            .insert_str("hello");
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).expect("fullscreen terminal");
+        let route = route::resolve(&app);
+        let mut view = FullscreenView::default();
+
+        draw_agent_frame(&mut terminal, &app, &route, &mut view);
+
+        let band = test_theme().chrome.composer_bg;
+        let rows = composer_band_rows(&terminal, 80, 24, band);
+        assert_eq!(rows, vec![20, 21, 22], "composer band rows");
+        // 单行输入垂直居中：`❯ hello` 落在色带中间一行。
+        let buffer = terminal.backend().buffer();
+        let middle: String = (0..80usize)
+            .filter_map(|x| buffer.cell((x as u16, 21)).map(|cell| cell.symbol()))
+            .collect();
+        assert!(middle.contains("❯ hello"), "middle row was {middle:?}");
     }
 
     #[test]

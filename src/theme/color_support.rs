@@ -21,10 +21,20 @@ impl ColorSupport {
         let no_color = std::env::var_os("NO_COLOR").is_some();
         let colorterm = std::env::var_os("COLORTERM");
         let term = std::env::var_os("TERM");
-        Self::detect_from(no_color, colorterm.as_deref(), term.as_deref())
+        Self::detect_from(
+            no_color,
+            colorterm.as_deref(),
+            term.as_deref(),
+            cfg!(windows),
+        )
     }
 
-    fn detect_from(no_color: bool, colorterm: Option<&OsStr>, term: Option<&OsStr>) -> Self {
+    fn detect_from(
+        no_color: bool,
+        colorterm: Option<&OsStr>,
+        term: Option<&OsStr>,
+        windows: bool,
+    ) -> Self {
         if no_color || os_eq_ignore_ascii_case(term, "dumb") {
             return Self::NoColor;
         }
@@ -35,6 +45,14 @@ impl ColorSupport {
         }
         if os_contains_ignore_ascii_case(term, "256color") {
             return Self::Ansi256;
+        }
+        // Windows 终端（Windows Terminal / conhost Win10+ / mintty）普遍支持
+        // 24-bit，但默认既不设 `COLORTERM` 也不设 `TERM`。缺了这条兜底，整套
+        // QAQH Night 会被静默量化成 16 个命名色——标题/链接落到 `Blue`、三级
+        // 标题落到 `Magenta`，在黑色背景上对比度只有 1.3:1 / 2.2:1（实测），
+        // 表现就是"markdown 主题色是难看又看不清的蓝紫"。
+        if windows {
+            return Self::TrueColor;
         }
         Self::Ansi16
     }
@@ -240,11 +258,11 @@ mod tests {
     #[test]
     fn detect_from_respects_no_color_and_dumb_terminal() {
         assert_eq!(
-            ColorSupport::detect_from(true, Some(OsStr::new("truecolor")), None),
+            ColorSupport::detect_from(true, Some(OsStr::new("truecolor")), None, false),
             ColorSupport::NoColor
         );
         assert_eq!(
-            ColorSupport::detect_from(false, None, Some(OsStr::new("dumb"))),
+            ColorSupport::detect_from(false, None, Some(OsStr::new("dumb")), false),
             ColorSupport::NoColor
         );
     }
@@ -255,17 +273,44 @@ mod tests {
             ColorSupport::detect_from(
                 false,
                 Some(OsStr::new("24bit")),
-                Some(OsStr::new("xterm-256color"))
+                Some(OsStr::new("xterm-256color")),
+                false
             ),
             ColorSupport::TrueColor
         );
         assert_eq!(
-            ColorSupport::detect_from(false, None, Some(OsStr::new("xterm-256color"))),
+            ColorSupport::detect_from(false, None, Some(OsStr::new("xterm-256color")), false),
             ColorSupport::Ansi256
         );
         assert_eq!(
-            ColorSupport::detect_from(false, None, Some(OsStr::new("xterm"))),
+            ColorSupport::detect_from(false, None, Some(OsStr::new("xterm")), false),
             ColorSupport::Ansi16
+        );
+    }
+
+    /// Windows 终端默认 `COLORTERM`/`TERM` 双空。此时若退到 Ansi16，整套
+    /// QAQH Night 会被量化成命名色（黑底上 Blue 1.3:1、Magenta 2.2:1），
+    /// 所以平台兜底必须是 TrueColor；显式声明与 NO_COLOR 仍然优先。
+    #[test]
+    fn detect_from_defaults_windows_to_truecolor() {
+        assert_eq!(
+            ColorSupport::detect_from(false, None, None, true),
+            ColorSupport::TrueColor
+        );
+        assert_eq!(
+            ColorSupport::detect_from(true, None, None, true),
+            ColorSupport::NoColor,
+            "NO_COLOR 必须压过平台兜底"
+        );
+        assert_eq!(
+            ColorSupport::detect_from(false, None, Some(OsStr::new("xterm-256color")), true),
+            ColorSupport::Ansi256,
+            "显式声明的 256 色终端不被平台兜底覆盖"
+        );
+        assert_eq!(
+            ColorSupport::detect_from(false, None, None, false),
+            ColorSupport::Ansi16,
+            "非 Windows 保持原行为"
         );
     }
 

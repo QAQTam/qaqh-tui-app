@@ -2,7 +2,8 @@
 //!
 //! 数据源是 [`App::sidebar_rows`]（daemon 启动后被激活过 / 正在跑的会话）；
 //! 渲染遵循鼠标优先的按钮规范（spec §5）：无框线，hover / pressed / 选中
-//! 全部用整行背景色表达。Working 会话的状态 glyph 走星芒动画
+//! 全部用整行背景色表达。整列另铺 `surface.light` 面板底色，与右侧**不铺底色**
+//! 的消息区形成竖向分界。Working 会话的状态 glyph 走星芒动画
 //! （200ms/帧，由 Tick 驱动重绘）。
 //!
 //! 命中目标与 `dispatch_pointer_action` 共用 [`AgentTarget::SidebarRow`] 的
@@ -173,7 +174,13 @@ pub fn draw(
         }
         lines.push(line);
     }
-    frame.render_widget(Paragraph::new(lines), area);
+    // 整列铺 `surface.light`：会话栏与右侧消息区因此有一条明确的竖向分界
+    // （消息区刻意不铺底色，保持终端背景）。`Paragraph::style` 会先
+    // `buf.set_style(area, ..)`，空行与行尾自动被填满，无需手动补空格。
+    frame.render_widget(
+        Paragraph::new(lines).style(Style::new().bg(theme.surface.light)),
+        area,
+    );
 }
 
 /// 按显示宽度截断（宽字符感知）；与 workspace 列表同一规则。
@@ -264,6 +271,76 @@ mod tests {
     fn rail_width_hides_on_narrow_terminals() {
         assert_eq!(rail_width(89), 0);
         assert_eq!(rail_width(90), RAIL_WIDTH);
+    }
+
+    /// 会话栏整列铺 `surface.light`，与右侧不铺底色的消息区形成竖向分界。
+    #[test]
+    fn sidebar_rail_paints_panel_background() {
+        use crate::app::session::SessionState;
+        use crate::ui::v2::hit::{FrameId, HitMapBuilder};
+        use crate::ui::v2::route::ScreenRoute;
+        use qaqh_client::{SessionListEntry, SessionMeta};
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let (mut app, _rx) = crate::app::App::new_for_test();
+        for id in ["s-1", "s-2"] {
+            app.tabs.push(id.into());
+            app.sessions.insert(id.into(), SessionState::new(id.into()));
+            let mut entry = SessionListEntry {
+                meta: SessionMeta {
+                    session_id: id.into(),
+                    title: Some(id.into()),
+                    ..SessionMeta::default()
+                },
+                running: true,
+                workspace_id: None,
+            };
+            entry.meta.title = Some(id.into());
+            app.session_list_cache.push(entry);
+        }
+        app.active = 0;
+        let theme = theme();
+        let rail_area = Rect::new(0, 0, RAIL_WIDTH, 8);
+        let mut anim = SidebarAnim::default();
+        let mut hit_map = HitMapBuilder::new(
+            FrameId::new(1),
+            ScreenRoute::Agent,
+            ratatui::layout::Size::new(100, 8),
+            0,
+        );
+        let pointer = FullscreenState::default();
+        let mut terminal = Terminal::new(TestBackend::new(100, 8)).expect("terminal");
+
+        terminal
+            .draw(|frame| {
+                draw(
+                    frame,
+                    &app,
+                    rail_area,
+                    &theme,
+                    &pointer,
+                    &mut anim,
+                    &mut hit_map,
+                )
+            })
+            .unwrap();
+
+        let buffer = terminal.backend().buffer();
+        assert_eq!(
+            buffer[(1, 0)].bg,
+            theme.chrome.selection,
+            "选中行仍是 selection 底色（面板底色被覆盖）"
+        );
+        assert_eq!(
+            buffer[(1, 1)].bg,
+            theme.surface.light,
+            "非选中行露出会话栏面板底色"
+        );
+        assert_eq!(
+            buffer[(RAIL_WIDTH - 1, 7)].bg,
+            theme.surface.light,
+            "列表没占满时，空行也要铺满整列"
+        );
     }
 
     #[test]

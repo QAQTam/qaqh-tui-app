@@ -75,6 +75,9 @@ pub enum AgentTarget {
     /// 菜单外框（阻断层）：命中它表示"点在菜单里但不在可执行行上"，
     /// 不得穿透到底下的消息行。
     MenuRoot,
+    /// 子代理预览按钮（子代理预览条）。语义与 `Ctrl+↑` 完全一致：进入 / 在子代理
+    /// 之间循环。键盘路径见 `App::subagent_nav_key`。
+    Subagents,
     /// 左侧会话栏的第 `index` 行（语义下标，与 `App::sidebar_rows` 同源）。
     SidebarRow(usize),
 }

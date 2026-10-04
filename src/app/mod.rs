@@ -1676,6 +1676,22 @@ impl App {
 
     // ───────────────────────── conversation 投影 ─────────────────────────
 
+    /// conversation 频道的回合终态 → timeline 回合状态。
+    ///
+    /// 两边是同一组词汇（`Completed` / `Failed` / `Cancelled`），映射是恒等的——
+    /// 写出来只是为了让「对话频道也能封口」这件事在类型上显式。
+    fn turn_terminal_state(
+        terminal: qaqh_client::ClientV2TurnTerminal,
+    ) -> qaqh_client::TimelineTurnState {
+        use qaqh_client::ClientV2TurnTerminal as T;
+        use qaqh_client::TimelineTurnState as S;
+        match terminal {
+            T::Completed => S::Completed,
+            T::Failed => S::Failed,
+            T::Cancelled => S::Cancelled,
+        }
+    }
+
     fn handle_conversation_delta(
         &mut self,
         session_id: String,
@@ -1722,8 +1738,25 @@ impl App {
                     conv.usage = Some(u);
                 }
             }
-            D::TurnFinished { turn_id, usage, .. } => {
+            D::TurnFinished {
+                turn_id,
+                terminal,
+                usage,
+                ..
+            } => {
                 streaming_done(sess, Some(turn_id.as_str()));
+                // 对话频道的终态是**完整事实**（含 Completed/Failed/Cancelled），
+                // 单调落进 timeline 模型：timeline 的终态条目若丢失，这个回合就会
+                // 永远停在 running，把 spinner 与状态栏钉在 answering（见
+                // `seal_turn_from_conversation` 注释）。
+                sess.timeline.seal_turn_from_conversation(
+                    turn_id.as_str(),
+                    Self::turn_terminal_state(terminal),
+                );
+                // 输出速率的右端：用本条**信封**时间（与左端 `TurnStarted` 同源）。
+                if let Some(ts_ms) = ts_ms {
+                    sess.last_turn_finished = Some((turn_id.as_str().to_string(), ts_ms));
+                }
                 force_redraw = true;
                 if let Some(u) = usage {
                     sess.usage = Some(u.clone());
@@ -1734,6 +1767,16 @@ impl App {
             }
             D::TurnInterrupted { turn_id, .. } => {
                 streaming_done(sess, Some(turn_id.as_str()));
+                // 与后端同口径（`engine_turn.rs` 的中断分支就是
+                // `TurnSealed { state: Cancelled }`）：对话频道的中断也是终态，
+                // 同样单调落进 timeline，免得那条 seal 被日志驱逐后回合永不封口。
+                sess.timeline.seal_turn_from_conversation(
+                    turn_id.as_str(),
+                    qaqh_client::TimelineTurnState::Cancelled,
+                );
+                if let Some(ts_ms) = ts_ms {
+                    sess.last_turn_finished = Some((turn_id.as_str().to_string(), ts_ms));
+                }
                 force_redraw = true;
             }
             D::CompactionApplied {
@@ -1982,7 +2025,7 @@ impl App {
                         self.toast(NoticeLevel::Info, format!("新会话已创建 {session_id}"));
                     }
                 }
-                self.session_list_cache = list;
+                self.session_list_cache = self.stable_session_order(list);
                 self.session_list_at = Some(Instant::now());
                 // 首页选中越界回绕
                 let count = self.filtered_sessions(self.home_show_archived).len();
@@ -2500,6 +2543,112 @@ mod tests {
         assert_eq!(ids, ["s-running", "s-idle-known"]);
     }
 
+    /// root + 一个指定状态的子代理（roster 是父子关系的唯一权威）。
+    fn team_snapshot_with_child(status: &str) -> qaqh_client::ClientV2TeamSnapshot {
+        serde_json::from_value(serde_json::json!({
+            "root_session_id": "root",
+            "agents": [
+                {
+                    "agent_id": "root",
+                    "agent_path": "/root",
+                    "role": "root",
+                    "status": "running",
+                    "residency": "loaded"
+                },
+                {
+                    "agent_id": "child",
+                    "agent_path": "/root/child",
+                    "nickname": "child",
+                    "status": status,
+                    "residency": "loaded",
+                    "parent_agent_path": "/root"
+                }
+            ],
+            "unread_messages": [],
+            "revision": 1,
+            "last_fact_seq": 1
+        }))
+        .expect("team snapshot")
+    }
+
+    /// 子代理**不是顶层会话**：daemon 的 `session.list` 不区分父子（`list_sessions`
+    /// 原样列出所有会话），所以它此前会作为一条独立会话混进对话列表。过滤只能
+    /// 在前端做，且必须用 roster（`subagent_session_ids` 在子代理跑完后会摘掉，
+    /// 那样 finished 的子代理又会冒回列表里）。
+    #[test]
+    fn sidebar_rows_hide_subagent_sessions() {
+        let (mut app, _rx) = App::new_for_test();
+        let mut parent = list_entry("root", 1);
+        parent.running = true;
+        let mut child = list_entry("child", 2);
+        child.running = true;
+        app.session_list_cache = vec![parent, child];
+        app.teams
+            .entry("root".into())
+            .or_default()
+            .replace_from_snapshot(team_snapshot_with_child("completed"));
+
+        assert!(app.is_subagent_session("child"));
+        assert!(!app.is_subagent_session("root"), "root 不是子代理");
+
+        let rows = app.sidebar_rows();
+        let ids: Vec<&str> = rows.iter().map(|row| row.session_id.as_str()).collect();
+        assert_eq!(ids, ["root"], "子代理不进对话列表（跑完也不进）");
+    }
+
+    /// 周期刷新**不得重排**：daemon 按 `updated_at` 降序，而 `updated_at` 每写一条
+    /// 消息就刷新一次（`save_one`）——整表替换会让列表在光标底下每 3 秒换一次位。
+    #[test]
+    fn session_list_refresh_keeps_displayed_order() {
+        let (mut app, _rx) = App::new_for_test();
+        app.session_list_cache = vec![list_entry("old-first", 1), list_entry("old-second", 2)];
+
+        // daemon 这次把 old-second 排到了最前（它刚被写过），并多了一个新会话。
+        let merged = app.stable_session_order(vec![
+            list_entry("brand-new", 3),
+            list_entry("old-second", 2),
+            list_entry("old-first", 1),
+        ]);
+        let ids: Vec<&str> = merged.iter().map(|e| e.meta.session_id.as_str()).collect();
+        assert_eq!(
+            ids,
+            ["brand-new", "old-first", "old-second"],
+            "老面孔留在原位（只换内容），新面孔插到最前"
+        );
+
+        // 已删除的会话自然消失，其余位置不变。
+        let merged = app.stable_session_order(vec![list_entry("old-first", 1)]);
+        let ids: Vec<&str> = merged.iter().map(|e| e.meta.session_id.as_str()).collect();
+        assert_eq!(ids, ["old-first"]);
+
+        // 首次装载（缓存为空）直接采信 daemon 的顺序。
+        app.session_list_cache.clear();
+        let merged = app.stable_session_order(vec![list_entry("b", 2), list_entry("a", 1)]);
+        let ids: Vec<&str> = merged.iter().map(|e| e.meta.session_id.as_str()).collect();
+        assert_eq!(ids, ["b", "a"]);
+    }
+
+    /// 会话历史列表（Ctrl+L / 首页）与侧栏**同口径**：子代理不出现。
+    ///
+    /// 漏一处就等于没过滤——子代理每写一条消息都刷新 `updated_at`，会每隔几秒
+    /// 从这个列表往上跳一次。
+    #[test]
+    fn session_history_list_hides_subagent_sessions() {
+        let (mut app, _rx) = App::new_for_test();
+        app.session_list_cache = vec![list_entry("root", 1), list_entry("child", 2)];
+        app.teams
+            .entry("root".into())
+            .or_default()
+            .replace_from_snapshot(team_snapshot_with_child("running"));
+
+        let visible: Vec<&str> = app
+            .filtered_sessions(false)
+            .into_iter()
+            .map(|index| app.session_list_cache[index].meta.session_id.as_str())
+            .collect();
+        assert_eq!(visible, ["root"]);
+    }
+
     #[test]
     fn sidebar_rows_mark_open_and_active_tabs() {
         let (mut app, _rx) = App::new_for_test();
@@ -2919,6 +3068,74 @@ mod tests {
         });
 
         assert!(app.force_redraw, "timeline 终态也必须触发下一帧强制重绘");
+    }
+
+    /// 回归（长会话 spinner 卡死）：timeline 的终态条目丢失时，对话频道的
+    /// `TurnFinished.terminal` 必须能把回合封口——否则这个回合永远停在 running，
+    /// 任何迟到的 timeline 条目都会把 streaming 重新武装成 `answering · r0`。
+    #[test]
+    fn conversation_terminal_seals_timeline_turn() {
+        let (mut app, _rx) = App::new_for_test();
+        app.sessions
+            .insert("session".into(), SessionState::new("session".into()));
+        init_v2_session(&mut app, "session");
+
+        // 1. timeline 开回合：模型 Running，streaming 武装。
+        app.handle_runtime(RuntimeMsg::Timeline {
+            session_id: "session".into(),
+            entry: Box::new(qaqh_client::TimelineEntry {
+                timeline_seq: 1,
+                turn_id: "turn-1".into(),
+                round_num: Some(0),
+                event: qaqh_client::TimelineEvent::TurnOpened {
+                    user_text: "q".into(),
+                },
+            }),
+        });
+        assert_eq!(
+            app.sessions["session"].timeline.running_turn_id(),
+            Some("turn-1")
+        );
+
+        // 2. 对话频道宣告终态（timeline 的 TurnSealed 丢了）。
+        app.handle(AppMsg::Runtime(v2_event(
+            "session",
+            qaqh_client::ClientV2Payload::ConversationDelta(
+                qaqh_client::ClientV2ConversationDelta::TurnFinished {
+                    revision: 1,
+                    turn_id: qaqh_client::ClientV2TurnId::new("turn-1"),
+                    terminal: qaqh_client::ClientV2TurnTerminal::Completed,
+                    usage: None,
+                    error: None,
+                },
+            ),
+        )));
+        assert!(app.sessions["session"].streaming.is_none());
+        assert_eq!(
+            app.sessions["session"].timeline.running_turn_id(),
+            None,
+            "对话频道的终态必须把回合封口"
+        );
+
+        // 3. 迟到的 timeline 条目（同一回合的收尾分片）：不得重新钉回 answering。
+        app.handle_runtime(RuntimeMsg::Timeline {
+            session_id: "session".into(),
+            entry: Box::new(qaqh_client::TimelineEntry {
+                timeline_seq: 2,
+                turn_id: "turn-1".into(),
+                round_num: Some(0),
+                event: qaqh_client::TimelineEvent::TextDelta {
+                    block_id: "b1".into(),
+                    fragment_seq: 0,
+                    delta: "迟到的尾巴".into(),
+                },
+            }),
+        });
+        assert!(
+            app.sessions["session"].streaming.is_none(),
+            "不得被重新武装成 answering"
+        );
+        assert_eq!(app.sessions["session"].activity_label(), "idle");
     }
 
     #[tokio::test]

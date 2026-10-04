@@ -531,7 +531,6 @@ impl TimelineModel {
     }
 
     /// 某回合的权威墙钟（`None` = 未知）。
-    #[cfg(test)]
     pub fn turn_started_at_ms(&self, turn_id: &str) -> Option<u64> {
         self.turns
             .iter()
@@ -845,12 +844,30 @@ impl TimelineModel {
     }
 
     /// 快照整体替换（re-baseline / 打开标签页）。
+    ///
+    /// 快照是**点时刻**状态，投递可能晚于它描述的时刻：长会话里重连 / 分页触发的
+    /// rebaseline，其快照可能截于「回合封口之前」而在封口**之后**才到达，把已经
+    /// 看到终态的回合退回 Running。回合状态是**单调**的（Running → 终态；唯一反向
+    /// 路径是后端显式 reopen，那是实时 `TurnOpened` 事件，不走快照），所以这里
+    /// 只允许前进、不允许回退——否则窗口里会留下一个永不封口的幽灵 Running 回合，
+    /// 把 UI 永久钉在 working（输入框上方的 spinner + 状态栏 answering）。
     pub fn replace_from_page(&mut self, page: &TimelinePage) {
+        let known = std::mem::take(&mut self.turns);
         self.turns = page
             .snapshot
             .turns
             .iter()
-            .map(|t| Turn::from_wire(t.clone()))
+            .map(|wire| {
+                let fresh = Turn::from_wire(wire.clone());
+                match known
+                    .iter()
+                    .find(|k| k.turn_id == fresh.turn_id && k.sealed && !fresh.sealed)
+                {
+                    // 内存里已见终态、快照却说还在跑 → 快照比内存旧，保留内存版本。
+                    Some(stale_snapshot) => stale_snapshot.clone(),
+                    None => fresh,
+                }
+            })
             .collect();
         self.has_more = page.has_more;
         self.total_turns = page.total_turns;
@@ -863,6 +880,35 @@ impl TimelineModel {
         self.compaction_marks.clear();
         self.rebaseline_epoch = self.rebaseline_epoch.saturating_add(1);
         self.bump();
+    }
+
+    /// conversation 频道的**完整终态**（`TurnFinished.terminal`）落到 timeline 模型。
+    ///
+    /// timeline 的 `TurnSealed` 是首选权威，但两条 SSE 独立投递、都可能丢。若对话
+    /// 频道先到、而 timeline 的终态条目始终没来，窗口里就留下一个永不封口的
+    /// running 回合：任何后续 timeline 条目都会把 streaming 重新武装成
+    /// `answering · r0`（实测症状：模型完成最终作答后，输入框上方的思考动画仍在
+    /// 转、状态栏仍写着 answering）。
+    ///
+    /// **单调**：只把 Running 推进到终态，绝不反向；后端显式 reopen 走实时
+    /// `TurnOpened`，是另一条路径。晚到的 timeline `TurnSealed` 仍可覆盖具体终态
+    /// （那条路径无条件写 state），所以这里不会把状态锁死。
+    pub fn seal_turn_from_conversation(&mut self, turn_id: &str, state: TimelineTurnState) -> bool {
+        if state == TimelineTurnState::Running {
+            return false;
+        }
+        let Some(turn) = self.turns.iter_mut().find(|t| t.turn_id == turn_id) else {
+            return false;
+        };
+        if !turn.is_streaming() {
+            return false;
+        }
+        turn.state = state;
+        turn.sealed = true;
+        // 与 timeline 终态条目同一纪律：封口即丢 reasoning body（幂等）。
+        discard_sealed_reasoning(turn);
+        self.bump();
+        true
     }
 
     /// 加载更早的回合（滚动上翻分页）。
@@ -946,13 +992,21 @@ impl TimelineModel {
         self.turns.iter().any(|t| t.is_streaming())
     }
 
-    /// 窗口内最新的 running turn（跳过已被淘汰的旧 running 幽灵）。
+    /// 窗口内**最新回合**的 id，且仅当它仍在跑。
+    ///
+    /// 只认最后一个回合，而不是「最新的 running 回合」：一个会话里的回合是
+    /// **串行**的（后端对运行中的重复 `TurnOpened` 直接返回 `DuplicateTurn`），
+    /// 所以只要某回合后面还有更新的回合，它就**不可能**还在跑——那是终态条目
+    /// 丢失或快照过期留下的幽灵。
+    ///
+    /// 旧实现取「最新的 running 回合」，于是当前回合一封口，窗口里更旧的幽灵就
+    /// 顶上来冒充 live：输入框上方的 spinner 与状态栏的 `answering · r0` 就此
+    /// 永久卡住（长会话里攒下幽灵后"有概率"复现）。
     pub fn running_turn_id(&self) -> Option<&str> {
         self.turns
-            .iter()
-            .rev()
-            .find(|t| t.is_streaming())
-            .map(|t| t.turn_id.as_str())
+            .last()
+            .filter(|turn| turn.is_streaming())
+            .map(|turn| turn.turn_id.as_str())
     }
 
     /// 该 turn 在窗口内的运行态：`Some(true)` 仍在跑，`Some(false)` 已终态，
@@ -2572,6 +2626,119 @@ exit_code: None,
         assert_eq!(m.turn_running("t1"), Some(false));
     }
 
+    /// 回归：窗口里更旧的 running 幽灵**不得**冒充 live。
+    ///
+    /// 旧实现取「最新的 running 回合」：当前回合一封口，前面那个终态条目丢失的
+    /// 幽灵就顶上来 → `session_is_working` 恒真 → 输入框上方的 spinner 与状态栏
+    /// 的 `answering · r0` 永久卡住。
+    #[test]
+    fn older_running_ghost_does_not_masquerade_as_live() {
+        let m = TimelineModel {
+            turns: vec![
+                // t1 的 TurnSealed 丢了 / 被过期快照退回 → 模型停在 Running。
+                turn_with("t1", TimelineTurnState::Running, false),
+                // 当前回合已经封口。
+                turn_with("t2", TimelineTurnState::Completed, true),
+            ],
+            ..TimelineModel::default()
+        };
+        assert_eq!(
+            m.running_turn_id(),
+            None,
+            "t1 后面已经有更新的回合，它不可能还在跑"
+        );
+    }
+
+    /// 回归：快照整体替换不得把**已见终态**的回合退回 Running。
+    ///
+    /// 长会话里 rebaseline 的快照可能截于封口之前、投递于封口之后；不加单调
+    /// 约束就会在窗口里重新种下一个永不封口的幽灵。
+    #[test]
+    fn rebaseline_snapshot_cannot_resurrect_a_sealed_turn() {
+        let mut m = TimelineModel::default();
+        m.apply(&entry(
+            1,
+            "t1",
+            TimelineEvent::TurnOpened {
+                user_text: "q".into(),
+            },
+        ));
+        m.apply(&entry(
+            2,
+            "t1",
+            TimelineEvent::TurnSealed {
+                state: TimelineTurnState::Completed,
+                failure: None,
+            },
+        ));
+
+        // 过期快照：同一个 turn 仍写着 Running。
+        let page = TimelinePage {
+            schema: "qaqh.Ringing".into(),
+            version: 1,
+            server_epoch: "ep".into(),
+            session_id: "s".into(),
+            has_more: false,
+            total_turns: 1,
+            truncated_before: false,
+            snapshot: qaqh_client::TimelineSnapshot {
+                watermark: 2,
+                turns: vec![qaqh_client::TimelineTurn {
+                    turn_index: None,
+                    turn_id: "t1".into(),
+                    created_seq: 1,
+                    user_text: "q".into(),
+                    sealed: false,
+                    offloaded: false,
+                    state: TimelineTurnState::Running,
+                    failure: None,
+                    rounds: vec![],
+                }],
+            },
+        };
+        m.replace_from_page(&page);
+        assert!(m.turns[0].sealed, "终态不得被更旧的快照抹掉");
+        assert_eq!(m.turns[0].state, TimelineTurnState::Completed);
+        assert_eq!(m.running_turn_id(), None);
+    }
+
+    /// `seal_turn_from_conversation`：只把 Running 推进到终态，且幂等。
+    #[test]
+    fn conversation_seal_is_monotonic_and_idempotent() {
+        let mut m = TimelineModel {
+            turns: vec![turn_with("t1", TimelineTurnState::Running, false)],
+            ..TimelineModel::default()
+        };
+        assert!(
+            !m.seal_turn_from_conversation("t1", TimelineTurnState::Running),
+            "Running 不是终态，不得当封口用"
+        );
+        assert!(m.seal_turn_from_conversation("t1", TimelineTurnState::Failed));
+        assert!(m.turns[0].sealed);
+        assert_eq!(m.turns[0].state, TimelineTurnState::Failed);
+        assert!(
+            !m.seal_turn_from_conversation("t1", TimelineTurnState::Completed),
+            "已封口即幂等，不得被第二个来源改写"
+        );
+        assert!(!m.seal_turn_from_conversation("t404", TimelineTurnState::Completed));
+        assert_eq!(m.running_turn_id(), None);
+    }
+
+    fn turn_with(turn_id: &str, state: TimelineTurnState, sealed: bool) -> Turn {
+        Turn {
+            turn_id: turn_id.into(),
+            turn_index: None,
+            started_at_ms: None,
+            user_text: "q".into(),
+            state,
+            failure: None,
+            sealed,
+            offloaded: false,
+            thinking: ThinkingStats::default(),
+            rounds: Vec::new(),
+        }
+    }
+
     #[test]
     fn missing_turn_entry_has_no_terminal() {
         // 快照窗口外的迟到条目：丢弃 + 计数，且不得伪造终态信号。
@@ -2856,8 +3023,8 @@ exit_code: None,
         let stamp = crate::ui::v2::transcript::format_wall_clock(1_759_488_000_000)
             .expect("固定 epoch 必须可格式化");
         assert!(
-            text.contains(&format!(" · {stamp}")),
-            "状态行带权威墙钟尾缀：
+            !text.contains(&stamp),
+            "工具卡不打时间戳：
 {text}"
         );
     }
@@ -2942,8 +3109,11 @@ exit_code: None,
         );
         assert_eq!(
             header.trim(),
-            format!("{} Mcp Srv Tool", theme.glyph.tool),
-            "MCP 卡头部只留工具名真相字段：
+            format!(
+                "{} Failed (mcp_tool_error) Mcp Srv Tool",
+                theme.glyph.failure
+            ),
+            "MCP 卡头部 = 状态词 + 分类 code + 工具名：
 {header}"
         );
     }

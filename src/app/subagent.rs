@@ -27,6 +27,36 @@ impl App {
 
     // ── 跟踪 ──
 
+    /// 该 session 是否是某个 roster 里的**非 root** 代理（即子代理会话）。
+    ///
+    /// 判定走 team roster 而不是 `subagent_session_ids`：后者只装「当前订阅中」的
+    /// 子代理，一进终态就被摘掉；而侧栏要的是「**永远**不把子代理当顶层会话」，
+    /// 所以需要一个在子代理跑完之后仍然成立的判据（roster 条目不会被裁）。
+    pub fn is_subagent_session(&self, session_id: &str) -> bool {
+        self.team_for_agent(session_id)
+            .is_some_and(|(_, team)| team.parent_agent_id(session_id).is_some())
+    }
+
+    /// 当前观测会话下**正在运行**的子代理（预览条与 Ctrl+↑ 同源）。
+    ///
+    /// 只看 `Running`：预览条的存在感就该等于「有东西在替你干活」——done 之后
+    /// 自然消失，不需要额外的清理时机。
+    pub fn running_child_agent_ids(&self) -> Vec<String> {
+        let Some(base) = self.view_session_id() else {
+            return Vec::new();
+        };
+        self.child_agent_ids(&base)
+            .into_iter()
+            .filter(|agent_id| {
+                self.team_for_agent(agent_id)
+                    .and_then(|(_, team)| team.agent_by_id(agent_id))
+                    .is_some_and(|agent| {
+                        agent.status == qaqh_client::ClientV2TeamAgentStatus::Running
+                    })
+            })
+            .collect()
+    }
+
     /// 确保子代理 `SessionState` 存在并进入 timeline 跟踪集。
     ///
     /// `parent` 只用于防止把会话自己当成自己的子代理；身份不来自该参数。
@@ -118,7 +148,10 @@ impl App {
 
     /// 在活动 agent 的子代理间循环切换：未观测时取最后一个 running，
     /// 否则取最后一个 child；已观测时顺序前进并回绕。
-    fn cycle_subagent(&mut self) {
+    ///
+    /// 键盘入口是 `Ctrl+↑`，鼠标入口是子代理预览条（`AgentTarget::Subagents`）——
+    /// 两个入口共用这一个动作。
+    pub(crate) fn cycle_subagent(&mut self) {
         let Some(base) = self.view_session_id() else {
             return;
         };
@@ -135,18 +168,11 @@ impl App {
                     .unwrap_or(0);
                 viewable[idx].clone()
             }
-            None => {
-                let running = viewable.iter().rev().find(|agent_id| {
-                    self.team_for_agent(agent_id)
-                        .and_then(|(_, team)| team.agent_by_id(agent_id))
-                        .is_some_and(|agent| {
-                            agent.status == qaqh_client::ClientV2TeamAgentStatus::Running
-                        })
-                });
-                running
-                    .cloned()
-                    .unwrap_or_else(|| viewable.last().unwrap().clone())
-            }
+            None => self
+                .running_child_agent_ids()
+                .last()
+                .cloned()
+                .unwrap_or_else(|| viewable.last().unwrap().clone()),
         };
         self.inspect = Some(next);
     }
