@@ -133,6 +133,21 @@ pub(super) fn draw_fullscreen_agent(
     view: &mut FullscreenView,
     hit_map: &mut HitMapBuilder,
 ) {
+    let for_background = hit_map.is_suspended();
+    draw_fullscreen_agent_inner(frame, app, theme, view, hit_map, for_background);
+}
+
+/// `for_background = true`：agent 视图这一帧是阻塞卡片的背景——照常渲染、
+/// 命中登记由挂起的 builder 吞掉，但**不抢硬件光标**（光标属于前景卡片，
+/// 比如 ask 的自定义输入行）。
+pub(super) fn draw_fullscreen_agent_inner(
+    frame: &mut Frame,
+    app: &App,
+    theme: &Theme,
+    view: &mut FullscreenView,
+    hit_map: &mut HitMapBuilder,
+    for_background: bool,
+) {
     let full = frame.area();
     // 左侧常驻会话栏：有 active session 且终端够宽时才占位；
     // 其余渲染全部收缩到右侧剩余区域，命中几何随之一致。
@@ -182,7 +197,9 @@ pub(super) fn draw_fullscreen_agent(
             hit_map,
         );
     }
-    if let Some(cursor) = rendered.cursor {
+    if let Some(cursor) = rendered.cursor
+        && !for_background
+    {
         frame.set_cursor_position((
             area.x.saturating_add(cursor.x),
             area.y.saturating_add(cursor.y),

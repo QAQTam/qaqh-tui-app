@@ -216,6 +216,19 @@ impl App {
         }
     }
 
+    /// 设置卡片的滚轮滚动：只滚视口，不动焦点。
+    pub fn settings_scroll(&mut self, up: bool, lines: usize) {
+        let Some(Overlay::Settings(mut state)) = self.overlays.last().cloned() else {
+            return;
+        };
+        state.scroll = if up {
+            state.scroll.saturating_sub(lines)
+        } else {
+            state.scroll.saturating_add(lines)
+        };
+        self.replace_overlay(Overlay::Settings(state));
+    }
+
     /// Workspace 滚轮滚动：History 详情有自己的 offset，其它页面走会话视口。
     pub fn workspace_scroll_view(&mut self, up: bool, lines: usize) {
         if let Some(Overlay::History {
@@ -460,8 +473,14 @@ impl App {
                     }
                     KeyCode::Up | KeyCode::Char('k') => st.move_focus(-1),
                     KeyCode::Down | KeyCode::Char('j') => st.move_focus(1),
-                    KeyCode::PageUp => st.move_focus(-8),
-                    KeyCode::PageDown => st.move_focus(8),
+                    // 自由滚动：只滚视口不动焦点（卡片化后的新行为；焦点移动
+                    // 时的跟随由 draw_settings_card 保证）。
+                    KeyCode::PageUp => {
+                        st.scroll = st.scroll.saturating_sub(8);
+                    }
+                    KeyCode::PageDown => {
+                        st.scroll = st.scroll.saturating_add(8);
+                    }
                     KeyCode::Enter => match kind {
                         FieldKind::Text
                         | FieldKind::Secret

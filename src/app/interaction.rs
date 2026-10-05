@@ -299,6 +299,46 @@ impl App {
         true
     }
 
+    /// 阻塞面板（permission/ask/plan）的滚轮滚动。lines 为正 = 向下（scroll 增大）。
+    ///
+    /// 统一入口：滚轮的语义与 `D::Scroll` 一致。向上滚动由 `terminal::agent`
+    /// 的 `modal_wheel_scroll_up` 对称处理（面板 scroll 是饱和的无符号数）。
+    pub fn modal_wheel_scroll(&mut self, route: crate::ui::v2::route::ModalRoute, lines: usize) {
+        let session_id = match self.active_session_id() {
+            Some(id) => id,
+            None => return,
+        };
+        match route {
+            crate::ui::v2::route::ModalRoute::Permission => {
+                if let Some(s) = self.sessions.get_mut(&session_id)
+                    && let Some(p) = s.pending_permissions.first_mut()
+                {
+                    p.scroll = p.scroll.saturating_add(lines);
+                }
+            }
+            crate::ui::v2::route::ModalRoute::Ask => {
+                if let Some(s) = self.sessions.get_mut(&session_id)
+                    && let Some(p) = s.pending_ask.as_mut()
+                {
+                    p.scroll = p.scroll.saturating_add(lines as u16);
+                }
+            }
+            crate::ui::v2::route::ModalRoute::Plan => {
+                if let Some(s) = self.sessions.get_mut(&session_id)
+                    && let Some(p) = s.pending_plan.as_mut()
+                {
+                    p.scroll = p.scroll.saturating_add(lines);
+                }
+            }
+            // 确认/输入/思考回放没有独立滚动状态（thinking 的滚动语义与
+            // 折行数不一致是历史遗留，见 overlay_ops，不在这里扩大改动面）。
+            crate::ui::v2::route::ModalRoute::Confirm
+            | crate::ui::v2::route::ModalRoute::AttachPath
+            | crate::ui::v2::route::ModalRoute::CwdInput
+            | crate::ui::v2::route::ModalRoute::Thinking => {}
+        }
+    }
+
     pub(super) fn ask_key(&mut self, session_id: &str, key: KeyEvent) -> bool {
         use crate::app::session::option_index_for_key;
         use ratatui::crossterm::event::{KeyCode, KeyModifiers};

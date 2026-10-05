@@ -325,6 +325,8 @@ pub struct HitMapBuilder {
     terminal_size: Size,
     scroll_offset: usize,
     regions: Vec<HitRegion>,
+    /// 挂起模式：`push` 变成 no-op（见 [`HitMapBuilder::suspended`]）。
+    suspended: bool,
 }
 
 impl HitMapBuilder {
@@ -340,10 +342,36 @@ impl HitMapBuilder {
             terminal_size,
             scroll_offset,
             regions: Vec::new(),
+            suspended: false,
         }
     }
 
+    /// 挂起状态：只画不登记。
+    ///
+    /// 阻塞卡片（permission/ask/设置）改由 agent 视图做背景后，背景层的锚点
+    /// 会被卡片的 `Clear` 盖成空白 cell——strict probe 会对这些"看不见的锚点"
+    /// 报 `anchor_missing`。背景层本来也不该可点（点哪里都是卡片外的阻断层），
+    /// 所以背景绘制拿一个挂起的 builder，命中登记全部落到卡片自己身上。
+    /// 画完背景记得 [`HitMapBuilder::set_suspended(false)`] 再画前景。
+    pub fn suspended(&mut self) -> &mut Self {
+        self.suspended = true;
+        self
+    }
+
+    /// 切换挂起模式（背景 → 前景的过渡用）。
+    pub fn set_suspended(&mut self, suspended: bool) {
+        self.suspended = suspended;
+    }
+
+    /// 是否处于挂起模式（背景绘制用来决定要不要抢硬件光标）。
+    pub fn is_suspended(&self) -> bool {
+        self.suspended
+    }
+
     pub fn push(&mut self, region: HitRegion) {
+        if self.suspended {
+            return;
+        }
         self.regions.push(region);
     }
 

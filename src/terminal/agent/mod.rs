@@ -20,7 +20,7 @@ use ratatui::crossterm::event::{
 };
 use ratatui::crossterm::{event::KeyCode, execute};
 use ratatui::layout::{Position, Rect, Size};
-use ratatui::style::Style;
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use ratatui::{DefaultTerminal, Frame};
@@ -35,6 +35,7 @@ use crate::ui::v2::hit::{
     AgentTarget, FrameHitMap, FrameId, HitMapBuilder, HitProbe, PointerTarget, ProbeFailure,
     ScrollbarPart,
 };
+use crate::ui::v2::modal;
 use crate::ui::v2::route::{self, ModalRoute, ScreenRoute};
 use crate::ui::v2::scrollbar::ScrollbarMetrics;
 use crate::ui::v2::transcript::{BlockKind, BlockState, TranscriptBlock};
@@ -702,7 +703,16 @@ fn dispatch_pointer_action(
                         fullscreen_view.scroll_down(app, 3);
                     }
                 }
-                ScreenRoute::Modal(_) => {}
+                // 卡片悬浮在对话上，背景不可点也不该跟着滚：滚轮直接滚动
+                // 卡片内容（Grok 的 blocking card 同款语义）。
+                ScreenRoute::Modal(modal_route) => {
+                    const WHEEL_LINES: usize = 3;
+                    if up {
+                        modal_wheel_scroll_up(app, *modal_route, WHEEL_LINES);
+                    } else {
+                        app.modal_wheel_scroll(*modal_route, WHEEL_LINES);
+                    }
+                }
             }
             frames.invalidate();
         }
@@ -769,11 +779,12 @@ fn menu_row_for(view: &FullscreenView, target: Option<&PointerTarget>) -> Option
 fn handle_workspace_scroll(app: &mut App, route: &route::WorkspaceRoute, up: bool) {
     match route {
         route::WorkspaceRoute::Sessions { .. }
-        | route::WorkspaceRoute::Settings
         | route::WorkspaceRoute::History { detail: false, .. }
         | route::WorkspaceRoute::Subagents { .. } => {
             app.workspace_move_selection(if up { -1 } else { 1 });
         }
+        // 设置卡片：滚轮直接滚视口（内容在卡片里，会话视口没有意义）。
+        route::WorkspaceRoute::Settings => app.settings_scroll(up, 3),
         route::WorkspaceRoute::History { detail: true, .. } => {
             app.workspace_scroll_view(up, 3);
         }
@@ -810,6 +821,40 @@ fn dispatch_modal_hit(app: &mut App, hit: ModalHit) {
         ModalHit::PlanApprove => app.respond_plan(true, false),
         ModalHit::PlanApproveAutonomous => app.respond_plan(true, true),
         ModalHit::PlanReject => app.mouse_plan_start_reject(),
+    }
+}
+
+/// 滚轮向上滚卡片：与 `App::modal_wheel_scroll` 的向下方向对称（面板的
+/// scroll 字段是 usize/u16 饱和类型，向上滚就是 saturating_sub）。
+fn modal_wheel_scroll_up(app: &mut App, route: ModalRoute, lines: usize) {
+    let session_id = match app.active_session_id() {
+        Some(id) => id,
+        None => return,
+    };
+    let session = match app.sessions.get_mut(&session_id) {
+        Some(session) => session,
+        None => return,
+    };
+    match route {
+        ModalRoute::Permission => {
+            if let Some(panel) = session.pending_permissions.first_mut() {
+                panel.scroll = panel.scroll.saturating_sub(lines);
+            }
+        }
+        ModalRoute::Ask => {
+            if let Some(panel) = session.pending_ask.as_mut() {
+                panel.scroll = panel.scroll.saturating_sub(lines as u16);
+            }
+        }
+        ModalRoute::Plan => {
+            if let Some(panel) = session.pending_plan.as_mut() {
+                panel.scroll = panel.scroll.saturating_sub(lines);
+            }
+        }
+        ModalRoute::Confirm
+        | ModalRoute::AttachPath
+        | ModalRoute::CwdInput
+        | ModalRoute::Thinking => {}
     }
 }
 
@@ -939,13 +984,41 @@ fn draw(
     let area = frame.area();
     match route {
         ScreenRoute::Agent => draw_fullscreen_agent(frame, app, theme, fullscreen_view, hit_map),
-        ScreenRoute::Modal(modal) => {
-            clear_screen(frame, theme);
-            crate::ui::v2::modal::draw(frame, app, area, theme, *modal, hit_map);
+        // 阻塞弹窗与设置卡片不再整屏清空：agent 视图继续做背景（Codex/Grok 的
+        // 「对话始终可见」），上面压一层 DIM 遮罩，卡片居中悬浮。
+        // 背景层不登记任何命中区（被卡片覆盖的锚点过不了 strict probe），
+        // 所以背景绘制期间 builder 挂起，画完再解除、由卡片自己登记。
+        ScreenRoute::Modal(modal_route) => {
+            draw_fullscreen_agent(frame, app, theme, fullscreen_view, hit_map.suspended());
+            hit_map.set_suspended(false);
+            dim_screen(frame, area, theme);
+            modal::draw(frame, app, area, theme, *modal_route, hit_map);
+        }
+        ScreenRoute::Workspace(route::WorkspaceRoute::Settings) => {
+            draw_fullscreen_agent(frame, app, theme, fullscreen_view, hit_map.suspended());
+            hit_map.set_suspended(false);
+            dim_screen(frame, area, theme);
+            workspace::draw_settings_card(frame, app, area, theme, hit_map);
         }
         ScreenRoute::Workspace(workspace_route) => {
             clear_screen(frame, theme);
             workspace::draw(frame, app, workspace_route, theme, hit_map);
+        }
+    }
+}
+
+/// 阻塞卡片下的整屏压暗层：前景统一压到 muted 并加 DIM，`Reset` 背景保持
+/// 原样（`terminal` 主题没有底色，塞 `Color::Reset` 会把颜色信息整个抹掉）。
+/// `Frame` 的光标状态不在这里碰——背景绘制已跳过 `set_cursor_position`，
+/// 前景卡片自己决定光标。
+fn dim_screen(frame: &mut Frame, area: Rect, theme: &Theme) {
+    for x in area.x..area.right() {
+        for y in area.y..area.bottom() {
+            let cell = &mut frame.buffer_mut()[(x, y)];
+            if cell.fg != Color::Reset {
+                cell.fg = theme.text.muted;
+            }
+            cell.modifier.insert(Modifier::DIM);
         }
     }
 }
@@ -1602,6 +1675,99 @@ mod tests {
         terminal
             .draw(|frame| draw(frame, app, &test_theme(), route, view, &mut hit_map))
             .expect("draw fullscreen agent");
+    }
+
+    /// 卡片化整帧验收：授权弹窗悬浮在 agent 视图上，背景 + 暗化 + 卡片同帧
+    /// 渲染且 HitMap 过 strict probe。回归点：
+    /// 1. 背景 transcript 内容仍然可见（不再整屏清空）；
+    /// 2. 卡片命中只来自弹窗自身（背景锚点被 Clear 覆盖后 probe 不报错）。
+    #[test]
+    fn permission_modal_renders_over_agent_background() {
+        let (mut app, _rx) = App::new_for_test();
+        let session_id = "session-1".to_string();
+        let mut session = SessionState::new(session_id.clone());
+        session.timeline = model_with_sealed_answer();
+        session.pending_permissions.push(PermissionPanel {
+            tool_call_id: "tool-1".into(),
+            tool_name: "bash".into(),
+            action_summary: Some("cargo build".into()),
+            reason: "构建".into(),
+            paths: vec![],
+            category: PermissionCategory::Exec,
+            level: 2,
+            risk: PermissionRisk::High,
+            consequence: "会执行本地命令".into(),
+            trust_folder: false,
+            scroll: 0,
+        });
+        app.tabs.push(session_id.clone());
+        app.sessions.insert(session_id, session);
+        let route = route::resolve(&app);
+        assert!(
+            matches!(route, ScreenRoute::Modal(_)),
+            "挂起 permission 必须解析成 Modal 路由"
+        );
+
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        let mut view = FullscreenView::default();
+        let mut hit_map = HitMapBuilder::new(
+            FrameId::new(1),
+            route.clone(),
+            ratatui::layout::Size::new(100, 30),
+            0,
+        );
+        terminal
+            .draw(|frame| draw(frame, &app, &test_theme(), &route, &mut view, &mut hit_map))
+            .expect("draw modal over agent");
+        let map = hit_map.finish();
+        assert!(map.validate().is_ok(), "{:?}", map.validate().err());
+        map.probe(terminal.backend().buffer(), map.frame_id, &map.route)
+            .expect("背景+卡片整帧必须过 strict probe");
+
+        // 背景 transcript（"hello"）与卡片（"工具权限"）同帧可见。
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        let flat: String = text.chars().filter(|ch| !ch.is_whitespace()).collect();
+        assert!(flat.contains("工具权限"), "卡片必须可见：{flat}");
+        assert!(
+            flat.contains("hello"),
+            "背景 transcript 必须仍然可见：{flat}"
+        );
+    }
+
+    /// 滚轮滚卡片：Modal 路由下滚轮滚的是面板内容，不是背景 transcript。
+    #[test]
+    fn wheel_over_modal_scrolls_panel_not_transcript() {
+        let (mut app, _rx) = App::new_for_test();
+        let session_id = "session-1".to_string();
+        let mut session = SessionState::new(session_id.clone());
+        session.pending_ask = Some(crate::app::session::AskPanel::new(
+            "interaction-1".into(),
+            "turn-1".into(),
+            qaqh_client::AskMode::Single,
+            vec![qaqh_client::DomainAskQuestion {
+                id: "q1".into(),
+                question: "选哪个？".into(),
+                options: vec!["A".into(), "B".into()],
+                allow_custom: false,
+            }],
+        ));
+        app.tabs.push(session_id.clone());
+        app.sessions.insert(session_id.clone(), session);
+
+        app.modal_wheel_scroll(ModalRoute::Ask, 2);
+        let ask_scroll = app.sessions[&session_id]
+            .pending_ask
+            .as_ref()
+            .expect("ask")
+            .scroll;
+        assert_eq!(ask_scroll, 2, "滚轮向下必须增大面板 scroll");
     }
 
     fn entry(seq: u64, turn: &str, event: TimelineEvent) -> TimelineEntry {

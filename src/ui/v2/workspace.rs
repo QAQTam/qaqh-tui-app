@@ -46,7 +46,9 @@ pub fn draw(
             selected,
             show_archived,
         } => draw_sessions(f, app, body, *selected, *show_archived, theme, hit_map),
-        WorkspaceRoute::Settings => draw_settings(f, app, body, theme, hit_map),
+        // 设置不再走全屏 Workspace：Overlay::Settings 在 terminal::agent::draw
+        // 里被拦截成居中卡片（draw_settings_card），不会进入这里。
+        WorkspaceRoute::Settings => {}
         WorkspaceRoute::Help => draw_help(f, body, theme),
         WorkspaceRoute::History {
             selected,
@@ -499,16 +501,73 @@ fn draw_history(
     f.render_widget(Paragraph::new(lines), area);
 }
 
-fn draw_settings(f: &mut Frame, app: &App, area: Rect, theme: &Theme, hit_map: &mut HitMapBuilder) {
+/// 设置卡片：悬浮在对话上的居中面板（F10 / Ctrl+, / /settings）。
+///
+/// 设置项数量固定，但小终端 + 全部展开值时内容可能超过整屏，所以卡片高度
+/// 向终端可用高度收口，内容统一滚动。旧全屏版只能「跟随焦点滚」，这里改为
+/// 焦点移动自动跟随 + 用户滚轮/PgUp/PgDn 自由滚动。
+pub fn draw_settings_card(
+    f: &mut Frame,
+    app: &App,
+    area: Rect,
+    theme: &Theme,
+    hit_map: &mut HitMapBuilder,
+) {
     let Some(Overlay::Settings(state)) = app.overlays.last() else {
         return;
     };
-    let width = usize::from(area.width);
-    let (mut lines, row_lines) = settings_lines(state, app.config.as_ref(), width, theme);
-    let height = usize::from(area.height).max(1);
+    const CARD_WIDTH: u16 = 78;
+    const FOOTER_ROWS: u16 = 1;
+    let width = CARD_WIDTH.min(area.width.saturating_sub(4));
+    let max_height = area.height.saturating_sub(4);
+    if width < 20 || max_height < 5 {
+        return;
+    }
+    // 内容行数（含分区头与空行）决定卡片高度，向可用高度收口。
+    let title = if state.draft.is_empty() {
+        " ⚙ 设置 ".to_owned()
+    } else {
+        " ⚙ 设置 · ● 未保存（Esc 丢弃） ".to_owned()
+    };
+    let content_total = state.total_lines() as u16;
+    let card_height = (content_total + FOOTER_ROWS + 2).clamp(8, max_height);
+    let rect = centered_card_rect(width, card_height, area);
+    let inner = Rect {
+        x: rect.x + 1,
+        y: rect.y + 1,
+        width: rect.width.saturating_sub(2),
+        height: rect.height.saturating_sub(2),
+    };
+
+    f.render_widget(Clear, rect);
+    f.render_widget(
+        Block::new()
+            .borders(ratatui::widgets::Borders::ALL)
+            .border_type(ratatui::widgets::BorderType::Rounded)
+            .border_style(Style::new().fg(theme.chrome.border_active))
+            .title(title),
+        rect,
+    );
+
+    let [content_area, footer_area] =
+        Layout::vertical([Constraint::Min(1), Constraint::Length(FOOTER_ROWS)]).areas(inner);
+    let (mut lines, row_lines) = settings_lines(
+        state,
+        app.config.as_ref(),
+        usize::from(content_area.width),
+        theme,
+    );
+    let height = usize::from(content_area.height).max(1);
+    let total = lines.len();
     let focus = state.focus.min(ROWS.len().saturating_sub(1));
     let focus_line = row_lines.get(focus).copied().unwrap_or(0);
-    let scroll = focus_line.saturating_sub(height.saturating_sub(1));
+    // 自由滚动 + 焦点跟随：先尊重 state.scroll，再保证焦点行可见。
+    let mut scroll = state.scroll.min(total.saturating_sub(height));
+    if focus_line < scroll {
+        scroll = focus_line;
+    } else if focus_line >= scroll.saturating_add(height) {
+        scroll = focus_line.saturating_sub(height.saturating_sub(1));
+    }
     for (index, line_index) in row_lines.iter().enumerate() {
         // 设置页的键盘焦点由 `▶` 前缀表达，不靠底色（spec §5.2 的 Focused 档
         // 在这里刻意留空），所以 `focused = false`。
@@ -521,8 +580,6 @@ fn draw_settings(f: &mut Frame, app: &App, area: Rect, theme: &Theme, hit_map: &
                 .style(visual.surface_style(theme, Color::Reset));
         }
     }
-    // 设置项可能被 focus 顶到滚动位置；只登记当前视口里的行，屏幕 y 由
-    // `line_index - scroll` 推出，和 `settings_hit_test` 的公式同源。
     for (index, line_index) in row_lines.iter().enumerate() {
         if *line_index < scroll || *line_index >= scroll.saturating_add(height) {
             continue;
@@ -532,18 +589,36 @@ fn draw_settings(f: &mut Frame, app: &App, area: Rect, theme: &Theme, hit_map: &
         };
         register_workspace_region(
             hit_map,
-            row_rect(area, line_index.saturating_sub(scroll)),
-            area,
+            row_rect(content_area, line_index.saturating_sub(scroll)),
+            content_area,
             WorkspaceHit::SettingsRow(index),
             z::WORKSPACE_ROW,
             line,
         );
     }
+    let visible: Vec<Line<'static>> = lines.into_iter().skip(scroll).take(height).collect();
+    f.render_widget(Paragraph::new(visible), content_area);
+
+    // 溢出徽标（▼N 贴顶边框右缘）+ footer 操作行。
+    let hidden_below = total.saturating_sub(scroll + height);
+    if hidden_below > 0 {
+        let text = format!("▼{hidden_below}");
+        let badge_width = text.len() as u16;
+        let x = rect.right().saturating_sub(1 + badge_width);
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                text,
+                Style::new().fg(theme.semantic.warning),
+            ))),
+            Rect::new(x, rect.y, badge_width, 1),
+        );
+    }
     f.render_widget(
-        Paragraph::new(lines)
-            .wrap(Wrap { trim: false })
-            .scroll((scroll as u16, 0)),
-        area,
+        Paragraph::new(Line::from(Span::styled(
+            " ↑↓ 选择 · Enter 编辑/切换 · s 保存 · r 刷新 · Esc 关闭 ",
+            Style::new().fg(theme.text.dim),
+        ))),
+        footer_area,
     );
 
     if let Some(buffer) = &state.editing
@@ -552,15 +627,27 @@ fn draw_settings(f: &mut Frame, app: &App, area: Rect, theme: &Theme, hit_map: &
     {
         let line = row_lines.get(focus).copied().unwrap_or(0);
         if line >= scroll && line < scroll.saturating_add(height) {
-            let value_x = area.x.saturating_add(22);
-            let value_width = usize::from(area.width).saturating_sub(22).max(1);
+            let value_x = content_area.x.saturating_add(22);
+            let value_width = usize::from(content_area.width).saturating_sub(22).max(1);
             let (_, offset) = edit_window(&buffer.buf, buffer.cursor, value_width);
             let x = value_x.saturating_add(offset as u16);
-            let y = area.y.saturating_add((line - scroll) as u16);
-            if x < area.x.saturating_add(area.width) {
+            let y = content_area.y.saturating_add((line - scroll) as u16);
+            if x < content_area.x.saturating_add(content_area.width) {
                 f.set_cursor_position((x, y));
             }
         }
+    }
+}
+
+/// 居中卡片的几何（宽高已定）。
+fn centered_card_rect(width: u16, height: u16, area: Rect) -> Rect {
+    let width = width.min(area.width.saturating_sub(2));
+    let height = height.min(area.height.saturating_sub(2));
+    Rect {
+        x: area.x + area.width.saturating_sub(width) / 2,
+        y: area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
     }
 }
 
@@ -1634,24 +1721,74 @@ mod tests {
     }
 
     /// settings 只登记可见的设置行；section 头不可点。
+    ///
+    /// 设置已卡片化：直接画 `draw_settings_card`（与生产路径
+    /// `terminal::agent::draw` 的 Workspace(Settings) 分支一致），整帧过
+    /// strict probe——背景 agent + 暗化 + 卡片的分层都不能破坏命中几何。
     #[test]
     fn settings_draw_registers_visible_rows() {
         let (mut app, _rx) = App::new_for_test();
         app.overlays
             .push(Overlay::Settings(SettingsState::default()));
         let route = WorkspaceRoute::Settings;
-        let (map, backend) = draw_workspace_to_map(&app, &route, 100, 24);
-        assert_anchors_non_empty(&backend, &map);
+        let width = 100u16;
+        let height = 24u16;
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        let mut builder = scratch_map(&route, width, height);
+        terminal
+            .draw(|frame| draw_settings_card(frame, &app, frame.area(), &theme(), &mut builder))
+            .expect("draw settings card");
+        let map = builder.finish();
+        assert!(
+            map.validate().is_ok(),
+            "绘制阶段登记的 HitMap 必须通过几何校验：{:?}",
+            map.validate().err()
+        );
+        let probe = map.probe(terminal.backend().buffer(), map.frame_id, &map.route);
+        assert!(
+            probe.is_ok(),
+            "设置卡片帧必须通过 strict 探针：{:?}",
+            probe.err()
+        );
+        assert_anchors_non_empty(&terminal.backend(), &map);
 
         assert_region_reachable(&map, &WorkspaceHit::SettingsRow(0));
-        assert_region_reachable(&map, &WorkspaceHit::Back);
 
-        let body = workspace_areas(Rect::new(0, 0, 100, 24))[1];
+        // 卡片外（左上角）不登记任何目标——设置卡片没有自己的阻断层语义，
+        // 生产路径上外层 ScreenRoute 由键盘守卫兜底。
         assert_eq!(
-            map.resolve(body.x + 5, body.y, MouseButton::Left)
+            map.resolve(0, 0, MouseButton::Left)
                 .expect("同 z 区域不得重叠"),
             None,
-            "section 头不是可点目标"
+            "卡片外不该有可点目标"
+        );
+    }
+
+    /// 设置卡片滚到底时的溢出徽标：内容行数超过卡片高度时出现 `▼N`。
+    #[test]
+    fn settings_card_overflow_badge_on_small_terminal() {
+        let (mut app, _rx) = App::new_for_test();
+        app.overlays
+            .push(Overlay::Settings(SettingsState::default()));
+        let backend = TestBackend::new(100, 16);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        let mut builder = scratch_map(&WorkspaceRoute::Settings, 100, 16);
+        terminal
+            .draw(|frame| draw_settings_card(frame, &app, frame.area(), &theme(), &mut builder))
+            .expect("draw settings card");
+        let map = builder.finish();
+        assert!(map.validate().is_ok());
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(
+            text.contains("▼"),
+            "16 行终端上设置内容必然溢出，必须出现 ▼ 徽标：{text}"
         );
     }
 

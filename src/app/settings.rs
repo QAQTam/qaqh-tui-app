@@ -224,6 +224,10 @@ pub struct SettingsState {
     pub draft: ConfigPatch,
     /// Profile 端口的候选名（None = 展示服务端现值）。
     pub profile_sel: Option<String>,
+    /// 用户自由滚动偏移（滚轮/PgUp/PgDn 调整）。焦点移动时自动跟随焦点行，
+    /// 其余时候尊重用户的视口——旧实现只能「跟随焦点滚」，顶部内容在焦点
+    /// 位于底部行时永远不可见。
+    pub scroll: usize,
 }
 
 impl SettingsState {
@@ -235,6 +239,28 @@ impl SettingsState {
         let n = ROWS.len() as i32;
         let next = (self.focus as i32 + delta).rem_euclid(n);
         self.focus = next as usize;
+        // 焦点跳转（含 wrap）后旧滚动偏移没有意义：绘制层会保证焦点行可见，
+        // 这里归零让视口回到焦点所在位置，而不是停在前一次自由滚动的偏移上。
+        self.scroll = 0;
+    }
+
+    /// 设置卡片的行数估算（分区头 + 空行 + 数据行），供绘制层决定卡片高度。
+    ///
+    /// 与渲染共用同一个分区规则：遇到新分区追加空行 + 标题行，每个字段一行。
+    pub fn total_lines(&self) -> usize {
+        let mut total = 0usize;
+        let mut section = "";
+        for row in ROWS {
+            if row.section != section {
+                section = row.section;
+                if total > 0 {
+                    total += 1; // 分区间空行
+                }
+                total += 1; // 分区标题行
+            }
+            total += 1;
+        }
+        total
     }
 
     /// 当前字段是否已有未保存草稿值。

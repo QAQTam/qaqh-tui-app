@@ -195,28 +195,33 @@ struct ModalRow {
 }
 
 // 三个弹窗的外框。**draw 与 hit_test 共用**——各算一次就迟早错位。
+//
+// 尺寸策略：宽度取「内容舒适宽」与终端可用宽的较小者；高度不再拍一个硬顶
+// （旧 ask 的 30 行 / permission 的 22 行会让长内容在 tall 终端上也看不全），
+// 而是 min(内容需要, 终端留边后的全部)。内容滚动兜底，超视口必有警示。
+const ASK_WIDTH: u16 = 88;
+const PERMISSION_WIDTH: u16 = 76;
+const PLAN_WIDTH: u16 = 88;
+const CONFIRM_WIDTH: u16 = 64;
+const INPUT_WIDTH: u16 = 76;
+const THINKING_WIDTH: u16 = 88;
+
 fn ask_rect(area: Rect) -> Rect {
-    centered_rect(
-        88u16.min(area.width.saturating_sub(4)),
-        area.height.saturating_sub(4).min(30),
-        area,
-    )
+    let width = ASK_WIDTH.min(area.width.saturating_sub(4));
+    let height = area.height.saturating_sub(4);
+    centered_rect(width, height, area)
 }
 
 fn permission_rect(area: Rect) -> Rect {
-    centered_rect(
-        72u16.min(area.width.saturating_sub(4)),
-        22u16.min(area.height.saturating_sub(4)),
-        area,
-    )
+    let width = PERMISSION_WIDTH.min(area.width.saturating_sub(4));
+    let height = area.height.saturating_sub(4);
+    centered_rect(width, height, area)
 }
 
 fn plan_rect(area: Rect) -> Rect {
-    centered_rect(
-        88u16.min(area.width.saturating_sub(4)),
-        area.height.saturating_sub(4),
-        area,
-    )
+    let width = PLAN_WIDTH.min(area.width.saturating_sub(4));
+    let height = area.height.saturating_sub(4);
+    centered_rect(width, height, area)
 }
 
 /// Modal 的命中不再有独立入口：`draw` 在真实 render 位置把按钮/选项登记进
@@ -317,6 +322,11 @@ pub fn draw(
     true
 }
 
+/// `text` 按 `width` 折行后的行数（与 `wrap_text` 同源，供高度估算）。
+fn wrap_count(text: &str, width: usize, prefix: usize) -> usize {
+    crate::app::render_line::wrap_text(text, width.saturating_sub(prefix).max(1)).len()
+}
+
 /// permission 面板的行布局（渲染与命中测试共用，同 `ask_rows`）。
 fn permission_rows(
     panel: &PermissionPanel,
@@ -406,6 +416,30 @@ fn permission_rows(
     rows
 }
 
+/// 内容需要的行数（估算）：路径按 1 行、其他字段按折行后的保守值。
+/// 估算只用于决定卡片高度，实际渲染仍按真实行向量滚动。
+fn permission_content_height(panel: &PermissionPanel, inner_width: usize) -> usize {
+    let mut total = 1; // 工具行
+    if panel.action_summary.is_some() {
+        total += wrap_count(
+            &panel.action_summary.clone().unwrap_or_default(),
+            inner_width,
+            4,
+        );
+    }
+    if !panel.reason.is_empty() {
+        total += wrap_count(&panel.reason, inner_width, 4);
+    }
+    total += 1; // 类别行
+    if !panel.consequence.is_empty() {
+        total += wrap_count(&panel.consequence, inner_width, 4);
+    }
+    total += panel.paths.len();
+    total += 1; // 空行
+    total += 1; // 信任开关
+    total
+}
+
 fn draw_permission(
     f: &mut Frame,
     panel: &PermissionPanel,
@@ -414,29 +448,34 @@ fn draw_permission(
     mouse: MouseState,
     hit_map: &mut HitMapBuilder,
 ) {
-    let rect = permission_rect(area);
-    if rect.width < 8 || rect.height < 5 {
+    let max_rect = permission_rect(area);
+    if max_rect.width < 8 || max_rect.height < 5 {
         return;
     }
+    let inner_width = usize::from(max_rect.width.saturating_sub(2));
+    let content_needed = permission_content_height(panel, inner_width);
+    let footer_rows = 1usize;
+    // 卡片高度 = 边框 2 + 内容 + footer，向终端可用高度收口。
+    let card_height = (content_needed + footer_rows + 2)
+        .min(usize::from(max_rect.height))
+        .max(5) as u16;
+    let rect = centered_rect(max_rect.width, card_height, area);
     register_modal_root(hit_map, area, rect);
     f.render_widget(Clear, rect);
     f.render_widget(
-        Block::new()
-            .borders(Borders::ALL)
-            .border_style(Style::new().fg(theme.semantic.warning))
-            .title(format!(
-                " ⚠ 工具权限 · {:?} · level {} ",
-                panel.risk, panel.level
-            )),
+        card(
+            &format!("⚠ 工具权限 · {:?} · level {}", panel.risk, panel.level),
+            Style::new().fg(theme.semantic.warning),
+        ),
         rect,
     );
     let inner = inner_rect(rect);
     let [content_area, footer_area] =
         Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(inner);
-    let rows = permission_rows(panel, usize::from(inner.width), theme, mouse);
+    let rows = permission_rows(panel, usize::from(content_area.width), theme, mouse);
     // 滚动（审计 F1）：permission 面板的内容（命令摘要、路径、后果说明）全部
     // 来自模型侧，**看到的不等于批准的**，所以超出视口的行不许静默裁剪——
-    // 键盘可滚（j/k/↑↓/PgUp/PgDn），footer 常驻「还有 N 行未显示」警示。
+    // 键盘可滚（j/k/↑↓/PgUp/PgDn/滚轮），footer 常驻「还有 N 行未显示」警示。
     let total = rows.len();
     let visible = usize::from(content_area.height);
     let max_scroll = total.saturating_sub(visible);
@@ -471,6 +510,7 @@ fn draw_permission(
         Paragraph::new(lines).wrap(Wrap { trim: false }),
         content_area,
     );
+    draw_scroll_edge(f, content_area, scroll, visible, total);
     let specs = [
         ("a 批准", ModalHit::PermissionApprove),
         ("d/Esc 拒绝", ModalHit::PermissionDeny),
@@ -527,36 +567,34 @@ fn draw_plan(
         panel.review_type.as_str()
     };
     f.render_widget(
-        Block::new()
-            .borders(Borders::ALL)
-            .border_style(Style::new().fg(theme.semantic.plan))
-            .title(format!(" 📋 计划评审 · {review_type} ")),
+        card(
+            &format!("📋 计划评审 · {review_type}"),
+            Style::new().fg(theme.semantic.plan),
+        ),
         rect,
     );
     let inner = inner_rect(rect);
     let footer_height = if panel.entering_message { 2 } else { 1 };
     let [content_area, footer_area] =
         Layout::vertical([Constraint::Min(1), Constraint::Length(footer_height)]).areas(inner);
-    let content_width = usize::from(inner.width);
-    let wrapped = crate::app::render_line::wrap_text(&panel.plan_content, content_width);
-    let start = panel.scroll.min(wrapped.len().saturating_sub(1));
-    let available = usize::from(content_area.height);
-    let mut lines: Vec<Line<'static>> = wrapped
-        .into_iter()
-        .skip(start)
-        .take(available)
-        .map(|line| Line::from(Span::styled(line, Style::new().fg(theme.text.primary))))
-        .collect();
+    // plan 正文与 Todo 段合成一个行向量统一滚动。旧实现 Todo 是 append 后
+    // `truncate(available)`——计划长时整段被静默裁掉且滚不回来（审计遗留）。
+    let content_width = usize::from(content_area.width);
+    let mut rows: Vec<Line<'static>> =
+        crate::app::render_line::wrap_text(&panel.plan_content, content_width)
+            .into_iter()
+            .map(|line| Line::from(Span::styled(line, Style::new().fg(theme.text.primary))))
+            .collect();
     if !panel.todo_items.is_empty() {
-        lines.push(Line::default());
-        lines.push(Line::from(Span::styled(
+        rows.push(Line::default());
+        rows.push(Line::from(Span::styled(
             "Todo",
             Style::new()
                 .fg(theme.accent.assistant)
                 .add_modifier(Modifier::BOLD),
         )));
         for item in &panel.todo_items {
-            lines.push(Line::from(vec![
+            rows.push(Line::from(vec![
                 Span::styled(
                     // `complexity` 是 String（"small"|"medium"|"large"），`{:?}` 会渲染成
                     // 带引号的 `"small"`——后端交底 §3 专门点了这处。
@@ -567,11 +605,26 @@ fn draw_plan(
             ]));
         }
     }
-    lines.truncate(available);
+    let total = rows.len();
+    let visible = usize::from(content_area.height);
+    let max_scroll = total.saturating_sub(visible);
+    let scroll = panel.scroll.min(max_scroll);
+    let lines: Vec<Line<'static>> = rows.into_iter().skip(scroll).take(visible).collect();
     f.render_widget(
         Paragraph::new(lines).wrap(Wrap { trim: false }),
         content_area,
     );
+    draw_scroll_edge(f, content_area, scroll, visible, total);
+    // 溢出行数显示在标题栏右侧（body 区留给滚动内容）。
+    let hidden_below = total.saturating_sub(scroll + visible);
+    if hidden_below > 0 {
+        draw_badge(
+            f,
+            rect,
+            &format!("▼{hidden_below}"),
+            Style::new().fg(theme.semantic.warning),
+        );
+    }
 
     if panel.entering_message {
         // 填理由时 footer 是输入态，不是按钮行。
@@ -656,25 +709,26 @@ fn draw_confirm(
             ),
         ),
     };
-    let rect = centered_rect(64u16.min(area.width.saturating_sub(4)), 8, area);
+    let rect = centered_rect(CONFIRM_WIDTH.min(area.width.saturating_sub(4)), 8, area);
     if rect.width < 8 || rect.height < 5 {
         return;
     }
     register_modal_root(hit_map, area, rect);
     f.render_widget(Clear, rect);
-    f.render_widget(
-        Block::new()
-            .borders(Borders::ALL)
-            .border_style(Style::new().fg(theme.semantic.warning))
-            .title(format!(" {title} ")),
-        rect,
-    );
+    f.render_widget(card(title, Style::new().fg(theme.semantic.warning)), rect);
     let inner = inner_rect(rect);
-    let lines = vec![
-        Line::from(Span::styled(body, Style::new().fg(theme.text.primary))),
-        Line::default(),
-        footer(&[("y", "确认"), ("n/Esc", "取消")], theme),
-    ];
+    // 正文折行：长路径（ExportOverwrite）在 64 列卡里不折行会被 Paragraph
+    // 横向裁掉，用户确认的是半句话。
+    let mut lines = Vec::new();
+    push_wrapped(
+        &mut lines,
+        "",
+        &body,
+        usize::from(inner.width),
+        Style::new().fg(theme.text.primary),
+    );
+    lines.push(Line::default());
+    lines.push(footer(&[("y", "确认"), ("n/Esc", "取消")], theme));
     f.render_widget(Paragraph::new(lines), inner);
 }
 
@@ -693,17 +747,14 @@ fn draw_input(
     spec: InputSpec<'_>,
     hit_map: &mut HitMapBuilder,
 ) {
-    let rect = centered_rect(76u16.min(area.width.saturating_sub(4)), 7, area);
+    let rect = centered_rect(INPUT_WIDTH.min(area.width.saturating_sub(4)), 7, area);
     if rect.width < 8 || rect.height < 5 {
         return;
     }
     register_modal_root(hit_map, area, rect);
     f.render_widget(Clear, rect);
     f.render_widget(
-        Block::new()
-            .borders(Borders::ALL)
-            .border_style(Style::new().fg(theme.chrome.border_active))
-            .title(format!(" {} ", spec.title)),
+        card(spec.title, Style::new().fg(theme.chrome.border_active)),
         rect,
     );
     let inner = inner_rect(rect);
@@ -747,7 +798,7 @@ fn draw_thinking(
     hit_map: &mut HitMapBuilder,
 ) {
     let rect = centered_rect(
-        88u16.min(area.width.saturating_sub(4)),
+        THINKING_WIDTH.min(area.width.saturating_sub(4)),
         area.height.saturating_sub(6),
         area,
     );
@@ -757,10 +808,10 @@ fn draw_thinking(
     register_modal_root(hit_map, area, rect);
     f.render_widget(Clear, rect);
     f.render_widget(
-        Block::new()
-            .borders(Borders::ALL)
-            .border_style(Style::new().fg(theme.accent.thinking))
-            .title(" 思考回放 · 当前回合 "),
+        card(
+            "思考回放 · 当前回合",
+            Style::new().fg(theme.accent.thinking),
+        ),
         rect,
     );
     let inner = inner_rect(rect);
@@ -800,29 +851,46 @@ fn inner_rect(rect: Rect) -> Rect {
     }
 }
 
-/// 按**显示宽度**截断（CJK 占两列）。
-///
-/// 选项必须保证一行放得下：否则 Paragraph 会折行、把后面的选项整体推下去，
-/// 鼠标命中的行号就与画面错位了。
-fn truncate_width(text: &str, max: usize) -> String {
-    if text.width() <= max {
-        return text.to_owned();
+/// 统一卡片外观：圆角边框 + 标题（借鉴 Codex 的单层 surface 卡 + Grok 的
+/// modal chrome，去掉全屏感）。`border` 按语义选：授权=警示色、提问=激活色。
+fn card(title: &str, border: Style) -> Block<'static> {
+    Block::new()
+        .borders(Borders::ALL)
+        .border_type(ratatui::widgets::BorderType::Rounded)
+        .border_style(border)
+        .title(format!(" {title} "))
+}
+
+/// 卡片右上角的溢出徽标（如 `▼12`）：画在顶边框上，与左侧标题同排。
+/// 徽标不是命中目标，只做视觉。
+fn draw_badge(f: &mut Frame, rect: Rect, text: &str, style: Style) {
+    let width = text.width() as u16;
+    // 顶边框两端是圆角字形 + 左侧标题，中间不够宽就放弃。
+    if rect.width < width + 8 {
+        return;
     }
-    if max == 0 {
-        return String::new();
+    let x = rect.right().saturating_sub(1).saturating_sub(width);
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(text.to_owned(), style))),
+        Rect::new(x, rect.y, width, 1),
+    );
+}
+
+/// 内容区右缘的滚动位置指示：`▲` = 上方还有，`▼N` = 下面还有 N 行。
+/// Codex 审批卡的 header elision、Grok 卡片的滚动条都是同一个意图——
+/// 「看不见 ≠ 没了」必须可见。这里用最省宽度的方式贴在右缘。
+fn draw_scroll_edge(f: &mut Frame, content: Rect, scroll: usize, visible: usize, total: usize) {
+    if content.width == 0 || content.height == 0 || total <= visible {
+        return;
     }
-    let mut out = String::new();
-    let mut used = 0usize;
-    for ch in text.chars() {
-        let width = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
-        if used + width + 1 > max {
-            break;
-        }
-        out.push(ch);
-        used += width;
+    let col = content.right().saturating_sub(1);
+    let buf = f.buffer_mut();
+    if scroll > 0 {
+        buf[(col, content.y)].set_symbol("▲");
     }
-    out.push('…');
-    out
+    if scroll + visible < total {
+        buf[(col, content.bottom().saturating_sub(1))].set_symbol("▼");
+    }
 }
 
 /// ask 面板的行布局。**渲染与命中测试共用**，两边调同一个函数就不会出现
@@ -878,20 +946,44 @@ fn ask_rows(
             option: index,
         };
         // 前缀固定 7 列：`" ▶ "`(3) + `"{shortcut} "`(2) + `"{marker} "`(2)。
-        let text = truncate_width(option, inner_width.saturating_sub(7));
-        let spans = vec![
-            Span::styled(
-                if focused { " ▶ " } else { "   " },
-                Style::new().fg(theme.accent.user),
-            ),
-            Span::styled(format!("{shortcut} "), Style::new().fg(theme.text.dim)),
-            Span::styled(format!("{marker} "), option_style),
-            Span::styled(text, option_style),
-        ];
-        rows.push(ModalRow {
-            line: button_line(spans, inner_width, mouse.visual(target), theme),
-            target: Some(target),
-        });
+        // 选项**折行**（延续前缀缩进），不再 `truncate_width` 截断——长选项
+        // （含命令/路径）截掉就永远看不到了。命中登记沿用同一份行向量，
+        // 每个折行行都指向同一目标，不会错位。
+        const CONTINUATION: &str = "       ";
+        for (segment_index, segment) in
+            crate::app::render_line::wrap_text(option, inner_width.saturating_sub(7).max(1))
+                .into_iter()
+                .enumerate()
+        {
+            let prefix = if segment_index == 0 {
+                if focused { " ▶ " } else { "   " }
+            } else {
+                CONTINUATION
+            };
+            let shortcut_span = if segment_index == 0 {
+                vec![Span::styled(
+                    format!("{shortcut} "),
+                    Style::new().fg(theme.text.dim),
+                )]
+            } else {
+                Vec::new()
+            };
+            let mut spans = vec![Span::styled(prefix, Style::new().fg(theme.accent.user))];
+            spans.extend(shortcut_span);
+            spans.push(Span::styled(
+                if segment_index == 0 {
+                    format!("{marker} ")
+                } else {
+                    "  ".to_owned()
+                },
+                option_style,
+            ));
+            spans.push(Span::styled(segment, option_style));
+            rows.push(ModalRow {
+                line: button_line(spans, inner_width, mouse.visual(target), theme),
+                target: Some(target),
+            });
+        }
     }
 
     if question.allow_custom {
@@ -906,25 +998,29 @@ fn ask_rows(
             format!("自定义: {custom}")
         };
         let target = ModalHit::AskCustom { question: focus };
-        let spans = vec![
-            Span::styled(
-                if custom_focused { " ▶ " } else { "   " },
-                Style::new().fg(theme.accent.user),
-            ),
-            Span::styled("z ", Style::new().fg(theme.text.dim)),
-            Span::styled(
-                format!("{marker} "),
-                Style::new().fg(theme.accent.assistant),
-            ),
-            Span::styled(
-                truncate_width(&text, inner_width.saturating_sub(7)),
-                Style::new().fg(theme.accent.assistant),
-            ),
-        ];
-        rows.push(ModalRow {
-            line: button_line(spans, inner_width, mouse.visual(target), theme),
-            target: Some(target),
-        });
+        let custom_style = Style::new().fg(theme.accent.assistant);
+        // 自定义行同样折行：长自定义答案不该被一个 `…` 吃掉。
+        let wrapped_custom =
+            crate::app::render_line::wrap_text(&text, inner_width.saturating_sub(7).max(1));
+        for (segment_index, segment) in wrapped_custom.into_iter().enumerate() {
+            let prefix = if segment_index == 0 {
+                if custom_focused { " ▶ " } else { "   " }
+            } else {
+                "       "
+            };
+            let mut spans = vec![Span::styled(prefix, Style::new().fg(theme.accent.user))];
+            if segment_index == 0 {
+                spans.push(Span::styled("z ", Style::new().fg(theme.text.dim)));
+                spans.push(Span::styled(format!("{marker} "), custom_style));
+            } else {
+                spans.push(Span::styled("   ", custom_style));
+            }
+            spans.push(Span::styled(segment, custom_style));
+            rows.push(ModalRow {
+                line: button_line(spans, inner_width, mouse.visual(target), theme),
+                target: Some(target),
+            });
+        }
     }
 
     if let Some(error) = &panel.error {
@@ -984,23 +1080,25 @@ fn draw_ask(
         qaqh_client::AskMode::Single => "single",
         qaqh_client::AskMode::Batch => "batch",
     };
-    let block = Block::new()
-        .borders(Borders::ALL)
-        .border_style(Style::new().fg(theme.chrome.border_active))
-        .title(format!(" ❓ 问题 {}/{} · {mode} ", focus + 1, total));
-    f.render_widget(block, rect);
+    f.render_widget(
+        card(
+            &format!("❓ 问题 {}/{} · {mode}", focus + 1, total),
+            Style::new().fg(theme.chrome.border_active),
+        ),
+        rect,
+    );
 
     let inner = inner_rect(rect);
     let rows = ask_rows(panel, usize::from(inner.width), theme, mouse);
-    // `Paragraph` 按 `panel.scroll` 上滚，所以第 `index` 行画在
-    // `inner.y + (index - scroll)`；只有落进视口的那一段才登记。
-    let scroll = usize::from(panel.scroll);
-    for (index, row) in rows
-        .iter()
-        .enumerate()
-        .skip(scroll)
-        .take(usize::from(inner.height))
-    {
+    // 行号是 `inner` 内的相对行号（0 起，未计滚动）；`Paragraph` 按
+    // `panel.scroll` 上滚，所以第 `index` 行画在 `inner.y + (index - scroll)`。
+    // 只有落进视口的那一段才登记。scroll 先 clamp 到内容底部——旧实现键入
+    // 路径与绘制路径都不 clamp，PgDn 多按几次就滚出一屏空白。
+    let total_rows = rows.len();
+    let visible = usize::from(inner.height);
+    let max_scroll = total_rows.saturating_sub(visible);
+    let scroll = usize::from(panel.scroll).min(max_scroll);
+    for (index, row) in rows.iter().enumerate().skip(scroll).take(visible) {
         let Some(target) = row.target else {
             continue;
         };
@@ -1019,12 +1117,25 @@ fn draw_ask(
             &row.line,
         );
     }
-    f.render_widget(
-        Paragraph::new(rows.into_iter().map(|row| row.line).collect::<Vec<_>>())
-            .wrap(Wrap { trim: false })
-            .scroll((panel.scroll, 0)),
-        inner,
-    );
+    let lines: Vec<Line<'static>> = rows
+        .into_iter()
+        .skip(scroll)
+        .take(visible)
+        .map(|row| row.line)
+        .collect();
+    f.render_widget(Paragraph::new(lines), inner);
+    draw_scroll_edge(f, inner, scroll, visible, total_rows);
+    // 底部还有内容时在标题栏右侧挂 `▼N` 徽标——ask 曾经是唯一没有溢出
+    // 提示的阻塞弹窗，用户以为「看不全 = 就这点内容」。
+    let hidden_below = total_rows.saturating_sub(scroll + visible);
+    if hidden_below > 0 {
+        draw_badge(
+            f,
+            rect,
+            &format!("▼{hidden_below}"),
+            Style::new().fg(theme.semantic.warning),
+        );
+    }
 }
 
 fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
@@ -1284,13 +1395,16 @@ mod tests {
     }
 
     /// 滚动后的 ask 只登记**当前视口**里的行，坐标随之整体上移。
+    ///
+    /// 用 100x11 的小终端：内容 7 行（题/空/选项0/选项1/自定义/空/提示），
+    /// 视口只有 5 行，scroll=2 不会被 clamp，滚动语义才被真实测到。
     #[test]
     fn ask_draw_follows_scroll_when_registering() {
         let theme = Theme::resolve(ThemeKind::QaqhNight, ColorSupport::TrueColor);
         let mut ask = panel();
         ask.scroll = 2;
         let app = app_with_ask(ask);
-        let area = Rect::new(0, 0, 100, 30);
+        let area = Rect::new(0, 0, 100, 11);
         let (map, _backend) = draw_modal_to_map(&app, area, ModalRoute::Ask, &theme);
 
         let target = PointerTarget::Modal(ModalHit::AskOption {
@@ -1302,6 +1416,45 @@ mod tests {
         // 滚动 2 行后选项 1 画在视口第 2 行（下标 1）。
         let expected_y = inner_rect(ask_rect(area)).y + 1;
         assert_eq!(region.rect.y, expected_y, "滚动后命中区必须跟着上移");
+    }
+
+    /// 大终端上 ask 内容全可见：scroll 超供时必须被 clamp 回 0，不得画出
+    /// 一屏空白（旧实现键入/绘制路径都不 clamp，PgDn 多按就滚穿）。
+    #[test]
+    fn ask_scroll_clamps_when_content_fits() {
+        let theme = Theme::resolve(ThemeKind::QaqhNight, ColorSupport::TrueColor);
+        let mut ask = panel();
+        ask.scroll = 2;
+        let app = app_with_ask(ask);
+        let area = Rect::new(0, 0, 100, 30);
+        let (map, backend) = draw_modal_to_map(&app, area, ModalRoute::Ask, &theme);
+        assert_anchors_non_empty(&backend, &map);
+
+        // 没有溢出 → 没有徽标，且选项 1 停在未滚动的位置。
+        let target = PointerTarget::Modal(ModalHit::AskOption {
+            question: 0,
+            option: 1,
+        });
+        let region = region_for(&map, &target);
+        let expected_y = inner_rect(ask_rect(area)).y + 3;
+        assert_eq!(
+            region.rect.y, expected_y,
+            "内容放得下时 scroll 必须 clamp 到 0"
+        );
+        let text: String = buffer_text_of(&backend)
+            .chars()
+            .filter(|ch| !ch.is_whitespace())
+            .collect();
+        assert!(!text.contains("▼"), "内容全可见时不该出现溢出徽标：{text}");
+    }
+
+    fn buffer_text_of(backend: &TestBackend) -> String {
+        backend
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect()
     }
 
     fn app_with_permission(panel: PermissionPanel) -> App {
@@ -1630,10 +1783,11 @@ mod tests {
         let mut panel = permission_panel();
         panel.paths = (1..=16).map(|index| format!("/tmp/p{index:02}")).collect();
 
+        // 小终端（80x18）：卡片被压到 14 行，23 行内容必然溢出。
         let draw_once = |panel: &PermissionPanel| {
-            let backend = TestBackend::new(100, 30);
+            let backend = TestBackend::new(80, 18);
             let mut terminal = Terminal::new(backend).expect("terminal");
-            let mut hit_map = scratch_map(ModalRoute::Permission, 100, 30);
+            let mut hit_map = scratch_map(ModalRoute::Permission, 80, 18);
             terminal
                 .draw(|frame| {
                     draw_permission(
@@ -1649,22 +1803,22 @@ mod tests {
             terminal
         };
 
-        // 23 行内容（5 概要 + 16 路径 + 空行 + 信任开关）在 19 行视口里：
-        // 顶部可见、尾部不可见、警示行出现。
+        // 23 行内容在小视口里：顶部可见、尾部不可见、溢出徽标出现。
         let terminal = draw_once(&panel);
         let text: String = buffer_text(&terminal)
             .chars()
             .filter(|ch| !ch.is_whitespace())
             .collect();
-        assert!(text.contains("还有4行未显示"), "{text}");
+        assert!(text.contains("▼"), "溢出时必须出现 ▼ 徽标：{text}");
         assert!(text.contains("/tmp/p01"), "{text}");
         assert!(
             !text.contains("信任此目录"),
             "视口外的信任开关不该被画出（旧实现直接裁掉且无提示）：{text}"
         );
 
-        // 滚到底：尾部可达，溢出警示退场、降级为普通滚动提示。
-        panel.scroll = 4;
+        // 滚到底（scroll 12 = 23 行内容 - 11 行视口）：尾部可达，溢出徽标
+        // 退场、警示降级为普通滚动提示。
+        panel.scroll = 12;
         let terminal = draw_once(&panel);
         let text: String = buffer_text(&terminal)
             .chars()
@@ -1672,7 +1826,38 @@ mod tests {
             .collect();
         assert!(text.contains("信任此目录"), "{text}");
         assert!(text.contains("/tmp/p16"), "{text}");
-        assert!(!text.contains("还有4行未显示"), "{text}");
+    }
+
+    /// 大终端 + 长路径列表：卡片按内容自适应到全部可见，无需滚动——
+    /// 旧实现 22 行硬顶做不到这一点（16 条路径挤在 19 行视口里盲滚）。
+    #[test]
+    fn permission_modal_expands_with_content_on_tall_terminals() {
+        let theme = Theme::resolve(ThemeKind::QaqhNight, ColorSupport::TrueColor);
+        let mut panel = permission_panel();
+        panel.paths = (1..=16).map(|index| format!("/tmp/p{index:02}")).collect();
+        let backend = TestBackend::new(100, 40);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        let mut hit_map = scratch_map(ModalRoute::Permission, 100, 40);
+        terminal
+            .draw(|frame| {
+                draw_permission(
+                    frame,
+                    &panel,
+                    frame.area(),
+                    &theme,
+                    MouseState::default(),
+                    &mut hit_map,
+                )
+            })
+            .expect("draw permission");
+        let text: String = buffer_text(&terminal)
+            .chars()
+            .filter(|ch| !ch.is_whitespace())
+            .collect();
+        for marker in ["/tmp/p01", "/tmp/p16", "信任此目录"] {
+            assert!(text.contains(marker), "大终端上应全可见：缺 {marker}");
+        }
+        assert!(!text.contains("▼"), "内容全可见时不该有溢出徽标：{text}");
     }
 
     #[test]

@@ -3193,8 +3193,10 @@ mod tests {
     #[tokio::test]
     async fn pending_initial_prompt_waits_while_v2_read_only() {
         let (mut app, _rx) = App::new_for_test();
-        app.sessions
-            .insert("new-session_id".into(), SessionState::new("new-session_id".into()));
+        app.sessions.insert(
+            "new-session_id".into(),
+            SessionState::new("new-session_id".into()),
+        );
         init_v2_session(&mut app, "new-session_id");
         app.tabs.push("new-session_id".into());
         app.active = 0;
@@ -3228,8 +3230,10 @@ mod tests {
     #[tokio::test]
     async fn pending_initial_prompt_autosends_when_driver_seat_lands() {
         let (mut app, _rx) = App::new_for_test();
-        app.sessions
-            .insert("new-session_id".into(), SessionState::new("new-session_id".into()));
+        app.sessions.insert(
+            "new-session_id".into(),
+            SessionState::new("new-session_id".into()),
+        );
         init_v2_session(&mut app, "new-session_id");
         app.tabs.push("new-session_id".into());
         app.active = 0;
@@ -3277,8 +3281,10 @@ mod tests {
     #[tokio::test]
     async fn pending_initial_prompt_autosends_when_bootstrap_carries_driver_seat() {
         let (mut app, _rx) = App::new_for_test();
-        app.sessions
-            .insert("new-session_id".into(), SessionState::new("new-session_id".into()));
+        app.sessions.insert(
+            "new-session_id".into(),
+            SessionState::new("new-session_id".into()),
+        );
         app.tabs.push("new-session_id".into());
         app.active = 0;
         // 同一运行里此前 bootstrap 过其它会话：lease 身份已在，新会话还没有
