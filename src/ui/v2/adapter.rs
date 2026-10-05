@@ -1057,11 +1057,26 @@ mod tests {
     #[test]
     fn path_header_keeps_op_as_verb_fact() {
         for (wire_op, view_op) in [
-            (qaqh_client::TimelinePathOp::Edit, super::super::transcript::PathOp::Edit),
-            (qaqh_client::TimelinePathOp::Write, super::super::transcript::PathOp::Write),
-            (qaqh_client::TimelinePathOp::Patch, super::super::transcript::PathOp::Patch),
-            (qaqh_client::TimelinePathOp::Delete, super::super::transcript::PathOp::Delete),
-            (qaqh_client::TimelinePathOp::Read, super::super::transcript::PathOp::Read),
+            (
+                qaqh_client::TimelinePathOp::Edit,
+                super::super::transcript::PathOp::Edit,
+            ),
+            (
+                qaqh_client::TimelinePathOp::Write,
+                super::super::transcript::PathOp::Write,
+            ),
+            (
+                qaqh_client::TimelinePathOp::Patch,
+                super::super::transcript::PathOp::Patch,
+            ),
+            (
+                qaqh_client::TimelinePathOp::Delete,
+                super::super::transcript::PathOp::Delete,
+            ),
+            (
+                qaqh_client::TimelinePathOp::Read,
+                super::super::transcript::PathOp::Read,
+            ),
         ] {
             let mut card = tool_card("edit", TimelineToolState::Succeeded);
             card.display = Some(TimelineToolDisplay {
