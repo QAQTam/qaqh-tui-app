@@ -312,7 +312,7 @@ mod tests {
 
     fn card(name: &str, state: TimelineToolState) -> ToolCard {
         ToolCard {
-exit_code: None,
+            exit_code: None,
             completed_at_ms: None,
             tool_call_id: format!("{name}-1"),
             name: name.into(),
@@ -328,6 +328,7 @@ exit_code: None,
             failure: None,
             permission: None,
             display: None,
+            stream_estimate: None,
         }
     }
 
@@ -367,6 +368,8 @@ exit_code: None,
                         c.display = Some(TimelineToolDisplay {
                             summary: Some("cargo test 通过".into()),
                             diff: None,
+                            lines_added: 0,
+                            lines_removed: 0,
                             header: Some(qaqh_client::TimelineToolHeader::Shell {
                                 command: "cargo test".into(),
                             }),

@@ -84,6 +84,11 @@ impl App {
         self.session_list_cache
             .iter()
             .enumerate()
+            // 子代理不是顶层会话：入口在子代理预览条与 Ctrl+↑。侧栏
+            // （`sidebar_rows`）与这里必须同口径，否则子代理会从另一个列表漏出来
+            // ——而且它每写一条消息都刷新 `updated_at`，每隔几秒就往上跳一次，
+            // 把真正的会话顶下去。
+            .filter(|(_, m)| !self.is_subagent_session(&m.meta.session_id))
             .filter(|(_, m)| (show_archived || !m.meta.archived) && !m.meta.ephemeral)
             .filter(|(_, m)| self.session_matches_cwd_filter(m))
             .map(|(i, _)| i)

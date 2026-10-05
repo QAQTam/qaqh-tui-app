@@ -50,6 +50,8 @@ pub(super) fn theme(support: ColorSupport) -> Theme {
             border_active: native(support, Color::Reset),
             selection: native(support, Color::Reset),
             scrollbar: native(support, Color::DarkGray),
+            // 原生主题不覆盖终端底色，输入带只靠三行留白与消息区分界。
+            composer_bg: native(support, Color::Reset),
         },
         diff: DiffTokens {
             add_fg: native(support, Color::Green),

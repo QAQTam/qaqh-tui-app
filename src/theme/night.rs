@@ -54,6 +54,8 @@ pub(super) fn theme(support: ColorSupport) -> Theme {
             border_active: token(support, Color::Rgb(76, 86, 106), 240, Color::Gray),
             selection: token(support, Color::Rgb(59, 66, 82), 237, Color::DarkGray),
             scrollbar: token(support, Color::Rgb(67, 76, 94), 238, Color::DarkGray),
+            // 暗土金：比 surface.base 亮一档的暖棕色块，与 primary 文本保持 7:1。
+            composer_bg: token(support, Color::Rgb(85, 68, 30), 58, Color::Yellow),
         },
         diff: DiffTokens {
             add_fg: token(support, Color::Rgb(163, 190, 140), 108, Color::Green),

@@ -18,6 +18,41 @@ pub struct SidebarRow {
 }
 
 impl App {
+    /// 周期刷新**只更新内容，不重排**。
+    ///
+    /// daemon 的 `session.list` 按 `updated_at` 降序（`SessionManager::list`），而
+    /// `updated_at` **每写一条消息就刷新一次**（`save_one`）。TUI 每 3 秒（首页 /
+    /// 历史的会话列表）或 8 秒（侧栏）整表拉一次，于是这段时间里写过东西的会话
+    /// 就会往上跳——列表在光标底下换位，点错行是必然的。
+    ///
+    /// 策略：**老面孔留在原位**（只换内容），**新面孔按 daemon 的顺序插到最前**。
+    /// 首次装载（缓存为空）直接采信 daemon 的顺序（"最近更新优先"仍然是初始口径）。
+    pub(super) fn stable_session_order(
+        &self,
+        fresh: Vec<SessionListEntry>,
+    ) -> Vec<SessionListEntry> {
+        if self.session_list_cache.is_empty() {
+            return fresh;
+        }
+        let mut slots: Vec<Option<SessionListEntry>> = fresh.into_iter().map(Some).collect();
+        let mut kept: Vec<SessionListEntry> = Vec::with_capacity(slots.len());
+        for old in &self.session_list_cache {
+            let Some(pos) = slots.iter().position(|slot| {
+                slot.as_ref()
+                    .is_some_and(|entry| entry.meta.session_id == old.meta.session_id)
+            }) else {
+                // 已删除 / 已归档：自然从列表里消失。
+                continue;
+            };
+            if let Some(entry) = slots[pos].take() {
+                kept.push(entry);
+            }
+        }
+        let mut ordered: Vec<SessionListEntry> = slots.into_iter().flatten().collect();
+        ordered.extend(kept);
+        ordered
+    }
+
     /// 侧栏数据源：daemon 启动后**被激活过**的会话（activity tracker 有快照）
     /// 加上 registry 里仍在跑的会话，归档的永不出现。
     ///
@@ -27,6 +62,10 @@ impl App {
         self.session_list_cache
             .iter()
             .filter(|entry| !entry.meta.archived)
+            // 子代理**不是**顶层会话：`session.list` 不区分父子（daemon 侧
+            // `list_sessions` 原样列出所有会话），所以过滤只能在前端做。子代理的
+            // 存在感收敛到子代理预览条（见 `subagent_strip_line`）与 Ctrl+↑。
+            .filter(|entry| !self.is_subagent_session(&entry.meta.session_id))
             .filter(|entry| {
                 entry.running
                     || self.activity_cache.contains_key(&entry.meta.session_id)
@@ -52,7 +91,10 @@ impl App {
     /// 侧栏行点击：已打开的 tab 直接聚焦，未打开的走既有 open（attach+bootstrap）。
     /// 全部复用 [`App::open_session_tab`]，不另开语义。
     pub fn sidebar_open(&mut self, index: usize) {
-        let Some(session_id) = self.sidebar_rows().get(index).map(|row| row.session_id.clone())
+        let Some(session_id) = self
+            .sidebar_rows()
+            .get(index)
+            .map(|row| row.session_id.clone())
         else {
             return;
         };
@@ -120,11 +162,14 @@ impl App {
         self.new_session_with_cwd(None);
     }
 
-    /// 品牌首屏提交：先把输入暂存，等新会话 session_id 落成后带进真实 composer。
+    /// 品牌首屏提交：先把输入暂存，等新会话 session_id 落成后带进真实 composer
+    /// 并**自动发送**（一次输入即可开始对话）。
     ///
     /// 空输入仍创建一个空会话，行为对齐原来的 Ctrl+N；有输入时不在前端预造
-    /// timeline，避免出现“本地临时消息 + 后端回放”双份正文。首条消息不自动发送，
-    /// 用户能在会话 composer 里继续编辑后再按 Enter。
+    /// timeline，避免出现“本地临时消息 + 后端回放”双份正文。会话刚开时
+    /// bootstrap / driver seat 可能尚未落地（此时 v2 面只读，直接发送会被
+    /// `reject_if_v2_read_only` 拦下），因此就绪即发、未就绪则把文本留在
+    /// composer 等就绪信号重试（见 [`App::maybe_autosend_pending_prompt`]）。
     pub(super) fn start_draft_conversation(&mut self) {
         let text = self.draft_composer.value();
         self.draft_composer.clear();
@@ -136,21 +181,44 @@ impl App {
         self.new_session_with_cwd(None);
     }
 
-    /// `SessionCreate` 已确认后调用：把首条草稿带进真实会话 composer。
+    /// `SessionCreate` 已确认后调用：把首条草稿带进真实会话 composer 并尝试
+    /// 自动发送。
+    ///
+    /// pending 标记**只在发送真正发生时**消费（[`App::maybe_autosend_pending_prompt`]）：
+    /// 就绪检查未通过时草稿留在 composer、标记保留，等 seat 落地重试。
     pub(super) fn transfer_pending_initial_prompt(&mut self) {
-        let Some(text) = self.pending_initial_prompt.take() else {
+        let Some(text) = self.pending_initial_prompt.clone() else {
             return;
         };
         let Some(session_id) = self.active_session_id() else {
-            self.pending_initial_prompt = Some(text);
             return;
         };
-        if let Some(session) = self.sessions.get_mut(&session_id) {
+        let Some(session) = self.sessions.get_mut(&session_id) else {
+            return;
+        };
+        // 只在 composer 为空时带入，避免覆盖用户在等待窗口内手动输入的内容。
+        if session.composer.is_empty() {
             session.composer.input = text.chars().collect();
             session.composer.cursor = session.composer.input.len();
-        } else {
-            self.pending_initial_prompt = Some(text);
         }
+        self.maybe_autosend_pending_prompt(&session_id);
+    }
+
+    /// 首条草稿的就绪自动发送：仅当目标会话是当前活跃 tab 且 v2 面可写
+    /// （bootstrap/driver seat 已落地）时才真正发送；否则保留 pending 标记与
+    /// composer 文本，等 `D::DriverChanged` 落地后由该处重试。
+    pub(super) fn maybe_autosend_pending_prompt(&mut self, session_id: &str) {
+        if self.pending_initial_prompt.is_none() {
+            return;
+        }
+        if self.active_session_id().as_deref() != Some(session_id) {
+            return;
+        }
+        if self.active_v2_read_only() {
+            return;
+        }
+        self.pending_initial_prompt = None;
+        self.send_message();
     }
 
     /// 创建命令没有进入 daemon，或等待 `SessionCreated` 超时：撤销 creating 状态，

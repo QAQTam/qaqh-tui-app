@@ -5,6 +5,7 @@
 //! `agent` module.
 
 use super::*;
+use crate::ui::v2::adapter;
 use crate::ui::v2::fullscreen as ui_fullscreen;
 use crate::ui::v2::fullscreen::{FullscreenState, MessageAction, MessageMenu, MessageRole};
 use crate::ui::v2::hit::{
@@ -13,9 +14,23 @@ use crate::ui::v2::hit::{
 };
 use crate::ui::v2::scrollbar::ScrollbarMetrics;
 use crate::ui::v2::sidebar;
+use crate::ui::v2::transcript::{TodoBlock, compose_todo_panel};
 use ratatui::crossterm::event::MouseButton;
 
 const NARROW_VIEWPORT_WIDTH: u16 = 40;
+
+/// 子代理预览条的最低可用宽度。
+///
+/// 条子本身约 16 列（缩进 + 方框），再窄就只剩它自己、连状态行都挤没了——那种
+/// 宽度下 Ctrl+↑ 仍然是完整入口，不值得为它牺牲状态行。
+const SUBAGENT_STRIP_MIN_WIDTH: usize = 32;
+
+/// sticky 待办面板的行数上限。
+///
+/// 面板是**常驻摘要**不是主视图：完整清单在 F4 的 Workspace Todo 面板。取 6 行
+/// （标题 + 5 项）——24 行终端下连 composer 带一共占掉约三分之一，再多就喧宾
+/// 夺主了。
+const TODO_PANEL_MAX_ROWS: usize = 6;
 
 pub(super) fn handle_fullscreen_menu_key(
     app: &mut App,
@@ -135,8 +150,37 @@ pub(super) fn draw_fullscreen_agent(
     );
     let rendered = render_fullscreen_agent(app, area.width, area.height, theme, view);
     frame.render_widget(Paragraph::new(rendered.lines), area);
+    // 子代理预览条：点它 = `Ctrl+↑`（进入 / 循环子代理视图）。几何来自渲染器
+    // 自己写回的那一份，不在这里重算。
+    if let Some(strip) = rendered.subagent_strip {
+        let rect = Rect::new(
+            area.x.saturating_add(strip.x),
+            area.y.saturating_add(strip.y),
+            strip.width,
+            1,
+        );
+        if let Some(region) = anchor_region(
+            rect,
+            area,
+            PointerTarget::Agent(AgentTarget::Subagents),
+            MouseButton::Left,
+            true,
+            z::AGENT_OVERLAY,
+            VisualAnchor::non_empty(Position::new(rect.x, rect.y)),
+        ) {
+            hit_map.push(region);
+        }
+    }
     if rail > 0 {
-        sidebar::draw(frame, app, rail_area, theme, &view.pointer, &mut view.sidebar_anim, hit_map);
+        sidebar::draw(
+            frame,
+            app,
+            rail_area,
+            theme,
+            &view.pointer,
+            &mut view.sidebar_anim,
+            hit_map,
+        );
     }
     if let Some(cursor) = rendered.cursor {
         frame.set_cursor_position((
@@ -145,7 +189,7 @@ pub(super) fn draw_fullscreen_agent(
         ));
     }
 
-    let (body, _) = fullscreen_layout(app, area, theme);
+    let (body, _) = fullscreen_layout(app, area, theme, view.current_todo.as_ref());
     if !body.is_empty()
         && let Some(session) = app.active_session()
     {
@@ -199,7 +243,12 @@ pub(super) fn draw_fullscreen_agent(
     // 消息行与浮层都按**刚画完的这一帧**登记：行窗口来自 render 写回的
     // `visible_start`，按钮/菜单矩形复用 ui_fullscreen 的渲染几何。
     let active_session_id = app.active_session_id();
-    register_agent_messages(hit_map, body, view, active_session_id.as_deref().unwrap_or(""));
+    register_agent_messages(
+        hit_map,
+        body,
+        view,
+        active_session_id.as_deref().unwrap_or(""),
+    );
     let show_back_to_latest = view.can_scroll(app)
         && app
             .active_session()
@@ -381,7 +430,9 @@ fn render_fullscreen_agent(
     }
 
     let area = Rect::new(0, 0, width, height.max(1));
-    let (body_area, bottom_area) = fullscreen_layout(app, area, theme);
+    // 面板要占位，所以数据源必须在算布局之前刷新。
+    view.sync_todo(app);
+    let (body_area, bottom_area) = fullscreen_layout(app, area, theme, view.current_todo.as_ref());
     view.body_area = body_area;
     view.body_height = body_area.height;
     // 右侧固定留一列给滚动条，避免内容宽度在“出现/消失滚动条”时抖动。
@@ -399,7 +450,20 @@ fn render_fullscreen_agent(
     }
     lines.truncate(usize::from(body_area.height));
 
-    let bottom = render_fullscreen_chrome(app, width, bottom_area.height, theme);
+    let bottom = render_fullscreen_chrome(
+        app,
+        width,
+        bottom_area.height,
+        theme,
+        view.current_todo.as_ref(),
+    );
+    // 预览条的行号是**块内相对**的，换算到整帧时加上历史区高度。
+    let subagent_strip = bottom.subagent_strip.map(|strip| Rect {
+        x: strip.x,
+        y: body_area.height.saturating_add(strip.y),
+        width: strip.width,
+        height: 1,
+    });
     lines.extend(bottom.lines);
     lines.truncate(usize::from(area.height));
 
@@ -412,10 +476,20 @@ fn render_fullscreen_agent(
                 .min(area.height.saturating_sub(1)),
         )
     });
-    AgentRender { lines, cursor }
+    AgentRender {
+        lines,
+        cursor,
+        // 被裁掉（终端太矮）时不登记命中：画都没画出来就不该可点。
+        subagent_strip: subagent_strip.filter(|strip| strip.y < area.height),
+    }
 }
 
-fn fullscreen_layout(app: &App, area: Rect, theme: &Theme) -> (Rect, Rect) {
+fn fullscreen_layout(
+    app: &App,
+    area: Rect,
+    theme: &Theme,
+    todo: Option<&TodoBlock>,
+) -> (Rect, Rect) {
     if area.height == 0 {
         return (area, Rect::new(area.x, area.y, area.width, 0));
     }
@@ -423,7 +497,7 @@ fn fullscreen_layout(app: &App, area: Rect, theme: &Theme) -> (Rect, Rect) {
     let reserve_body = u16::from(area.height > 1);
     let max_bottom = area.height.saturating_sub(reserve_body).max(1);
     let desired_bottom =
-        u16::try_from(fullscreen_chrome_layout(app, area.width, max_bottom, theme).height())
+        u16::try_from(fullscreen_chrome_layout(app, area.width, max_bottom, theme, todo).height())
             .unwrap_or(u16::MAX);
     let bottom_height = desired_bottom.clamp(1, max_bottom);
     let body_height = area.height.saturating_sub(bottom_height);
@@ -439,7 +513,13 @@ fn fullscreen_layout(app: &App, area: Rect, theme: &Theme) -> (Rect, Rect) {
     )
 }
 
-fn fullscreen_chrome_layout(app: &App, width: u16, available: u16, theme: &Theme) -> AgentLayout {
+fn fullscreen_chrome_layout(
+    app: &App,
+    width: u16,
+    available: u16,
+    theme: &Theme,
+    todo: Option<&TodoBlock>,
+) -> AgentLayout {
     let available = usize::from(available.max(1));
     let Some(session) = app.active_session() else {
         return AgentLayout {
@@ -449,16 +529,15 @@ fn fullscreen_chrome_layout(app: &App, width: u16, available: u16, theme: &Theme
             thinking_rows: 0,
             composer_rows: 0,
             status_rows: 0,
-            shortcuts_rows: 0,
+            subagent_rows: 0,
+            todo_rows: 0,
         };
     };
 
     let narrow = width < NARROW_VIEWPORT_WIDTH;
-    let min_composer = if narrow {
-        1
-    } else {
-        usize::from(theme.spacing.composer_min_height.max(1))
-    };
+    // composer 输入带（通栏底色块）的最低高度：上下各一行留白夹住输入行，
+    // 与消息区分界。窄屏同样生效；空间不够时由下方收缩循环压回 1 行。
+    let min_composer = usize::from(theme.spacing.composer_min_height.max(1));
     let max_composer = usize::from(theme.spacing.composer_max_height.max(1)).max(min_composer);
     let preferred_composer = composer_visual_rows(session, width, theme)
         .clamp(min_composer.min(available), max_composer.min(available));
@@ -469,18 +548,37 @@ fn fullscreen_chrome_layout(app: &App, width: u16, available: u16, theme: &Theme
         thinking_rows: usize::from(session_is_working(session)),
         composer_rows: preferred_composer,
         status_rows: usize::from(theme.spacing.status_height.max(1)),
-        shortcuts_rows: if narrow {
-            0
-        } else {
-            usize::from(theme.spacing.shortcuts_height.max(1))
-        },
+        // 子代理预览条：**只在有子代理在跑时**占一行（done 就消失，数据源是 roster
+        // 的 Running 状态），窄屏不挤——Ctrl+↑ 仍然可用。
+        subagent_rows: usize::from(
+            !narrow
+                && usize::from(width) >= SUBAGENT_STRIP_MIN_WIDTH
+                && !app.running_child_agent_ids().is_empty(),
+        ),
+        // 行数由面板自己算（标题 + 放得下的条目），上限 `TODO_PANEL_MAX_ROWS`。
+        todo_rows: todo.map_or(0, |todo| {
+            compose_todo_panel(todo, usize::from(width), TODO_PANEL_MAX_ROWS, theme).len()
+        }),
     };
 
+    // 收缩顺序 = 舍弃顺序：斜杠菜单（用户正打字，按 Esc 就没了）→ 子代理预览条
+    // （Ctrl+↑ 等价）→ 待办面板（F4 里有完整清单）→ composer 留白 → 状态行 →
+    // 思考行。
+    shrink_chrome_layout(&mut layout, available);
+    layout
+}
+
+/// 空间不足时按**舍弃优先级**逐行压缩（见 [`fullscreen_chrome_layout`]）。
+///
+/// 单独成函数是为了能脱离 `App` 直接测：这套顺序是版面契约，不是实现细节。
+fn shrink_chrome_layout(layout: &mut AgentLayout, available: usize) {
     while layout.height() > available {
         if layout.slash_rows > 0 {
             layout.slash_rows -= 1;
-        } else if layout.shortcuts_rows > 0 {
-            layout.shortcuts_rows = 0;
+        } else if layout.subagent_rows > 0 {
+            layout.subagent_rows = 0;
+        } else if layout.todo_rows > 0 {
+            layout.todo_rows = 0;
         } else if layout.composer_rows > 1 {
             layout.composer_rows -= 1;
         } else if layout.status_rows > 0 {
@@ -491,19 +589,40 @@ fn fullscreen_chrome_layout(app: &App, width: u16, available: u16, theme: &Theme
             break;
         }
     }
-    layout
 }
 
-fn render_fullscreen_chrome(app: &App, width: u16, height: u16, theme: &Theme) -> AgentRender {
+fn render_fullscreen_chrome(
+    app: &App,
+    width: u16,
+    height: u16,
+    theme: &Theme,
+    todo: Option<&TodoBlock>,
+) -> AgentRender {
     let Some(session) = app.active_session() else {
         return render_brand(app, width, height, theme);
     };
     let height = usize::from(height.max(1));
-    let layout =
-        fullscreen_chrome_layout(app, width, u16::try_from(height).unwrap_or(u16::MAX), theme);
+    let layout = fullscreen_chrome_layout(
+        app,
+        width,
+        u16::try_from(height).unwrap_or(u16::MAX),
+        theme,
+        todo,
+    );
     let mut lines = slash_menu_lines(app, width, theme, layout.slash_rows);
     if layout.thinking_rows > 0 {
         lines.push(thinking_line(session, width, theme));
+    }
+    if layout.todo_rows > 0
+        && let Some(todo) = todo
+    {
+        // 贴在输入带上沿：进行中的那项在第一行，扫一眼就知道现在在干什么。
+        lines.extend(compose_todo_panel(
+            todo,
+            usize::from(width),
+            layout.todo_rows,
+            theme,
+        ));
     }
     let composer_start = lines.len();
     let composer = composer_lines(
@@ -513,25 +632,68 @@ fn render_fullscreen_chrome(app: &App, width: u16, height: u16, theme: &Theme) -
         theme,
         layout.composer_rows,
     );
-    lines.extend(composer.lines);
+    // 输入带：composer 区整体铺 `chrome.composer_bg` 通栏底色，行尾由
+    // `band_line` 补齐（Paragraph 不会为短行补格）；输入行不足最低高度时
+    // 上下补白居中，让消息区与输入区形成一条明确的土金色分界。
+    let band_pad_top = layout.composer_rows.saturating_sub(composer.lines.len()) / 2;
+    for _ in 0..band_pad_top {
+        lines.push(band_line(Line::default(), width, theme));
+    }
+    lines.extend(
+        composer
+            .lines
+            .into_iter()
+            .map(|line| band_line(line, width, theme)),
+    );
     while lines.len() < composer_start.saturating_add(layout.composer_rows) {
-        lines.push(Line::default());
+        lines.push(band_line(Line::default(), width, theme));
     }
     if layout.status_rows > 0 {
         lines.push(status_line(app, width, theme));
     }
-    if layout.shortcuts_rows > 0 {
-        lines.push(shortcuts_line(app, width, theme));
+    // 子代理预览条（只有跑着的子代理才占这一行）。
+    let mut subagent_strip = None;
+    if layout.subagent_rows > 0
+        && let Some(line) = subagent_strip_line(app, width, theme)
+    {
+        subagent_strip = Some(Rect::new(
+            SUBAGENT_STRIP_INDENT as u16,
+            u16::try_from(lines.len()).unwrap_or(u16::MAX),
+            subagent_strip_width(),
+            1,
+        ));
+        lines.push(line);
     }
     lines.truncate(height);
 
     let cursor_y = composer_start
+        .saturating_add(band_pad_top)
         .saturating_add(composer.cursor_row)
         .min(height.saturating_sub(1)) as u16;
     AgentRender {
         lines,
         cursor: Some(Position::new(composer.cursor_x, cursor_y)),
+        subagent_strip,
     }
+}
+
+/// 输入带的一行：已有 span 全部叠上 `chrome.composer_bg` 底色，并把行尾
+/// 补空格铺满整行宽度，让 composer 区在画面上成为一条连续的土金色带。
+fn band_line(line: Line<'static>, width: u16, theme: &Theme) -> Line<'static> {
+    let bg = theme.chrome.composer_bg;
+    let mut spans = line.spans;
+    for span in &mut spans {
+        span.style = span.style.bg(bg);
+    }
+    let filled: usize = spans.iter().map(|span| span.content.width()).sum();
+    let width = usize::from(width);
+    if width > filled {
+        spans.push(Span::styled(
+            " ".repeat(width - filled),
+            Style::new().bg(bg),
+        ));
+    }
+    Line::from(spans)
 }
 
 #[derive(Debug, Default)]
@@ -548,6 +710,13 @@ pub(super) struct FullscreenView {
     pub(super) visible_start: usize,
     pub(super) body_height: u16,
     pub(super) menu: Option<MessageMenu>,
+    /// 当前生效的待办清单（最后一次成功 `todo_write` 的入参）。
+    ///
+    /// 由 [`FullscreenView::sync_todo`] 按 `(session_id, timeline.version)` 缓存：
+    /// 清单要参与**布局**（面板占几行），所以必须在本帧渲染前拿到，不能等
+    /// transcript 缓存同步时再顺手算。
+    pub(super) current_todo: Option<TodoBlock>,
+    pub(super) current_todo_key: Option<(String, u64)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -570,6 +739,24 @@ impl FullscreenView {
     pub(super) fn close_menu(&mut self) {
         self.menu = None;
     }
+
+    /// 刷新 sticky 待办面板的数据源。
+    ///
+    /// 倒扫整条 timeline 是 O(块数)，不能每帧做；按 `(session_id, timeline.version)`
+    /// 缓存，版本没动就直接复用。切会话时 key 必然不同，无需显式失效。
+    pub(super) fn sync_todo(&mut self, app: &App) {
+        let Some(session) = app.active_session() else {
+            self.current_todo = None;
+            self.current_todo_key = None;
+            return;
+        };
+        let key = (session.session_id.clone(), session.timeline.version);
+        if self.current_todo_key.as_ref() == Some(&key) {
+            return;
+        }
+        self.current_todo = adapter::current_todo(&session.timeline);
+        self.current_todo_key = Some(key);
+    }
 }
 
 impl FullscreenView {
@@ -579,12 +766,11 @@ impl FullscreenView {
     }
 
     pub(super) fn max_offset(&self, app: &App) -> usize {
-        app.active_session_id()
-            .map_or(0, |id| {
-                self.transcripts
-                    .len_for(&id)
-                    .saturating_sub(usize::from(self.body_height))
-            })
+        app.active_session_id().map_or(0, |id| {
+            self.transcripts
+                .len_for(&id)
+                .saturating_sub(usize::from(self.body_height))
+        })
     }
 
     pub(super) fn scroll_up(&mut self, app: &mut App, lines: usize) {
@@ -678,6 +864,21 @@ struct FullscreenBlockKey {
 }
 
 impl FullscreenTranscriptCache {
+    #[cfg(test)]
+    pub(super) fn rendered_lines(&self) -> &[Line<'static>] {
+        &self.lines
+    }
+
+    /// 工具类命中区域（`block_id`, start, end）——测试用，不暴露内部结构。
+    #[cfg(test)]
+    pub(super) fn tool_spans(&self) -> Vec<(String, usize, usize)> {
+        self.spans
+            .iter()
+            .filter(|span| matches!(span.kind, SpanKind::Tool))
+            .map(|span| (span.block_id.clone(), span.start, span.end))
+            .collect()
+    }
+
     pub(super) fn sync(&mut self, session: &SessionState, width: u16, theme: &Theme) {
         let key = FullscreenTranscriptKey {
             session_id: session.session_id.clone(),
@@ -709,35 +910,77 @@ impl FullscreenTranscriptCache {
         let mut used = HashSet::with_capacity(blocks.len());
         let mut spans = Vec::with_capacity(blocks.len());
         let mut lines = Vec::new();
-        for (index, block) in blocks.iter().enumerate() {
+        let mut index = 0;
+        while index < blocks.len() {
             if index > 0 {
                 lines.push(Line::default());
             }
             let start = lines.len();
-            let block_key = FullscreenBlockKey::from_block(block, width);
-            used.insert(block_key.clone());
-            let rendered = self.blocks.entry(block_key).or_insert_with(|| {
-                #[cfg(test)]
-                {
-                    self.render_misses = self.render_misses.saturating_add(1);
-                }
-                crate::ui::v2::transcript::render_block(block, usize::from(width), theme)
-            });
-            lines.extend(rendered.iter().cloned());
-            let kind = match &block.kind {
-                BlockKind::User { .. } => SpanKind::Message(MessageRole::User),
-                BlockKind::Assistant { .. } => SpanKind::Message(MessageRole::Assistant),
-                BlockKind::Thinking { .. } => SpanKind::Thinking,
-                BlockKind::Tool(_) => SpanKind::Tool,
-                _ => continue,
+            // 连续查询族合并成一张卡（与 `render_transcript` 同一条规则，
+            // 免得子代理视图和全屏视图长得不一样）。
+            let group = crate::ui::v2::transcript::lookup_group_len(&blocks[index..]);
+            let (span, rendered) = if group >= 2 {
+                let members = &blocks[index..index + group];
+                let block_key = FullscreenBlockKey::from_group(members, width);
+                used.insert(block_key.clone());
+                let rendered = self.blocks.entry(block_key).or_insert_with(|| {
+                    #[cfg(test)]
+                    {
+                        self.render_misses = self.render_misses.saturating_add(1);
+                    }
+                    crate::ui::v2::transcript::render_lookup_group(
+                        members,
+                        usize::from(width),
+                        theme,
+                    )
+                });
+                // 合并卡只有一个命中区域，指向**首成员**：点它即展开，而展开态会
+                // 让 `lookup_group_len` 归零——卡片自己拆回 N 张独立卡，正好是
+                // 「给我看每一次调用」。
+                let head = &members[0];
+                index += group;
+                (
+                    Some(FullscreenBlockSpan {
+                        turn_id: head.turn_id.clone(),
+                        block_id: head.id.to_string(),
+                        kind: SpanKind::Tool,
+                        start,
+                        end: start + rendered.len(),
+                    }),
+                    rendered,
+                )
+            } else {
+                let block = &blocks[index];
+                let block_key = FullscreenBlockKey::from_block(block, width);
+                used.insert(block_key.clone());
+                let rendered = self.blocks.entry(block_key).or_insert_with(|| {
+                    #[cfg(test)]
+                    {
+                        self.render_misses = self.render_misses.saturating_add(1);
+                    }
+                    crate::ui::v2::transcript::render_block(block, usize::from(width), theme)
+                });
+                let kind = match &block.kind {
+                    BlockKind::User { .. } => Some(SpanKind::Message(MessageRole::User)),
+                    BlockKind::Assistant { .. } => Some(SpanKind::Message(MessageRole::Assistant)),
+                    BlockKind::Thinking { .. } => Some(SpanKind::Thinking),
+                    BlockKind::Tool(_) => Some(SpanKind::Tool),
+                    _ => None,
+                };
+                let span = kind.map(|kind| FullscreenBlockSpan {
+                    turn_id: block.turn_id.clone(),
+                    block_id: block.id.to_string(),
+                    kind,
+                    start,
+                    end: start + rendered.len(),
+                });
+                index += 1;
+                (span, rendered)
             };
-            spans.push(FullscreenBlockSpan {
-                turn_id: block.turn_id.clone(),
-                block_id: block.id.to_string(),
-                kind,
-                start,
-                end: lines.len(),
-            });
+            lines.extend(rendered.iter().cloned());
+            if let Some(span) = span {
+                spans.push(span);
+            }
         }
         self.blocks.retain(|key, _| used.contains(key));
         self.spans = spans;
@@ -755,6 +998,35 @@ impl FullscreenBlockKey {
             block_id: block.id.to_string(),
             revision: block.revision,
             state: block.state,
+            width,
+            content_hash: hasher.finish(),
+        }
+    }
+
+    /// 合并卡的缓存键：没有单一 block，就把**每个成员**的 id 与内容都揉进去，
+    /// 任何一个成员变了都会 miss 重渲（缓存命中率不受影响——同一次同步里
+    /// 逐帧比对的是同一组成员）。
+    fn from_group(members: &[TranscriptBlock], width: u16) -> Self {
+        let mut hasher = DefaultHasher::new();
+        let mut revision = 0u64;
+        let mut ids = Vec::with_capacity(members.len());
+        for block in members {
+            block.kind.hash(&mut hasher);
+            block.state.hash(&mut hasher);
+            revision = revision.max(block.revision);
+            ids.push(block.id.to_string());
+        }
+        Self {
+            turn_id: members
+                .first()
+                .map(|block| block.turn_id.clone())
+                .unwrap_or_default(),
+            block_id: ids.join("\u{1}"),
+            revision,
+            state: members
+                .first()
+                .map(|block| block.state)
+                .unwrap_or(BlockState::Sealed),
             width,
             content_hash: hasher.finish(),
         }
@@ -808,10 +1080,8 @@ impl TranscriptCaches {
             self.lru.push(id);
         } else {
             self.lru.push(session_id.to_string());
-            self.entries.insert(
-                session_id.to_string(),
-                FullscreenTranscriptCache::default(),
-            );
+            self.entries
+                .insert(session_id.to_string(), FullscreenTranscriptCache::default());
             while self.lru.len() > Self::CAP {
                 let evicted = self.lru.remove(0);
                 self.entries.remove(&evicted);
@@ -889,7 +1159,11 @@ fn render_brand(app: &App, width: u16, height: u16, theme: &Theme) -> AgentRende
     let cursor_x = 2u16.saturating_add(composer.cursor_x);
     let cursor = (cursor_y < height && usize::from(cursor_x) < width)
         .then_some(Position::new(cursor_x, cursor_y as u16));
-    AgentRender { lines, cursor }
+    AgentRender {
+        lines,
+        cursor,
+        subagent_strip: None,
+    }
 }
 
 fn brand_lines(width: usize, theme: &Theme) -> Vec<Line<'static>> {
@@ -932,4 +1206,71 @@ fn centered_line(text: &str, width: usize, style: Style) -> Line<'static> {
         format!("{}{}", " ".repeat(padding), text),
         style,
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn layout() -> AgentLayout {
+        AgentLayout {
+            live_rows: 0,
+            slash_rows: 3,
+            stream_rows: 0,
+            thinking_rows: 1,
+            composer_rows: 3,
+            status_rows: 1,
+            subagent_rows: 1,
+            todo_rows: 4,
+        }
+    }
+
+    /// 空间不足时先丢**顺带看**的（斜杠菜单 → 子代理预览条 → 待办面板），
+    /// 最后才动 composer / 状态行 / 思考行——输入带和「在跑什么」是底线。
+    #[test]
+    fn chrome_shrinks_optional_rows_before_the_composer() {
+        let mut roomy = layout();
+        let room = roomy.height();
+        shrink_chrome_layout(&mut roomy, room);
+        assert_eq!(roomy.todo_rows, 4, "够放就不动");
+        assert_eq!(roomy, layout());
+
+        // 少一行：只丢斜杠菜单，待办面板毫发无损。
+        let mut tight = layout();
+        let room = tight.height() - 1;
+        shrink_chrome_layout(&mut tight, room);
+        assert_eq!((tight.slash_rows, tight.todo_rows), (2, 4));
+        assert_eq!(tight.height(), 12);
+
+        // 只留得下 composer + 状态行 + 思考行：面板、子代理预览条、斜杠菜单全让路。
+        let mut squeezed = layout();
+        shrink_chrome_layout(&mut squeezed, 5);
+        assert_eq!(squeezed.height(), 5);
+        assert_eq!(
+            (
+                squeezed.slash_rows,
+                squeezed.subagent_rows,
+                squeezed.todo_rows
+            ),
+            (0, 0, 0)
+        );
+        assert_eq!((squeezed.composer_rows, squeezed.status_rows), (3, 1));
+        assert_eq!(squeezed.thinking_rows, 1);
+    }
+
+    /// 极限压缩：composer 保底 1 行，再不够就依次丢状态行、思考行。
+    #[test]
+    fn chrome_never_shrinks_the_composer_below_one_row() {
+        let mut squeezed = layout();
+        shrink_chrome_layout(&mut squeezed, 2);
+        assert_eq!(squeezed.composer_rows, 1);
+        assert_eq!(squeezed.status_rows, 0);
+        assert_eq!(squeezed.thinking_rows, 1);
+
+        // 比底线还窄也不 panic（死循环 / 下溢都会在这里炸）。
+        let mut impossible = layout();
+        shrink_chrome_layout(&mut impossible, 0);
+        assert_eq!(impossible.height(), 1);
+        assert_eq!(impossible.composer_rows, 1);
+    }
 }

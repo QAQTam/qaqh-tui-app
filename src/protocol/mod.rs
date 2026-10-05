@@ -32,8 +32,8 @@
 /// 配置契约：**直接用权威 crate**，本仓不再手工镜像。
 ///
 /// 2026-09-15 前的 `protocol/config.rs` 是 367 行手抄，已漂移出 T-11：
-/// `ConfigPatch` 少 `permission_level`（后端 BUG-2026-09-13-15 补的 1..=4 值域
-/// 校验因此形同虚设）、`ConfigDto` 少 `mcp`/`lsp`，且注释还写着「刻意不含」——
+/// `ConfigPatch` 少 `permission_level`（后端 BUG-2026-09-13-15 补的 1..=3 值域
+/// 校验因此形同虚设；2026-10-03 收敛为三档制）、`ConfigDto` 少 `mcp`/`lsp`，且注释还写着「刻意不含」——
 /// **文档断言与后端现状相反**。改为依赖后，此类漂移在编译期即暴露。
 pub use qaqh_config_api::{ConfigDto, ConfigPatch, ProviderDto, SubagentDto, SubagentPatch};
 
@@ -109,19 +109,26 @@ mod tests {
     /// 那几个字段」，而非上游测试的复制。
     #[test]
     fn config_contract_exposes_fields_tui_needs() {
-        // 1) 写路径：权限档位可经 patch 下发并受值域校验（BUG-2026-09-13-15）。
+        // 1) 写路径：权限档位可经 patch 下发并受值域校验（BUG-2026-09-13-15；
+        //    2026-10-03 收敛为三档 1..=3，旧四档值 4 必须被拒）。
         let ok = ConfigPatch {
+            permission_level: Some(3),
+            ..Default::default()
+        };
+        ok.validate().expect("档位 3 合法");
+        assert_eq!(serde_json::to_value(&ok).unwrap()["permissionLevel"], 3);
+
+        let legacy = ConfigPatch {
             permission_level: Some(4),
             ..Default::default()
         };
-        ok.validate().expect("档位 4 合法");
-        assert_eq!(serde_json::to_value(&ok).unwrap()["permissionLevel"], 4);
+        assert!(legacy.validate().is_err(), "旧四档值 4 必须被拒");
 
         let bad = ConfigPatch {
             permission_level: Some(5),
             ..Default::default()
         };
-        assert!(bad.validate().is_err(), "档位 5 必须被拒，不得落成 Level 4");
+        assert!(bad.validate().is_err(), "档位 5 必须被拒");
 
         // 2) 读路径：mcp/lsp 两段不再是盲区（T-11 前 ConfigDto 里没有）。
         //    载荷由权威类型自身生成——**完整**是它的默认状态。本仓要钉的是

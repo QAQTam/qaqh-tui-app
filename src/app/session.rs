@@ -476,6 +476,13 @@ pub struct SessionState {
     pub usage: Option<UsageInfo>,
     pub usage_totals: Option<UsageInfo>,
     pub context_limit: Option<u32>,
+    /// 最近**已结束**回合的 `(turn_id, 信封 ts_ms)`。
+    ///
+    /// 只服务「输出速率」这一个指标：tok/s 需要一个时长，而两端都必须是权威
+    /// 墙钟——起点是 `TurnStarted` 的信封时间（已存在 `Turn::started_at_ms`），
+    /// 终点是本条 `TurnFinished` / `TurnInterrupted` 的信封时间。只留最近一条
+    /// （不按回合累积）：界面上也只看得到最近一次的速率。
+    pub last_turn_finished: Option<(String, u64)>,
     pub streaming: Option<StreamingState>,
     pub pending_ask: Option<AskPanel>,
     pub pending_plan: Option<PlanPanel>,
@@ -520,6 +527,7 @@ impl SessionState {
             usage: None,
             usage_totals: None,
             context_limit: None,
+            last_turn_finished: None,
             streaming: None,
             pending_ask: None,
             pending_plan: None,
@@ -923,7 +931,7 @@ mod tests {
                 state: TimelineBlockState::Sealed,
                 text: String::new(),
                 tool: Some(ToolCard {
-exit_code: None,
+                    exit_code: None,
                     completed_at_ms: None,
                     tool_call_id: "call".into(),
                     name: "exec".into(),
@@ -939,6 +947,7 @@ exit_code: None,
                     failure: None,
                     permission: None,
                     display: None,
+                    stream_estimate: None,
                 }),
                 last_fragment: 0,
                 rev: 1,
@@ -1077,6 +1086,27 @@ exit_code: None,
         );
         sync_streaming_from_timeline_at(&mut s, now);
         assert_eq!(s.streaming.as_ref().map(|s| s.turn_id.as_str()), Some("t2"));
+    }
+
+    /// 回归（长会话 spinner 卡死）：窗口里更旧的 running 幽灵不得把 streaming
+    /// 重新武装成 `answering`。
+    ///
+    /// 实测症状：长会话里模型完成最终作答后，输入框上方的思考动画仍在转、
+    /// 状态栏仍写着 `answering · r0`。链路是 `running_turn_id()` 认了幽灵 →
+    /// `(None, Some(ghost))` 分支凭空造出一个 `Answering` 的 streaming 状态。
+    #[test]
+    fn stale_older_running_ghost_does_not_rearm_streaming() {
+        let now = Instant::now();
+        let mut s = session_with(
+            vec![
+                turn("t1", TimelineTurnState::Running),   // 幽灵
+                turn("t2", TimelineTurnState::Completed), // 当前回合已完成
+            ],
+            None,
+        );
+        sync_streaming_from_timeline_at(&mut s, now);
+        assert!(s.streaming.is_none(), "幽灵不得重新武装 streaming");
+        assert_eq!(s.activity_label(), "idle", "状态栏不得停在 answering");
     }
 
     // ───────────── 权限面板：已响应后不得被补投复活（幽灵面板回归） ─────────────
