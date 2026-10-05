@@ -1423,8 +1423,16 @@ impl App {
                 match outcome {
                     ringing_v2::DriverOutcome::Applied => {
                         self.force_redraw = true;
+                        // driver seat 落地是首屏草稿的自动发送信号之一：
+                        // transfer 时会话多半还没就绪（只读），seat 到手后补发。
+                        self.maybe_autosend_pending_prompt(&session_id);
                     }
-                    ringing_v2::DriverOutcome::Duplicate => {}
+                    // 快照已带同一 seat 时 delta 会判 Duplicate：状态没变，但
+                    // 可写性可能直到 bootstrap 才成立。补发检查是幂等的
+                    // （pending / 活跃 tab / 只读三重门控），重放一次无害。
+                    ringing_v2::DriverOutcome::Duplicate => {
+                        self.maybe_autosend_pending_prompt(&session_id);
+                    }
                     ringing_v2::DriverOutcome::Stale | ringing_v2::DriverOutcome::Conflict => {
                         log::warn!("ignore driver delta for {session_id}: {outcome:?}");
                     }
@@ -1921,6 +1929,14 @@ impl App {
                         if should_claim {
                             self.spawn_claim_driver(bootstrap_session_id.clone());
                         }
+                        // bootstrap 落地是首屏草稿**最常见**的就绪点：transfer 时
+                        // 会话多半只读（v2_client_session_id 已是旧会话的身份、
+                        // 新会话还没有 driver 状态），可写性在这里随快照的 driver
+                        // 段一次性成立；自建会话的快照 seat 已在手，之后不会再有
+                        // DriverChanged::Applied（同状态只会判 Duplicate，甚至被
+                        // snapshot cursor 跳过），不在这里补发，草稿就一直停在
+                        // composer 等用户手动二次回车。
+                        self.maybe_autosend_pending_prompt(&bootstrap_session_id);
                         // v2 control 投影不携带 dashboard 快照（v1 领域 control state
                         // 才有），workspace 面板一律回退到 `session.dashboard` 拉取。
                         self.fetch_dashboard(bootstrap_session_id);
@@ -1937,6 +1953,11 @@ impl App {
                         NoticeLevel::Warn,
                         format!("driver claim 失败[{session_id}]: {error}"),
                     );
+                } else {
+                    // claim ack 只是本地信号（权威 holder 以随后的 reliable
+                    // `DriverChanged` 为准，那边也会重试）；这里提前一次，
+                    // 让 seat 已在手的会话尽快发出首屏草稿。
+                    self.maybe_autosend_pending_prompt(&session_id);
                 }
             }
             ActionResult::InteractionBody {
@@ -3151,7 +3172,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pending_initial_prompt_is_transferred_when_create_lands() {
+    async fn pending_initial_prompt_autosends_when_create_lands() {
         let (mut app, _rx) = App::new_for_test();
         app.pending_initial_prompt = Some("hello".into());
         app.pending_creates
@@ -3163,10 +3184,137 @@ mod tests {
 
         assert_eq!(app.tabs, vec!["new-session_id".to_string()]);
         assert!(app.pending_initial_prompt.is_none());
+        assert!(
+            app.sessions["new-session_id"].composer.is_empty(),
+            "首条草稿应原样带入真实会话 composer 并自动发送（composer 被发送取走）"
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_initial_prompt_waits_while_v2_read_only() {
+        let (mut app, _rx) = App::new_for_test();
+        app.sessions
+            .insert("new-session_id".into(), SessionState::new("new-session_id".into()));
+        init_v2_session(&mut app, "new-session_id");
+        app.tabs.push("new-session_id".into());
+        app.active = 0;
+        app.v2_client_session_id = Some("cs-1".into());
+        // driver seat 被别人持有：v2 面只读，自动发送必须等待。
+        let session = app.sessions.get_mut("new-session_id").expect("session");
+        session
+            .ringing_v2
+            .apply_driver_state(qaqh_client::ClientV2DriverState {
+                holder: Some("other-client".into()),
+                driver_epoch: 1,
+                can_claim: false,
+            });
+        assert!(app.active_v2_read_only());
+
+        app.pending_initial_prompt = Some("hello".into());
+        app.transfer_pending_initial_prompt();
+
         assert_eq!(
             app.sessions["new-session_id"].composer.value(),
             "hello",
-            "首条草稿应原样带入真实会话 composer"
+            "只读窗口内草稿必须留在 composer，不得被吞掉"
+        );
+        assert_eq!(
+            app.pending_initial_prompt.as_deref(),
+            Some("hello"),
+            "未发送成功前 pending 标记必须保留，等 seat 落地重试"
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_initial_prompt_autosends_when_driver_seat_lands() {
+        let (mut app, _rx) = App::new_for_test();
+        app.sessions
+            .insert("new-session_id".into(), SessionState::new("new-session_id".into()));
+        init_v2_session(&mut app, "new-session_id");
+        app.tabs.push("new-session_id".into());
+        app.active = 0;
+        app.v2_client_session_id = Some("cs-1".into());
+        let session = app.sessions.get_mut("new-session_id").expect("session");
+        session
+            .ringing_v2
+            .apply_driver_state(qaqh_client::ClientV2DriverState {
+                holder: Some("other-client".into()),
+                driver_epoch: 1,
+                can_claim: false,
+            });
+        app.pending_initial_prompt = Some("hello".into());
+        app.transfer_pending_initial_prompt();
+        assert_eq!(app.pending_initial_prompt.as_deref(), Some("hello"));
+
+        // reliable `DriverChanged`：seat 落到本客户端 → 自动补发首条草稿。
+        // （fact_seq 取 2：init_v2_session 的 bootstrap cursor 已在 (1,0)。）
+        app.handle(AppMsg::Runtime(v2_reliable_event(
+            "new-session_id",
+            2,
+            0,
+            qaqh_client::ClientV2Payload::ControlDelta(
+                qaqh_client::ClientV2ControlDelta::DriverChanged {
+                    revision: 2,
+                    holder: Some("cs-1".into()),
+                    // 同 epoch 换 holder 会被 reducer 判 Conflict（不得抢座）；
+                    // 生产路径 claim 成功必然伴随 epoch 前进。
+                    driver_epoch: 2,
+                },
+            ),
+        )));
+
+        assert!(app.pending_initial_prompt.is_none());
+        assert!(
+            app.sessions["new-session_id"].composer.is_empty(),
+            "seat 落地后必须自动发出首条草稿"
+        );
+    }
+
+    /// 自建会话的快照通常直接携带本客户端的 driver seat：transfer 时会话
+    /// 只读、可写性随 bootstrap 一次性成立，且不会再有 `DriverChanged::Applied`
+    /// 补发信号。bootstrap 落地必须成为自动发送的重试点，否则首条草稿停在
+    /// composer，等用户手动二次回车。
+    #[tokio::test]
+    async fn pending_initial_prompt_autosends_when_bootstrap_carries_driver_seat() {
+        let (mut app, _rx) = App::new_for_test();
+        app.sessions
+            .insert("new-session_id".into(), SessionState::new("new-session_id".into()));
+        app.tabs.push("new-session_id".into());
+        app.active = 0;
+        // 同一运行里此前 bootstrap 过其它会话：lease 身份已在，新会话还没有
+        // driver 状态 → transfer 时只读，草稿只能留下。
+        app.v2_client_session_id = Some("cs-1".into());
+        app.pending_initial_prompt = Some("hello".into());
+        app.transfer_pending_initial_prompt();
+        assert_eq!(
+            app.sessions["new-session_id"].composer.value(),
+            "hello",
+            "只读窗口内草稿必须留在 composer"
+        );
+        assert_eq!(app.pending_initial_prompt.as_deref(), Some("hello"));
+
+        // bootstrap 快照携带本客户端的 seat：可写性在这里成立，必须补发。
+        app.handle(AppMsg::Action(ActionResult::Bootstrap {
+            session_id: "new-session_id".into(),
+            result: Ok(v2_fixtures::bootstrap_typed(
+                "new-session_id",
+                "e1",
+                "log-1",
+                1,
+                1,
+                &[],
+                Some(v2_fixtures::driver("cs-1", 1, false)),
+            )),
+            client_session_id: Some("cs-1".into()),
+        }));
+
+        assert!(
+            app.pending_initial_prompt.is_none(),
+            "bootstrap 落地且 seat 已在手时必须自动补发首条草稿"
+        );
+        assert!(
+            app.sessions["new-session_id"].composer.is_empty(),
+            "草稿应被发送取走，而不是等用户手动二次回车"
         );
     }
 

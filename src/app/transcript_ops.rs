@@ -92,6 +92,10 @@ impl App {
             return;
         }
         let (text, attachments) = sess.composer.take();
+        // 手动发送即视为首屏草稿已处置：清掉自动发送标记，防止 seat 稍后落地
+        // 时对空 composer 触发一次幽灵补发（send_message 对空输入会静默返回，
+        // 标记却会一直挂着）。
+        self.pending_initial_prompt = None;
         let content_refs: Vec<ContentRef> = attachments.into_iter().map(|a| a.content).collect();
         self.spawn_api(move |api, tx| async move {
             let result = api
