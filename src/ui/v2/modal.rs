@@ -853,12 +853,53 @@ fn inner_rect(rect: Rect) -> Rect {
 
 /// 统一卡片外观：圆角边框 + 标题（借鉴 Codex 的单层 surface 卡 + Grok 的
 /// modal chrome，去掉全屏感）。`border` 按语义选：授权=警示色、提问=激活色。
+///
+/// 四角字形来自 `theme.border.rounded`（主题纪律：所有符号出自 Theme）——
+/// ConHost/CP437 等老终端没有 `╭╮╰╯`，主题层负责退回 `┌┐└┘`。
+/// 设置卡片复用 [`settings_card_block`]，本函数只负责加标题空格。
 fn card(title: &str, border: Style) -> Block<'static> {
+    settings_card_block(format!(" {title} "), border)
+}
+
+/// 卡片 Block：字形出自 `Theme::border.rounded`，颜色由调用方按语义给。
+pub fn settings_card_block(title: impl Into<String>, border: Style) -> Block<'static> {
+    let glyphs: &'static str = Theme::current().border.rounded;
+    // token 契约：七段「╭─╮│╰─╯」= 左上/顶/右上/竖/左下/底/右下；段数不对
+    // 时整体退回 ratatui 的 plain 集（老终端安全字形）。
+    let offsets: Vec<usize> = glyphs
+        .char_indices()
+        .map(|(index, _)| index)
+        .chain(std::iter::once(glyphs.len()))
+        .collect();
+    let segments: [&'static str; 7] = if offsets.len() == 8 {
+        let mut iter = offsets.windows(2).map(|w| &glyphs[w[0]..w[1]]);
+        [
+            iter.next().unwrap_or("┌"),
+            iter.next().unwrap_or("─"),
+            iter.next().unwrap_or("┐"),
+            iter.next().unwrap_or("│"),
+            iter.next().unwrap_or("└"),
+            iter.next().unwrap_or("─"),
+            iter.next().unwrap_or("┘"),
+        ]
+    } else {
+        ["┌", "─", "┐", "│", "└", "─", "┘"]
+    };
+    let [tl, top, tr, v, bl, bottom, br] = segments;
     Block::new()
         .borders(Borders::ALL)
-        .border_type(ratatui::widgets::BorderType::Rounded)
+        .border_set(ratatui::symbols::border::Set {
+            top_left: tl,
+            top_right: tr,
+            bottom_left: bl,
+            bottom_right: br,
+            vertical_left: v,
+            vertical_right: v,
+            horizontal_top: top,
+            horizontal_bottom: bottom,
+        })
         .border_style(border)
-        .title(format!(" {title} "))
+        .title(title.into())
 }
 
 /// 卡片右上角的溢出徽标（如 `▼12`）：画在顶边框上，与左侧标题同排。

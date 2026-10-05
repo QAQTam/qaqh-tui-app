@@ -541,11 +541,11 @@ pub fn draw_settings_card(
 
     f.render_widget(Clear, rect);
     f.render_widget(
-        Block::new()
-            .borders(ratatui::widgets::Borders::ALL)
-            .border_type(ratatui::widgets::BorderType::Rounded)
-            .border_style(Style::new().fg(theme.chrome.border_active))
-            .title(title),
+        // 字形出自 theme.border（与 modal::card 同一纪律，老终端退回 ┌┐└┘）。
+        crate::ui::v2::modal::settings_card_block(
+            title,
+            Style::new().fg(theme.chrome.border_active),
+        ),
         rect,
     );
 
