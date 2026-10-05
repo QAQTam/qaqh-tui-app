@@ -991,15 +991,16 @@ impl FullscreenTranscriptCache {
 
 impl FullscreenBlockKey {
     fn from_block(block: &TranscriptBlock, width: u16) -> Self {
-        let mut hasher = DefaultHasher::new();
-        block.kind.hash(&mut hasher);
         Self {
             turn_id: block.turn_id.clone(),
             block_id: block.id.to_string(),
             revision: block.revision,
             state: block.state,
             width,
-            content_hash: hasher.finish(),
+            // 内容身份由 (block_id, revision) 承担：rev 是「可见内容可能变化
+            // 即自增」的权威计数（timeline_model::Block::touch），缓存键不再
+            // 哈希块内容——那曾要求 BlockKind/ToolBlock derive Hash。
+            content_hash: 0,
         }
     }
 
@@ -1011,7 +1012,8 @@ impl FullscreenBlockKey {
         let mut revision = 0u64;
         let mut ids = Vec::with_capacity(members.len());
         for block in members {
-            block.kind.hash(&mut hasher);
+            // 逐成员 revision（而不是 max）：max 不动的成员更新也要 miss。
+            block.revision.hash(&mut hasher);
             block.state.hash(&mut hasher);
             revision = revision.max(block.revision);
             ids.push(block.id.to_string());

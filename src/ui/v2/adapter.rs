@@ -14,7 +14,6 @@ use crate::ui::v2::transcript::{
 use qaqh_client::{
     TimelineBlockKind, TimelineBlockState, TimelineToolBody, TimelineToolHeader, TimelineToolState,
 };
-
 pub fn from_turns(turns: &[Turn]) -> Vec<TranscriptBlock> {
     from_turns_with_expanded(turns, &HashSet::new())
 }
@@ -409,14 +408,21 @@ fn from_tool(tool: &ToolCard) -> ToolBlock {
     }
 }
 
-/// 类型化头部（09-18 契约 §3.3）→ view 头部。Path 的 op 略去：工具名
-/// （Read/Write/Edit/…）已经说了操作，路径才是要紧信息。
+/// 类型化头部（09-18 契约 §3.3）→ view 头部。
+///
+/// Path 的 `op` **必须保留**：它是文件改动族动词的唯一事实源
+/// （edit→Edited / write→Wrote / patch→Patched / delete→Deleted）。曾因
+/// 「工具名已经说了操作」被丢弃——工具名随后被动词折并后此理由失效，四个
+/// 语义各异的工具族读起来只剩「Edited」一种说法。
 fn typed_header(header: Option<&TimelineToolHeader>) -> Option<ToolHeader> {
     match header? {
         TimelineToolHeader::Shell { command } => Some(ToolHeader::Shell {
             command: command.clone(),
         }),
-        TimelineToolHeader::Path { path, .. } => Some(ToolHeader::Path { path: path.clone() }),
+        TimelineToolHeader::Path { path, op } => Some(ToolHeader::Path {
+            path: path.clone(),
+            op: *op,
+        }),
         TimelineToolHeader::Query { query, scope } => Some(ToolHeader::Query {
             query: query.clone(),
             scope: scope.clone(),
@@ -1043,6 +1049,44 @@ mod tests {
         assert_eq!(tool.output.as_deref(), Some("hello\nworld\n"));
         assert_eq!(tool.streams, None);
         assert_eq!(tool.exit_code, Some(0));
+    }
+
+    /// Path 头的 op 是文件改动族动词的唯一事实源，投影**不得丢弃**：
+    /// 曾因「工具名已经说了操作」被略去，四个语义各异的工具族
+    /// （edit/write/apply_patch/delete）读起来只剩「Edited」一种说法。
+    #[test]
+    fn path_header_keeps_op_as_verb_fact() {
+        for (wire_op, view_op) in [
+            (qaqh_client::TimelinePathOp::Edit, super::super::transcript::PathOp::Edit),
+            (qaqh_client::TimelinePathOp::Write, super::super::transcript::PathOp::Write),
+            (qaqh_client::TimelinePathOp::Patch, super::super::transcript::PathOp::Patch),
+            (qaqh_client::TimelinePathOp::Delete, super::super::transcript::PathOp::Delete),
+            (qaqh_client::TimelinePathOp::Read, super::super::transcript::PathOp::Read),
+        ] {
+            let mut card = tool_card("edit", TimelineToolState::Succeeded);
+            card.display = Some(TimelineToolDisplay {
+                summary: None,
+                diff: None,
+                lines_added: 0,
+                lines_removed: 0,
+                header: Some(TimelineToolHeader::Path {
+                    path: "src/lib.rs".to_string(),
+                    op: wire_op,
+                }),
+                body: None,
+                metrics: None,
+                outcome: None,
+            });
+            let tool = from_tool(&card);
+            assert_eq!(
+                tool.header,
+                Some(ToolHeader::Path {
+                    path: "src/lib.rs".to_string(),
+                    op: view_op,
+                }),
+                "{wire_op:?} 必须原样投影"
+            );
+        }
     }
 
     /// H16 兜底（无 display）：output 原样透出——JSON 拆包考古层已删

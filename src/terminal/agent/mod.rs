@@ -2453,6 +2453,11 @@ mod tests {
             .find(|block| block.kind == TimelineBlockKind::Text)
             .expect("text block");
         block.text.push_str(" updated");
+        // 缓存键的内容身份是 (block_id, rev)——rev 是「可见内容可能变化即自增」
+        // 的权威计数（`Block::touch`），生产路径（TextDelta 等）必然调用；这里
+        // 模拟同一条纪律。旧键曾哈希整个 kind 内容，绕过 rev 也能 miss，但那
+        // 要求 view 类型 derive Hash 且每次 O(内容)。
+        block.touch();
 
         cache.sync(&app.sessions["session-1"], 79, &theme);
         assert_eq!(

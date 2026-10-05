@@ -17,6 +17,9 @@ use crate::theme::Theme;
 
 use super::display_tool_name;
 
+/// Path 头部的操作语义（动词事实源）。直接吃权威 wire 类型，本仓不手抄镜像
+/// ——纪律同 protocol/mod.rs。
+pub use qaqh_client::TimelinePathOp as PathOp;
 const MIN_WIDTH: usize = 20;
 
 /// 工具正文的预览行数（终态）。与三家一致取 3——再多就不是「扫一眼」了。
@@ -86,13 +89,23 @@ impl ToolState {
 /// adapter 从 `ToolCard.display` 投影而来；`None` → 走 legacy summary 兜底。
 /// 头部正文（命令/路径/查询）由后端声明为「真相字段」，渲染层不再从
 /// 模型向 JSON 里考古。
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+///
+/// Path 的 `op` 是动词的**事实源**（§3.3 wire 契约）：edit→Edited、
+/// write→Wrote、patch→Patched、delete→Deleted。没有它，头部只剩
+/// 「改过某个文件」一种说法——改一行、整文件覆盖和删除读起来一样。
+///
+/// op 用权威 wire 类型 `qaqh_client::TimelinePathOp`（Copy），本仓不手抄镜像
+/// ——纪律同 protocol/mod.rs。它没实现 `Hash`，所以这里的 `Hash` derive 全部
+/// 撤除：这些 view 类型从未被哈希过（全仓零使用点），derive 是历史遗留的死
+/// 面——而且 wire 类型缺哪个 trait 都不该倒逼本仓改后端。
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ToolHeader {
     Shell {
         command: String,
     },
     Path {
         path: String,
+        op: PathOp,
     },
     Query {
         query: String,
@@ -253,7 +266,7 @@ fn todo_id(value: Option<&serde_json::Value>) -> Option<String> {
 }
 
 /// ToolBlock 的 V2 view model。
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolBlock {
     pub name: String,
     pub summary: Option<String>,
@@ -280,7 +293,7 @@ pub struct ToolBlock {
     pub line_stats: Option<LineStats>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BlockKind {
     User {
         text: String,
@@ -677,7 +690,7 @@ pub fn render_lookup_group(
         return Vec::new();
     };
     let (marker, marker_style) = tool_marker(ToolState::Success, theme);
-    let verb = tool_verb(&head.name, ToolState::Success)
+    let verb = tool_verb(head, &head.name, ToolState::Success)
         .map(str::to_owned)
         .unwrap_or_else(|| display_tool_name(&head.name));
     let noun = match head.name.as_str() {
@@ -783,8 +796,24 @@ fn tool_marker(state: ToolState, theme: &Theme) -> (&'static str, Style) {
 /// 头一行要读成一句人话（`Ran cargo test`），不是协议名（`Exec cargo test`
 /// ——命令本身已经说明了它在执行）。只覆盖能一眼看懂的家族，其余回退到标题化
 /// 的工具名（至少不是 `todo_write` 这种 wire 标识符）。
-fn tool_verb(name: &str, state: ToolState) -> Option<&'static str> {
+///
+/// 语义源是**类型化事实**而不是工具名折并：
+/// - exec/read/grep/web/todo 各家族共享一条 wire 名臂——这些名字在不同
+///   harness 间同义（Codex `Ran`、Claude `Bash`、Grok `Run Command` 都不区分
+///   同族别名），折并是安全的；
+/// - 文件改动族**只认 Path 头的 `op`**（edit/write/apply_patch/copy_range/
+///   delete 在 wire 上各发各的 op，语义差异恰好是用户关心的：改一行 vs 整
+///   文件覆盖 vs 多文件补丁 vs 删除），名字臂不再折并它们；
+/// - 运行中的文件卡给**中性现在时**（`Edit`，非 `Editing`）：此刻没有任何
+///   编辑证据可显示（diff 在执行完才存在），过去式的进行时版是伪形态；
+///   exec 族不同——它有流式输出 tail 作证据，`Running` 站得住。
+fn tool_verb(tool: &ToolBlock, name: &str, state: ToolState) -> Option<&'static str> {
     let running = state.is_running();
+    // 文件改动族：op 在手则 op 是唯一动词源；无 op（legacy/Other 头）回退
+    // 名字臂与 exec 同等待遇——比编一个家族词诚实。
+    if let Some(ToolHeader::Path { op, .. }) = tool.header.as_ref() {
+        return path_op_verb(*op, running);
+    }
     Some(match (name, running) {
         ("exec" | "shell" | "bash" | "run", true) => "Running",
         ("exec" | "shell" | "bash" | "run", false) => "Ran",
@@ -804,6 +833,19 @@ fn tool_verb(name: &str, state: ToolState) -> Option<&'static str> {
     })
 }
 
+/// Path op → 动词（运行中 = 中性现在时，终态 = 过去式）。
+fn path_op_verb(op: PathOp, running: bool) -> Option<&'static str> {
+    let (past, present) = match op {
+        PathOp::Edit => ("Edited", "Edit"),
+        PathOp::Write => ("Wrote", "Write"),
+        PathOp::Patch => ("Patched", "Patch"),
+        PathOp::Delete => ("Deleted", "Delete"),
+        PathOp::Read | PathOp::List => ("Read", "Reading"),
+        PathOp::Unknown => return None,
+    };
+    Some(if running { present } else { past })
+}
+
 /// 头部动词：终态失败/取消用状态词（理由进括号），其余走 [`tool_verb`]。
 fn tool_head_word(tool: &ToolBlock) -> String {
     match tool.state {
@@ -814,7 +856,7 @@ fn tool_head_word(tool: &ToolBlock) -> String {
         },
         ToolState::Cancelled => "Cancelled".to_string(),
         ToolState::Backgrounded => "Backgrounded".to_string(),
-        _ => tool_verb(&tool.name, tool.state)
+        _ => tool_verb(tool, &tool.name, tool.state)
             .map(str::to_owned)
             .unwrap_or_else(|| display_tool_name(&tool.name)),
     }
@@ -1075,7 +1117,7 @@ fn truncate_width(text: &str, max: usize) -> String {
 fn typed_header_rest(header: &ToolHeader) -> String {
     match header {
         ToolHeader::Shell { command } => sanitize_text(command),
-        ToolHeader::Path { path } => sanitize_text(path),
+        ToolHeader::Path { path, .. } => sanitize_text(path),
         ToolHeader::Query { query, scope } => {
             let query = sanitize_text(query);
             match scope.as_deref().filter(|scope| !scope.is_empty()) {
@@ -1722,7 +1764,10 @@ mod tests {
 
     fn read_block_in(id: &str, path: &str, state: ToolState, expanded: bool) -> TranscriptBlock {
         let mut tool = tool_block("read", None, state);
-        tool.header = Some(ToolHeader::Path { path: path.into() });
+        tool.header = Some(ToolHeader::Path {
+            path: path.into(),
+            op: PathOp::Read,
+        });
         tool.expanded = expanded;
         TranscriptBlock::new(id, BlockKind::Tool(Box::new(tool)))
     }
@@ -2143,9 +2188,12 @@ more context follows"
         let theme = theme();
         let home = std::env::var("HOME").unwrap_or_else(|_| "/home/u".into());
         let long = format!("{home}/projects/very/deep/tree/with/many/segments/file.txt");
-        // 现行 wire：write 走 typed Path 头；summary 为 None → 正文无逐字去重。
+        // 现行 wire：write 走 typed Path 头（op=Write）；summary 为 None → 正文无逐字去重。
         let mut tool = tool_block("write", None, ToolState::Success);
-        tool.header = Some(ToolHeader::Path { path: long.clone() });
+        tool.header = Some(ToolHeader::Path {
+            path: long.clone(),
+            op: PathOp::Write,
+        });
         tool.output = Some(long.clone());
         let text = text_of(&render_block(
             &TranscriptBlock::new("t1", BlockKind::Tool(Box::new(tool))),
@@ -2157,7 +2205,7 @@ more context follows"
             header.starts_with(&format!("{} ", theme.glyph.success)),
             "{text}"
         );
-        assert!(header.contains("Edited"), "动词是「做了什么」：{header}");
+        assert!(header.contains("Wrote"), "op 是动词事实源：{header}");
         assert!(
             !header.contains(&format!("{home}/projects")),
             "头部应把 home 换成 ~：{header}"
@@ -2235,6 +2283,96 @@ more context follows"
             "成功退出码是噪声，不该上屏：\n{text}"
         );
         assert!(!text.contains("exec"), "wire 名不上屏：\n{text}");
+    }
+
+    /// 文件改动族动词矩阵：**op 是唯一事实源**，四个 wire 语义各出一词，不再
+    /// 折并成一个 "Edited"；运行中给中性现在时（此刻没有 diff 证据可显示，
+    /// 过去式的进行时版是伪形态）；失败态照旧让位给 `Failed (code)` 状态词。
+    #[test]
+    fn path_op_drives_file_mutation_verbs() {
+        let cases = [
+            (PathOp::Edit, "edit", ("Edit", "Edited")),
+            (PathOp::Write, "write", ("Write", "Wrote")),
+            (PathOp::Patch, "apply_patch", ("Patch", "Patched")),
+            (PathOp::Delete, "delete", ("Delete", "Deleted")),
+        ];
+        for (op, name, (present, past)) in cases {
+            for (state, expected) in [(ToolState::Running, present), (ToolState::Success, past)] {
+                let mut tool = tool_block(name, None, state);
+                tool.header = Some(ToolHeader::Path {
+                    path: "src/lib.rs".into(),
+                    op,
+                });
+                let text = text_of(&render_block(
+                    &TranscriptBlock::new("t1", BlockKind::Tool(Box::new(tool))),
+                    80,
+                    &theme(),
+                ));
+                let header = text.lines().next().unwrap_or_default();
+                assert!(
+                    header.contains(expected),
+                    "{op:?} × {state:?} 应读作 `{expected}`：{text}"
+                );
+                assert!(
+                    !header.contains("Editing") || expected == "Edit",
+                    "{op:?} 运行中不得读作 Edited 家族统称：{text}"
+                );
+            }
+        }
+    }
+
+    /// 无 Path 头的文件族（legacy 会话 / Other 头兜底）：回退名字臂而不是编造
+    /// 家族词——但比 op 缺席前更诚实的是，Unknown op 明确不给动词。
+    #[test]
+    fn file_family_without_path_header_falls_back_to_name_arm() {
+        for name in ["edit", "write", "apply_patch", "delete"] {
+            let mut tool = tool_block(name, None, ToolState::Success);
+            tool.header = Some(ToolHeader::Other {
+                label: "legacy".into(),
+            });
+            let text = text_of(&render_block(
+                &TranscriptBlock::new("t1", BlockKind::Tool(Box::new(tool))),
+                80,
+                &theme(),
+            ));
+            let header = text.lines().next().unwrap_or_default();
+            assert!(
+                header.contains("Edited"),
+                "{name} 无 op 时回退名字臂（现行 wire 兼容）：{text}"
+            );
+        }
+    }
+
+    /// 未入词表的新工具：实名兜底是稳态（Grok 治理纪律——词表每加一项必须
+    /// 有配套文案，否则裸实名比编造的家族词诚实）。`copy_range` 发 Write op
+    /// 但名字不在任何折并臂里，正好钉住这条边界。
+    #[test]
+    fn unknown_tools_fall_back_to_display_name() {
+        let mut tool = tool_block("copy_range", None, ToolState::Success);
+        tool.header = Some(ToolHeader::Path {
+            path: "src/a.rs".into(),
+            op: PathOp::Write,
+        });
+        let text = text_of(&render_block(
+            &TranscriptBlock::new("t1", BlockKind::Tool(Box::new(tool))),
+            80,
+            &theme(),
+        ));
+        let header = text.lines().next().unwrap_or_default();
+        // op 在手：op 赢过名字兜底——这是路径首刀的语义。
+        assert!(header.contains("Wrote"), "op 在手则 op 是动词源：{text}");
+
+        let tool = tool_block("copy_range", None, ToolState::Success);
+        let text = text_of(&render_block(
+            &TranscriptBlock::new("t2", BlockKind::Tool(Box::new(tool))),
+            80,
+            &theme(),
+        ));
+        let header = text.lines().next().unwrap_or_default();
+        assert!(
+            header.contains("Copy Range"),
+            "无 op 无词表 → 实名兜底（不编造家族词）：{text}"
+        );
     }
 
     /// 分离流正文：stdout/stderr 都进正文，**stderr 只换色不占行**（参考三家

@@ -297,7 +297,7 @@ impl Block {
     }
 
     /// 标记内容已变（任何可能影响渲染的写入之后调用）。
-    fn touch(&mut self) {
+    pub(crate) fn touch(&mut self) {
         self.rev = self.rev.wrapping_add(1);
     }
 }
