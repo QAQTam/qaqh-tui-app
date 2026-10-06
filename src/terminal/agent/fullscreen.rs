@@ -877,6 +877,9 @@ struct FullscreenBlockKey {
     revision: u64,
     state: BlockState,
     width: u16,
+    /// 展开标志（tool/thinking 专属；其余块恒 false）。翻转必须 miss：
+    /// 展开不改 rev，键里没有它的话逐块缓存永远命中折叠渲染。
+    expanded: bool,
     content_hash: u64,
 }
 
@@ -1008,12 +1011,21 @@ impl FullscreenTranscriptCache {
 
 impl FullscreenBlockKey {
     fn from_block(block: &TranscriptBlock, width: u16) -> Self {
+        // 展开标志必须在键里（点击展开 bug 的根因）：`ceaf7ae` 把键改成
+        // (block_id, revision) 后，展开翻转不动 rev——逐块缓存全部命中旧的
+        // 折叠渲染，外层重建空转，表现为「点击后闪一下但没展开」。
+        let expanded = match &block.kind {
+            BlockKind::Tool(tool) => tool.expanded,
+            BlockKind::Thinking { expanded, .. } => *expanded,
+            _ => false,
+        };
         Self {
             turn_id: block.turn_id.clone(),
             block_id: block.id.to_string(),
             revision: block.revision,
             state: block.state,
             width,
+            expanded,
             // 内容身份由 (block_id, revision) 承担：rev 是「可见内容可能变化
             // 即自增」的权威计数（timeline_model::Block::touch），缓存键不再
             // 哈希块内容——那曾要求 BlockKind/ToolBlock derive Hash。
@@ -1035,6 +1047,9 @@ impl FullscreenBlockKey {
             revision = revision.max(block.revision);
             ids.push(block.id.to_string());
         }
+        // 合并卡只在全员折叠时存在（`groupable` 要求 `!expanded`），展开态下
+        // 成员拆回独立卡、各自走 `from_block`——这里恒为 false 即可，但显式
+        // 写出来让键的语义完整。
         Self {
             turn_id: members
                 .first()
@@ -1047,6 +1062,7 @@ impl FullscreenBlockKey {
                 .map(|block| block.state)
                 .unwrap_or(BlockState::Sealed),
             width,
+            expanded: false,
             content_hash: hasher.finish(),
         }
     }
@@ -1120,6 +1136,24 @@ impl TranscriptCaches {
         self.entries
             .get(session_id)
             .map(|cache| cache.lines.len())
+            .unwrap_or(0)
+    }
+
+    /// 测试用：某会话已渲染行的纯文本视图（点击展开的端到端断言用）。
+    #[cfg(test)]
+    pub(super) fn lines_for_test(&self, session_id: &str) -> &[Line<'static>] {
+        self.entries
+            .get(session_id)
+            .map(|cache| cache.rendered_lines())
+            .unwrap_or(&[])
+    }
+
+    /// 测试用：某会话缓存的累计重建次数。
+    #[cfg(test)]
+    pub(super) fn render_misses_for_test(&self, session_id: &str) -> usize {
+        self.entries
+            .get(session_id)
+            .map(|cache| cache.render_misses)
             .unwrap_or(0)
     }
 }

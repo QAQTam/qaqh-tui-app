@@ -3155,6 +3155,100 @@ mod tests {
         );
     }
 
+    /// 用户报告的 bug 复现：点击展开「闪了一下，但没真正展开」。
+    ///
+    /// 完整走 run_loop 的绘制路径：点击前一帧 → Down/Up → 重绘一帧，
+    /// 断言**画面上**工具卡正文真的变多（不是只看 App 集合翻转）。
+    #[test]
+    fn tool_card_click_actually_expands_on_the_repainted_frame() {
+        let mut app = app_with_model(model_with_tool_card());
+        app.show_workspace = false;
+        let mut view = FullscreenView::default();
+        let width = 80;
+        let height = 24;
+
+        let measure_body = |app: &App, view: &mut FullscreenView| -> (usize, String) {
+            let mut frames = publish_frame(app, view, width, height);
+            let len = view.transcripts.len_for("session-1");
+            let text = view
+                .transcripts
+                .lines_for_test("session-1")
+                .iter()
+                .map(|line| {
+                    line.spans
+                        .iter()
+                        .map(|span| span.content.as_ref())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            let _ = &mut frames;
+            (len, text)
+        };
+
+        let (rows_before, text_before) = measure_body(&app, &mut view);
+        // 折叠态显示的是**尾部 3 行**预览 + `… +5 行（点击展开）` 提示。
+        assert!(
+            text_before.contains("+5 行"),
+            "折叠态必须显示折叠提示：{text_before}"
+        );
+        assert!(
+            !text_before.contains("one\n"),
+            "折叠态不该露出正文头部（one…）：{text_before}"
+        );
+
+        let mut frames = publish_frame(&app, &mut view, width, height);
+        let rect = frames
+            .current()
+            .expect("published frame")
+            .regions
+            .iter()
+            .find_map(|region| match &region.target {
+                PointerTarget::Agent(AgentTarget::Tool { block_id, .. })
+                    if block_id == "tool-1" =>
+                {
+                    Some(region.rect)
+                }
+                _ => None,
+            })
+            .expect("tool card must be registered");
+        let (column, row) = (rect.x + 1, rect.y);
+        for kind in [
+            MouseEventKind::Down(MouseButton::Left),
+            MouseEventKind::Up(MouseButton::Left),
+        ] {
+            handle_message(
+                &mut app,
+                AppMsg::Mouse(left_mouse(kind, column, row)),
+                &mut frames,
+                &mut view,
+            );
+        }
+
+        // 关键一步：run_loop 在点击消息后的下一次迭代会重绘（B2 门控下
+        // processed_messages=true 必绘）。这里用与 run_loop 相同的路径重画一帧。
+        let (rows_after, text_after) = measure_body(&app, &mut view);
+
+        assert!(
+            app.sessions["session-1"].expanded_tools.contains("tool-1"),
+            "App 状态应翻转"
+        );
+        assert!(
+            rows_after > rows_before,
+            "展开后画面行数必须真的变多（曾因块缓存键缺 expanded 位而停在 \
+             折叠渲染，表现为「点击后闪一下但没展开」）：\
+             before={rows_before} after={rows_after}"
+        );
+        assert!(
+            text_after.contains("one"),
+            "展开后正文头部必须出现在画面上：{text_after}"
+        );
+        assert!(
+            !text_after.contains("+5 行"),
+            "展开后折叠提示必须消失：{text_after}"
+        );
+    }
+
     #[test]
     fn agent_draw_registers_back_to_latest_only_when_scrolled() {
         let mut app = app_with_model(model_with_many_sealed_turns(30));
