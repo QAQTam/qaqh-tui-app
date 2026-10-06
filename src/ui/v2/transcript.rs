@@ -126,6 +126,15 @@ pub struct ToolStreams {
 /// `todo_write` 的线名。专用渲染靠它分流，不走通用工具卡。
 pub(super) const TODO_TOOL_NAME: &str = "todo_write";
 
+/// todo 工具家族谓词（对齐后端 `qaqh-runtime::dashboard::is_todo_tool`）。
+///
+/// 渲染侧曾只认 `todo_write` 精确名（B1）：模型工作时的状态推进全部走
+/// `todo_update`，在名字门就被丢弃，置顶面板冻结在最后一次整表写。
+/// 所有「这是不是 todo 工具」的判定一律走本函数，禁止再各自手写。
+pub fn is_todo_tool(name: &str) -> bool {
+    matches!(name, "todo_write" | "todo_update" | "todo_list")
+}
+
 /// 折叠态最多画几行清单（超出的交给「点击展开」）。
 const TODO_PREVIEW_ROWS: usize = 3;
 
@@ -176,6 +185,53 @@ impl TodoBlock {
         }
         let items = items.iter().map(todo_item).collect::<Option<Vec<_>>>()?;
         Some(Self { items })
+    }
+
+    /// 解析 `todo_update` 的入参 delta（单一形态 `{id, status, evidence?}`，
+    /// 一次一条——后端 `split.rs::handle_update` 的 `reject_fields` 明确拒绝
+    /// `items`/批量字段）。
+    ///
+    /// 返回 `(目标 id, 新状态, 新证据)`；evidence 缺省 = 不动原值（与后端
+    /// `exec_todo_set` 语义一致）。id 缺失或 status 非法时返回 `None`，调用方
+    /// 忽略这条 delta（面板维持上一次已知状态，不整体作废）。
+    pub fn parse_update(args_json: &str) -> Option<(String, TodoStatus, Option<Option<String>>)> {
+        let value: serde_json::Value = serde_json::from_str(args_json).ok()?;
+        let id = value.get("id").and_then(serde_json::Value::as_str)?.trim();
+        if id.is_empty() {
+            return None;
+        }
+        let status = match value.get("status").and_then(serde_json::Value::as_str)? {
+            "pending" => TodoStatus::Pending,
+            "in_progress" => TodoStatus::InProgress,
+            "completed" => TodoStatus::Completed,
+            _ => return None,
+        };
+        let evidence = match value.get("evidence") {
+            None | Some(serde_json::Value::Null) => None,
+            Some(v) => v
+                .as_str()
+                .map(|text| Some(text.trim().to_owned()))
+                .or(Some(None)),
+        };
+        Some((id.to_owned(), status, evidence))
+    }
+
+    /// 把一条 `todo_update` delta 按 id 折叠进清单（就地修改）。
+    ///
+    /// id 找不到就忽略——delta 可能先于 write 到达（乱序回放）或指向已删除
+    /// 条目，宁可少改也不错改。
+    pub fn apply_update(&mut self, id: &str, status: TodoStatus, evidence: Option<Option<String>>) {
+        let Some(item) = self
+            .items
+            .iter_mut()
+            .find(|item| item.id.as_deref() == Some(id))
+        else {
+            return;
+        };
+        item.status = status;
+        if let Some(evidence) = evidence {
+            item.evidence = evidence;
+        }
     }
 
     /// `(待办, 进行中, 已完成)`。
@@ -558,10 +614,11 @@ fn render_thinking(
 }
 
 fn render_tool(tool: &ToolBlock, width: usize, theme: &Theme) -> Vec<Line<'static>> {
-    // `todo_write` 有专属形状：它没有「命令/路径」正文，服务端输出是
+    // todo 家族有专属形状：没有「命令/路径」正文，服务端输出是
     // `{replaced,total,assigned,current_id,...}` 记账 JSON——那串东西对人没有
-    // 信息量，照通用工具卡透出就是"屏幕上一条 JSON"。
-    if tool.name == TODO_TOOL_NAME {
+    // 信息量，照通用工具卡透出就是"屏幕上一条 JSON"。update 的入参 delta
+    // 同样不该走通用卡（B1 家族谓词）。
+    if is_todo_tool(&tool.name) {
         return render_todo_tool(tool, width, theme);
     }
     let name = display_tool_name(&tool.name);
@@ -829,6 +886,10 @@ fn tool_verb(tool: &ToolBlock, name: &str, state: ToolState) -> Option<&'static 
         ("web_fetch" | "web_search", false) => "Fetched",
         ("todo_write", true) => "Updating Plan",
         ("todo_write", false) => "Updated Plan",
+        ("todo_update", true) => "Updating Plan",
+        ("todo_update", false) => "Updated Plan",
+        ("todo_list", true) => "Reading Plan",
+        ("todo_list", false) => "Read Plan",
         _ => return None,
     })
 }

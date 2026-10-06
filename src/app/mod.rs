@@ -146,6 +146,28 @@ pub enum AppMsg {
     FocusLost,
 }
 
+/// B3 解析地板：ask 正文的类型化视图。
+///
+/// 逐字段 `#[serde(default)]`，畸形字段归默认值而不是整块
+/// `unwrap_or_default()` 归零成空面板（空面板会吞掉全部按键，见
+/// `interaction::ask_key`）。顶层 `kind` 仍由调用方先行分派，这里只收
+/// `kind = "ask"` 的剩余字段。
+#[derive(Debug, Clone, serde::Deserialize)]
+struct AskBody {
+    /// 正文里没有这个字段（interaction_body 只写 kind/mode/questions）；
+    /// 字段预留：后端补 wire 字段后自动生效，现路径一律空串。
+    #[serde(default)]
+    turn_id: String,
+    #[serde(default = "default_ask_mode")]
+    mode: qaqh_client::AskMode,
+    #[serde(default)]
+    questions: Vec<qaqh_client::DomainAskQuestion>,
+}
+
+fn default_ask_mode() -> qaqh_client::AskMode {
+    qaqh_client::AskMode::Single
+}
+
 /// 后台任务取用的 API 句柄。
 ///
 /// T-01 阶段 1.5 后本仓**不再持有自己的 HTTP 客户端**——连接生命周期、三条
@@ -769,6 +791,51 @@ pub struct App {
     pub pending_pager: Option<String>,
     /// 后端回合终态到达时置位；主循环下一帧清 viewport 后强制重绘。
     pub force_redraw: bool,
+    /// 上一次实际绘制的动画帧号（B2 绘制门控用）。
+    pub(crate) last_drawn_frame: u64,
+}
+
+impl App {
+    /// 空闲 tick 是否需要重绘（B2 绘制门控）。
+    ///
+    /// run_loop 曾对每个 200ms tick **无条件**整屏重画（5fps 恒定负载，动画还
+    /// 被同一量子锁死）。现在的契约：
+    /// - 有任何会话在流式 / working / 动画（菊花、sidebar 余晖）→ 持续重绘，
+    ///   动画因此能走自己的相位（帧号变化即重绘）；
+    /// - toast 在显示窗口内（淡出肉眼可见）→ 重绘；
+    /// - 首页会话列表自动刷新的过期判定也要画面跟随（旧实现依赖每帧重画兜底）；
+    /// - 其余空闲 tick 跳过绘制，帧率负载降为 0。
+    ///
+    /// 键/鼠标/后端消息路径照旧每条消息后必重绘一次（run_loop 的下一轮迭代），
+    /// 本判定只管「没有消息、只有 tick」的空闲分支。
+    pub fn needs_draw(&self) -> bool {
+        if self.force_redraw {
+            return true;
+        }
+        // 任何会话仍在工作或流式：菊花/正文都在动。
+        if self.sessions.values().any(|session| {
+            session.streaming.is_some() || session.activity == Some(ActivityState::Working)
+        }) {
+            return true;
+        }
+        // sidebar 余晖动画在窗口内。
+        if self.tabs.len() > 1 {
+            return true;
+        }
+        // toast 有 6s 显示窗：淡出前画面必须持续刷新。
+        if !self.toasts.is_empty() {
+            return true;
+        }
+        // 首页自动刷新兜底：无 tab / 有在途 create 时列表可能悄悄变化。
+        if self.tabs.is_empty() || !self.pending_creates.is_empty() {
+            return true;
+        }
+        // 动画帧号变了（菊花相位推进）。
+        if crate::app::anim::frame_now() != self.last_drawn_frame {
+            return true;
+        }
+        false
+    }
 }
 
 /// `TimelineLost` 的处置结论。
@@ -871,6 +938,7 @@ impl App {
             subagent_session_ids: HashSet::new(),
             pending_pager: None,
             force_redraw: false,
+            last_drawn_frame: 0,
         }
     }
 
@@ -1022,10 +1090,13 @@ impl App {
                         qaqh_client::ClientV2ActivityState::Running,
                     );
                 }
+                // 单一事实源（B1）：与 `transcript::is_todo_tool`（对齐后端
+                // `is_todo_tool`）同一家族谓词。曾手写 `starts_with("todo")`
+                // 化石——与置顶面板的精确名门不一致，两面板行为漂移的来源。
                 let todo_tool_touched = matches!(
                     &entry.event,
                     qaqh_client::TimelineEvent::ToolUpdated { tool, .. }
-                        if tool.name.starts_with("todo")
+                        if crate::ui::v2::transcript::is_todo_tool(&tool.name)
                 );
                 let Some(sess) = self.sessions.get_mut(&session_id) else {
                     return;
@@ -1261,7 +1332,12 @@ impl App {
                 ringing_v2::ApplyOutcome::ReliableApplied { .. }
                 | ringing_v2::ApplyOutcome::ReplaceableApplied { .. }
                 | ringing_v2::ApplyOutcome::Ephemeral => true,
-                ringing_v2::ApplyOutcome::Duplicate => false,
+                // Duplicate 曾连日志都没有（B3 审计出口 2）：drop 必须可见，
+                // 否则「面板为什么没弹」在默认无 logger 的线上无从排查。
+                ringing_v2::ApplyOutcome::Duplicate => {
+                    log::warn!("drop v2 event for {session_id}: Duplicate");
+                    false
+                }
                 outcome => {
                     log::warn!("drop v2 event for {session_id}: {outcome:?}");
                     false
@@ -1481,7 +1557,17 @@ impl App {
                     content_ref.hash().as_str(),
                 );
             }
-            qaqh_client::ClientV2ContentValue::Unavailable(_) => {}
+            qaqh_client::ClientV2ContentValue::Unavailable(reason) => {
+                // B3 审计出口 3：曾 `=> {}`——正文不可用时无日志无 toast，
+                // 面板不弹且不可见原因。ingress 必须响。
+                log::warn!(
+                    "interaction {interaction_id} for {session_id}: request unavailable: {reason:?}"
+                );
+                self.toast(
+                    NoticeLevel::Warn,
+                    format!("交互请求正文不可用[{session_id}]，面板未弹出"),
+                );
+            }
         }
     }
 
@@ -1534,7 +1620,28 @@ impl App {
                         &content_ref,
                     );
                 }
-                Some(qaqh_client::ClientV2PendingContentValue::Unavailable(_)) | None => {}
+                Some(qaqh_client::ClientV2PendingContentValue::Unavailable(reason)) => {
+                    // B3 审计出口 3（bootstrap 恢复路径）：静默丢弃会让
+                    // 「恢复会话后 ask 不弹」无从排查。None（正文未携带）同响。
+                    log::warn!(
+                        "pending interaction {} for {session_id}: request unavailable: {reason:?}",
+                        interaction.interaction_id
+                    );
+                    self.toast(
+                        NoticeLevel::Warn,
+                        format!("挂起交互正文不可用[{session_id}]，未恢复面板"),
+                    );
+                }
+                None => {
+                    log::warn!(
+                        "pending interaction {} for {session_id}: request missing",
+                        interaction.interaction_id
+                    );
+                    self.toast(
+                        NoticeLevel::Warn,
+                        format!("挂起交互缺正文[{session_id}]，未恢复面板"),
+                    );
+                }
             },
         }
     }
@@ -1592,6 +1699,9 @@ impl App {
         bytes: &[u8],
     ) {
         let Ok(body) = serde_json::from_slice::<serde_json::Value>(bytes) else {
+            // ingress 变响（B3）：正文不是合法 JSON 时不能无声消失。
+            log::warn!("interaction {interaction_id} for {session_id}: body is not valid JSON");
+            self.toast(NoticeLevel::Warn, "交互正文解析失败，面板未弹出");
             return;
         };
         let kind = body
@@ -1608,18 +1718,44 @@ impl App {
         };
         match kind {
             "ask" => {
-                let mode = serde_json::from_value(body.get("mode").cloned().unwrap_or_default())
-                    .unwrap_or(qaqh_client::AskMode::Single);
-                let questions =
-                    serde_json::from_value(body.get("questions").cloned().unwrap_or_default())
-                        .unwrap_or_default();
-                sess.pending_ask = Some(AskPanel::new(
-                    interaction_id.to_string(),
-                    String::new(),
-                    mode,
-                    questions,
-                ));
-                sess.scroll.follow = true;
+                // 类型化地板（B3）：逐字段 `#[serde(default)]`，畸形字段归默认值
+                // 而不是整块归零成空面板——permission 早已如此（session.rs 的
+                // from_interaction_body），ask/plan 补齐同款。
+                match serde_json::from_value::<AskBody>(body) {
+                    Ok(parsed) => {
+                        let mut panel = AskPanel::new(
+                            interaction_id.to_string(),
+                            parsed.turn_id,
+                            parsed.mode,
+                            parsed.questions,
+                        );
+                        // 「零个问题」不是可交互面板（空面板会吞掉全部按键，
+                        // 见 interaction::ask_key），用 body 原文造兜底问题，
+                        // 允许自定义输入——用户至少能把看到的东西交回去。
+                        if panel.questions.is_empty() {
+                            log::warn!(
+                                "interaction {interaction_id} for {session_id}: ask body has no questions, synthesizing fallback"
+                            );
+                            panel.questions.push(qaqh_client::DomainAskQuestion {
+                                id: "fallback".into(),
+                                question: "模型请求确认（正文未携带问题清单）".into(),
+                                options: Vec::new(),
+                                allow_custom: true,
+                            });
+                            panel.selections = vec![None];
+                            panel.customs = vec![String::new()];
+                            panel.option_cursor = vec![0];
+                        }
+                        sess.pending_ask = Some(panel);
+                        sess.scroll.follow = true;
+                    }
+                    Err(error) => {
+                        log::warn!(
+                            "interaction {interaction_id} for {session_id}: ask body malformed: {error}"
+                        );
+                        self.toast(NoticeLevel::Warn, "ask 正文畸形，面板未弹出");
+                    }
+                }
             }
             "plan" => {
                 let plan_content = body
@@ -1657,7 +1793,13 @@ impl App {
                     sess.restore_permission_from_snapshot(panel);
                 }
             }
-            _ => {}
+            other => {
+                // ingress 变响（B3）：未知 kind 一律 warn + toast。
+                log::warn!(
+                    "interaction {interaction_id} for {session_id}: unknown body kind {other:?}"
+                );
+                self.toast(NoticeLevel::Warn, format!("未知交互类型 {other:?}，已忽略"));
+            }
         }
     }
 
@@ -2767,6 +2909,72 @@ mod tests {
         assert_eq!(panel.tool_name, "exec");
         assert_eq!(panel.action_summary.as_deref(), Some("cargo test"));
         assert_eq!(panel.risk, PermissionRisk::High);
+    }
+
+    /// B3 回归：ask 正文合法时面板正常落地。
+    #[test]
+    fn ask_interaction_body_builds_panel() {
+        let (mut app, _rx) = App::new_for_test();
+        app.tabs.push("session".into());
+        app.sessions
+            .insert("session".into(), SessionState::new("session".into()));
+        let body = serde_json::to_vec(&serde_json::json!({
+            "kind": "ask",
+            "mode": "batch",
+            "questions": [
+                {"id": "q1", "question": "选哪个？", "options": ["甲", "乙"], "allow_custom": true}
+            ]
+        }))
+        .expect("body");
+
+        app.apply_interaction_body("session", "int_1", None, &body);
+
+        let ask = app.sessions["session"].pending_ask.as_ref().expect("ask");
+        assert_eq!(ask.interaction_id, "int_1");
+        assert_eq!(ask.questions.len(), 1);
+        assert!(matches!(ask.mode, qaqh_client::AskMode::Batch));
+    }
+
+    /// B3 回归（解析地板）：畸形字段逐个归默认值，**不整块归零**——
+    /// status 缺失的条目、空 questions 等异常不能再产出「空面板吞键」。
+    #[test]
+    fn ask_interaction_body_malformed_questions_get_fallback_question() {
+        let (mut app, _rx) = App::new_for_test();
+        app.tabs.push("session".into());
+        app.sessions
+            .insert("session".into(), SessionState::new("session".into()));
+        // questions 缺失：地板归空，然后必须合成兜底问题（allow_custom=true）。
+        let body = serde_json::to_vec(&serde_json::json!({"kind": "ask", "mode": "single"}))
+            .expect("body");
+
+        app.apply_interaction_body("session", "int_1", None, &body);
+
+        let ask = app.sessions["session"].pending_ask.as_ref().expect("ask");
+        assert_eq!(ask.questions.len(), 1, "空清单必须合成兜底问题");
+        assert!(ask.questions[0].allow_custom, "兜底问题必须允许自定义输入");
+    }
+
+    /// B3 回归（ingress 变响）：非法 JSON 与未知 kind 不再静默——面板不弹
+    /// 但必须有 toast（线上默认无 logger，toast 是唯一可见信号）。
+    #[test]
+    fn ask_interaction_body_invalid_json_and_unknown_kind_toast() {
+        let (mut app, _rx) = App::new_for_test();
+        app.tabs.push("session".into());
+        app.sessions
+            .insert("session".into(), SessionState::new("session".into()));
+
+        app.apply_interaction_body("session", "int_1", None, b"not json{");
+        let toast_count = app.toasts.len();
+        assert!(toast_count > 0, "非法 JSON 必须有 toast");
+        assert!(app.sessions["session"].pending_ask.is_none());
+
+        let unknown = serde_json::to_vec(&serde_json::json!({"kind": "wat"})).expect("body");
+        let before = app.toasts.len();
+        app.apply_interaction_body("session", "int_2", None, &unknown);
+        assert!(
+            app.toasts.len() > before,
+            "未知 kind 必须有 toast（曾静默 => {{}}）"
+        );
     }
 
     #[tokio::test]
@@ -3923,6 +4131,46 @@ mod tests {
             reason: TimelineLostReason::SessionMissing,
         });
         assert!(!app.subagent_session_ids.contains(&sub));
+    }
+
+    /// B2 绘制门控：完全空闲（无流式/无 working/无 toast/单 tab/无 create）
+    /// 且动画帧号没变 → 不需要重绘；任一条件翻转 → 需要。
+    ///
+    /// 旧 run_loop 对每个 200ms tick 无条件整屏重画（恒定 5fps 负载）；
+    /// 本测试锁住 `needs_draw` 的空闲为假，防回退。
+    #[test]
+    fn needs_draw_is_false_when_fully_idle() {
+        let (mut app, _rx) = app_with_tabs(&["s1"], 0);
+        app.last_drawn_frame = crate::app::anim::frame_now();
+        assert!(
+            !app.needs_draw(),
+            "完全空闲且帧号同步时不得要求重绘（B2 门控）"
+        );
+    }
+
+    #[test]
+    fn needs_draw_is_true_when_streaming_or_frame_advances() {
+        let (mut app, _rx) = app_with_tabs(&["s1"], 0);
+        // 1) 有会话在流式 → 持续重绘。
+        app.sessions.get_mut("s1").expect("session").streaming =
+            Some(crate::app::session::StreamingState {
+                turn_id: "t1".into(),
+                phase: crate::app::session::StreamPhase::Answering,
+                round_num: 1,
+                tool_name: None,
+                armed_at: Instant::now(),
+            });
+        assert!(app.needs_draw(), "流式会话必须持续重绘");
+        app.sessions.get_mut("s1").expect("session").streaming = None;
+
+        // 2) 动画帧号推进（模拟时间流逝）→ 重绘菊花相位。
+        app.last_drawn_frame = crate::app::anim::frame_now().wrapping_sub(7);
+        assert!(app.needs_draw(), "动画帧号变化必须重绘");
+
+        // 3) force_redraw 依旧最高优先。
+        app.last_drawn_frame = crate::app::anim::frame_now();
+        app.force_redraw = true;
+        assert!(app.needs_draw());
     }
 
     #[test]

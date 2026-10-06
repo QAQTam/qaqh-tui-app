@@ -212,6 +212,9 @@ async fn run_loop(
     let mut frames = FramePublisher::default();
     // `QAQH_HIT_PROBE=1|strict`（spec §8.1）；默认关闭。
     let probe = HitProbe::from_env();
+    // B2 绘制门控：上一轮迭代是否处理过消息。Tick 不是消息——纯 tick 醒来
+    // 且没有动画/活动在跑时，本轮跳过绘制（见 `App::needs_draw`）。
+    let mut processed_messages = true;
     loop {
         if app.quit {
             break;
@@ -233,15 +236,19 @@ async fn run_loop(
             terminal.terminal.clear()?;
             app.force_redraw = false;
         }
-        draw_and_publish(
-            terminal,
-            &mut frames,
-            app,
-            theme,
-            &route,
-            fullscreen_view,
-            probe,
-        )?;
+        // 首轮必画（冷启动画面），此后按门控判定。
+        if processed_messages || app.needs_draw() {
+            draw_and_publish(
+                terminal,
+                &mut frames,
+                app,
+                theme,
+                &route,
+                fullscreen_view,
+                probe,
+            )?;
+            app.last_drawn_frame = crate::app::anim::frame_now();
+        }
         if route == ScreenRoute::Agent {
             fullscreen_view.clamp_scroll(app);
         }
@@ -250,6 +257,7 @@ async fn run_loop(
             break;
         };
         handle_message(app, msg, &mut frames, fullscreen_view);
+        processed_messages = true;
         while let Ok(msg) = app_rx.try_recv() {
             handle_message(app, msg, &mut frames, fullscreen_view);
             if app.quit {

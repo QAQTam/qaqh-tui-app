@@ -3,11 +3,16 @@
 use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// 当前动画帧号（200ms/帧，与 Tick 周期一致）。
+/// 动画帧时长（ms）。与 `TICK_INTERVAL` **解耦**（B2）：动画相位由
+/// `Instant` 差值驱动、按本时长量化；tick 只负责醒来的频率。动画需要
+/// 更快的步进时改这里即可，不再把两者焊死在同一个常量上。
+pub(crate) const FRAME_MILLIS: u64 = 200;
+
+/// 当前动画帧号（FRAME_MILLIS/帧）。
 pub(crate) fn frame_now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64 / 200)
+        .map(|d| d.as_millis() as u64 / FRAME_MILLIS)
         .unwrap_or(0)
 }
 
@@ -48,8 +53,8 @@ fn base_frames() -> &'static [&'static str] {
 /// Claude Code `Spinner/SpinnerGlyph.tsx`）。倒放让菊花"开→合"地呼吸，而不是
 /// 从最重的 `✽` 硬切回 `·`；峰顶那一帧按 Claude 的写法连出两次。
 ///
-/// Claude 的推进节奏是 120ms/帧；本仓的 Tick 是 200ms（`TICK_INTERVAL`），
-/// 按 120ms 走会在两次重绘之间跳帧，所以保持与 Tick 对齐，一个呼吸周期 2.4s。
+/// Claude 的推进节奏是 120ms/帧；本仓动画相位是 `FRAME_MILLIS`（200ms），
+/// 按 120ms 走会在两次重绘之间跳帧，所以保持对齐，一个呼吸周期 2.4s。
 pub(crate) fn claude_spinner_glyph(frame: u64) -> &'static str {
     let frames = base_frames();
     let cycle = frames.len() * 2;

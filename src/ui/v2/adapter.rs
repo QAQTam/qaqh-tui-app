@@ -212,12 +212,14 @@ fn todo_block(name: &str, args_json: Option<&str>) -> Option<TodoBlock> {
     TodoBlock::parse(args_json?)
 }
 
-/// 当前生效的待办清单 = timeline 里**最后一次成功**的 `todo_write` 入参。
+/// 当前生效的待办清单 = timeline 里最后一次成功的 `todo_write` 入参，
+/// **再按时间顺序折叠其后所有成功的 `todo_update` delta**。
 ///
 /// 与 bugent `currentTodoList` 同思路：只认**成功**的调用——被拒的清单不能当成
 /// 生效的（实测 `items[0] references unknown id T1` 那次就是硬失败，参数本身还
 /// 能解析，只有状态能区分）。`todo_write` 是整表替换，所以最后一次成功的入参
-/// 就是全量。
+/// 就是全量；`todo_update` 是单条 delta（`{id, status, evidence?}`），必须叠上去
+/// ——B1：渲染侧曾只认 `todo_write` 精确名，模型逐条推进状态时面板纹丝不动。
 ///
 /// 走**前向**扫而不是倒扫，是为了补标题：入参里 `title` 省略时后端沿用同 id 的
 /// 旧标题，而最后一次入参里看不到那个旧标题——必须带着 id→标题的历史往前走。
@@ -232,7 +234,35 @@ pub fn current_todo(model: &TimelineModel) -> Option<TodoBlock> {
                 let Some(tool) = block.tool.as_ref() else {
                     continue;
                 };
-                if tool.name != TODO_TOOL_NAME || tool_state(tool.state) != ToolState::Success {
+                if !crate::ui::v2::transcript::is_todo_tool(&tool.name)
+                    || tool_state(tool.state) != ToolState::Success
+                {
+                    continue;
+                }
+                if tool.name == "todo_list" {
+                    // 只读工具：不改变清单状态。
+                    continue;
+                }
+                if tool.name == "todo_update" {
+                    // B1：delta 折叠。还没有基线（write 未成功落地）时无处可叠，
+                    // 忽略；id 不在当前清单也不在历史标题里 = 乱序/悬空 delta，
+                    // 同样忽略——宁可少改也不错改。
+                    let Some(todo) = current.as_mut() else {
+                        continue;
+                    };
+                    let Some((id, status, evidence)) =
+                        TodoBlock::parse_update(tool.args_json.as_deref().unwrap_or_default())
+                    else {
+                        continue;
+                    };
+                    let known = todo
+                        .items
+                        .iter()
+                        .any(|item| item.id.as_deref() == Some(&id))
+                        || titles.contains_key(&id);
+                    if known {
+                        todo.apply_update(&id, status, evidence);
+                    }
                     continue;
                 }
                 let Some(mut todo) = todo_block(&tool.name, tool.args_json.as_deref()) else {
@@ -258,6 +288,10 @@ pub fn current_todo(model: &TimelineModel) -> Option<TodoBlock> {
                     let Some(id) = id else {
                         continue;
                     };
+                    // 回写的 id 必须落回条目本身：`todo_update` delta 靠 id 找
+                    // 条目（`apply_update`），只记进 titles 表的话，匿名条目
+                    // 永远认不出后续 delta 是自己的（B1 折叠链上的隐坑）。
+                    item.id = Some(id.clone());
                     if item.title.is_empty() {
                         if let Some(title) = titles.get(&id) {
                             item.title = title.clone();
@@ -660,6 +694,146 @@ mod tests {
         assert!(current_todo(&model).is_none());
     }
 
+    /// B1 回归：成功的 `todo_update` delta 必须按时间顺序折叠进清单。
+    /// 模型逐条推进状态时，面板不能再冻结在最后一次整表写。
+    #[test]
+    fn current_todo_folds_successful_updates() {
+        let model = model(vec![
+            turn(vec![todo_tool_block_with(
+                "write-1",
+                TimelineToolState::Succeeded,
+                r#"{"items":[{"title":"定位瓶颈","status":"pending"},{"title":"写修复","status":"pending"}]}"#,
+                Some(
+                    r#"{"replaced":0,"total":2,"assigned":["T1","T2"],"current_id":"T1","message":"Plan updated: 2 item(s).","status":"ok"}"#,
+                ),
+            )]),
+            turn(vec![
+                todo_update_block(
+                    "upd-1",
+                    TimelineToolState::Succeeded,
+                    r#"{"id":"T1","status":"in_progress"}"#,
+                ),
+                todo_update_block(
+                    "upd-2",
+                    TimelineToolState::Succeeded,
+                    r#"{"id":"T1","status":"completed","evidence":"profiler 输出"}"#,
+                ),
+                // T2 不动，仍是 pending。
+            ]),
+        ]);
+
+        let todo = current_todo(&model).expect("todo");
+        assert_eq!(todo.items.len(), 2);
+        assert_eq!(
+            todo.items[0].status,
+            super::super::transcript::TodoStatus::Completed
+        );
+        assert_eq!(
+            todo.items[0].evidence.as_deref(),
+            Some("profiler 输出"),
+            "delta 携带的 evidence 必须写进条目"
+        );
+        assert_eq!(
+            todo.items[1].status,
+            super::super::transcript::TodoStatus::Pending
+        );
+    }
+
+    /// 失败/取消的 `todo_update` 不得折叠（与 `todo_write` 同一纪律：被拒的
+    /// 调用不代表生效状态）。
+    #[test]
+    fn current_todo_ignores_failed_updates() {
+        let model = model(vec![
+            turn(vec![todo_tool_block(
+                "write-1",
+                TimelineToolState::Succeeded,
+                r#"{"items":[{"title":"唯一任务","status":"in_progress"}]}"#,
+            )]),
+            turn(vec![todo_update_block(
+                "upd-bad",
+                TimelineToolState::Failed,
+                r#"{"id":"T1","status":"completed"}"#,
+            )]),
+        ]);
+
+        let todo = current_todo(&model).expect("todo");
+        assert_eq!(
+            todo.items[0].status,
+            super::super::transcript::TodoStatus::InProgress,
+            "失败的 delta 不得改状态"
+        );
+    }
+
+    /// 悬空 delta（id 不在清单、也不在历史标题里）不得错改任何条目。
+    #[test]
+    fn current_todo_ignores_dangling_update_ids() {
+        let model = model(vec![
+            turn(vec![todo_tool_block(
+                "write-1",
+                TimelineToolState::Succeeded,
+                r#"{"items":[{"title":"A","status":"pending"}]}"#,
+            )]),
+            turn(vec![todo_update_block(
+                "upd-ghost",
+                TimelineToolState::Succeeded,
+                r#"{"id":"T99","status":"completed"}"#,
+            )]),
+        ]);
+
+        let todo = current_todo(&model).expect("todo");
+        assert_eq!(
+            todo.items[0].status,
+            super::super::transcript::TodoStatus::Pending,
+            "悬空 delta 不得波及现有条目"
+        );
+    }
+
+    /// delta 先于任何成功 write 到达（乱序回放）时无处可叠：忽略，不 panic
+    /// 也不凭空造清单。
+    #[test]
+    fn current_todo_drops_update_before_any_write() {
+        let model = model(vec![turn(vec![todo_update_block(
+            "upd-orphan",
+            TimelineToolState::Succeeded,
+            r#"{"id":"T1","status":"completed"}"#,
+        )])]);
+        assert!(current_todo(&model).is_none());
+    }
+
+    /// `todo_update` 的入参解析：单一形态 `{id, status, evidence?}`。
+    #[test]
+    fn parse_update_accepts_single_shape_and_rejects_garbage() {
+        use super::super::transcript::{TodoBlock, TodoStatus};
+        let (id, status, evidence) =
+            TodoBlock::parse_update(r#"{"id":"T1","status":"completed","evidence":"done"}"#)
+                .expect("valid delta");
+        assert_eq!(id, "T1");
+        assert_eq!(status, TodoStatus::Completed);
+        assert_eq!(evidence, Some(Some("done".to_owned())));
+
+        // evidence 缺省 = 不动原值。
+        let (_, _, evidence) =
+            TodoBlock::parse_update(r#"{"id":"T1","status":"in_progress"}"#).expect("valid");
+        assert_eq!(evidence, None);
+
+        assert!(TodoBlock::parse_update(r#"{"id":"","status":"pending"}"#).is_none());
+        assert!(TodoBlock::parse_update(r#"{"id":"T1","status":"archived"}"#).is_none());
+        assert!(TodoBlock::parse_update(r#"{"status":"pending"}"#).is_none());
+        assert!(TodoBlock::parse_update("not json").is_none());
+    }
+
+    /// B1 单一事实源：app 侧的 todo 触发判定必须与渲染侧家族谓词一致。
+    #[test]
+    fn todo_family_predicate_covers_the_trio() {
+        use super::super::transcript::is_todo_tool;
+        assert!(is_todo_tool("todo_write"));
+        assert!(is_todo_tool("todo_update"));
+        assert!(is_todo_tool("todo_list"));
+        assert!(!is_todo_tool("todo"));
+        assert!(!is_todo_tool("todo_list_extra"));
+        assert!(!is_todo_tool("exec"));
+    }
+
     /// `TimelineModel` 有私有字段，测试里不能直接写字面量。
     fn model(turns: Vec<Turn>) -> TimelineModel {
         let mut model = TimelineModel::default();
@@ -718,6 +892,14 @@ mod tests {
 
     fn todo_tool_block(id: &str, state: TimelineToolState, args: &str) -> Block {
         todo_tool_block_with(id, state, args, None)
+    }
+
+    /// `todo_update` 工具块（B1 测试专用：delta 入参，无 output）。
+    fn todo_update_block(id: &str, state: TimelineToolState, args: &str) -> Block {
+        let mut block = tool_block_of(id, "todo_update", state);
+        let tool = block.tool.as_mut().expect("tool");
+        tool.args_json = Some(args.to_string());
+        block
     }
 
     fn todo_tool_block_with(

@@ -374,10 +374,19 @@ impl App {
             let Some(ask) = sess.pending_ask.as_ref() else {
                 return true;
             };
+            // 空清单（畸形正文落成的空面板）不再吞键（B3 次生缺陷）：曾对
+            // **每个键**返回 true（= 已消费），阻塞 Modal 门据此短路
+            // handle_key，Esc/Enter 全部不可达——「问不出来、也关不掉」。
+            // 现在空面板下 Esc 关掉它（dismiss_ask 内部按 active session 定位），
+            // 其余键维持已消费语义但不再有键盘死角。
             let focus = ask.focus.min(ask.questions.len().saturating_sub(1));
-            let Some(question) = ask.questions.get(focus) else {
+            if ask.questions.get(focus).is_none() {
+                if let KeyCode::Esc = key.code {
+                    self.dismiss_ask();
+                }
                 return true;
-            };
+            }
+            let question = ask.questions.get(focus).expect("checked above");
             let on_custom = ask.is_on_custom_row();
             if ask.editing_custom.is_some() {
                 match key.code {
@@ -898,5 +907,38 @@ mod tests {
             .expect("ask panel");
         assert_eq!(ask.focus, 0);
         assert!(ask.error.is_some());
+    }
+
+    /// B3 次生缺陷回归：空清单面板（畸形正文归零）曾对**每个键**返回已消费，
+    /// 阻塞 Modal 门据此短路——Esc 关不掉、Enter 答不了（「问不出来、也关
+    /// 不掉」）。现在 Esc 必须能关掉空面板。
+    #[tokio::test]
+    async fn empty_ask_panel_dismisses_on_esc() {
+        let (mut app, _rx) = App::new_for_test();
+        let session_id = "session-ask".to_string();
+        let mut session = SessionState::new(session_id.clone());
+        // 模拟畸形正文落成的空面板：questions 为空。
+        session.pending_ask = Some(AskPanel::new(
+            "interaction-empty".into(),
+            "turn-1".into(),
+            AskMode::Single,
+            Vec::new(),
+        ));
+        app.tabs.push(session_id.clone());
+        app.sessions.insert(session_id, session);
+
+        let consumed = app.ask_key(
+            "session-ask",
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+        );
+
+        assert!(consumed, "Esc 仍是已消费按键");
+        let gone = app
+            .sessions
+            .get("session-ask")
+            .expect("session")
+            .pending_ask
+            .is_none();
+        assert!(gone, "空面板必须被 Esc 关掉（曾吞键永锁）");
     }
 }
