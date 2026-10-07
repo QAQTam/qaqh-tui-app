@@ -2,6 +2,9 @@
 
 use super::*;
 
+/// 首页「继续上次」块最多显示的会话数（超过的去 Ctrl+L 列表里翻）。
+const HOME_RECENT_SESSIONS: usize = 5;
+
 /// 左侧会话栏的一行（渲染与点击共用同一份数据事实源）。
 #[derive(Debug)]
 pub struct SidebarRow {
@@ -58,6 +61,20 @@ impl App {
     ///
     /// 顺序沿用 `session_list_cache`（daemon 侧已按 updated_at 排序），打开的
     /// tab 不重排——侧栏是"监控位"，不是 tab 栏镜像。
+    /// 首页「继续上次」块的数据源：最近 5 个会话。`session.list` 已按
+    /// `updated_at` 降序，这里只过滤：归档、子代理、**已打开的 tab**（它们
+    /// 在侧栏里有实时状态，不该重复出现）。已结束/未打开的会话没有别的入口
+    /// 提到眼前——这正是这个块存在的理由。
+    pub fn home_recent_sessions(&self) -> Vec<&SessionListEntry> {
+        self.session_list_cache
+            .iter()
+            .filter(|entry| !entry.meta.archived)
+            .filter(|entry| !self.is_subagent_session(&entry.meta.session_id))
+            .filter(|entry| !self.tabs.contains(&entry.meta.session_id))
+            .take(HOME_RECENT_SESSIONS)
+            .collect()
+    }
+
     pub fn sidebar_rows(&self) -> Vec<SidebarRow> {
         self.session_list_cache
             .iter()
@@ -103,7 +120,8 @@ impl App {
 
     pub fn open_session_tab(&mut self, session_id: &str) {
         if self.tabs.iter().any(|s| s == session_id) {
-            self.active = self.tabs.iter().position(|s| s == session_id).unwrap_or(0);
+            let index = self.tabs.iter().position(|s| s == session_id).unwrap_or(0);
+            self.select_tab(index);
             self.prune_overlays_for_active_session_id();
             self.fetch_team(session_id.to_owned());
             // 目标 tab 可能一直挂在后台（停流状态）：重新挂流，
@@ -116,7 +134,7 @@ impl App {
             session_id.to_owned(),
             SessionState::new(session_id.to_owned()),
         );
-        self.active = self.tabs.len() - 1;
+        self.select_tab(self.tabs.len() - 1);
         self.prune_overlays_for_active_session_id();
         self.sync_tracked();
         // attach + bootstrap（timeline 流由 runtime 自动建立）。
@@ -313,7 +331,7 @@ impl App {
             self.teams.remove(session_id);
             self.tracked_session_ids.remove(session_id);
             if self.active >= self.tabs.len() && self.active > 0 {
-                self.active = self.tabs.len() - 1;
+                self.select_tab(self.tabs.len() - 1);
             }
             // 活动标签可能已经换成别的 session_id：旧 session_id 的确认/附件 overlay 作废。
             self.prune_overlays_for_active_session_id();

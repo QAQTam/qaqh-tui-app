@@ -4,7 +4,7 @@
 //! 渲染遵循鼠标优先的按钮规范（spec §5）：无框线，hover / pressed / 选中
 //! 全部用整行背景色表达。整列另铺 `surface.light` 面板底色，与右侧**不铺底色**
 //! 的消息区形成竖向分界。Working 会话的状态 glyph 走星芒动画
-//! （200ms/帧，由 Tick 驱动重绘）。
+//! （120ms/帧，动画期 Tick 提速到 60ms 驱动重绘）。
 //!
 //! 命中目标与 `dispatch_pointer_action` 共用 [`AgentTarget::SidebarRow`] 的
 //! 语义下标；下标必须来自同一次 [`App::sidebar_rows`]，绘制与点击各算一次
@@ -27,7 +27,6 @@ use crate::ui::v2::fullscreen::FullscreenState;
 use crate::ui::v2::hit::{
     AgentTarget, HitMapBuilder, PointerTarget, VisualAnchor, anchor_region, z,
 };
-use std::time::Instant;
 
 /// 侧栏宽度（状态 glyph + 标题）。
 pub const RAIL_WIDTH: u16 = 22;
@@ -70,56 +69,19 @@ fn status_glyph(
     }
 }
 
-/// 侧栏选中切换的余晖动画状态（渲染侧持有，App 不感知）。
-///
-/// 选中行切换后的短窗口内，旧行保留一帧 hover 底色——终端行高恒为 1，
-/// 做不了逐像素滑动，"旧行余晖 + 新行点亮"在两三个 Tick 帧内读作高亮滑走。
-#[derive(Debug, Default)]
-pub struct SidebarAnim {
-    /// 上一帧的选中行（检测切换用）。
-    active_row: Option<usize>,
-    /// 余晖：旧行下标 + 起始时刻。
-    slide_from: Option<(usize, Instant)>,
-}
-
-/// 余晖窗口 ≈2 个 200ms Tick 帧。
-const AFTERGLOW_MS: u128 = 360;
-
-impl SidebarAnim {
-    /// 检测选中行切换并推进动画；每帧绘制前调用一次。
-    fn advance(&mut self, active_index: Option<usize>) {
-        if active_index != self.active_row {
-            if let (Some(prev), Some(_)) = (self.active_row, active_index) {
-                self.slide_from = Some((prev, Instant::now()));
-            }
-            self.active_row = active_index;
-        }
-        if self
-            .slide_from
-            .is_some_and(|(_, at)| at.elapsed().as_millis() >= AFTERGLOW_MS)
-        {
-            self.slide_from = None;
-        }
-    }
-
-    fn afterglow_row(&self) -> Option<usize> {
-        self.slide_from.map(|(from, _)| from)
-    }
-}
-
 /// 绘制侧栏并登记行命中区。
+///
+/// 选中切换是瞬切（对齐 opencode/Codex：列表选中态不做过渡动画）；行上的
+/// 唯一动画是 working 会话的星芒菊花。
 pub fn draw(
     frame: &mut Frame,
     app: &App,
     area: Rect,
     theme: &Theme,
     pointer: &FullscreenState,
-    anim: &mut SidebarAnim,
     hit_map: &mut HitMapBuilder,
 ) {
     let rows = app.sidebar_rows();
-    anim.advance(rows.iter().position(|row| row.is_active));
-    let afterglow = anim.afterglow_row();
     let width = usize::from(area.width);
     let frame_no = anim::frame_now();
     let mut lines: Vec<Line<'static>> = Vec::with_capacity(usize::from(area.height));
@@ -154,13 +116,21 @@ pub fn draw(
             Span::styled(title, Style::new().fg(theme.text.primary)),
         ])
         .patch_style(visual.surface_style(theme, theme.chrome.selection));
-        // 余晖：刚失去选中的行保留 hover 底色（hover/pressed/选中优先级更高）。
-        if afterglow == Some(index)
-            && !row.is_active
-            && pointer.sidebar_hover != Some(index)
-            && pointer.sidebar_pressed != Some(index)
+        // 选中底色渐显（替代已删的余晖）：切换后 120ms 内 selection 底从
+        // 面板底色插值上来（outQuad）。非真彩 mix 不到或动画总开关关闭 →
+        // 瞬切，零开销。
+        if row.is_active
+            && crate::app::anim::enabled()
+            && let Some(at) = app.active_switch
         {
-            line = line.patch_style(Style::new().bg(theme.surface.hover));
+            let t = (at.elapsed().as_secs_f32() * 1000.0 / crate::app::anim::TAB_FADE_MS as f32)
+                .min(1.0);
+            let alpha = crate::app::anim::ease_out_quad(t);
+            if let Some(bg) =
+                crate::app::anim::mix_rgb(theme.surface.light, theme.chrome.selection, alpha)
+            {
+                line = line.patch_style(Style::new().bg(bg));
+            }
         }
         if let Some(region) = anchor_region(
             Rect::new(area.x, y, area.width, 1),
@@ -303,7 +273,6 @@ mod tests {
         app.active = 0;
         let theme = theme();
         let rail_area = Rect::new(0, 0, RAIL_WIDTH, 8);
-        let mut anim = SidebarAnim::default();
         let mut hit_map = HitMapBuilder::new(
             FrameId::new(1),
             ScreenRoute::Agent,
@@ -314,17 +283,7 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(100, 8)).expect("terminal");
 
         terminal
-            .draw(|frame| {
-                draw(
-                    frame,
-                    &app,
-                    rail_area,
-                    &theme,
-                    &pointer,
-                    &mut anim,
-                    &mut hit_map,
-                )
-            })
+            .draw(|frame| draw(frame, &app, rail_area, &theme, &pointer, &mut hit_map))
             .unwrap();
 
         let buffer = terminal.backend().buffer();
@@ -345,8 +304,10 @@ mod tests {
         );
     }
 
+    /// 选中底色渐显（余晖的替代形态）：切换后窗口内 selection 底从面板底色
+    /// 插值上来（≠ 两端色），窗口过后精确落在 selection。
     #[test]
-    fn sidebar_paints_afterglow_when_selection_moves() {
+    fn active_row_background_fades_in_after_selection_switch() {
         use crate::app::session::SessionState;
         use crate::ui::v2::hit::{FrameId, HitMapBuilder};
         use crate::ui::v2::route::ScreenRoute;
@@ -357,22 +318,19 @@ mod tests {
         for id in ["s-1", "s-2"] {
             app.tabs.push(id.into());
             app.sessions.insert(id.into(), SessionState::new(id.into()));
-            let mut entry = SessionListEntry {
+            app.session_list_cache.push(SessionListEntry {
                 meta: SessionMeta {
                     session_id: id.into(),
                     title: Some(id.into()),
                     ..SessionMeta::default()
                 },
-                running: true,
+                running: false,
                 workspace_id: None,
-            };
-            entry.meta.title = Some(id.into());
-            app.session_list_cache.push(entry);
+            });
         }
-        app.active = 0;
+        app.select_tab(1);
         let theme = theme();
         let rail_area = Rect::new(0, 0, RAIL_WIDTH, 8);
-        let mut anim = SidebarAnim::default();
         let mut hit_map = HitMapBuilder::new(
             FrameId::new(1),
             ScreenRoute::Agent,
@@ -382,50 +340,29 @@ mod tests {
         let pointer = FullscreenState::default();
         let mut terminal = Terminal::new(TestBackend::new(100, 8)).expect("terminal");
 
-        // 帧一：s-1 选中，无动画。
+        // 渐显窗口中段（t≈0.5 → alpha≈0.75）：选中行底色是插值中间态，
+        // 既不是 selection 终态也不是面板底色起点。
+        std::thread::sleep(std::time::Duration::from_millis(60));
         terminal
-            .draw(|frame| {
-                draw(
-                    frame,
-                    &app,
-                    rail_area,
-                    &theme,
-                    &pointer,
-                    &mut anim,
-                    &mut hit_map,
-                )
-            })
+            .draw(|frame| draw(frame, &app, rail_area, &theme, &pointer, &mut hit_map))
             .unwrap();
-        assert_eq!(anim.active_row, Some(0));
-        assert!(anim.slide_from.is_none());
-
-        // 帧二：切到 s-2 → 旧行 s-1 保留余晖底色，新行点亮 selection。
-        app.active = 1;
-        terminal
-            .draw(|frame| {
-                draw(
-                    frame,
-                    &app,
-                    rail_area,
-                    &theme,
-                    &pointer,
-                    &mut anim,
-                    &mut hit_map,
-                )
-            })
-            .unwrap();
-        assert_eq!(anim.active_row, Some(1));
-        assert_eq!(anim.slide_from.map(|(from, _)| from), Some(0));
         let buffer = terminal.backend().buffer();
-        assert_eq!(
-            buffer[(1, 0)].bg,
-            theme.surface.hover,
-            "刚失去选中的行应保留余晖底色"
-        );
+        let fading = buffer[(1, 1)].bg;
+        assert_ne!(fading, theme.chrome.selection, "窗口中段不得已是终态");
+        assert_ne!(fading, theme.surface.light, "窗口中段不得还是起点");
+
+        // 窗口过后：精确落到 selection。
+        std::thread::sleep(std::time::Duration::from_millis(
+            crate::app::anim::TAB_FADE_MS as u64 + 30,
+        ));
+        terminal
+            .draw(|frame| draw(frame, &app, rail_area, &theme, &pointer, &mut hit_map))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
         assert_eq!(
             buffer[(1, 1)].bg,
             theme.chrome.selection,
-            "新选中行是 selection 底色"
+            "渐显结束后选中行必须是 selection 底色"
         );
     }
 }

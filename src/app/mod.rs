@@ -793,6 +793,10 @@ pub struct App {
     pub force_redraw: bool,
     /// 上一次实际绘制的动画帧号（B2 绘制门控用）。
     pub(crate) last_drawn_frame: u64,
+    /// 激活标签切换时刻（选中底色渐显用）；未切换时为 None。
+    pub(crate) active_switch: Option<Instant>,
+    /// 首页品牌画面的出现时刻：logo 入场扫光与示例 prompt 轮换的时间锚。
+    pub(crate) brand_shown_at: Instant,
 }
 
 impl App {
@@ -812,14 +816,31 @@ impl App {
         if self.force_redraw {
             return true;
         }
-        // 任何会话仍在工作或流式：菊花/正文都在动。
+        // 动画帧号变了（菊花相位推进）。
+        if crate::app::anim::frame_now() != self.last_drawn_frame {
+            return true;
+        }
+        self.is_animating()
+    }
+
+    /// 画面上是否有**正在动的东西**：决定 tick 的节奏（动画期 60ms、空闲
+    /// 200ms）与空闲重绘。菊花/shimmer 只在工作会话上转，平滑滚动在收敛，
+    /// 选中底色在渐显，toast 在淡出，首页列表要跟随刷新——这些都在 App
+    /// 状态里可见。
+    pub fn is_animating(&self) -> bool {
+        // 任何会话仍在工作或流式（菊花/正文都在动），或有滚动 tween 未收敛。
         if self.sessions.values().any(|session| {
-            session.streaming.is_some() || session.activity == Some(ActivityState::Working)
+            session.streaming.is_some()
+                || session.activity == Some(ActivityState::Working)
+                || session.scroll.tween_active()
         }) {
             return true;
         }
-        // sidebar 余晖动画在窗口内。
-        if self.tabs.len() > 1 {
+        // 选中底色渐显窗口内。
+        if self
+            .active_switch
+            .is_some_and(|at| at.elapsed().as_millis() < crate::app::anim::TAB_FADE_MS)
+        {
             return true;
         }
         // toast 有 6s 显示窗：淡出前画面必须持续刷新。
@@ -828,10 +849,6 @@ impl App {
         }
         // 首页自动刷新兜底：无 tab / 有在途 create 时列表可能悄悄变化。
         if self.tabs.is_empty() || !self.pending_creates.is_empty() {
-            return true;
-        }
-        // 动画帧号变了（菊花相位推进）。
-        if crate::app::anim::frame_now() != self.last_drawn_frame {
             return true;
         }
         false
@@ -939,6 +956,17 @@ impl App {
             pending_pager: None,
             force_redraw: false,
             last_drawn_frame: 0,
+            active_switch: None,
+            brand_shown_at: Instant::now(),
+        }
+    }
+
+    /// 切换激活标签（**唯一入口**：记录选中底色渐显的时间锚，sidebar 绘制
+    /// 据此对选中行做 120ms 的颜色插值）。
+    pub(crate) fn select_tab(&mut self, index: usize) {
+        if self.active != index {
+            self.active = index;
+            self.active_switch = Some(Instant::now());
         }
     }
 
@@ -2553,7 +2581,7 @@ impl App {
         if key.modifiers.contains(KeyModifiers::ALT)
             && let Some(next) = keymap::alt_tab_target(self.active, self.tabs.len(), key.code)
         {
-            self.active = next;
+            self.select_tab(next);
             // 切标签即退出子代理观测（观测作用域属于原标签）。
             if self.inspecting() {
                 self.exit_inspect();

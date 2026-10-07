@@ -80,6 +80,10 @@ pub enum AgentTarget {
     Subagents,
     /// 左侧会话栏的第 `index` 行（语义下标，与 `App::sidebar_rows` 同源）。
     SidebarRow(usize),
+    /// 首页「继续上次」行：点击等价 `App::open_session_tab`。
+    HomeSession {
+        session_id: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -435,8 +435,10 @@ impl App {
         let Some(sess) = self.sessions.get_mut(&session_id) else {
             return;
         };
+        // 交互滚动（wheel/PageUp）：视觉偏移缓动收敛到新目标。
         sess.scroll.follow = false;
-        sess.scroll.offset = sess.scroll.offset.saturating_add(lines);
+        let target = sess.scroll.offset.saturating_add(lines);
+        sess.scroll.scroll_to(target);
     }
 
     pub fn scroll_down(&mut self, lines: usize) {
@@ -447,10 +449,12 @@ impl App {
             return;
         };
         if sess.scroll.offset <= lines {
+            // 重新咬住底部是语义跳变：follow 分支直接画底，无需缓动。
             sess.scroll.offset = 0;
             sess.scroll.follow = true;
         } else {
-            sess.scroll.offset -= lines;
+            let target = sess.scroll.offset - lines;
+            sess.scroll.scroll_to(target);
         }
     }
 

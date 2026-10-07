@@ -7,7 +7,7 @@ use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::io::stdout;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
 use std::time::Duration;
 
@@ -50,7 +50,12 @@ use fullscreen::{
 };
 use pointer::{PointerAction, PointerEvent};
 
+/// 空闲 tick 周期：无动画时的最低唤醒频率（B2 门控下多数 tick 不绘制）。
 const TICK_INTERVAL: Duration = Duration::from_millis(200);
+/// 动画期 tick 周期：快于动画帧量子 [`FRAME_MILLIS`](crate::app::anim::FRAME_MILLIS)
+/// （120ms），菊花 / shimmer / 余晖不跳帧；只在 [`App::is_animating`] 或侧栏
+/// 余晖窗口内生效。
+const TICK_ANIM_INTERVAL: Duration = Duration::from_millis(60);
 const MAX_SLASH_ROWS: usize = 4;
 
 /// 启动真实 V2 fullscreen Agent shell。
@@ -75,6 +80,8 @@ pub async fn run(no_spawn: bool, resume: bool) -> Result<()> {
     let mut app = App::new(runtime.clone(), app_tx.clone());
     app.show_workspace = false;
     app.fetch_session_list();
+    // 首页信息行要展示当前模型 / BYOK 密钥状态：启动即拉，不等设置页打开。
+    app.fetch_config();
     if resume {
         app.startup_intent = StartupIntent::Resume;
         app.session_cwd_filter = app.initial_cwd.clone().map(|cwd| {
@@ -95,7 +102,8 @@ pub async fn run(no_spawn: bool, resume: bool) -> Result<()> {
     };
 
     let mut input = InputPump::new(app_tx.clone());
-    spawn_tick(app_tx.clone());
+    let tick_period = Arc::new(AtomicU64::new(TICK_INTERVAL.as_millis() as u64));
+    spawn_tick(app_tx.clone(), tick_period.clone());
 
     let mut fullscreen_view = FullscreenView::default();
     let result = run_loop(
@@ -105,6 +113,7 @@ pub async fn run(no_spawn: bool, resume: bool) -> Result<()> {
         &mut app,
         &mut fullscreen_view,
         theme,
+        &tick_period,
     )
     .await;
 
@@ -188,11 +197,13 @@ impl InputPump {
     }
 }
 
-fn spawn_tick(tx: mpsc::UnboundedSender<AppMsg>) {
+fn spawn_tick(tx: mpsc::UnboundedSender<AppMsg>, period: Arc<AtomicU64>) {
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(TICK_INTERVAL);
         loop {
-            interval.tick().await;
+            // 周期由 run_loop 每轮按「画面上有没有在动的东西」回写：动画期
+            // 60ms（菊花/shimmer/余晖不跳帧），空闲 200ms。sleep 前读最新值，
+            // 节奏切换在下一个周期生效，不需要通知机制。
+            tokio::time::sleep(Duration::from_millis(period.load(Ordering::Relaxed))).await;
             if tx.send(AppMsg::Tick).is_err() {
                 break;
             }
@@ -207,6 +218,7 @@ async fn run_loop(
     app: &mut App,
     fullscreen_view: &mut FullscreenView,
     theme: &'static Theme,
+    tick_period: &AtomicU64,
 ) -> Result<()> {
     // 已发布帧：只有真正 flush 成功的帧才会进来，鼠标事件只查它。
     let mut frames = FramePublisher::default();
@@ -219,6 +231,17 @@ async fn run_loop(
         if app.quit {
             break;
         }
+        // 分区节奏：内容区是消息驱动的（消息到即整帧重绘，不进这里）；这里调的
+        // 是动画类区域的采样率——菊花 / shimmer 在动就把 tick 提到 60ms，全部
+        // 静止则回到 200ms。
+        tick_period.store(
+            if app.is_animating() {
+                TICK_ANIM_INTERVAL.as_millis() as u64
+            } else {
+                TICK_INTERVAL.as_millis() as u64
+            },
+            Ordering::Relaxed,
+        );
         let route = route::resolve(app);
         if route != ScreenRoute::Agent {
             fullscreen_view.close_menu();
@@ -391,12 +414,13 @@ fn draw_and_publish(
     }
 }
 
-/// 这一帧对应的滚动量；用于 stale 判定与诊断。
+/// 这一帧对应的滚动量；用于 stale 判定与诊断。命中图必须描述**屏幕上
+/// 实际画出的**内容，所以取视觉偏移（平滑滚动进行中与正文同步滑行）。
 fn frame_scroll_offset(app: &App, route: &ScreenRoute) -> usize {
     match route {
         ScreenRoute::Agent => app
             .active_session()
-            .map_or(0, |session| session.scroll.offset),
+            .map_or(0, |session| session.scroll.visual_offset()),
         ScreenRoute::Modal(ModalRoute::Ask) => app
             .active_session()
             .and_then(|session| session.pending_ask.as_ref())
@@ -667,6 +691,11 @@ fn dispatch_pointer_action(
                 fullscreen_view.pointer_state.clear();
                 frames.invalidate();
             }
+            PointerTarget::Agent(AgentTarget::HomeSession { session_id }) => {
+                app.open_session_tab(&session_id);
+                fullscreen_view.pointer_state.clear();
+                frames.invalidate();
+            }
             PointerTarget::Agent(AgentTarget::MenuAction(action)) => {
                 if action.enabled() {
                     activate_message_action(app, fullscreen_view, action);
@@ -760,7 +789,7 @@ fn scrollbar_metrics(app: &App, view: &FullscreenView) -> Option<ScrollbarMetric
         view.transcripts.len_for(&session.session_id),
         usize::from(view.body_height),
         session.scroll.follow,
-        session.scroll.offset,
+        session.scroll.visual_offset(),
     )
 }
 
@@ -1047,6 +1076,19 @@ struct AgentRender {
     /// 子代理预览条的命中矩形（**相对本块左上角**，高度恒为 1）；`None` = 这一帧
     /// 没画。渲染与命中登记共用这一份几何——各算一次就迟早错位。
     subagent_strip: Option<Rect>,
+    /// 首页「继续上次」可点行的命中信息（相对本块左上角，高度恒为 1）。
+    /// 渲染与命中登记共用同一份几何；只有品牌画面非空。
+    home_rows: Vec<BrandRow>,
+}
+
+/// 首页最近会话行：渲染器写回，命中登记照着登记。
+#[derive(Debug)]
+struct BrandRow {
+    /// 行在 `lines` 里的下标（被 truncate 裁掉的行不登记）。
+    row: usize,
+    session_id: String,
+    /// 非空锚点列（行首的 ▸），strict probe 要求锚点 cell 非空。
+    anchor_x: u16,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1104,7 +1146,7 @@ fn composer_visual_rows(
 /// - 始终保留 spinner：只要 turn/stream 仍在工作，即使当前没有 reasoning
 ///   正文，也不能把“正在工作”信号关掉。
 /// - 文本只取 reasoning 当前行的尾部窗口；换行后只显示新行。
-/// - 正文按字符做 shimmer，保证移动高光与字符边界一致。
+/// - 正文走 Codex 式节律扫光（见 [`shimmer_spans`]），不是每帧全亮。
 fn thinking_line(session: &SessionState, width: u16, theme: &Theme) -> Line<'static> {
     let frame = crate::app::anim::frame_now();
     let spinner = crate::app::anim::claude_spinner_glyph(frame);
@@ -1122,8 +1164,27 @@ fn thinking_line(session: &SessionState, width: u16, theme: &Theme) -> Line<'sta
     let shown = tail_cols(&text, budget);
 
     let mut spans = vec![Span::styled(prefix, Style::new().fg(theme.accent.thinking))];
-    spans.extend(shimmer_spans(&shown, frame, theme));
+    if crate::app::anim::enabled() {
+        spans.extend(shimmer_spans(&shown, frame, theme));
+    } else {
+        spans.push(Span::styled(shown, Style::new().fg(theme.text.dim)));
+    }
     Line::from(spans)
+}
+
+/// 反闪烁窗口：流式刚 armed 且正文一个字都没有时，不显示思考行。
+///
+/// 快问快答的回合（<400ms 结束）菊花闪一下就消失，比不出现更扎眼——
+/// opencode `startup-loading` 的同款哲学（延迟 500ms 才显示）。「在干活」
+/// 仍由状态行活动文案与侧栏菊花表达；reasoning 正文一到立即恢复。
+const STREAM_ANTI_FLASH: Duration = Duration::from_millis(400);
+
+fn thinking_line_suppressed(session: &SessionState) -> bool {
+    session
+        .streaming
+        .as_ref()
+        .is_some_and(|stream| stream.armed_at.elapsed() < STREAM_ANTI_FLASH)
+        && latest_reasoning_line(session).is_none()
 }
 
 /// 当前 running turn 中最后一个 reasoning block 的当前行。
@@ -1171,28 +1232,60 @@ fn tail_cols(line: &str, max_width: usize) -> String {
     chars.into_iter().collect()
 }
 
-/// 字符级 shimmer：每个字符独立取色，形成一条从左向右移动的窄光带。
+/// shimmer 节律（对齐 Codex `summary_shimmer`）：600ms 起始延迟，每 4s 扫
+/// 一次、单次 1s；其余时间文本停在「半沉入背景」的静止亮度——扫光是**事件**
+/// 而非常亮状态，"活着"的信号由前缀菊花承担。
+const SHIMMER_START_DELAY_MS: f64 = 600.0;
+const SHIMMER_SWEEP_MS: f64 = 1000.0;
+const SHIMMER_INTERVAL_MS: f64 = 4000.0;
+
+/// thinking 行 shimmer：Codex 式的节律扫光带。
+///
+/// 旧版不对劲的根因：光带中心 = `frame % (文本长度 + 8)`。reasoning 尾窗在
+/// 流式期间**每个 delta 都在变长/变短**，周期跟着漂移，光带中心逐帧乱跳，
+/// 加上 3 档硬编码阶梯取色，读出来就是"字符随机闪"而不是"光带在扫"。
+/// 现在按 Codex 的语义重来：
+/// - 相位只由墙钟驱动（`frame_now × FRAME_MILLIS`），与文本长度**完全解耦**；
+/// - 亮度用 fg↔bg 余弦混合成一条 ≥6 列的连续渐变带（`half_width = max(宽度
+///   的 10%, 3)`），不再有阶梯跳变；
+/// - 色深不足（token 解析成非 Rgb）时整行退成静态 dim——与 Codex 的
+///   fallback 同款，光带的动态对比本来就依赖真彩混合。
 fn shimmer_spans(text: &str, frame: u64, theme: &Theme) -> Vec<Span<'static>> {
-    let chars: Vec<char> = text.chars().collect();
-    if chars.is_empty() {
+    if text.is_empty() {
         return Vec::new();
     }
-    let period = chars.len().max(8) + 8;
-    let center = (frame % period as u64) as isize - 4;
-    chars
-        .into_iter()
-        .enumerate()
-        .map(|(index, ch)| {
-            let distance = (index as isize - center).unsigned_abs();
-            let style = match distance {
-                0 => Style::new().fg(theme.text.bright),
-                1 => Style::new().fg(theme.accent.thinking),
-                2 => Style::new().fg(theme.text.muted),
-                _ => Style::new().fg(theme.text.dim),
-            };
-            Span::styled(ch.to_string(), style)
+    let width = text.width() as f64;
+    let half_width = (width * 0.1).max(3.0);
+    let elapsed = frame.saturating_mul(crate::app::anim::FRAME_MILLIS) as f64;
+    // 静止期 sweep 被钳在 SWEEP_MS：位置停在文本右缘之外，全体落在基准亮度。
+    let sweep =
+        ((elapsed - SHIMMER_START_DELAY_MS).max(0.0) % SHIMMER_INTERVAL_MS).min(SHIMMER_SWEEP_MS);
+    let position = sweep / SHIMMER_SWEEP_MS * (width + 2.0 * half_width) - half_width;
+
+    let mut column = 0.0;
+    text.chars()
+        .map(|ch| {
+            let glyph_width = ch.width().unwrap_or(0) as f64;
+            let center = column + glyph_width / 2.0;
+            column += glyph_width;
+            let distance = ((center - position).abs() / half_width).min(1.0);
+            let intensity = 0.5 * (1.0 + (std::f64::consts::PI * distance).cos());
+            let alpha = (0.5 + 0.5 * intensity) as f32;
+            Span::styled(ch.to_string(), shimmer_style(theme, alpha))
         })
         .collect()
+}
+
+/// 带峰亮度 = 主题前景，基准亮度 = 前景向背景混合一半；token 不是真彩 Rgb
+/// 时整体退成静态 dim。
+fn shimmer_style(theme: &Theme, alpha: f32) -> Style {
+    let mix = |fg: u8, bg: u8| (f32::from(bg) + (f32::from(fg) - f32::from(bg)) * alpha) as u8;
+    match (theme.text.primary, theme.surface.base) {
+        (Color::Rgb(fr, fgc, fb), Color::Rgb(br, bgc, bb)) => {
+            Style::new().fg(Color::Rgb(mix(fr, br), mix(fgc, bgc), mix(fb, bb)))
+        }
+        _ => Style::new().fg(theme.text.dim),
+    }
 }
 
 struct ComposerRender {
@@ -1683,6 +1776,55 @@ mod tests {
         terminal
             .draw(|frame| draw(frame, app, &test_theme(), route, view, &mut hit_map))
             .expect("draw fullscreen agent");
+    }
+
+    /// shimmer 修复回归（旧版病根：相位 = `frame % (文本长度 + 8)`，流式文本
+    /// 逐 delta 变长导致光带中心逐帧乱跳）。本条锁「扫光间歇期整行等亮」：
+    /// frame 21 → 2520ms，落在两次扫光之间，光带停在文本右缘之外。
+    #[test]
+    fn shimmer_rest_phase_is_uniform() {
+        let theme = test_theme();
+        let spans = shimmer_spans(&"x".repeat(20), 21, &theme);
+        assert!(!spans.is_empty());
+        let base = spans[0].style;
+        assert!(
+            spans.iter().all(|span| span.style == base),
+            "扫光间歇期全体字符必须同亮（停在基准亮度）"
+        );
+    }
+
+    /// 非真彩终端走静态兜底：相位完全不影响任何像素（Codex 同款 fallback）。
+    #[test]
+    fn shimmer_falls_back_to_static_without_truecolor() {
+        let theme = Theme::resolve(ThemeKind::QaqhNight, ColorSupport::Ansi16);
+        let early = shimmer_spans(&"x".repeat(20), 10, &theme);
+        let late = shimmer_spans(&"x".repeat(20), 30, &theme);
+        assert!(
+            early.iter().all(|span| span.style == early[0].style),
+            "非真彩下必须整行静态"
+        );
+        assert_eq!(
+            early[0].style, late[0].style,
+            "非真彩下相位不得影响任何字符"
+        );
+    }
+
+    /// 扫光窗口内光带随时间**右移**：与静止基准不同的最左字符下标必须递增。
+    /// 旧版这里会随文本长度漂移——正是"鸟样"的来源。
+    #[test]
+    fn shimmer_band_advances_forward_during_sweep() {
+        let theme = test_theme();
+        let text = "x".repeat(30);
+        let base = shimmer_spans(&text, 21, &theme)[0].style;
+        let leftmost = |frame: u64| {
+            shimmer_spans(&text, frame, &theme)
+                .iter()
+                .position(|span| span.style != base)
+        };
+        // frame 6 → 720ms → 光带在文本最左侧；frame 10 → 1200ms → 已扫到中段。
+        let early = leftmost(6).expect("扫光窗口内必须存在亮带");
+        let late = leftmost(10).expect("扫光窗口内必须存在亮带");
+        assert!(late > early, "光带必须随时间右移：{early:?} → {late:?}");
     }
 
     /// 卡片化整帧验收：授权弹窗悬浮在 agent 视图上，背景 + 暗化 + 卡片同帧

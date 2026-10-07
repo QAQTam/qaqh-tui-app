@@ -186,16 +186,26 @@ pub(super) fn draw_fullscreen_agent_inner(
             hit_map.push(region);
         }
     }
+    // 「继续上次」行：点击 = `open_session_tab`（与 Ctrl+L 列表选中同语义）。
+    for row in &rendered.home_rows {
+        let y = area.y.saturating_add(row.row as u16);
+        let rect = Rect::new(area.x, y, area.width, 1);
+        if let Some(region) = anchor_region(
+            rect,
+            area,
+            PointerTarget::Agent(AgentTarget::HomeSession {
+                session_id: row.session_id.clone(),
+            }),
+            MouseButton::Left,
+            true,
+            z::AGENT_SIDEBAR_ROW,
+            VisualAnchor::non_empty(Position::new(area.x.saturating_add(row.anchor_x), y)),
+        ) {
+            hit_map.push(region);
+        }
+    }
     if rail > 0 {
-        sidebar::draw(
-            frame,
-            app,
-            rail_area,
-            theme,
-            &view.pointer,
-            &mut view.sidebar_anim,
-            hit_map,
-        );
+        sidebar::draw(frame, app, rail_area, theme, &view.pointer, hit_map);
     }
     if let Some(cursor) = rendered.cursor
         && !for_background
@@ -211,13 +221,15 @@ pub(super) fn draw_fullscreen_agent_inner(
         && let Some(session) = app.active_session()
     {
         let transcript_len = view.transcripts.len_for(&session.session_id);
+        // 滚动条与正文必须用同一个视觉偏移：tween 进行中两者同步滑行。
+        let visual_offset = session.scroll.visual_offset();
         ui_fullscreen::draw_scrollbar(
             frame,
             body,
             transcript_len,
             usize::from(view.body_height),
             session.scroll.follow,
-            session.scroll.offset,
+            visual_offset,
             theme,
         );
         let track = Rect::new(
@@ -231,7 +243,7 @@ pub(super) fn draw_fullscreen_agent_inner(
             transcript_len,
             usize::from(view.body_height),
             session.scroll.follow,
-            session.scroll.offset,
+            visual_offset,
         ) {
             if let Some(region) = anchor_region(
                 metrics.track,
@@ -498,6 +510,7 @@ fn render_fullscreen_agent(
         cursor,
         // 被裁掉（终端太矮）时不登记命中：画都没画出来就不该可点。
         subagent_strip: subagent_strip.filter(|strip| strip.y < area.height),
+        home_rows: Vec::new(),
     }
 }
 
@@ -562,7 +575,9 @@ fn fullscreen_chrome_layout(
         live_rows: 0,
         slash_rows: slash_menu_rows(app),
         stream_rows: 0,
-        thinking_rows: usize::from(session_is_working(session)),
+        thinking_rows: usize::from(
+            session_is_working(session) && !thinking_line_suppressed(session),
+        ),
         composer_rows: preferred_composer,
         status_rows: usize::from(theme.spacing.status_height.max(1)),
         // 子代理预览条：**只在有子代理在跑时**占一行（done 就消失，数据源是 roster
@@ -691,6 +706,7 @@ fn render_fullscreen_chrome(
         lines,
         cursor: Some(Position::new(composer.cursor_x, cursor_y)),
         subagent_strip,
+        home_rows: Vec::new(),
     }
 }
 
@@ -721,8 +737,6 @@ pub(super) struct FullscreenView {
     pub(super) pointer: FullscreenState,
     /// 每会话独立的 transcript 渲染缓存（切 tab 零重渲染）。
     pub(super) transcripts: TranscriptCaches,
-    /// 侧栏余晖动画状态。
-    pub(super) sidebar_anim: sidebar::SidebarAnim,
     pub(super) body_area: Rect,
     pub(super) visible_start: usize,
     pub(super) body_height: u16,
@@ -1087,7 +1101,12 @@ fn render_fullscreen_history(
     let cache = caches.touch(&session.session_id);
     cache.sync(session, width, theme);
     let total = cache.lines.len();
-    let top = crate::ui::viewport_top(total, height, session.scroll.follow, session.scroll.offset);
+    let top = crate::ui::viewport_top(
+        total,
+        height,
+        session.scroll.follow,
+        session.scroll.visual_offset(),
+    );
     let end = top.saturating_add(height).min(total);
     (cache.lines[top.min(total)..end].to_vec(), top)
 }
@@ -1165,7 +1184,12 @@ impl TranscriptCaches {
 fn render_brand(app: &App, width: u16, height: u16, theme: &Theme) -> AgentRender {
     let height = usize::from(height.max(1));
     let width = usize::from(width.max(1));
-    let mut lines = brand_lines(width, theme);
+    let mut lines = brand_lines(app, width, theme);
+
+    // 「继续上次」：最近 5 个未打开的会话（点击直达）。放在输入框上方，
+    // 让"从哪继续"和"要开始什么"在同一个视野里。
+    let mut home_rows = Vec::new();
+    lines.extend(home_recent_lines(app, width, theme, &mut home_rows));
 
     let box_width = width;
     let inner_width = box_width.saturating_sub(4).max(1);
@@ -1182,10 +1206,27 @@ fn render_brand(app: &App, width: u16, height: u16, theme: &Theme) -> AgentRende
         format!("╭{}╮", "─".repeat(box_width.saturating_sub(2))),
         border_style,
     )));
-    for line in composer.lines {
+    // 草稿为空时首行正文换成 shimmer 扫光的示例 prompt（每 6s 轮换）：
+    // 「这个框是干嘛的」不需要文档，占位符自己会说话。
+    let prefix_width = theme.glyph.user.width() + 1;
+    let example =
+        (app.draft_composer.input.is_empty() && app.pending_creates.is_empty()).then(|| {
+            let budget = inner_width.saturating_sub(prefix_width + 1).max(4);
+            brand_example_spans(app, theme, budget)
+        });
+    for (row, line) in composer.lines.into_iter().enumerate() {
         let mut spans = Vec::with_capacity(line.spans.len() + 2);
         spans.push(Span::styled("│ ".to_string(), border_style));
-        spans.extend(line.spans);
+        if row == 0 {
+            if let Some(example) = &example {
+                spans.extend(line.spans.iter().take(1).cloned());
+                spans.extend(example.iter().cloned());
+            } else {
+                spans.extend(line.spans);
+            }
+        } else {
+            spans.extend(line.spans);
+        }
         spans.push(Span::styled(" │".to_string(), border_style));
         lines.push(Line::from(spans));
     }
@@ -1205,6 +1246,8 @@ fn render_brand(app: &App, width: u16, height: u16, theme: &Theme) -> AgentRende
         Style::new().fg(theme.text.dim),
     )));
     lines.truncate(height);
+    // 被 truncate 裁掉的行画都没画出来，不许登记命中。
+    home_rows.retain(|row| row.row < height);
 
     let cursor_y = composer_start
         .saturating_add(1)
@@ -1216,10 +1259,101 @@ fn render_brand(app: &App, width: u16, height: u16, theme: &Theme) -> AgentRende
         lines,
         cursor,
         subagent_strip: None,
+        home_rows,
     }
 }
 
-fn brand_lines(width: usize, theme: &Theme) -> Vec<Line<'static>> {
+/// 首页「继续上次」块：标题行 + 最近会话行（`▸ 标题 · 相对时间`）。
+/// 返回行内容的同时把可点行的下标写进 `home_rows`——渲染与命中登记共用
+/// 这一份几何。
+fn home_recent_lines(
+    app: &App,
+    width: usize,
+    theme: &Theme,
+    home_rows: &mut Vec<BrandRow>,
+) -> Vec<Line<'static>> {
+    let recent = app.home_recent_sessions();
+    if recent.is_empty() || width < 48 {
+        return Vec::new();
+    }
+    let dim = Style::new().fg(theme.text.dim);
+    let marker = Style::new().fg(theme.accent.assistant);
+    let title_style = Style::new().fg(theme.text.secondary);
+    let mut lines = vec![Line::default(), Line::from(Span::styled("  继续上次", dim))];
+    for entry in recent {
+        let title = entry.meta.display_title();
+        let time = relative_time(entry.meta.updated_at);
+        // 布局：2 缩进 + "▸ " + 标题 + " · " + 时间；标题按剩余列数截断
+        //（CJK 为主，字符预算按列数折半）。
+        let used = 2 + 2 + 3 + time.width();
+        let title_cols = width.saturating_sub(used).max(6);
+        let title = crate::app::truncate_str(&title, (title_cols / 2).max(4));
+        lines.push(Line::from(vec![
+            Span::styled("  ", Style::new()),
+            Span::styled("▸ ", marker),
+            Span::styled(title, title_style),
+            Span::styled(format!(" · {time}"), dim),
+        ]));
+        home_rows.push(BrandRow {
+            row: lines.len() - 1,
+            session_id: entry.meta.session_id.clone(),
+            anchor_x: 2,
+        });
+    }
+    lines
+}
+
+/// `updated_at`（daemon 墙钟，**秒**）→ 粗粒度相对时间。桶足够大以容忍
+/// 客户端/daemon 的时钟偏差；只做展示，不参与任何判定。
+fn relative_time(updated_at_secs: u64) -> String {
+    let Ok(now) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) else {
+        return String::new();
+    };
+    let mins = now.as_secs().saturating_sub(updated_at_secs) / 60;
+    match mins {
+        0 => "刚刚".to_string(),
+        1..=59 => format!("{mins} 分钟前"),
+        60..=1439 => format!("{} 小时前", mins / 60),
+        1440..=43199 => format!("{} 天前", mins / 1440),
+        _ => format!("{} 个月前", (mins / 43200).max(1)),
+    }
+}
+
+/// 首页 composer 的示例 prompt：每 6s 轮换一条，正文走 shimmer 扫光。
+const BRAND_EXAMPLES: [&str; 5] = [
+    "帮我看看这个 crate 为什么编译慢",
+    "给 utils 模块补上单元测试",
+    "解释这段报错并给出修复方案",
+    "审查最近的改动，找出潜在 bug",
+    "把 README 的安装一节翻译成英文",
+];
+const BRAND_EXAMPLE_ROTATE_MS: u128 = 6000;
+
+fn brand_example_spans(app: &App, theme: &Theme, budget_cols: usize) -> Vec<Span<'static>> {
+    let elapsed = app.brand_shown_at.elapsed().as_millis();
+    let index = (elapsed / BRAND_EXAMPLE_ROTATE_MS) % BRAND_EXAMPLES.len() as u128;
+    let text = BRAND_EXAMPLES[index as usize];
+    // 示例以 CJK 为主：按列预算折半成字符预算，超宽截断（预算列溢出比截断
+    // 难看，宁可短两个字）。
+    let shown = crate::app::truncate_str(text, (budget_cols / 2).max(4));
+    if !crate::app::anim::enabled() {
+        return vec![Span::styled(shown, Style::new().fg(theme.text.dim))];
+    }
+    super::shimmer_spans(&shown, crate::app::anim::frame_now(), theme)
+}
+
+/// ASCII 标志的入场扫光时长：亮带扫过一遍后静止在 accent。
+const BRAND_SWEEP_MS: u128 = 900;
+
+fn brand_sweep_t(app: &App) -> Option<f32> {
+    if !crate::app::anim::enabled() {
+        return None;
+    }
+    let ms = app.brand_shown_at.elapsed().as_millis();
+    (ms < BRAND_SWEEP_MS).then(|| ms as f32 / BRAND_SWEEP_MS as f32)
+}
+
+fn brand_lines(app: &App, width: usize, theme: &Theme) -> Vec<Line<'static>> {
     let accent = Style::new()
         .fg(theme.accent.assistant)
         .add_modifier(ratatui::style::Modifier::BOLD);
@@ -1240,9 +1374,13 @@ fn brand_lines(width: usize, theme: &Theme) -> Vec<Line<'static>> {
         " ╚██████╔╝██║  ██║╚██████╔╝██║  ██║",
         "  ╚═════╝ ╚═╝  ╚═╝ ╚═════╝ ╚═╝  ╚═╝",
     ];
+    let sweep_t = brand_sweep_t(app);
     let mut lines: Vec<Line<'static>> = ART
         .into_iter()
-        .map(|text| centered_line(text, width, accent))
+        .map(|text| match sweep_t {
+            Some(t) => centered_spans_line(text, width, art_sweep_spans(text, theme, accent, t)),
+            None => centered_line(text, width, accent),
+        })
         .collect();
     lines.push(centered_line(
         "Q A Q - H A R N E S S   ·   T E R M I N A L",
@@ -1250,7 +1388,80 @@ fn brand_lines(width: usize, theme: &Theme) -> Vec<Line<'static>> {
         muted,
     ));
     lines.push(Line::default());
+    lines.extend(brand_info_lines(app, width, theme));
     lines
+}
+
+/// 信息行 + BYOK 引导：cwd · 客户端版本 · 模型；密钥未配置时给一行警告。
+///
+/// config 启动即拉（run_loop 侧 `fetch_config`），拉到前这行只显示 cwd 与
+/// 版本——不猜模型名。
+fn brand_info_lines(app: &App, width: usize, theme: &Theme) -> Vec<Line<'static>> {
+    let dim = Style::new().fg(theme.text.dim);
+    let mut segments: Vec<String> = Vec::new();
+    if let Some(cwd) = app.effective_cwd(None) {
+        let abbreviated = crate::app::truncate_str(&cwd, 32);
+        segments.push(abbreviated);
+    }
+    segments.push(format!("qaqh-tui v{}", env!("CARGO_PKG_VERSION")));
+    if let Some(model) = app
+        .config
+        .as_ref()
+        .map(|config| config.model.as_str())
+        .filter(|model| !model.is_empty())
+    {
+        segments.push(format!("模型 {model}"));
+    }
+    let mut lines = vec![centered_line(&segments.join(" · "), width, dim)];
+
+    if app
+        .config
+        .as_ref()
+        .is_some_and(|config| config.api_key.is_empty())
+    {
+        let warning = Style::new().fg(theme.semantic.warning);
+        lines.push(centered_line(
+            "⚠ 尚未配置 API key —— Ctrl+P 打开设置",
+            width,
+            warning,
+        ));
+    }
+    lines
+}
+
+/// 入场扫光：亮带（accent → bright 的余弦混合）从左扫到右，t ∈ [0,1]。
+/// 混不出来（非真彩）时整段退回 accent——入场动画本来就是装饰。
+fn art_sweep_spans(text: &str, theme: &Theme, accent: Style, t: f32) -> Vec<Span<'static>> {
+    let width = text.width() as f32;
+    let half = 6.0_f32;
+    let position = t.clamp(0.0, 1.0) * (width + 2.0 * half) - half;
+    let mut column = 0.0_f32;
+    text.chars()
+        .map(|ch| {
+            let glyph = ch.width().unwrap_or(0) as f32;
+            let center = column + glyph / 2.0;
+            column += glyph;
+            let distance = ((center - position).abs() / half).min(1.0);
+            let intensity = 0.5 * (1.0 + (std::f64::consts::PI * distance as f64).cos()) as f32;
+            let style =
+                crate::app::anim::mix_rgb(theme.accent.assistant, theme.text.bright, intensity)
+                    .map(|fg| {
+                        Style::new()
+                            .fg(fg)
+                            .add_modifier(ratatui::style::Modifier::BOLD)
+                    })
+                    .unwrap_or(accent);
+            Span::styled(ch.to_string(), style)
+        })
+        .collect()
+}
+
+fn centered_spans_line(text: &str, width: usize, spans: Vec<Span<'static>>) -> Line<'static> {
+    let padding = width.saturating_sub(text.width()) / 2;
+    let mut all = Vec::with_capacity(spans.len() + 1);
+    all.push(Span::styled(" ".repeat(padding), Style::new()));
+    all.extend(spans);
+    Line::from(all)
 }
 
 fn centered_line(text: &str, width: usize, style: Style) -> Line<'static> {
@@ -1325,5 +1536,260 @@ mod tests {
         shrink_chrome_layout(&mut impossible, 0);
         assert_eq!(impossible.height(), 1);
         assert_eq!(impossible.composer_rows, 1);
+    }
+
+    // ───────────── 首页品牌画面（占位示例 / 信息行 / 入场扫光） ─────────────
+
+    /// 与 `brand_lines` 内 ART 首行同源的单行样本（扫光纯函数测这个）。
+    const ART_LINE_FOR_TEST: &str = "  ██████╗  █████╗  ██████╗ ██╗  ██╗";
+
+    fn brand_text(app: &App, width: u16) -> String {
+        render_brand(
+            app,
+            width,
+            30,
+            &crate::theme::Theme::resolve(
+                crate::theme::ThemeKind::QaqhNight,
+                crate::theme::ColorSupport::TrueColor,
+            ),
+        )
+        .lines
+        .into_iter()
+        .flat_map(|line| line.spans.into_iter().map(|span| span.content.into_owned()))
+        .collect()
+    }
+
+    /// 草稿为空：composer 框里必须有示例 prompt 占位（「这个框是干嘛的」）。
+    #[test]
+    fn brand_shows_example_prompt_when_draft_is_empty() {
+        let (app, _rx) = App::new_for_test();
+        let text = brand_text(&app, 100);
+        let example = BRAND_EXAMPLES
+            .iter()
+            .find(|example| text.contains(example.trim()))
+            .unwrap_or_else(|| panic!("空草稿必须显示示例占位：{text}"));
+        assert!(!example.is_empty());
+    }
+
+    /// 一旦开始输入，占位立即让位——示例不是背景噪声。
+    #[test]
+    fn brand_hides_example_prompt_once_user_types() {
+        let (mut app, _rx) = App::new_for_test();
+        app.draft_composer.insert_str("hi");
+        let text = brand_text(&app, 100);
+        assert!(
+            !BRAND_EXAMPLES
+                .iter()
+                .any(|example| text.contains(example.trim())),
+            "输入后不得残留示例占位：{text}"
+        );
+        assert!(text.contains("hi"), "用户输入必须可见");
+    }
+
+    /// 信息行：模型名跟 config 走；BYOK 密钥未配置时给 Ctrl+P 引导。
+    #[test]
+    fn brand_info_line_shows_model_and_key_guidance() {
+        use crate::protocol::ConfigDto;
+        let (mut app, _rx) = App::new_for_test();
+
+        // config 未拉到：只有 cwd / 版本，不猜模型，也没有警告。
+        let text = brand_text(&app, 100);
+        assert!(text.contains("qaqh-tui v"), "版本必须可见：{text}");
+        assert!(
+            !text.contains("API key"),
+            "config 未到不得瞎报未配置：{text}"
+        );
+
+        // 已配置：模型可见，无警告。
+        app.config = Some(ConfigDto {
+            model: "glm-4.6".into(),
+            api_key: "****".into(),
+            ..ConfigDto::default()
+        });
+        let text = brand_text(&app, 100);
+        assert!(text.contains("模型 glm-4.6"), "{text}");
+        assert!(!text.contains("API key"), "{text}");
+
+        // 密钥未配置：首启引导。
+        app.config = Some(ConfigDto {
+            model: "glm-4.6".into(),
+            api_key: String::new(),
+            ..ConfigDto::default()
+        });
+        let text = brand_text(&app, 100);
+        assert!(text.contains("尚未配置 API key"), "{text}");
+        assert!(text.contains("Ctrl+P"), "{text}");
+    }
+
+    /// 入场扫光纯函数：中段必须有字符比 accent 亮（混合成功），端点外全暗。
+    #[test]
+    fn art_sweep_spans_brighten_the_passing_band() {
+        let theme = crate::theme::Theme::resolve(
+            crate::theme::ThemeKind::QaqhNight,
+            crate::theme::ColorSupport::TrueColor,
+        );
+        let accent = Style::new()
+            .fg(theme.accent.assistant)
+            .add_modifier(ratatui::style::Modifier::BOLD);
+        let text = ART_LINE_FOR_TEST;
+        let mid = art_sweep_spans(text, &theme, accent, 0.5);
+        assert!(
+            mid.iter()
+                .any(|span| span.style == accent && span.content != " "),
+            "扫光中段至少有一个字符应保持在 accent（光带外）"
+        );
+        assert!(
+            mid.iter()
+                .any(|span| span.style.fg != accent.fg && span.content != " "),
+            "扫光中段必须有字符被亮带染色：{:?}",
+            mid.iter().map(|s| s.style.fg).collect::<Vec<_>>()
+        );
+    }
+
+    /// 扫光结束（t=1 之后走 brand_lines 的静止分支）：标志整段回归 accent。
+    #[test]
+    fn brand_art_is_static_after_the_sweep_window() {
+        let theme = crate::theme::Theme::resolve(
+            crate::theme::ThemeKind::QaqhNight,
+            crate::theme::ColorSupport::TrueColor,
+        );
+        let accent = Style::new()
+            .fg(theme.accent.assistant)
+            .add_modifier(ratatui::style::Modifier::BOLD);
+        let spans = art_sweep_spans(
+            ART_LINE_FOR_TEST,
+            &theme,
+            accent,
+            BRAND_SWEEP_MS as f32 / BRAND_SWEEP_MS as f32,
+        );
+        // t=1：光带中心已越过右缘，可见字符全部回到 accent（mix 在端点精确）。
+        assert!(
+            spans
+                .iter()
+                .filter(|span| span.content != " ")
+                .all(|span| span.style == accent),
+            "t=1 时可见字符必须全部回归 accent"
+        );
+    }
+
+    // ───────────── 首页「继续上次」块 ─────────────
+
+    fn session_list_entry(
+        id: &str,
+        title: &str,
+        updated_at_secs: u64,
+        archived: bool,
+    ) -> qaqh_client::SessionListEntry {
+        qaqh_client::SessionListEntry {
+            meta: qaqh_client::SessionMeta {
+                session_id: id.into(),
+                title: Some(title.into()),
+                updated_at: updated_at_secs,
+                archived,
+                ..qaqh_client::SessionMeta::default()
+            },
+            running: false,
+            workspace_id: None,
+        }
+    }
+
+    /// 未打开的最近会话渲染成可点行；归档与已在 tab 里的被过滤。
+    #[test]
+    fn home_recent_lines_lists_unopened_sessions_only() {
+        let (mut app, _rx) = App::new_for_test();
+        let theme = crate::theme::Theme::resolve(
+            crate::theme::ThemeKind::QaqhNight,
+            crate::theme::ColorSupport::TrueColor,
+        );
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_secs();
+        app.session_list_cache = vec![
+            session_list_entry("s-old", "修复 CI flaky", now - 120, false),
+            session_list_entry("s-arch", "已归档", now, true),
+        ];
+        app.tabs.push("s-old".into());
+
+        // 已在 tab 里：整块消失（打开的会话由侧栏负责）。
+        let mut rows = Vec::new();
+        let lines = home_recent_lines(&app, 100, &theme, &mut rows);
+        assert!(lines.is_empty() && rows.is_empty());
+
+        // 关掉 tab：块出现，归档项被过滤，可点行指向未打开的会话。
+        app.tabs.clear();
+        let mut rows = Vec::new();
+        let lines = home_recent_lines(&app, 100, &theme, &mut rows);
+        let text: String = lines
+            .iter()
+            .flat_map(|line| line.spans.iter().map(|span| span.content.as_ref()))
+            .collect();
+        assert!(text.contains("继续上次"), "{text}");
+        assert!(text.contains("修复 CI flaky"), "{text}");
+        assert!(text.contains("2 分钟前"), "{text}");
+        assert!(!text.contains("已归档"), "归档会话不得出现：{text}");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].session_id, "s-old");
+        assert_eq!(rows[0].row, lines.len() - 1, "锚点行必须是最后一行");
+    }
+
+    /// 相对时间桶：刚刚 / 分钟 / 小时 / 天，负偏移（时钟 ahead）钳成刚刚。
+    #[test]
+    fn relative_time_uses_coarse_buckets() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_secs();
+        assert_eq!(relative_time(now), "刚刚");
+        assert_eq!(relative_time(now - 120), "2 分钟前");
+        assert_eq!(relative_time(now - 3600), "1 小时前");
+        assert_eq!(relative_time(now - 86_400 * 3), "3 天前");
+        assert_eq!(relative_time(now + 600), "刚刚", "时钟 ahead 必须钳住");
+    }
+
+    // ───────────── 反闪烁 ─────────────
+
+    /// 流式刚 armed 且正文为空：思考行整行不出现；过了窗口或已有正文则恢复。
+    #[test]
+    fn anti_flash_suppresses_thinking_line_for_fresh_streams() {
+        use crate::app::session::{StreamPhase, StreamingState};
+        use std::time::Duration;
+        use std::time::Instant;
+
+        let theme = crate::theme::Theme::resolve(
+            crate::theme::ThemeKind::QaqhNight,
+            crate::theme::ColorSupport::TrueColor,
+        );
+        let (mut app, _rx) = App::new_for_test();
+        app.tabs.push("s1".into());
+        app.sessions
+            .insert("s1".into(), SessionState::new("s1".into()));
+        let armed = Instant::now();
+        app.sessions.get_mut("s1").expect("session").streaming = Some(StreamingState {
+            turn_id: "t1".into(),
+            phase: StreamPhase::Answering,
+            round_num: 0,
+            tool_name: None,
+            armed_at: armed,
+        });
+
+        // 刚 armed：抑制 → 布局里没有思考行。
+        let session = app.sessions.get("s1").expect("session");
+        assert!(thinking_line_suppressed(session));
+        let layout = fullscreen_chrome_layout(&app, 100, 30, &theme, None);
+        assert_eq!(layout.thinking_rows, 0);
+
+        // 窗口已过：恢复思考行。
+        app.sessions.get_mut("s1").expect("session").streaming = Some(StreamingState {
+            turn_id: "t1".into(),
+            phase: StreamPhase::Answering,
+            round_num: 0,
+            tool_name: None,
+            armed_at: armed - Duration::from_millis(500),
+        });
+        let session = app.sessions.get("s1").expect("session");
+        assert!(!thinking_line_suppressed(session));
+        let layout = fullscreen_chrome_layout(&app, 100, 30, &theme, None);
+        assert_eq!(layout.thinking_rows, 1);
     }
 }

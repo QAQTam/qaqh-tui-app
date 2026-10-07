@@ -448,12 +448,64 @@ impl Composer {
 
 // ───────────────────────── 滚动 ─────────────────────────
 
+/// 平滑滚动时长：交互滚动（wheel/PageUp）的偏移变化在此时长内按 outQuad
+/// 收敛到目标。语义跳变（跟随/回底/滚动条拖拽）不经过 tween，仍然瞬切。
+const SCROLL_TWEEN_SECS: f32 = 0.15;
+
+/// 进行中的平滑滚动：起点视觉偏移 + 起始时刻。
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ScrollTween {
+    from: usize,
+    at: Instant,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct ScrollState {
     /// 跟随底部（新内容自动下滚）。
     pub follow: bool,
-    /// 非跟随模式下，距底部的行数。
+    /// 非跟随模式下，距底部的行数。**唯一目标值**——其他路径直接改它时
+    /// tween 不清除，视觉继续向新目标收敛（短于 tween 时长的改写只会
+    /// 让滑行终点平移，不会跳变）。
     pub offset: usize,
+    pub(crate) tween: Option<ScrollTween>,
+}
+
+impl ScrollState {
+    /// 交互滚动：从当前视觉位置向新目标缓动（opentui Timeline 同款语义：
+    /// 属性插值，起点取**视觉值**而不是旧目标，连续滚动不叠加跳变）。
+    /// 动画总开关关闭时退化为瞬切。
+    pub fn scroll_to(&mut self, target: usize) {
+        if !crate::app::anim::enabled() {
+            self.offset = target;
+            return;
+        }
+        let from = self.visual_offset();
+        self.offset = target;
+        self.tween = (from != target).then_some(ScrollTween {
+            from,
+            at: Instant::now(),
+        });
+    }
+
+    /// 渲染用视觉偏移：tween 进行中按 outQuad 从起点收敛到 `offset`，
+    /// 否则等于 `offset`（直接写 `offset` 的路径视觉不受影响，测试稳定）。
+    pub fn visual_offset(&self) -> usize {
+        let Some(tween) = self.tween else {
+            return self.offset;
+        };
+        let t = tween.at.elapsed().as_secs_f32() / SCROLL_TWEEN_SECS;
+        if t >= 1.0 {
+            return self.offset;
+        }
+        let eased = crate::app::anim::ease_out_quad(t);
+        (tween.from as f32 + (self.offset as f32 - tween.from as f32) * eased).round() as usize
+    }
+
+    /// tween 是否未收敛——`is_animating` 据此保持 60ms 动画 tick。
+    pub fn tween_active(&self) -> bool {
+        self.tween
+            .is_some_and(|tween| tween.at.elapsed().as_secs_f32() < SCROLL_TWEEN_SECS)
+    }
 }
 
 // ───────────────────────── 会话状态 ─────────────────────────
@@ -539,6 +591,7 @@ impl SessionState {
             scroll: ScrollState {
                 follow: true,
                 offset: 0,
+                tween: None,
             },
             expanded_tools: HashSet::new(),
             expanded_tools_revision: 0,
@@ -876,6 +929,62 @@ mod tests {
         c.insert_str("第一行\n第二行\r\n第三行");
         assert_eq!(c.value().lines().count(), 3);
         assert!(c.value().starts_with("第一行\n第二行\n第三行"));
+    }
+
+    // ───────────── 平滑滚动 tween（wheel 视觉偏移收敛） ─────────────
+
+    #[test]
+    fn scroll_to_glides_from_visual_start_toward_target() {
+        let mut scroll = ScrollState {
+            follow: false,
+            offset: 10,
+            tween: None,
+        };
+        // 连续滚动以**视觉值**为起点：再滚 30 行，目标 40，起点仍是 10。
+        scroll.scroll_to(40);
+        assert!(scroll.tween_active(), "tween 进行中");
+        let visual = scroll.visual_offset();
+        assert!(
+            (10..=40).contains(&visual),
+            "视觉偏移必须在起点与目标之间：{visual}"
+        );
+    }
+
+    #[test]
+    fn scroll_tween_converges_and_then_reports_offset() {
+        let mut scroll = ScrollState {
+            follow: false,
+            offset: 5,
+            tween: None,
+        };
+        scroll.scroll_to(25);
+        // tween 时长 150ms；睡过窗口后视觉必须精确落到目标。
+        std::thread::sleep(std::time::Duration::from_millis(170));
+        assert!(!scroll.tween_active());
+        assert_eq!(scroll.visual_offset(), 25);
+    }
+
+    /// 直接写 `offset` 的路径（跟随回零、clamp、滚动条等）不经过 tween：
+    /// 视觉立即等于目标，既有语义与全部既有测试不受影响。
+    #[test]
+    fn direct_offset_writes_bypass_the_tween() {
+        let mut scroll = ScrollState {
+            follow: false,
+            offset: 7,
+            tween: None,
+        };
+        assert_eq!(scroll.visual_offset(), 7);
+        assert!(!scroll.tween_active());
+        // 同值 scroll_to 不产生 tween。
+        scroll.scroll_to(7);
+        assert!(scroll.tween.is_none());
+    }
+
+    #[test]
+    fn scroll_to_same_target_is_a_noop() {
+        let mut scroll = ScrollState::default();
+        scroll.scroll_to(0);
+        assert!(scroll.tween.is_none(), "目标与视觉相同不得起 tween");
     }
 
     // ───────────── streaming ↔ timeline 收敛（"working 卡死"回归） ─────────────

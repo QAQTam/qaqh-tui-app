@@ -1380,9 +1380,11 @@ fn tool_body_style(line: &str, diff: bool, theme: &Theme) -> Style {
             // 而不是拿 `semantic.command`（命令黄）喊出来。
             fg(theme.diff.gutter_fg)
         } else if line.starts_with('+') && !line.starts_with("+++") {
-            fg(theme.diff.add_fg)
+            // 增删行加背景色带（GitHub 式）：token 在两套主题里各有一版，
+            // terminal 主题降级为 Reset（无底色），16 色走最近的 ANSI 色号。
+            fg(theme.diff.add_fg).bg(theme.diff.add_bg)
         } else if line.starts_with('-') && !line.starts_with("---") {
-            fg(theme.diff.del_fg)
+            fg(theme.diff.del_fg).bg(theme.diff.del_bg)
         } else {
             fg(theme.diff.equal_fg)
         }
@@ -1929,6 +1931,39 @@ mod tests {
             .map(|span| span.style)
             .expect("hunk header line");
         assert_eq!(hunk.fg, Some(theme.diff.gutter_fg));
+    }
+
+    /// diff 增删行带背景色带（GitHub 式）：`add_bg`/`del_bg` token 此前定义了
+    /// 却从未接入渲染，这里锁住「+ 行配 add_bg、- 行配 del_bg」的成对关系。
+    #[test]
+    fn diff_add_del_lines_carry_background_bands() {
+        let theme = theme();
+        let mut tool = tool_block("edit", None, ToolState::Success);
+        tool.diff = Some("@@ -1,2 +1,2 @@\n-old\n+new\n context".into());
+        // 预览窗口只取 3 行，context 行会被裁掉；展开看全量才能断言到它。
+        tool.expanded = true;
+        let lines = render_block(
+            &TranscriptBlock::new("t1", BlockKind::Tool(Box::new(tool))),
+            60,
+            &theme,
+        );
+        let style_of = |needle: &str| {
+            lines
+                .iter()
+                .find(|line| {
+                    line.spans
+                        .iter()
+                        .any(|span| span.content.trim_start().starts_with(needle))
+                })
+                .and_then(|line| line.spans.last())
+                .map(|span| span.style)
+                .unwrap_or_else(|| panic!("{needle} line missing"))
+        };
+        assert_eq!(style_of("+new").bg, Some(theme.diff.add_bg));
+        assert_eq!(style_of("-old").bg, Some(theme.diff.del_bg));
+        // 上下文行与段头不铺色带：背景只标记增删，避免整屏染色。
+        assert_eq!(style_of("context").bg, None);
+        assert_eq!(style_of("@@").bg, None);
     }
 
     fn theme() -> Theme {
