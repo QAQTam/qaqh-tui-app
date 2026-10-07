@@ -516,8 +516,9 @@ impl App {
                     },
                     KeyCode::Char('s') | KeyCode::Char('S') => self.save_settings(&mut st),
                     KeyCode::Char('r') => self.fetch_config(),
-                    // 权限级别：聚焦该行时数字键即时生效（沿用旧面板行为）。
-                    KeyCode::Char(c @ '1'..='4') if id == settings::FieldId::PermissionLevel => {
+                    // 权限级别：聚焦该行时数字键即时生效（三档制 2026-10-03；
+                    // 档位 4 是旧四档遗留值，daemon 现在直接拒）。
+                    KeyCode::Char(c @ '1'..='3') if id == settings::FieldId::PermissionLevel => {
                         self.set_permission_level(c as u8 - b'0');
                     }
                     _ => {}

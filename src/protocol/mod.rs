@@ -35,7 +35,11 @@
 /// `ConfigPatch` 少 `permission_level`（后端 BUG-2026-09-13-15 补的 1..=3 值域
 /// 校验因此形同虚设；2026-10-03 收敛为三档制）、`ConfigDto` 少 `mcp`/`lsp`，且注释还写着「刻意不含」——
 /// **文档断言与后端现状相反**。改为依赖后，此类漂移在编译期即暴露。
-pub use qaqh_config_api::{ConfigDto, ConfigPatch, ProviderDto, SubagentDto, SubagentPatch};
+///
+/// 同理暴露 BYOK（2026-10-06）：后端删了 `ProviderDto`/`EndpointDto`，`ConfigDto`
+/// 以 `wire` + `contextLength` 取代 `providerId`/`endpoint`/`contextLimit`——这里
+/// 少一个 re-export、设置页多一处引用，都直接变成编译错误，不会静默。
+pub use qaqh_config_api::{ConfigDto, ConfigPatch, SubagentDto, SubagentPatch};
 
 #[cfg(test)]
 mod tests {
@@ -130,6 +134,32 @@ mod tests {
         };
         assert!(bad.validate().is_err(), "档位 5 必须被拒");
 
+        // 1b) BYOK（2026-10-06 provider 目录退役）：设置页那两行直接读
+        //     `wire` + `contextLength`——协议由用户声明，词表与值域都得由
+        //     权威 crate 兜住，本仓不另立第二张表。
+        let wire = ConfigPatch {
+            wire: Some("anthropic".into()),
+            ..Default::default()
+        };
+        wire.validate().expect("anthropic 是合法 wire");
+        assert_eq!(serde_json::to_value(&wire).unwrap()["wire"], "anthropic");
+        for bogus in ["openai-chat", "", "responses "] {
+            let rejected = ConfigPatch {
+                wire: Some(bogus.into()),
+                ..Default::default()
+            };
+            assert!(rejected.validate().is_err(), "wire {bogus:?} 必须被拒");
+        }
+        assert!(
+            ConfigPatch {
+                context_length: Some(0),
+                ..Default::default()
+            }
+            .validate()
+            .is_err(),
+            "contextLength = 0 必须被拒（它是本地压缩的分母）"
+        );
+
         // 2) 读路径：mcp/lsp 两段不再是盲区（T-11 前 ConfigDto 里没有）。
         //    载荷由权威类型自身生成——**完整**是它的默认状态。本仓要钉的是
         //    「这几个字段够得着」，wire 形状本身由后端
@@ -137,9 +167,13 @@ mod tests {
         let mut payload = serde_json::to_value(ConfigDto::default()).expect("serialize");
         payload["mcp"]["enabled"] = serde_json::json!(true);
         payload["lsp"]["idleShutdownSecs"] = serde_json::json!(600);
+        payload["wire"] = serde_json::json!("anthropic");
+        payload["contextLength"] = serde_json::json!(1_000_000);
         let dto: ConfigDto = serde_json::from_value(payload).expect("完整载荷必须可解析");
         assert!(dto.mcp.enabled);
         assert_eq!(dto.lsp.idle_shutdown_secs, 600);
+        assert_eq!(dto.wire, "anthropic");
+        assert_eq!(dto.context_length, 1_000_000);
 
         // 3) 反向闸：**残缺载荷必须失败**。G2 之前这里断言的是相反的行为
         //    （「旧 daemon 的 snake_case 形状仍须可解析」）——该兼容臂已按后端

@@ -65,7 +65,7 @@ impl App {
     pub(super) fn settings_port_activate(&mut self, st: &mut SettingsState) {
         match st.row().id {
             settings::FieldId::PermissionLevel => {
-                self.toast(NoticeLevel::Info, "聚焦权限级别后按 1-4 即时生效");
+                self.toast(NoticeLevel::Info, "聚焦权限级别后按 1-3 即时生效");
             }
             settings::FieldId::ActiveProfile => {
                 let name = st

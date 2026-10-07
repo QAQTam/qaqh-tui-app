@@ -7,22 +7,31 @@
 //!   不在 Patch 内：回车/数字即时生效（App 层发起 service 调用）；
 //! - apiKey 只进不出：掩码/空 = 保持现值，用户显式输入才写；
 //! - ConfigChanged 重拉只替换 loaded 快照，脏字段草稿值优先（B5 回声拉回教训）。
+//!
+//! BYOK（2026-10-06 后端 provider 预设目录退役）：设置面就是那六个字段自身
+//! ——`baseUrl` / `wire` / `apiKey` / `model` / `maxTokens` / `contextLength`。
+//! daemon 不再下发 provider/endpoint 目录，协议由用户直接声明（[`WIRE_PROTOCOLS`]），
+//! 切 wire 也**不许**顺手改写 baseUrl——那正是「改 maxTokens 后端点被改回预设」
+//! 那个缺陷的入口，webui 同批删除了 `applyEndpoint()`。
 
 use crate::protocol::{ConfigDto, ConfigPatch, SubagentPatch};
 
 /// 后端 `validate` 允许的思考强度枚举。
 pub const REASONING_EFFORTS: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
 
+/// BYOK 的三条 wire（`ConfigPatch::validate` 的值域）。provider 目录已退役，
+/// 协议没有可查的表，由用户在设置页直接声明。
+pub const WIRE_PROTOCOLS: [&str; 3] = ["openai", "responses", "anthropic"];
+
 /// 可聚焦字段的稳定标识（行序即 UI 顺序）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FieldId {
-    Model,
-    Provider,
-    Endpoint,
     BaseUrl,
+    Wire,
+    Model,
     ApiKey,
     MaxTokens,
-    ContextLimit,
+    ContextLength,
     ReasoningEffort,
     AutoCompactThreshold,
     PermissionLevel,
@@ -69,34 +78,28 @@ pub struct Row {
 
 pub const ROWS: &[Row] = &[
     Row {
-        id: FieldId::Model,
-        label: "模型",
-        kind: FieldKind::Text,
-        section: "模型与提供商",
-    },
-    Row {
-        id: FieldId::Provider,
-        label: "提供商",
-        kind: FieldKind::Enum,
-        section: "模型与提供商",
-    },
-    Row {
-        id: FieldId::Endpoint,
-        label: "端点",
-        kind: FieldKind::Enum,
-        section: "模型与提供商",
-    },
-    Row {
         id: FieldId::BaseUrl,
         label: "Base URL",
         kind: FieldKind::Text,
-        section: "模型与提供商",
+        section: "端点与模型（BYOK）",
+    },
+    Row {
+        id: FieldId::Wire,
+        label: "wire 协议",
+        kind: FieldKind::Enum,
+        section: "端点与模型（BYOK）",
+    },
+    Row {
+        id: FieldId::Model,
+        label: "模型",
+        kind: FieldKind::Text,
+        section: "端点与模型（BYOK）",
     },
     Row {
         id: FieldId::ApiKey,
         label: "API Key",
         kind: FieldKind::Secret,
-        section: "模型与提供商",
+        section: "端点与模型（BYOK）",
     },
     Row {
         id: FieldId::MaxTokens,
@@ -105,8 +108,8 @@ pub const ROWS: &[Row] = &[
         section: "生成参数",
     },
     Row {
-        id: FieldId::ContextLimit,
-        label: "contextLimit",
+        id: FieldId::ContextLength,
+        label: "contextLength",
         kind: FieldKind::Number,
         section: "生成参数",
     },
@@ -266,13 +269,12 @@ impl SettingsState {
     /// 当前字段是否已有未保存草稿值。
     pub fn dirty(&self, id: FieldId) -> bool {
         match id {
-            FieldId::Model => self.draft.model.is_some(),
-            FieldId::Provider => self.draft.provider_id.is_some(),
-            FieldId::Endpoint => self.draft.endpoint.is_some(),
             FieldId::BaseUrl => self.draft.base_url.is_some(),
+            FieldId::Wire => self.draft.wire.is_some(),
+            FieldId::Model => self.draft.model.is_some(),
             FieldId::ApiKey => self.draft.api_key.is_some(),
             FieldId::MaxTokens => self.draft.max_tokens.is_some(),
-            FieldId::ContextLimit => self.draft.context_limit.is_some(),
+            FieldId::ContextLength => self.draft.context_length.is_some(),
             FieldId::ReasoningEffort => self.draft.reasoning_effort.is_some(),
             FieldId::AutoCompactThreshold => self.draft.auto_compact_threshold.is_some(),
             FieldId::Lang => self.draft.lang.is_some(),
@@ -309,25 +311,18 @@ impl SettingsState {
     pub fn display(&self, loaded: Option<&ConfigDto>, id: FieldId) -> String {
         let d = &self.draft;
         match id {
-            FieldId::Model => owned_or(d.model.clone(), loaded.map(|c| c.model.as_str()), "—"),
-            FieldId::Provider => owned_or(
-                d.provider_id.clone(),
-                loaded.map(|c| c.provider_id.as_str()),
-                "—",
-            ),
-            FieldId::Endpoint => {
-                owned_or(d.endpoint.clone(), loaded.map(|c| c.endpoint.as_str()), "—")
-            }
             FieldId::BaseUrl => {
                 owned_or(d.base_url.clone(), loaded.map(|c| c.base_url.as_str()), "—")
             }
+            FieldId::Wire => owned_or(d.wire.clone(), loaded.map(|c| c.wire.as_str()), "—"),
+            FieldId::Model => owned_or(d.model.clone(), loaded.map(|c| c.model.as_str()), "—"),
             FieldId::ApiKey => match (&d.api_key, loaded) {
                 (Some(_), _) => "●●●●（待保存）".into(),
                 (None, Some(c)) if c.api_key == "****" => "(已配置 ****)".into(),
                 (None, _) => "(未配置)".into(),
             },
             FieldId::MaxTokens => num_or(d.max_tokens, loaded.map(|c| c.max_tokens)),
-            FieldId::ContextLimit => num_or(d.context_limit, loaded.map(|c| c.context_limit)),
+            FieldId::ContextLength => num_or(d.context_length, loaded.map(|c| c.context_length)),
             FieldId::ReasoningEffort => owned_or(
                 d.reasoning_effort.clone(),
                 loaded
@@ -346,7 +341,7 @@ impl SettingsState {
                 }
             }
             FieldId::PermissionLevel => loaded
-                .map(|c| format!("L{}（按 1-4 即时生效）", c.permission_level))
+                .map(|c| format!("L{}（按 1-3 即时生效）", c.permission_level))
                 .unwrap_or_else(|| "…".into()),
             FieldId::ActiveProfile => {
                 let cur = self
@@ -475,8 +470,8 @@ impl SettingsState {
             FieldId::MaxTokens => self.effective(loaded, |d, c| {
                 d.max_tokens.unwrap_or(c.max_tokens).to_string()
             }),
-            FieldId::ContextLimit => self.effective(loaded, |d, c| {
-                d.context_limit.unwrap_or(c.context_limit).to_string()
+            FieldId::ContextLength => self.effective(loaded, |d, c| {
+                d.context_length.unwrap_or(c.context_length).to_string()
             }),
             FieldId::SubMaxTokens => self.effective(loaded, |d, c| {
                 d.subagent
@@ -510,8 +505,7 @@ impl SettingsState {
                 }
             }),
             FieldId::ApiKey | FieldId::SubApiKey => String::new(),
-            FieldId::Provider
-            | FieldId::Endpoint
+            FieldId::Wire
             | FieldId::ReasoningEffort
             | FieldId::NotificationsEnabled
             | FieldId::ComplianceEnabled
@@ -536,7 +530,7 @@ impl SettingsState {
         let text = raw.trim().to_string();
         match id {
             FieldId::MaxTokens
-            | FieldId::ContextLimit
+            | FieldId::ContextLength
             | FieldId::SubMaxTokens
             | FieldId::SubTimeoutSecs => {
                 let v: u64 = text.parse().map_err(|_| format!("{text:?} 不是有效整数"))?;
@@ -607,8 +601,7 @@ impl SettingsState {
                     .default_tools = Some(tools);
             }
             // 不可编辑字段：静默忽略（理论上不会到达）。
-            FieldId::Provider
-            | FieldId::Endpoint
+            FieldId::Wire
             | FieldId::ReasoningEffort
             | FieldId::NotificationsEnabled
             | FieldId::ComplianceEnabled
@@ -620,8 +613,8 @@ impl SettingsState {
         Ok(())
     }
 
-    /// 循环切换（←→ / Enter）。返回 Ok(true) = 已消费；Ok(false) = 端口字段，
-    /// 由 App 层处理；Err = 提示性失败（如目录为空）。
+    /// 循环切换（←→ / Enter）。返回 Ok(true) = 已消费；Ok(false) = 无候选可循环
+    /// （端口字段由 App 层处理，文本字段什么都不做）。
     pub fn cycle(&mut self, loaded: Option<&ConfigDto>, delta: i32) -> Result<bool, String> {
         let id = self.row().id;
         match id {
@@ -658,95 +651,26 @@ impl SettingsState {
                 self.draft.compliance_enabled = Some(!cur);
                 Ok(true)
             }
-            FieldId::Provider => {
-                let cfg = loaded.ok_or_else(|| "配置未加载".to_string())?;
-                if cfg.providers.is_empty() {
-                    return Err("daemon 未提供 provider 目录".into());
-                }
+            FieldId::Wire => {
+                // BYOK：协议由用户声明，daemon 不给目录，所以词表就是本地常量。
+                // 刻意**不**跟着改 baseUrl——切 wire 只切 wire。
                 let cur = self
                     .draft
-                    .provider_id
-                    .as_deref()
-                    .unwrap_or(cfg.provider_id.as_str());
-                let idx = cfg.providers.iter().position(|p| p.id == cur).unwrap_or(0);
-                let next = (idx as i32 + delta).rem_euclid(cfg.providers.len() as i32) as usize;
-                let p = &cfg.providers[next];
-                self.draft.provider_id = Some(p.id.clone());
-                // 跟随 provider 预设：端点与 Base URL 一并落入草稿（用户仍可改）。
-                if let Some(ep) = p.endpoints.first() {
-                    self.draft.endpoint = Some(ep.id.clone());
-                    if !ep.base_url.is_empty() {
-                        self.draft.base_url = Some(ep.base_url.clone());
-                    }
-                }
+                    .wire
+                    .clone()
+                    .or_else(|| loaded.map(|c| c.wire.clone()))
+                    .unwrap_or_default();
+                let idx = WIRE_PROTOCOLS.iter().position(|w| *w == cur).unwrap_or(0);
+                let next = (idx as i32 + delta).rem_euclid(WIRE_PROTOCOLS.len() as i32) as usize;
+                self.draft.wire = Some(WIRE_PROTOCOLS[next].to_string());
                 Ok(true)
             }
-            FieldId::Endpoint => {
-                let cfg = loaded.ok_or_else(|| "配置未加载".to_string())?;
-                let Some(p) = self.effective_provider(cfg) else {
-                    return Err("当前 provider 不在目录中".into());
-                };
-                if p.endpoints.is_empty() {
-                    return Err("该 provider 无端点预设".into());
-                }
-                let cur = self
-                    .draft
-                    .endpoint
-                    .as_deref()
-                    .unwrap_or(cfg.endpoint.as_str());
-                let idx = p.endpoints.iter().position(|e| e.id == cur).unwrap_or(0);
-                let next = (idx as i32 + delta).rem_euclid(p.endpoints.len() as i32) as usize;
-                let ep = &p.endpoints[next];
-                self.draft.endpoint = Some(ep.id.clone());
-                if !ep.base_url.is_empty() {
-                    self.draft.base_url = Some(ep.base_url.clone());
-                }
-                Ok(true)
-            }
-            FieldId::Model => {
-                // ←→ 在当前端点的 models 列表里循环；Enter 自由输入。
-                let cfg = loaded.ok_or_else(|| "配置未加载".to_string())?;
-                let models = self.effective_provider(cfg).and_then(|p| {
-                    let eid = self
-                        .draft
-                        .endpoint
-                        .as_deref()
-                        .unwrap_or(cfg.endpoint.as_str());
-                    p.endpoints
-                        .iter()
-                        .find(|e| e.id == eid)
-                        .or_else(|| p.endpoints.first())
-                        .map(|e| &e.models)
-                });
-                match models.filter(|m| !m.is_empty()) {
-                    Some(models) => {
-                        let cur = self.draft.model.as_deref().unwrap_or(cfg.model.as_str());
-                        let idx = models.iter().position(|m| m == cur).unwrap_or(0);
-                        let next = (idx as i32 + delta).rem_euclid(models.len() as i32) as usize;
-                        self.draft.model = Some(models[next].clone());
-                        Ok(true)
-                    }
-                    None => Err("端点无模型列表——回车直接输入".into()),
-                }
-            }
+            // 端口字段 cycle 返回 Ok(false)，由 App 层处理。
             FieldId::PermissionLevel | FieldId::ActiveProfile => Ok(false),
+            // model/baseUrl 是自由文本（BYOK 后没有目录可循环）：←→ 无操作，
+            // Enter 进编辑态。
             _ => Ok(false),
         }
-    }
-
-    fn effective_provider<'a>(
-        &self,
-        cfg: &'a ConfigDto,
-    ) -> Option<&'a crate::protocol::ProviderDto> {
-        let pid = self
-            .draft
-            .provider_id
-            .as_deref()
-            .unwrap_or(cfg.provider_id.as_str());
-        cfg.providers
-            .iter()
-            .find(|p| p.id == pid)
-            .or_else(|| cfg.providers.first())
     }
 
     fn effective<T>(
@@ -767,7 +691,7 @@ impl SettingsState {
     fn set_sub_or_top(&mut self, id: FieldId, v: u64) {
         match id {
             FieldId::MaxTokens => self.draft.max_tokens = Some(v),
-            FieldId::ContextLimit => self.draft.context_limit = Some(v),
+            FieldId::ContextLength => self.draft.context_length = Some(v),
             FieldId::SubMaxTokens => {
                 self.draft
                     .subagent
@@ -847,22 +771,20 @@ mod tests {
     /// 完整读模型载荷。
     ///
     /// **由权威类型自身生成**（`ConfigDto::default()` 序列化出来就是完整形状），
-    /// 只覆盖本测试真正关心的几个字段与 providers 树——这样后端新增字段时这里
-    /// 不会因为「少写一个键」而红，而要钉住的东西（providers 树、subagent）仍是
-    /// 显式写出来的。
+    /// 只覆盖本测试真正关心的那几个字段——这样后端新增字段时这里不会因为
+    /// 「少写一个键」而红，而要钉住的东西（BYOK 六字段、subagent）仍是显式写出来的。
     ///
-    /// 历史：原先是一份手写 JSON，靠 `qaqh-config-api` 的 struct 级
-    /// `#[serde(default)]` 才解析得动——缺 `lang`/`fontFamily`/`theme`/`mcp`/`lsp`/
-    /// `tokenizerPath`，且 `subagent.api_key` 还是 snake_case、靠 `alias` 兜着。
-    /// 那两个兼容臂已按后端 spec §0b 删除，故改为从类型生成。
+    /// 历史：原先这份 fixture 还手搭一棵 `providers` 目录树（两个 provider、各自的
+    /// endpoints 与 models），靠 `qaqh-config-api` 的 struct 级 `#[serde(default)]`
+    /// 才解析得动。2026-10-06 BYOK 之后 daemon 不再下发目录，那棵树连同
+    /// `providerId`/`endpoint` 两个键一起删了。
     fn cfg() -> ConfigDto {
         let mut payload = serde_json::to_value(ConfigDto::default()).expect("serialize");
         payload["model"] = json!("gpt-5");
         payload["baseUrl"] = json!("https://api.example.com/v1");
-        payload["providerId"] = json!("prov-a");
-        payload["endpoint"] = json!("ep-a1");
+        payload["wire"] = json!("openai");
         payload["maxTokens"] = json!(96000);
-        payload["contextLimit"] = json!(1000000);
+        payload["contextLength"] = json!(1000000);
         payload["reasoningEffort"] = json!("high");
         payload["autoCompactThreshold"] = json!(0.95);
         payload["permissionLevel"] = json!(3);
@@ -871,14 +793,6 @@ mod tests {
         payload["profiles"] = json!(["default", "fast"]);
         payload["notificationsEnabled"] = json!(true);
         payload["complianceEnabled"] = json!(false);
-        payload["providers"] = json!([
-            { "id": "prov-a", "display": "A", "endpoints": [
-                { "id": "ep-a1", "display": "A1", "protocol": "openai", "baseUrl": "https://api.example.com/v1", "defaultModel": "", "models": ["gpt-5", "gpt-5-mini"], "stateful": false, "beta": false }
-            ]},
-            { "id": "prov-b", "display": "B", "endpoints": [
-                { "id": "ep-b1", "display": "B1", "protocol": "openai", "baseUrl": "https://b.example.com/v1", "defaultModel": "", "models": ["b1"], "stateful": false, "beta": false }
-            ]}
-        ]);
         payload["subagent"] = json!({
             "model": "", "baseUrl": "", "apiKey": "", "apiKeySet": false,
             "maxTokens": 4096, "timeoutSecs": 120, "defaultTools": []
@@ -897,9 +811,9 @@ mod tests {
             ..Default::default()
         };
         st.move_focus(1);
-        assert_eq!(st.row().id, FieldId::Provider);
-        st.move_focus(-1);
-        assert_eq!(st.row().id, FieldId::Model);
+        assert_eq!(st.row().id, FieldId::ApiKey);
+        st.move_focus(-2);
+        assert_eq!(st.row().id, FieldId::Wire);
         st.focus = ROWS.len() - 1;
         st.move_focus(1);
         assert_eq!(st.focus, 0);
@@ -959,7 +873,7 @@ mod tests {
     }
 
     #[test]
-    fn cycle_effort_toggles_and_providers() {
+    fn cycle_effort_toggles_and_wire() {
         let c = cfg();
         let mut st = SettingsState {
             focus: row_index(FieldId::ReasoningEffort),
@@ -974,20 +888,26 @@ mod tests {
         st.cycle(Some(&c), 1).unwrap();
         assert_eq!(st.draft.notifications_enabled, Some(false));
 
-        st.focus = row_index(FieldId::Provider);
+        // wire：三值循环（openai → responses → anthropic → openai），且切 wire
+        // **不许**连带改写 baseUrl——目录已退役，任何「顺手填端点」都是凭空发明。
+        st.focus = row_index(FieldId::Wire);
         st.cycle(Some(&c), 1).unwrap();
-        assert_eq!(st.draft.provider_id.as_deref(), Some("prov-b"));
-        assert_eq!(st.draft.endpoint.as_deref(), Some("ep-b1"));
-        assert_eq!(
-            st.draft.base_url.as_deref(),
-            Some("https://b.example.com/v1")
-        );
+        assert_eq!(st.draft.wire.as_deref(), Some("responses"));
+        st.cycle(Some(&c), 1).unwrap();
+        assert_eq!(st.draft.wire.as_deref(), Some("anthropic"));
+        st.cycle(Some(&c), 1).unwrap();
+        assert_eq!(st.draft.wire.as_deref(), Some("openai"));
+        assert_eq!(st.draft.base_url, None, "切 wire 不得落 baseUrl 草稿");
         st.cycle(Some(&c), -1).unwrap();
-        assert_eq!(st.draft.provider_id.as_deref(), Some("prov-a"));
-
-        st.focus = row_index(FieldId::Model);
+        assert_eq!(st.draft.wire.as_deref(), Some("anthropic"));
+        // 已加载的 wire 不在词表里（旧配置）：从表首开始，不 panic。
+        st.draft.wire = Some("legacy".into());
         st.cycle(Some(&c), 1).unwrap();
-        assert_eq!(st.draft.model.as_deref(), Some("gpt-5-mini"));
+        assert_eq!(st.draft.wire.as_deref(), Some("responses"));
+
+        // BYOK 后没有模型目录：model 行 ←→ 无操作（Ok(false)），Enter 才进编辑。
+        st.focus = row_index(FieldId::Model);
+        assert!(!st.cycle(Some(&c), 1).unwrap());
 
         // 端口字段 cycle 返回 Ok(false)，由 App 层处理。
         st.focus = row_index(FieldId::ActiveProfile);
@@ -998,7 +918,7 @@ mod tests {
     fn patch_roundtrip_and_validation_on_save() {
         let c = cfg();
         let mut st = SettingsState {
-            focus: row_index(FieldId::ContextLimit),
+            focus: row_index(FieldId::ContextLength),
             ..Default::default()
         };
         st.commit_edit(
@@ -1009,10 +929,18 @@ mod tests {
             },
         )
         .unwrap();
+        // BYOK：切 wire 与改 contextLength 一起发，键名跟齐权威 crate。
+        st.focus = row_index(FieldId::Wire);
+        st.cycle(Some(&c), 1).unwrap();
         assert!(!st.draft.is_empty());
         st.draft.validate().unwrap();
         let v = serde_json::to_value(&st.draft).unwrap();
-        assert_eq!(v["contextLimit"], 2_000_000);
+        assert_eq!(v["contextLength"], 2_000_000);
+        assert_eq!(v["wire"], "responses");
         assert!(v.get("model").is_none(), "未改动字段不得出现在 wire 上");
+        assert!(
+            v.get("providerId").is_none() && v.get("endpoint").is_none(),
+            "provider 目录已退役，patch 上不得出现目录键：{v}"
+        );
     }
 }
