@@ -12,8 +12,11 @@ pub struct SidebarRow {
     pub title: String,
     /// 领域活动状态；`None` = daemon 本生命周期内从未激活过（仅 running 兜底）。
     pub activity: Option<ActivityState>,
-    /// daemon registry 实时查询：该会话当前是否有 worker 在跑。
-    pub running: bool,
+    /// 统一运行状态（`SessionRunStatus`，2026-10-06 归一裁决：取代旧
+    /// `running: bool` 的 worker 进程存在性语义）。此处压成 bool 只保留
+    /// 「daemon 本进程是否加载了该会话」这一个闸门判据（`!= NotRunning`）；
+    /// 渲染仍优先走 `activity`，状态词表的细分留给 glyph 升级。
+    pub loaded: bool,
     /// 已在当前 tab 集里。
     pub is_open: bool,
     /// 当前 active tab。
@@ -57,7 +60,8 @@ impl App {
     }
 
     /// 侧栏数据源：daemon 启动后**被激活过**的会话（activity tracker 有快照）
-    /// 加上 registry 里仍在跑的会话，归档的永不出现。
+    /// 加上已加载的会话（`status != not_running`，2026-10-06 归一裁决后取代
+    /// 旧 `running` 的 worker 存在性判据），归档与 ephemeral 的永不出现。
     ///
     /// 顺序沿用 `session_list_cache`（daemon 侧已按 updated_at 排序），打开的
     /// tab 不重排——侧栏是"监控位"，不是 tab 栏镜像。
@@ -69,6 +73,11 @@ impl App {
         self.session_list_cache
             .iter()
             .filter(|entry| !entry.meta.archived)
+            // `ephemeral` 是 daemon 侧的子代理标志（`index=false` 写入时置
+            // true），必须与 roster 判据并存：`is_subagent_session` 只认**本进程
+            // 收到过 team 快照**的父子关系，daemon 重启或没 attach 过父会话时，
+            // 单靠它会漏。与 `filtered_sessions` 同口径。
+            .filter(|entry| !entry.meta.ephemeral)
             .filter(|entry| !self.is_subagent_session(&entry.meta.session_id))
             .filter(|entry| !self.tabs.contains(&entry.meta.session_id))
             .take(HOME_RECENT_SESSIONS)
@@ -82,9 +91,13 @@ impl App {
             // 子代理**不是**顶层会话：`session.list` 不区分父子（daemon 侧
             // `list_sessions` 原样列出所有会话），所以过滤只能在前端做。子代理的
             // 存在感收敛到子代理预览条（见 `subagent_strip_line`）与 Ctrl+↑。
+            // roster 判据（`is_subagent_session`）只认本进程收到过的 team 快照，
+            // daemon 重启/未 attach 父会话时会漏——`meta.ephemeral` 是 daemon 写入
+            // 的标志位，两道都要有（与 `filtered_sessions` 同口径）。
+            .filter(|entry| !entry.meta.ephemeral)
             .filter(|entry| !self.is_subagent_session(&entry.meta.session_id))
             .filter(|entry| {
-                entry.running
+                entry.status != SessionRunStatus::NotRunning
                     || self.activity_cache.contains_key(&entry.meta.session_id)
                     || self.tabs.contains(&entry.meta.session_id)
             })
@@ -98,7 +111,7 @@ impl App {
                         .is_some_and(|active| active == &session_id),
                     title: entry.meta.display_title(),
                     activity: self.activity_cache.get(&session_id).copied(),
-                    running: entry.running,
+                    loaded: entry.status != SessionRunStatus::NotRunning,
                     session_id,
                 }
             })

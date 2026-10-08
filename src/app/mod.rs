@@ -45,7 +45,7 @@ use qaqh_client::{ContentRef, DomainActivityState as ActivityState, NoticeLevel,
 use qaqh_client::{
     ControlCommand, ConversationCommand, ConversationInputPurpose, RingingCommand, ToolCommand,
 };
-use qaqh_client::{SessionActivity, SessionListEntry};
+use qaqh_client::{SessionActivity, SessionListEntry, SessionRunStatus};
 use session::{
     AskPanel, Composer, PermissionPanel, PlanPanel, SessionState, StreamPhase, activity_from_v2,
     conversation_cache_from_v2, streaming_done, sync_streaming_from_timeline,
@@ -2694,7 +2694,7 @@ mod tests {
                 created_at,
                 ..SessionMeta::default()
             },
-            running: false,
+            status: SessionRunStatus::NotRunning,
             workspace_id: None,
         }
     }
@@ -2706,7 +2706,7 @@ mod tests {
                 cwd: cwd.map(str::to_owned),
                 ..SessionMeta::default()
             },
-            running: false,
+            status: SessionRunStatus::NotRunning,
             workspace_id: None,
         }
     }
@@ -2715,10 +2715,10 @@ mod tests {
     fn sidebar_rows_filter_to_activated_sessions() {
         let (mut app, _rx) = App::new_for_test();
         let mut archived = list_entry("s-archived", 1);
-        archived.running = true;
+        archived.status = SessionRunStatus::Idle;
         archived.meta.archived = true;
         let mut running = list_entry("s-running", 2);
-        running.running = true;
+        running.status = SessionRunStatus::Idle;
         let idle_known = list_entry("s-idle-known", 3);
         let never_active = list_entry("s-never", 4);
         app.session_list_cache = vec![archived, running, idle_known, never_active];
@@ -2727,7 +2727,7 @@ mod tests {
 
         let rows = app.sidebar_rows();
         let ids: Vec<&str> = rows.iter().map(|row| row.session_id.as_str()).collect();
-        // 归档永不出现；从未激活（running=false 且无活动记录）不出现。
+        // 归档永不出现；从未激活（未加载，即 `status = not_running`，且无活动记录）不出现。
         assert_eq!(ids, ["s-running", "s-idle-known"]);
     }
 
@@ -2767,9 +2767,9 @@ mod tests {
     fn sidebar_rows_hide_subagent_sessions() {
         let (mut app, _rx) = App::new_for_test();
         let mut parent = list_entry("root", 1);
-        parent.running = true;
+        parent.status = SessionRunStatus::Idle;
         let mut child = list_entry("child", 2);
-        child.running = true;
+        child.status = SessionRunStatus::Idle;
         app.session_list_cache = vec![parent, child];
         app.teams
             .entry("root".into())
@@ -2782,6 +2782,41 @@ mod tests {
         let rows = app.sidebar_rows();
         let ids: Vec<&str> = rows.iter().map(|row| row.session_id.as_str()).collect();
         assert_eq!(ids, ["root"], "子代理不进对话列表（跑完也不进）");
+    }
+
+    /// daemon 的 `session.list` **不过滤** ephemeral（`list_sessions` 原样下发，
+    /// 过滤是前端契约职责）。roster 判据只认本进程收到过的 team 快照——daemon
+    /// 重启后、或从未 attach 过父会话时，`is_subagent_session` 恒为 false，
+    /// 单靠它子代理会漏进首页「继续上次」与侧栏。`meta.ephemeral` 是 daemon
+    /// 落盘时就打上的标志，两道过滤都要有（与 `filtered_sessions` 同口径）。
+    #[test]
+    fn ephemeral_sessions_hide_without_local_roster() {
+        let (mut app, _rx) = App::new_for_test();
+        let mut orphan_sub = list_entry("sub-no-roster", 1);
+        orphan_sub.meta.ephemeral = true;
+        orphan_sub.status = SessionRunStatus::Idle; // 过侧栏的状态（已加载）/activity 闸门
+        app.session_list_cache = vec![orphan_sub, list_entry("normal-session_id", 2)];
+        app.activity_cache
+            .insert("normal-session_id".into(), ActivityState::Idle);
+        assert!(
+            !app.is_subagent_session("sub-no-roster"),
+            "前提：本进程 roster 不认识这个子代理（旧实现正是在这里漏出）"
+        );
+
+        let rows = app.sidebar_rows();
+        let ids: Vec<&str> = rows.iter().map(|row| row.session_id.as_str()).collect();
+        assert_eq!(ids, ["normal-session_id"], "ephemeral 子代理不进侧栏");
+
+        let recent = app.home_recent_sessions();
+        let home: Vec<&str> = recent
+            .iter()
+            .map(|entry| entry.meta.session_id.as_str())
+            .collect();
+        assert_eq!(
+            home,
+            ["normal-session_id"],
+            "ephemeral 子代理不进首页「继续上次」"
+        );
     }
 
     /// 周期刷新**不得重排**：daemon 按 `updated_at` 降序，而 `updated_at` 每写一条
@@ -2858,8 +2893,8 @@ mod tests {
     async fn sidebar_open_switches_within_tabs_and_opens_new() {
         let (mut app, _rx) = App::new_for_test();
         let mut s2 = list_entry("s-2", 2);
-        // 侧栏只列"daemon 激活过/在跑"的会话：s-2 靠 running 入列。
-        s2.running = true;
+        // 侧栏只列"daemon 激活过/已加载"的会话：s-2 靠 status（!= not_running）入列。
+        s2.status = SessionRunStatus::Idle;
         app.session_list_cache = vec![list_entry("s-1", 1), s2];
         app.open_session_tab("s-1");
         app.active = 0;

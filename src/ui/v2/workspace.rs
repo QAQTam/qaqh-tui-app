@@ -1645,7 +1645,7 @@ mod tests {
     }
 
     fn app_with_session_list() -> App {
-        use qaqh_client::{SessionListEntry, SessionMeta};
+        use qaqh_client::{SessionListEntry, SessionMeta, SessionRunStatus};
 
         let (mut app, _rx) = App::new_for_test();
         app.session_list_cache = (0..6)
@@ -1655,7 +1655,7 @@ mod tests {
                     created_at: index,
                     ..SessionMeta::default()
                 },
-                running: false,
+                status: SessionRunStatus::NotRunning,
                 workspace_id: None,
             })
             .collect();

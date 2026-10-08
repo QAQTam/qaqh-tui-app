@@ -1688,7 +1688,7 @@ mod tests {
                 archived,
                 ..qaqh_client::SessionMeta::default()
             },
-            running: false,
+            status: qaqh_client::SessionRunStatus::NotRunning,
             workspace_id: None,
         }
     }

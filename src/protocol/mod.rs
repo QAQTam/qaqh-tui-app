@@ -44,7 +44,7 @@ pub use qaqh_config_api::{ConfigDto, ConfigPatch, SubagentDto, SubagentPatch};
 #[cfg(test)]
 mod tests {
     use super::*;
-    use qaqh_client::{SessionActivity, SessionListEntry};
+    use qaqh_client::{SessionActivity, SessionListEntry, SessionRunStatus};
 
     /// **G2 回归闸（消费侧）**：会话列表条目与会话活动快照的**权威类型**必须
     /// 解析得出 UI 真正要用的那几个字段。
@@ -65,18 +65,26 @@ mod tests {
             "mode": 1,
             "archived": true,
             "ephemeral": false,
-            "running": true,
+            "status": "working",
         });
         let entry: SessionListEntry =
             serde_json::from_value(wire.clone()).expect("会话列表条目可解析");
         // 列表渲染真正读的每一个字段（ui/home.rs、ui/overlays.rs、app/overlay_ops.rs）。
         assert_eq!(entry.meta.session_id, "0123abcd");
         assert!(entry.meta.archived && !entry.meta.ephemeral);
-        assert!(entry.running);
+        assert_eq!(entry.status, SessionRunStatus::Working);
         assert_eq!(entry.meta.updated_at, 1757900000000);
         assert_eq!(entry.meta.display_title(), "Bun 引导 daemon");
         // 未分组/旧 daemon 不带 workspace_id 时必须仍是 `None` 而不是解析失败。
         assert_eq!(entry.workspace_id, None);
+        // 2026-10-06 归一裁决：旧 `running: bool`（worker 存在性）退场，统一状态
+        // 词表 `status` 落 wire。缺 `status` 键的旧回包必须兜默认 `not_running`，
+        // **不得被误读成 idle**（与后端 `session_run_status_wire_vocabulary_is_locked` 同口径）。
+        let mut legacy = wire.clone();
+        legacy.as_object_mut().unwrap().remove("status");
+        let legacy: SessionListEntry =
+            serde_json::from_value(legacy).expect("缺 status 的旧回包仍须可解析");
+        assert_eq!(legacy.status, SessionRunStatus::NotRunning);
 
         // **严格度差异（须知会）**：`session_id`/`created_at`/`updated_at`/`model`/
         // `message_count` 在 `SessionMeta` 上没有 `#[serde(default)]`，缺一个整条就被

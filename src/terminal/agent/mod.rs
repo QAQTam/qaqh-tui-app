@@ -1747,8 +1747,8 @@ mod tests {
     use crate::ui::v2::fullscreen::{FullscreenState, MessageAction, MessageMenu, MessageRole};
     use crate::ui::v2::hit::{AgentTarget, FrameHitMap, HitRegion, PointerTarget, VisualAnchor, z};
     use qaqh_client::{
-        PermissionCategory, PermissionRisk, SessionListEntry, SessionMeta, TimelineBlock,
-        TimelineBlockKind, TimelineBlockState, TimelineEntry, TimelineEvent,
+        PermissionCategory, PermissionRisk, SessionListEntry, SessionMeta, SessionRunStatus,
+        TimelineBlock, TimelineBlockKind, TimelineBlockState, TimelineEntry, TimelineEvent,
     };
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
@@ -3014,7 +3014,7 @@ mod tests {
                     session_id: "session-1".into(),
                     ..SessionMeta::default()
                 },
-                running: true,
+                status: SessionRunStatus::Idle,
                 workspace_id: None,
             },
             SessionListEntry {
@@ -3022,7 +3022,7 @@ mod tests {
                     session_id: "session-2".into(),
                     ..SessionMeta::default()
                 },
-                running: true,
+                status: SessionRunStatus::Idle,
                 workspace_id: None,
             },
         ];
@@ -3098,7 +3098,7 @@ mod tests {
                 session_id: "session-1".into(),
                 ..SessionMeta::default()
             },
-            running: true,
+            status: SessionRunStatus::Idle,
             workspace_id: None,
         }];
         app.show_workspace = false;
@@ -3191,7 +3191,7 @@ mod tests {
                 session_id: "session-2".into(),
                 ..SessionMeta::default()
             },
-            running: true,
+            status: SessionRunStatus::Idle,
             workspace_id: None,
         };
         entry2.meta.title = Some("第二个会话".into());
@@ -3201,7 +3201,7 @@ mod tests {
                     session_id: "session-1".into(),
                     ..SessionMeta::default()
                 },
-                running: true,
+                status: SessionRunStatus::Idle,
                 workspace_id: None,
             },
             entry2,
@@ -3982,7 +3982,7 @@ mod tests {
                     created_at: index,
                     ..SessionMeta::default()
                 },
-                running: false,
+                status: SessionRunStatus::NotRunning,
                 workspace_id: None,
             })
             .collect();

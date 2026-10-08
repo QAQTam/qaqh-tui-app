@@ -46,15 +46,16 @@ pub fn rail_width(total_width: u16) -> u16 {
 /// 会话行的状态 glyph 与前景色。
 ///
 /// 星芒（Working/Starting）每帧变化；WaitingUser=黄、Failed=红、
-/// Idle=绿、Disconnected=灰。无活动记录但在跑的会话退化为空心圆。
+/// Idle=绿、Disconnected=灰。无活动记录但已加载（`status != not_running`）的
+/// 会话退化为空心圆。
 fn status_glyph(
     state: Option<DomainActivityState>,
-    running: bool,
+    loaded: bool,
     frame: u64,
     theme: &Theme,
 ) -> (&'static str, Style) {
     let running_style = Style::new().fg(theme.accent.running);
-    match (state, running) {
+    match (state, loaded) {
         (Some(DomainActivityState::Working | DomainActivityState::Starting), _) => {
             (anim::claude_spinner_glyph(frame), running_style)
         }
@@ -99,7 +100,7 @@ pub fn draw(
             pointer.sidebar_hover == Some(index),
             pointer.sidebar_pressed == Some(index),
         );
-        let (glyph, glyph_style) = status_glyph(row.activity, row.running, frame_no, theme);
+        let (glyph, glyph_style) = status_glyph(row.activity, row.loaded, frame_no, theme);
         // ▣ = 已在 tab 集里（点击即切换、零加载）；与 workspace 列表同词汇。
         let open_marker = if row.is_open { "▣" } else { " " };
         let title = fit_width(&row.title, width.saturating_sub(5));
@@ -251,7 +252,7 @@ mod tests {
         use crate::app::session::SessionState;
         use crate::ui::v2::hit::{FrameId, HitMapBuilder};
         use crate::ui::v2::route::ScreenRoute;
-        use qaqh_client::{SessionListEntry, SessionMeta};
+        use qaqh_client::{SessionListEntry, SessionMeta, SessionRunStatus};
         use ratatui::{Terminal, backend::TestBackend};
 
         let (mut app, _rx) = crate::app::App::new_for_test();
@@ -264,7 +265,7 @@ mod tests {
                     title: Some(id.into()),
                     ..SessionMeta::default()
                 },
-                running: true,
+                status: SessionRunStatus::Idle,
                 workspace_id: None,
             };
             entry.meta.title = Some(id.into());
@@ -311,7 +312,7 @@ mod tests {
         use crate::app::session::SessionState;
         use crate::ui::v2::hit::{FrameId, HitMapBuilder};
         use crate::ui::v2::route::ScreenRoute;
-        use qaqh_client::{SessionListEntry, SessionMeta};
+        use qaqh_client::{SessionListEntry, SessionMeta, SessionRunStatus};
         use ratatui::{Terminal, backend::TestBackend};
 
         let (mut app, _rx) = crate::app::App::new_for_test();
@@ -324,7 +325,7 @@ mod tests {
                     title: Some(id.into()),
                     ..SessionMeta::default()
                 },
-                running: false,
+                status: SessionRunStatus::NotRunning,
                 workspace_id: None,
             });
         }
