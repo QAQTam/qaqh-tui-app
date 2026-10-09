@@ -147,6 +147,7 @@ impl App {
                 Overlay::History { .. }
                 | Overlay::SessionList { .. }
                 | Overlay::Settings(_)
+                | Overlay::Remote(_)
                 | Overlay::Subagents { .. }
                 | Overlay::Help,
             ) => {
@@ -368,6 +369,8 @@ impl App {
         };
 
         match top {
+            // `/remote` 页自成一套按键机（状态机在 remote_ops）。
+            Overlay::Remote(_) => self.remote_overlay_key(key),
             Overlay::Thinking { body, .. } => {
                 // 只读回放：滚动 + Esc 关闭。总行数按折行后算（与 draw 同一 wrap）。
                 let total = body.lines().count().max(1);

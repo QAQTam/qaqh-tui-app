@@ -12,6 +12,8 @@ pub enum WorkspaceRoute {
         show_archived: bool,
     },
     Settings,
+    /// `/remote`：远端直连 + 设备配对页。
+    Remote,
     Help,
     History {
         selected: usize,
@@ -75,6 +77,7 @@ pub fn resolve(app: &App) -> ScreenRoute {
                 });
             }
             Overlay::Settings(_) => return ScreenRoute::Workspace(WorkspaceRoute::Settings),
+            Overlay::Remote(_) => return ScreenRoute::Workspace(WorkspaceRoute::Remote),
             Overlay::Help => return ScreenRoute::Workspace(WorkspaceRoute::Help),
             Overlay::History {
                 selected,

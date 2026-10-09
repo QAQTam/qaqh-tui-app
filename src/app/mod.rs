@@ -11,6 +11,11 @@ pub(crate) mod keymap;
 mod overlay_ops;
 pub(crate) mod pager;
 mod paste_guard;
+/// 终端二维码（半块渲染）：`/remote` 页给手机扫码用。
+pub mod qr;
+/// `/remote` 页状态：远端直连目标与设备配对（见模块头的三条边界）。
+pub mod remote;
+pub(crate) mod remote_ops;
 pub mod render_line;
 pub(crate) mod ringing_v2;
 pub mod session;
@@ -105,6 +110,20 @@ pub enum ActionResult {
         session_id: String,
         path: String,
         result: Result<ContentRef, String>,
+    },
+    /// `/remote`：`pairing/tokens` 的结果（一次性配对令牌 + 有效期 + 指纹）。
+    PairTicket(Result<qaqh_client::RingingV2PairTokenResponse, String>),
+    /// `/remote`：设备列表结果（内容不含 token 材料，可直接上屏）。
+    Devices(Result<Vec<qaqh_client::RingingV2DeviceWire>, String>),
+    /// `/remote`：吊销结果。`device_id` 随结果回传，用来精确清掉两步确认的置位——
+    /// 失败时不能把用户的「再按一次确认」状态一起吞掉。
+    DeviceRevoked {
+        device_id: String,
+        result: Result<(), String>,
+    },
+    /// `/remote`：换连接目标的重连结果（`Ok` 带目标描述，页面直接显示连上了哪)。
+    RemoteReconnect {
+        result: Result<String, String>,
     },
     Rebaseline {
         session_id: String,
@@ -328,6 +347,40 @@ impl ApiCtx {
             .map(|state| state.client_session_id)
     }
 
+    // ───────────────────────── /remote：设备配对 ─────────────────────────
+    //
+    // 三个调用都在 `qaqh-client` 里（本仓不自建 HTTP）。Admin 身份才够得着：本地
+    // daemon 的 token 就是 admin token，所以「读本机 daemon + 发配对码」这条链在
+    // 默认部署下天然成立。
+
+    /// 申请一次性配对令牌（120 秒）。
+    pub async fn issue_pairing_token(
+        &self,
+        scope: qaqh_client::PairScope,
+        device_name: &str,
+        platform: &str,
+    ) -> Result<qaqh_client::RingingV2PairTokenResponse, String> {
+        self.client()?
+            .issue_pairing_token(scope, device_name, platform)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    /// 已配对设备列表（不含 token 材料）。
+    pub async fn list_devices(&self) -> Result<Vec<qaqh_client::RingingV2DeviceWire>, String> {
+        self.client()?
+            .list_devices()
+            .await
+            .map_err(|e| e.to_string())
+    }
+    /// 吊销设备。
+    pub async fn revoke_device(&self, device_id: &str) -> Result<(), String> {
+        self.client()?
+            .revoke_device(device_id)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
     /// 显式声明 driver seat；holder 仍以随后的 reliable `DriverChanged` 为准。
     pub async fn claim_driver(&self, session_id: &str) -> Result<(), String> {
         self.client()?
@@ -535,6 +588,8 @@ pub enum Overlay {
         show_archived: bool,
     },
     Settings(settings::SettingsState),
+    /// `/remote`：远端 daemon 直连 + 设备配对。**应用级**，不绑定某个会话。
+    Remote(remote::RemoteState),
     Help,
     AttachPath {
         input: Vec<char>,
@@ -611,6 +666,7 @@ impl Overlay {
             // 切标签时让它跟着走，不关掉（与 SessionList/Settings 同属全局面）。
             Overlay::SessionList { .. }
             | Overlay::Settings(_)
+            | Overlay::Remote(_)
             | Overlay::Help
             | Overlay::History { .. }
             | Overlay::Subagents { .. }
@@ -763,6 +819,12 @@ pub struct App {
     dashboard_fetching: HashSet<String>,
     /// config.load 的 typed 快照（ConfigDto 镜像；ConfigChanged 到达时重拉）。
     pub config: Option<ConfigDto>,
+    /// 进程启动时的连接目标。`/remote` 页「回到本地」要恢复的是**这个**里的拉起
+    /// 标志，而不是硬编码 `true`——`--no-spawn` 启动的进程不该因为切一趟远端就
+    /// 获得拉 daemon 的权力。
+    pub startup_target: crate::runtime::ConnectTarget,
+    /// 配对签发的载荷上下文（见 [`remote::RemotePending`]）。
+    pub remote_pending: Option<remote::RemotePending>,
     /// settings 保存请求在途标记（防 config.save 双发——事故 R4）。
     pub settings_saving: bool,
     /// 右侧 workspace 面板开关（F4；窄终端自动隐藏）。
@@ -909,6 +971,9 @@ impl App {
         msg_tx: tokio::sync::mpsc::UnboundedSender<AppMsg>,
         initial_cwd: Option<String>,
     ) -> Self {
+        // 启动目标要记得住：`/remote` 页「回到本地」时恢复的是它（含 `--no-spawn`
+        // 带来的拉起标志），不是硬编码的 true。
+        let startup_target = runtime.current_target();
         Self {
             quit: false,
             runtime,
@@ -940,6 +1005,8 @@ impl App {
             activity_cache: HashMap::new(),
             dashboard_fetching: HashSet::new(),
             config: None,
+            startup_target,
+            remote_pending: None,
             settings_saving: false,
             show_workspace: true,
             tracked_session_ids: HashSet::new(),
@@ -988,6 +1055,14 @@ impl App {
 
     fn handle_tick(&mut self) {
         self.last_tick = Instant::now();
+        // 配对码倒计时由 tick 推，渲染层不读时钟（draw 保持纯函数）。秒数变了才
+        // 置重绘——B3 的绘制门控会丢弃「什么都没变」的帧。
+        if let Some(Overlay::Remote(mut st)) = self.overlays.last().cloned()
+            && st.advance_clock(self.last_tick)
+        {
+            self.replace_overlay(Overlay::Remote(st));
+            self.force_redraw = true;
+        }
         // 过期 toast / 未命中的 create 关联。
         while let Some(front) = self.toasts.front() {
             if front.at.elapsed() > Duration::from_secs(6) {
@@ -1239,6 +1314,9 @@ impl App {
                 // client 作废，告警账本整体清空——否则旧代遗留的 timeline 告警
                 // 会永久挂在状态栏上（那条流再也不会发 `Open` 来撤自己）。
                 self.stream_issues = StreamIssues::default();
+                // 重拉配置：`context_length` 是状态栏上下文占比的分母（v2 投影不再
+                // 携带它），daemon 重启或换 profile 都得跟着刷新。
+                self.fetch_config();
                 // 重 open（租约重建 / daemon 重启）：重新 attach 全部 open session_ids
                 // 并 re-baseline；epoch 变化时 timeline 流自行重放。
                 // 子代理 session_id 走 SessionAttach（无 actor 副作用，运行中的子代理
@@ -1870,6 +1948,33 @@ impl App {
         }
     }
 
+    /// 压缩终态帧的 toast 文案（`CompactFinished`）。
+    ///
+    /// 卡已经消失，终态就只能靠 toast 交代——尤其 `failed` / `cancelled`：这两种
+    /// 情况**不会**有随后的 `CompactionApplied`，如果没有这条提示，用户只看到
+    /// 「压缩卡闪过、上下文一点没短」，无从判断发生了什么。
+    fn compact_finished_notice(
+        status: qaqh_client::ClientV2CompactStatus,
+        turns_compacted: Option<u32>,
+    ) -> (NoticeLevel, String) {
+        use qaqh_client::ClientV2CompactStatus as S;
+        let folded = turns_compacted
+            .map(|n| format!(" · 折入摘要 {n} 回合"))
+            .unwrap_or_default();
+        match status {
+            S::Completed => (NoticeLevel::Info, format!("上下文压缩完成{folded}")),
+            S::Skipped => (
+                NoticeLevel::Info,
+                "上下文压缩跳过（还没到阈值）".to_string(),
+            ),
+            S::Failed => (
+                NoticeLevel::Error,
+                "上下文压缩失败：历史未折叠（Ctrl+E 可重试）".to_string(),
+            ),
+            S::Cancelled => (NoticeLevel::Warn, "上下文压缩已取消".to_string()),
+        }
+    }
+
     fn handle_conversation_delta(
         &mut self,
         session_id: String,
@@ -1881,6 +1986,8 @@ impl App {
             return;
         };
         let mut force_redraw = false;
+        // `sess` 借用了 `self.sessions`，toast 必须等 match 结束、借用释放后再发。
+        let mut compact_toast: Option<(NoticeLevel, String)> = None;
         match delta {
             D::TurnStarted { turn_id, .. } => {
                 // 权威源 fact 墙钟随**信封**到达（timeline wire 根本没有时间
@@ -1912,8 +2019,7 @@ impl App {
                     .get_or_insert_with(qaqh_client::ConversationState::default);
                 conv.model = Some(model);
                 if let Some(u) = usage {
-                    sess.usage = Some(u.clone());
-                    conv.usage = Some(u);
+                    sess.usage = Some(u);
                 }
             }
             D::TurnFinished {
@@ -1937,10 +2043,7 @@ impl App {
                 }
                 force_redraw = true;
                 if let Some(u) = usage {
-                    sess.usage = Some(u.clone());
-                    if let Some(conv) = sess.conversation.as_mut() {
-                        conv.usage = Some(u);
-                    }
+                    sess.usage = Some(u);
                 }
             }
             D::TurnInterrupted { turn_id, .. } => {
@@ -1967,7 +2070,44 @@ impl App {
                 sess.timeline.record_compaction(context_revision);
                 force_redraw = true;
             }
+            // 以下三帧是**瞬态**镜像（不入 fact 链、不进快照）：它们只负责让「正在
+            // 压缩」这件事可见。口径见 `timeline_model::InFlightCompact` 的注释。
+            D::CompactStarted {
+                compact_id,
+                turns_total,
+                turns_keeping,
+                ..
+            } => {
+                sess.timeline
+                    .begin_compact(compact_id, turns_total, turns_keeping);
+                force_redraw = true;
+            }
+            D::CompactProgress {
+                compact_id, delta, ..
+            } => {
+                // `delta` 是累计全文快照，整帧替换（不是追加）。正因为是快照而不是
+                // 增量，这里不需要按 `revision` 排序：迟到的旧帧只会让文本短暂回退，
+                // 下一帧就自愈（与后端的幂等设计同口径）。
+                sess.timeline.update_compact(&compact_id, delta);
+                force_redraw = true;
+            }
+            D::CompactFinished {
+                compact_id,
+                status,
+                turns_compacted,
+                ..
+            } => {
+                // 收卡无条件试一次；终态文案**只在本地确实有过这张卡**时才给——
+                // 重连补投的迟到终态帧不该凭空弹一条「压缩完成」。
+                if sess.timeline.finish_compact(&compact_id).is_some() {
+                    compact_toast = Some(Self::compact_finished_notice(status, turns_compacted));
+                }
+                force_redraw = true;
+            }
             D::InputAccepted { .. } => {}
+        }
+        if let Some((level, text)) = compact_toast {
+            self.toast(level, text);
         }
         if force_redraw {
             self.force_redraw = true;
@@ -2055,13 +2195,13 @@ impl App {
                         sync_streaming_from_timeline(sess);
                         // 会话模式的实际来源是 transcript_ops.rs 的乐观更新 +
                         // SessionMetaChanged 刷新，bootstrap 不携带该字段。
-                        // conversation 快照里本仓只缓存 model/usage（v2 投影不再
-                        // 有聚合的 usage_totals / context_limit）。
-                        let conv = conversation_cache_from_v2(&b.conversation.state);
-                        sess.usage = conv.usage.clone();
-                        sess.usage_totals = conv.usage_totals.clone();
-                        sess.context_limit =
-                            conv.context_limit.map(|v| v.min(u32::MAX as u64) as u32);
+                        // conversation 快照里本仓只缓存 model；单次请求用量取最新
+                        // assistant block。累计用量与上下文分母已不在投影上：前者由
+                        // `session.list` 的 `meta.usage_totals` 刷，后者是
+                        // `config.load` 的 `context_length`（见 `App::context_limit`）。
+                        let (conv, latest_usage) =
+                            conversation_cache_from_v2(&b.conversation.state);
+                        sess.usage = latest_usage;
                         sess.conversation = Some(conv);
                         self.apply_child_activity_hint(&bootstrap_session_id, bootstrap_activity);
                         // v2 bootstrap 的 `interactions` 已由 daemon 过滤为未决集合。
@@ -2216,6 +2356,14 @@ impl App {
                         self.toast(NoticeLevel::Info, format!("新会话已创建 {session_id}"));
                     }
                 }
+                // 累计用量的权威源：`SessionMeta.usage_totals` 是后端唯一的聚合点
+                // （投影上的 `usage_totals` 已删），列表刷新时顺带给在跟踪的会话补数。
+                // 状态栏的 cache% 用它，单次请求的命中率抖动过大。
+                for entry in &list {
+                    if let Some(sess) = self.sessions.get_mut(&entry.meta.session_id) {
+                        sess.usage_totals = Some(entry.meta.usage_totals.clone());
+                    }
+                }
                 self.session_list_cache = self.stable_session_order(list);
                 self.session_list_at = Some(Instant::now());
                 // 首页选中越界回绕
@@ -2249,6 +2397,11 @@ impl App {
                 }
             }
             ActionResult::SessionActivity(Err(_)) => {}
+            // `/remote` 页的三类结果：状态机都在 remote_ops 里，避免把这个 match 撑大。
+            ev @ (ActionResult::PairTicket(..)
+            | ActionResult::Devices(..)
+            | ActionResult::DeviceRevoked { .. }
+            | ActionResult::RemoteReconnect { .. }) => self.handle_remote_result(ev),
             ActionResult::ConfigLoaded(Ok(v)) => match serde_json::from_value::<ConfigDto>(v) {
                 Ok(dto) => self.config = Some(dto),
                 Err(e) => self.toast(NoticeLevel::Error, format!("config.load 解析失败: {e}")),
@@ -3113,6 +3266,160 @@ mod tests {
         )));
 
         assert!(app.force_redraw, "回合终态必须触发下一帧强制重绘");
+    }
+
+    /// 压缩三态帧的 App 层接线：开卡 → 累计快照换文本 → 收卡并弹**一条**终态 toast。
+    ///
+    /// 锁两件事：① 三帧都得有人接（瞬态帧没有事实链兜底，漏一帧就永久隐身）；
+    /// ② 迟到的重复终态帧不再弹 toast——重连时 hub 会重放槽里的最新帧，见卡不在
+    /// 本地就不该凭空报「压缩完成」。
+    #[test]
+    fn compact_frames_drive_the_live_card_and_one_terminal_toast() {
+        use qaqh_client::ClientV2CompactStatus as CS;
+        use qaqh_client::ClientV2ConversationDelta as D;
+        let (mut app, _rx) = App::new_for_test();
+        app.sessions
+            .insert("session".into(), SessionState::new("session".into()));
+        init_v2_session(&mut app, "session");
+
+        // 嵌套函数而不是闭包：闭包会一直借用 `app`，与下面的 `app.handle` 冲突。
+        fn card(app: &App) -> Option<crate::app::timeline_model::InFlightCompact> {
+            app.sessions["session"].timeline.in_flight_compact.clone()
+        }
+
+        app.handle(AppMsg::Runtime(v2_event(
+            "session",
+            qaqh_client::ClientV2Payload::ConversationDelta(D::CompactStarted {
+                revision: 1,
+                compact_id: "c1".into(),
+                turns_total: 12,
+                turns_keeping: 3,
+            }),
+        )));
+        let started = card(&app).expect("CompactStarted 开卡");
+        assert_eq!((started.turns_total, started.turns_keeping), (12, 3));
+        assert!(started.summary.is_empty());
+
+        app.handle(AppMsg::Runtime(v2_event(
+            "session",
+            qaqh_client::ClientV2Payload::ConversationDelta(D::CompactProgress {
+                revision: 2,
+                compact_id: "c1".into(),
+                delta: "摘要全文快照".into(),
+            }),
+        )));
+        assert_eq!(card(&app).unwrap().summary, "摘要全文快照");
+
+        let toasts_before = app.toasts.len();
+        app.handle(AppMsg::Runtime(v2_event(
+            "session",
+            qaqh_client::ClientV2Payload::ConversationDelta(D::CompactFinished {
+                revision: 3,
+                compact_id: "c1".into(),
+                status: CS::Completed,
+                summary_chars: Some(6),
+                turns_compacted: Some(9),
+                turns_removed: Some(9),
+            }),
+        )));
+        assert!(card(&app).is_none(), "终态帧收卡");
+        let toast = app.toasts.back().expect("终态要留痕");
+        assert_eq!(toast.level, NoticeLevel::Info);
+        assert!(
+            toast.text.contains("压缩完成") && toast.text.contains("9 回合"),
+            "{}",
+            toast.text
+        );
+
+        // 同 id 的迟到终态帧（重连重放）：卡已经没了，不再弹第二条。
+        app.handle(AppMsg::Runtime(v2_event(
+            "session",
+            qaqh_client::ClientV2Payload::ConversationDelta(D::CompactFinished {
+                revision: 4,
+                compact_id: "c1".into(),
+                status: CS::Failed,
+                summary_chars: None,
+                turns_compacted: None,
+                turns_removed: None,
+            }),
+        )));
+        assert_eq!(app.toasts.len(), toasts_before + 1, "只弹首条终态 toast");
+    }
+
+    /// `failed` / `cancelled` 不会有随后的 `CompactionApplied`，终态 toast 是用户
+    /// 唯一能看到的交代——文案与级别都得区分开。
+    #[test]
+    fn compact_finished_notice_distinguishes_terminal_states() {
+        use qaqh_client::ClientV2CompactStatus as CS;
+        let (level, text) = App::compact_finished_notice(CS::Failed, None);
+        assert_eq!(level, NoticeLevel::Error);
+        assert!(text.contains("失败"), "{text}");
+        let (level, _) = App::compact_finished_notice(CS::Cancelled, None);
+        assert_eq!(level, NoticeLevel::Warn);
+        let (level, text) = App::compact_finished_notice(CS::Skipped, None);
+        assert_eq!(level, NoticeLevel::Info);
+        assert!(text.contains("跳过"), "{text}");
+    }
+
+    /// 换源接线：`session.list` 带回的 `meta.usage_totals` 必须落到会话状态。
+    ///
+    /// conversation 投影上的 `usage_totals` 已被后端删除，状态栏的 cache% 只剩这
+    /// 一个源；漏接的表现是「命中率永远不显示」，属于静默失效，所以钉在这里。
+    #[test]
+    fn session_list_refresh_fills_usage_totals() {
+        let (mut app, _rx) = App::new_for_test();
+        app.sessions
+            .insert("session".into(), SessionState::new("session".into()));
+        init_v2_session(&mut app, "session");
+        assert!(app.sessions["session"].usage_totals.is_none());
+
+        let mut entry = list_entry("session", 1);
+        entry.meta.usage_totals = qaqh_client::UsageInfo {
+            prompt_tokens: 900,
+            prompt_cache_hit_tokens: 870,
+            prompt_cache_miss_tokens: 130,
+            cache_usage_reported: Some(true),
+            ..Default::default()
+        };
+        app.handle(AppMsg::Action(ActionResult::SessionList(Ok(vec![entry]))));
+        let totals = app.sessions["session"]
+            .usage_totals
+            .clone()
+            .expect("列表刷新要落进会话");
+        assert_eq!(totals.prompt_cache_hit_tokens, 870);
+
+        // 列表这次没提到本会话：已有的累计值保持原样，不得被清空。
+        app.handle(AppMsg::Action(ActionResult::SessionList(Ok(vec![
+            list_entry("other", 2),
+        ]))));
+        assert_eq!(
+            app.sessions["session"]
+                .usage_totals
+                .as_ref()
+                .map(|u| u.prompt_tokens),
+            Some(900),
+            "缺席条目不该把已知的累计用量抹掉"
+        );
+    }
+
+    /// 上下文占比的分母：`ConfigDto.context_length`（u64）→ u32，且 `0` 当作
+    /// 「没给」——后端 `validate` 本就拒绝 contextLength = 0。
+    #[test]
+    fn context_limit_comes_from_daemon_config() {
+        let (mut app, _rx) = App::new_for_test();
+        assert_eq!(app.context_limit(), None, "config 还没拉到就不猜分母");
+
+        app.config = Some(ConfigDto {
+            context_length: 200_000,
+            ..Default::default()
+        });
+        assert_eq!(app.context_limit(), Some(200_000));
+
+        app.config.as_mut().unwrap().context_length = 0;
+        assert_eq!(app.context_limit(), None, "0 分母不得画占比（除零）");
+
+        app.config.as_mut().unwrap().context_length = u64::MAX;
+        assert_eq!(app.context_limit(), Some(u32::MAX), "越界饱和而不是回绕");
     }
 
     #[test]
@@ -4078,8 +4385,11 @@ mod tests {
     ///
     /// 证伪方式：删掉 `Ready` 分支里的 `self.stream_issues = StreamIssues::default();`
     /// ——`stream_issues.is_empty()` 断言立刻变红（相位也回不到 `Ready`）。
-    #[test]
-    fn handle_conn_ready_clears_the_stream_issue_ledger() {
+    ///
+    /// 需要 tokio 运行时：`Ready` 分支除了清账本还会重拉 config（上下文占比的分母），
+    /// 那条拉取走 `spawn_api`。
+    #[tokio::test]
+    async fn handle_conn_ready_clears_the_stream_issue_ledger() {
         let (mut app, _rx) = App::new_for_test();
 
         // 连接就绪 → 某条流告警 → 相位进入 ReadyWithIssue。

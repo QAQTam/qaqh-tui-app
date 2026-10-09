@@ -39,7 +39,7 @@
 /// 同理暴露 BYOK（2026-10-06）：后端删了 `ProviderDto`/`EndpointDto`，`ConfigDto`
 /// 以 `wire` + `contextLength` 取代 `providerId`/`endpoint`/`contextLimit`——这里
 /// 少一个 re-export、设置页多一处引用，都直接变成编译错误，不会静默。
-pub use qaqh_config_api::{ConfigDto, ConfigPatch, SubagentDto, SubagentPatch};
+pub use qaqh_config_api::{ConfigDto, ConfigPatch, ExecPatch, SubagentDto, SubagentPatch};
 
 #[cfg(test)]
 mod tests {
@@ -116,6 +116,129 @@ mod tests {
         assert_eq!(acts[0].turn_id.as_deref(), Some("t1"));
     }
 
+    /// **压缩三态的消费侧闸门**（2026-10-09 后端把压缩的瞬态镜像并进 v2
+    /// conversation 流）：三帧的 wire kind 名与本仓读的字段都得钉住。
+    ///
+    /// 这三帧**不入 fact 链、不进快照**，没有「回放补齐」这层安全网：后端改名或
+    /// 挪字段，TUI 只会表现为「压缩卡永远不出现」——静默且难复现。所以断言写在
+    /// 解析层，让它在这一轮就变红。
+    #[test]
+    fn compact_transient_frames_wire_vocabulary_is_locked() {
+        use qaqh_client::{ClientV2CompactStatus, ClientV2ConversationDelta as D};
+
+        let started: D = serde_json::from_value(serde_json::json!({
+            "kind": "compact_started",
+            "data": { "revision": 7, "compact_id": "c1", "turns_total": 12, "turns_keeping": 3 },
+        }))
+        .expect("CompactStarted 必须可解析");
+        match started {
+            D::CompactStarted {
+                compact_id,
+                turns_total,
+                turns_keeping,
+                ..
+            } => {
+                assert_eq!(compact_id, "c1");
+                assert_eq!((turns_total, turns_keeping), (12, 3));
+            }
+            other => panic!("compact_started 的 wire 形状变了：{other:?}"),
+        }
+
+        // `delta` 是**累计全文**快照而不是 chunk 增量：本仓据此整帧替换。
+        let progress: D = serde_json::from_value(serde_json::json!({
+            "kind": "compact_progress",
+            "data": { "revision": 8, "compact_id": "c1", "delta": "摘要全文" },
+        }))
+        .expect("CompactProgress 必须可解析");
+        match progress {
+            D::CompactProgress { delta, .. } => assert_eq!(delta, "摘要全文"),
+            other => panic!("compact_progress 的 wire 形状变了：{other:?}"),
+        }
+
+        // 终态：四个 status 词都要认；`summaryChars` / `turns*` 是可选键
+        //（后端 `skip_serializing_if` 掉了就整键缺席），缺席必须仍可解析。
+        let finished: D = serde_json::from_value(serde_json::json!({
+            "kind": "compact_finished",
+            "data": { "revision": 9, "compact_id": "c1", "status": "cancelled" },
+        }))
+        .expect("CompactFinished 缺可选字段仍须可解析");
+        match finished {
+            D::CompactFinished { status, .. } => {
+                assert_eq!(status, ClientV2CompactStatus::Cancelled)
+            }
+            other => panic!("compact_finished 的 wire 形状变了：{other:?}"),
+        }
+        for word in ["completed", "skipped", "failed"] {
+            let frame = serde_json::json!({
+                "kind": "compact_finished",
+                "data": { "revision": 1, "compact_id": "c", "status": word },
+            });
+            match serde_json::from_value::<D>(frame).expect("终态词表可解析") {
+                D::CompactFinished { .. } => {}
+                other => panic!("期望 CompactFinished，得到 {other:?}"),
+            }
+        }
+        // 词表是闭集：未知终态不得被兜成某个已知值（那会把失败读成完成）。
+        let bogus = serde_json::json!({
+            "kind": "compact_finished",
+            "data": { "revision": 1, "compact_id": "c", "status": "aborted" },
+        });
+        assert!(
+            serde_json::from_value::<D>(bogus).is_err(),
+            "未知 compact status 必须解析失败"
+        );
+    }
+
+    /// 每轮 provider 真值 usage 的落点（`TurnFinished.usage`）。
+    ///
+    /// 后端删掉 conversation 投影上的聚合 `usage` / `usage_totals` 之后，本仓的
+    /// 单次用量只从 `AssistantBlockSealed` / `TurnFinished` 两条 delta 取，累计值
+    /// 取 `SessionMeta.usage_totals`——两条源都要有闸。
+    #[test]
+    fn per_turn_usage_and_session_totals_are_the_only_two_sources() {
+        use qaqh_client::ClientV2ConversationDelta as D;
+        let finished: D = serde_json::from_value(serde_json::json!({
+            "kind": "turn_finished",
+            "data": {
+                "revision": 1,
+                "turn_id": "t1",
+                "terminal": "completed",
+                "usage": {
+                    "prompt_tokens": 1200,
+                    "completion_tokens": 300,
+                    "total_tokens": 1500
+                },
+            },
+        }))
+        .expect("TurnFinished 带 usage 可解析");
+        match finished {
+            D::TurnFinished { usage, .. } => {
+                let usage = usage.expect("usage 有值就必须解得出");
+                assert_eq!(usage.prompt_tokens, 1200);
+                assert_eq!(usage.completion_tokens, 300);
+            }
+            other => panic!("turn_finished 的 wire 形状变了：{other:?}"),
+        }
+
+        // 累计值：`session.list` 的 meta.usage_totals（cache% 的唯一分母之一）。
+        let entry: SessionListEntry = serde_json::from_value(serde_json::json!({
+            "session_id": "0123abcd",
+            "created_at": 1,
+            "updated_at": 2,
+            "model": "m1",
+            "message_count": 1,
+            "status": "working",
+            "usage_totals": {
+                "prompt_tokens": 900,
+                "completion_tokens": 100,
+                "total_tokens": 1000
+            },
+        }))
+        .expect("带 usage_totals 的条目可解析");
+        assert_eq!(entry.meta.usage_totals.prompt_tokens, 900);
+        assert_eq!(entry.meta.usage_totals.completion_tokens, 100);
+    }
+
     /// T-11 回归闸：这几条断言**必须**对着权威 crate 成立，否则说明本仓又
     /// 悄悄接回了手抄件（或依赖被换成了缩小版）。断言刻意贴着「TUI 实际要用的
     /// 那几个字段」，而非上游测试的复制。
@@ -134,6 +257,10 @@ mod tests {
             permission_level: Some(4),
             ..Default::default()
         };
+        // 2026-10-09 后端 `qaqh-policy` 加了第四档 `SandboxRun = 4`，但写口
+        // （`ConfigPatch::validate` / `config.set_permission_level` / config.toml 的
+        // `permission_tier`）仍是 1..=3 —— 所以档位 4 现在**只能读、不能写**，设置页
+        // 不提供该选项。后端哪天放开值域，这条断言与 `settings.rs` 的只读分支要一起改。
         assert!(legacy.validate().is_err(), "旧四档值 4 必须被拒");
 
         let bad = ConfigPatch {
@@ -167,6 +294,57 @@ mod tests {
             .is_err(),
             "contextLength = 0 必须被拒（它是本地压缩的分母）"
         );
+
+        // 1c) 第四值 `gemini`（2026-10-08 后端 `Wire::Gemini`）：设置页的循环表
+        //     `[&str; 4]` 必须与这里的值域同源——少一个值就是「循环里选不到」，
+        //     多一个值就是「保存被 validate 拒」。
+        for word in ["openai", "responses", "anthropic", "gemini"] {
+            let patch = ConfigPatch {
+                wire: Some(word.into()),
+                ..Default::default()
+            };
+            patch
+                .validate()
+                .unwrap_or_else(|e| panic!("{word} 合法却被拒：{e}"));
+            assert_eq!(serde_json::to_value(&patch).unwrap()["wire"], word);
+        }
+        assert_eq!(crate::app::settings::WIRE_PROTOCOLS.len(), 4);
+        for declared in crate::app::settings::WIRE_PROTOCOLS {
+            assert!(
+                ConfigPatch {
+                    wire: Some(declared.into()),
+                    ..Default::default()
+                }
+                .validate()
+                .is_ok(),
+                "本地循环表里的 {declared:?} 不在后端值域内"
+            );
+        }
+
+        // 1d) 2026-10-09 新开的两个可写字段：嵌套 `exec.defaultShell` 与
+        //     `sessionIdleUnloadSecs`。camelCase 键名是设置页保存路径的唯一依赖，
+        //     改名 / 挪层级都会在这里先红。
+        let exec_patch = ConfigPatch {
+            exec: Some(ExecPatch {
+                default_shell: Some("pwsh".into()),
+            }),
+            session_idle_unload_secs: Some(0),
+            ..Default::default()
+        };
+        exec_patch
+            .validate()
+            .expect("exec/sessionIdleUnloadSecs 可写；idle=0 是合法的「禁用」");
+        let saved = serde_json::to_value(&exec_patch).expect("serialize");
+        assert_eq!(saved["exec"]["defaultShell"], "pwsh");
+        assert_eq!(saved["sessionIdleUnloadSecs"], 0);
+
+        // 读路径同样够得着（设置页两行的 loaded 值）。
+        let mut dto_payload = serde_json::to_value(ConfigDto::default()).expect("serialize");
+        dto_payload["exec"]["defaultShell"] = serde_json::json!("bash");
+        dto_payload["sessionIdleUnloadSecs"] = serde_json::json!(900);
+        let dto: ConfigDto = serde_json::from_value(dto_payload).expect("读模型可解析");
+        assert_eq!(dto.exec.default_shell.as_deref(), Some("bash"));
+        assert_eq!(dto.session_idle_unload_secs, 900);
 
         // 2) 读路径：mcp/lsp 两段不再是盲区（T-11 前 ConfigDto 里没有）。
         //    载荷由权威类型自身生成——**完整**是它的默认状态。本仓要钉的是

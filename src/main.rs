@@ -73,11 +73,21 @@ fn main() -> Result<()> {
             println!("  qaqh-tui            连接本地 daemon 并进入 V2 全屏 TUI");
             println!("  qaqh-tui resume     直接浏览当前 cwd 下的会话");
             println!("  qaqh-tui --no-spawn 不自动拉起 daemon（仅连接已有实例）");
+            println!("  qaqh-tui --remote http://<ip>:<port> --token <T>  直连远端 daemon");
             println!("  qaqh-tui doctor     自检：发现/pid 判活/open 握手");
             println!("  qaqh-tui --version  打印版本");
             println!();
             println!(
                 "环境: QAQH_DATA_DIR（数据目录覆盖）、QAQH_BACKEND_ROOT（daemon 拉起候选）、QAQH_DEFAULT_CWD（新建会话默认目录，支持 ~/ 展开）、QAQH_THEME=night|day|terminal|auto"
+            );
+            println!(
+                "     QAQH_REMOTE_URL / QAQH_REMOTE_TOKEN（远端直连，等价于 --remote/--token；\
+                 凭据走环境变量比走 argv 安全，argv 在同机进程表里可读）"
+            );
+            println!();
+            println!(
+                "远端直连目前只支持 http://：daemon 局域网面用的是自签证书，客户端侧还没有\
+                 指纹锚定能力，https 会在握手期失败。"
             );
             return Ok(());
         }
@@ -93,11 +103,23 @@ fn main() -> Result<()> {
 
     let resume = args.iter().any(|arg| arg == "resume");
     let no_spawn = args.iter().any(|arg| arg == "--no-spawn");
+    // 远端直连目标（`--remote/--token` 或同名环境变量）。校验放在这里：给了个
+    // 非法地址却要先进终端、再对着空白屏猜原因，是最差的失败方式。
+    let remote = runtime::resolve_remote_target(
+        &args,
+        std::env::var("QAQH_REMOTE_URL").ok().as_deref(),
+        std::env::var("QAQH_REMOTE_TOKEN").ok().as_deref(),
+    )
+    .map_err(anyhow::Error::msg)?;
+    if remote.is_some() && !no_spawn {
+        // 直连模式不拉 daemon，`--no-spawn` 只是没写出来而已——明示而不是静默。
+        println!("远端直连：不读取 daemon.json、不自动拉起 daemon（等价 --no-spawn）");
+    }
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .context("构建 tokio runtime")?;
-    runtime.block_on(terminal::agent::run(no_spawn, resume))
+    runtime.block_on(terminal::agent::run(no_spawn, resume, remote))
 }
 
 // ───────────────────────── doctor 自检 ─────────────────────────

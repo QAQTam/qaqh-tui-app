@@ -132,6 +132,14 @@ impl App {
                 self.toggle_settings();
                 true
             }
+            SlashCmd::Remote => {
+                if let Some(sess) = self.active_session_mut() {
+                    sess.composer.clear();
+                }
+                self.slash_selected = 0;
+                self.open_remote();
+                true
+            }
             SlashCmd::History => {
                 if let Some(sess) = self.active_session_mut() {
                     sess.composer.clear();

@@ -29,7 +29,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::app::session::SessionState;
 use crate::app::{App, AppMsg, ConnPhase, ModalHit, StartupIntent, WorkspaceHit};
-use crate::runtime::{Runtime, RuntimeMsg};
+use crate::runtime::{ConnectTarget, RemoteTarget, Runtime, RuntimeMsg};
 use crate::theme::Theme;
 use crate::ui::v2::hit::{
     AgentTarget, FrameHitMap, FrameId, HitMapBuilder, HitProbe, PointerTarget, ProbeFailure,
@@ -59,7 +59,10 @@ const TICK_ANIM_INTERVAL: Duration = Duration::from_millis(60);
 const MAX_SLASH_ROWS: usize = 4;
 
 /// 启动真实 V2 fullscreen Agent shell。
-pub async fn run(no_spawn: bool, resume: bool) -> Result<()> {
+///
+/// `remote = Some` 时直连远端 daemon：不读 `daemon.json`、不判活、不拉起，且
+/// `--no-spawn` 被隐含（`ConnectTarget::Remote` 一侧本就不 spawn）。
+pub async fn run(no_spawn: bool, resume: bool, remote: Option<RemoteTarget>) -> Result<()> {
     let (app_tx, mut app_rx) = mpsc::unbounded_channel::<AppMsg>();
     let (rt_tx, mut rt_rx) = mpsc::unbounded_channel::<RuntimeMsg>();
     {
@@ -73,7 +76,13 @@ pub async fn run(no_spawn: bool, resume: bool) -> Result<()> {
         });
     }
 
-    let runtime = Runtime::start(rt_tx, !no_spawn)
+    let target = match remote {
+        Some(remote) => ConnectTarget::Remote(remote),
+        None => ConnectTarget::Local {
+            launch_daemon_if_missing: !no_spawn,
+        },
+    };
+    let runtime = Runtime::start(rt_tx, target)
         .await
         .context("连接 daemon 失败")?;
 
@@ -833,6 +842,8 @@ fn handle_workspace_scroll(app: &mut App, route: &route::WorkspaceRoute, up: boo
             }
         }
         route::WorkspaceRoute::Help => {}
+        // 远端页滚的是它自己的视口（里面有二维码），不是会话视口。
+        route::WorkspaceRoute::Remote => app.remote_scroll(up, 3),
     }
 }
 
@@ -1478,7 +1489,7 @@ fn status_line(app: &App, width: u16, theme: &Theme) -> Line<'static> {
                 ),
                 Style::new().fg(theme.text.dim),
             ));
-            for span in usage_segments(session, theme) {
+            for span in usage_segments(session, app.context_limit(), theme) {
                 optional.push(span);
             }
             // cwd 排在使用量之后：三项指标比"我在哪个目录"更需要看见（目录在
@@ -1563,11 +1574,16 @@ fn status_line(app: &App, width: u16, theme: &Theme) -> Line<'static> {
 /// 用量三件套（v1 回归）：`↑12k ↓3k (6%) · 41 tok/s · cache 87%`。
 ///
 /// 每一项都**只在数据存在时**出现——三个来源的可得性各不相同：
-/// - **上下文占比**要 `context_limit`（daemon 没给就不猜比例）；
+/// - **上下文占比**要 `context_limit`（来自 `config.load` 的 `context_length`，
+///   daemon 没给就不猜比例；v2 投影上的该字段已随后端 Info 面板一起删除）；
 /// - **输出速率**要两端权威墙钟（`TurnStarted` / `TurnFinished` 的信封时间）；
 /// - **缓存命中率**要 `cache_usage_reported == Some(true)`：真 0% 与「没上报」
 ///   必须可区分（协议里专门留了这个字段），不能把不上报画成 0%。
-fn usage_segments(session: &SessionState, theme: &Theme) -> Vec<Span<'static>> {
+fn usage_segments(
+    session: &SessionState,
+    context_limit: Option<u32>,
+    theme: &Theme,
+) -> Vec<Span<'static>> {
     let dim = Style::new().fg(theme.text.dim);
     let Some(usage) = session.usage.as_ref() else {
         return Vec::new();
@@ -1582,7 +1598,7 @@ fn usage_segments(session: &SessionState, theme: &Theme) -> Vec<Span<'static>> {
     )];
     // 上下文占用：`prompt_tokens` 是本次请求的输入（≈ 当前上下文），除以 daemon
     // 给的窗口上限。v1 就是 `↑xk ↓yk (pct%)`，v2 移植时把手动百分比弄丢了。
-    if let Some(limit) = session.context_limit.filter(|limit| *limit > 0) {
+    if let Some(limit) = context_limit.filter(|limit| *limit > 0) {
         let pct = (u64::from(usage.prompt_tokens) * 100 / u64::from(limit)).min(999);
         spans.push(Span::styled(format!(" ({pct}%)"), dim));
     }
@@ -2441,6 +2457,146 @@ mod tests {
         );
     }
 
+    /// 端到端（绘制面）：压缩进行中的卡要真的出现在重绘帧上，且摘要帧进来后**重画**。
+    ///
+    /// 块缓存键是 `(block_id, revision)`：`revision` 若不动，画面就永远停在第一帧的
+    /// 表头——这正是本仓「点击展开闪一下没展开」那个 bug 的同一类失效。
+    #[test]
+    fn in_flight_compact_reaches_the_painted_frame() {
+        let mut model = model_with_sealed_answer();
+        model.begin_compact("c1".into(), 12, 3);
+        let mut app = app_with_model(model);
+        app.show_workspace = false;
+        let mut view = FullscreenView::default();
+
+        let painted = |view: &FullscreenView| -> String {
+            view.transcripts
+                .lines_for_test("session-1")
+                .iter()
+                .map(|line| {
+                    line.spans
+                        .iter()
+                        .map(|span| span.content.as_ref())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+
+        let mut frames = publish_frame(&app, &mut view, 80, 24);
+        let _ = &mut frames;
+        let text = painted(&view);
+        assert!(
+            text.contains("正在压缩上下文 · 保留 3/12 回合"),
+            "表头没上屏：{text}"
+        );
+
+        // 摘要帧：同一张卡（同 block_id）文本换掉，第二行也画得出来。
+        app.sessions
+            .get_mut("session-1")
+            .expect("会话在")
+            .timeline
+            .update_compact("c1", "上下文已折叠为摘要".into());
+        let mut frames = publish_frame(&app, &mut view, 80, 24);
+        let _ = &mut frames;
+        let text = painted(&view);
+        assert!(
+            text.contains("上下文已折叠为摘要"),
+            "摘要文本没重画（缓存键没失效）：{text}"
+        );
+    }
+
+    /// 接线断言：`/remote` 打开后路由要走到这一页，而且**真的画进缓冲区**。
+    ///
+    /// 只测 `route::resolve` 不够——路由对了但 workspace 的 draw 分支漏了，屏幕上
+    /// 就是一片空白，而这种缺口在 TUI 里没有任何其它信号会报出来。
+    #[test]
+    fn remote_overlay_routes_and_paints_its_page() {
+        let (mut app, _rx) = App::new_for_test();
+        app.open_remote();
+        let route = route::resolve(&app);
+        assert!(
+            matches!(route, ScreenRoute::Workspace(route::WorkspaceRoute::Remote)),
+            "路由没走到 Remote 页：{route:?}"
+        );
+
+        let backend = TestBackend::new(80, 40);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        let mut view = FullscreenView::default();
+        let frames = FramePublisher::default();
+        let mut builder = frames.begin(route.clone(), Size::new(80, 40), 0);
+        terminal
+            .draw(|frame| draw(frame, &app, &test_theme(), &route, &mut view, &mut builder))
+            .expect("draw remote page");
+
+        let painted: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .flat_map(|cell| cell.symbol().chars())
+            // 宽字符占两格，第二格是空单元格：不滤掉的话任何中文子串都匹配不上。
+            .filter(|ch| !ch.is_whitespace())
+            .collect();
+        assert!(painted.contains("当前连接"), "{painted}");
+        assert!(
+            painted.contains("只支持http://"),
+            "http-only 这条约束必须写在页面上：{painted}"
+        );
+    }
+
+    /// 面板 1 的二维码要**真画出来**：`qr` 模块自己测得过，不代表页面拿得到它——
+    /// 宽度算错或票据为空时用户看到的是一片空白，而这页唯一的功能就是那张码。
+    #[test]
+    fn remote_page_paints_the_pairing_qr() {
+        use crate::app::remote::{PairTicket, build_pair_payload};
+        let (mut app, _rx) = App::new_for_test();
+        app.open_remote();
+        let payload = build_pair_payload(
+            "https://192.168.1.8:64413",
+            "pt-0123456789abcdef",
+            "sha256:deadbeefcafe",
+            "studio",
+        );
+        {
+            let Some(Overlay::Remote(st)) = app.overlays.last_mut() else {
+                panic!("overlay 未打开");
+            };
+            st.panel = 1;
+            st.ticket_countdown = Some(97);
+            st.ticket = Some(PairTicket {
+                scope: "view",
+                device_name: "studio-phone".into(),
+                payload,
+                expires_at: std::time::Instant::now() + std::time::Duration::from_secs(97),
+            });
+        }
+
+        let route = route::resolve(&app);
+        let backend = TestBackend::new(100, 60);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        let mut view = FullscreenView::default();
+        let frames = FramePublisher::default();
+        let mut builder = frames.begin(route.clone(), Size::new(100, 60), 0);
+        terminal
+            .draw(|frame| draw(frame, &app, &test_theme(), &route, &mut view, &mut builder))
+            .expect("draw qr page");
+        let painted: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .flat_map(|cell| cell.symbol().chars())
+            .filter(|ch| !ch.is_whitespace())
+            .collect();
+        assert!(painted.contains("配对码"), "{painted}");
+        assert!(painted.contains("97"), "倒计时要上屏：{painted}");
+        assert!(
+            painted.contains(['█', '▀', '▄']),
+            "半块二维码没画出来：{painted}"
+        );
+    }
+
     /// 用量三件套（v1 回归）：上下文占比 / 输出速率 / 缓存命中率。
     #[test]
     fn usage_segments_render_context_rate_and_cache_hit() {
@@ -2448,26 +2604,25 @@ mod tests {
         let mut session = SessionState::new("s".into());
         // 无 usage → 一项都不画。
         assert!(
-            usage_segments(&session, &theme).is_empty(),
+            usage_segments(&session, None, &theme).is_empty(),
             "无 usage 就不画"
         );
 
         session.usage = Some(usage_info(12_000, 3_000));
         session.usage_totals = Some(usage_info(100, 10));
-        let text = spans_text(&usage_segments(&session, &theme));
+        let text = spans_text(&usage_segments(&session, None, &theme));
         assert!(text.contains("↑12k ↓3k"), "{text}");
         assert!(!text.contains('%'), "没有 context_limit 就不画占比：{text}");
         assert!(!text.contains("cache"), "没上报缓存就不画命中率：{text}");
 
         // context_limit + 缓存上报 → 占比与命中率都出来。
-        session.context_limit = Some(200_000);
         session.usage_totals = Some(qaqh_client::UsageInfo {
             prompt_cache_hit_tokens: 870,
             prompt_cache_miss_tokens: 130,
             cache_usage_reported: Some(true),
             ..usage_info(0, 0)
         });
-        let text = spans_text(&usage_segments(&session, &theme));
+        let text = spans_text(&usage_segments(&session, Some(200_000), &theme));
         assert!(text.contains("(6%)"), "12000/200000 = 6%：{text}");
         assert!(text.contains("cache 87%"), "{text}");
         assert!(!text.contains("tok/s"), "回合没结束就没有速率：{text}");

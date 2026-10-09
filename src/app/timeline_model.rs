@@ -429,6 +429,26 @@ pub struct TurnTerminal {
     pub state: TimelineTurnState,
 }
 
+/// 压缩**进行中**的瞬态镜像（`ConversationDelta::CompactStarted/Progress/Finished`）。
+///
+/// 后端把这三帧定为瞬态：不入 fact 链、不进快照，重连时由 hub 的
+/// `conversation:compact:{compact_id}` 槽重放最新一帧，终态帧清槽。两条口径要记住：
+/// - `summary` 是**累计全文**快照而非增量（worker 桥接侧合并 chunk 后整帧重发），
+///   所以按 `compact_id` 整块替换——丢一帧自愈，重复投递幂等。
+/// - 持久分界仍是 `CompactionApplied`（[`CompactionMark`]）；这张卡只负责「正在压」
+///   的可见性，收到 durable fact 或终态帧就该消失。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InFlightCompact {
+    /// 权威 `compact_id`（三帧同源，用于幂等与串代丢弃）。
+    pub compact_id: String,
+    /// 参与压缩的回合数。
+    pub turns_total: u32,
+    /// 压缩后保留的回合数。
+    pub turns_keeping: u32,
+    /// 累计摘要全文（随 `CompactProgress` 整帧替换）。
+    pub summary: String,
+}
+
 /// 一次上下文压缩在 transcript 里的分隔锚点。
 ///
 /// 后端 `CompactionApplied`（beta-readiness W3/D10）是 **conversation** 频道事实，
@@ -474,6 +494,8 @@ pub struct TimelineModel {
     pub dropped_missing_turn: u64,
     /// W3/D10：本会话已发生的压缩分隔锚（见 [`CompactionMark`]）。
     pub compaction_marks: Vec<CompactionMark>,
+    /// 正在进行的压缩（瞬态，见 [`InFlightCompact`]）；`None` = 没有在压。
+    pub in_flight_compact: Option<InFlightCompact>,
     /// 信封墙钟比 timeline 条目先到时暂存（回合尚未物化）。
     ///
     /// 只存尚未被 `TurnOpened` 兑现的那几个；兑现即移除。快照替换时清空——
@@ -516,11 +538,17 @@ impl TimelineModel {
     /// 锚定「事件到达时窗口里的最后一个回合之后」——与 webui W3 同口径。同一
     /// `context_revision` 重复到达（回放 / reset 后重投）按幂等处理。
     pub fn record_compaction(&mut self, context_revision: u64) {
+        // 权威事实到达 = 这一轮压缩已经收尾：瞬态卡在这里一并撤掉。它是
+        // `CompactFinished` 丢帧（断线期间）时唯一的兜底清除点。
+        let cleared = self.in_flight_compact.take().is_some();
         if self
             .compaction_marks
             .iter()
             .any(|mark| mark.context_revision == context_revision)
         {
+            if cleared {
+                self.bump();
+            }
             return;
         }
         self.compaction_marks.push(CompactionMark {
@@ -528,6 +556,55 @@ impl TimelineModel {
             context_revision,
         });
         self.bump();
+    }
+
+    /// 开一张压缩卡（`CompactStarted`）。
+    ///
+    /// 重连时 hub 会从槽里重放最新一帧，于是这里可能收到**第二次** `CompactStarted`
+    /// （本地已有同名卡）：按 `compact_id` 幂等，不叠两张。
+    pub fn begin_compact(&mut self, compact_id: String, turns_total: u32, turns_keeping: u32) {
+        if self
+            .in_flight_compact
+            .as_ref()
+            .is_some_and(|c| c.compact_id == compact_id)
+        {
+            return;
+        }
+        self.in_flight_compact = Some(InFlightCompact {
+            compact_id,
+            turns_total,
+            turns_keeping,
+            summary: String::new(),
+        });
+        self.bump();
+    }
+
+    /// 刷新卡的摘要文本（`CompactProgress`）。`delta` 是**累计全文**，整帧替换。
+    ///
+    /// `compact_id` 与本地卡不符 = 旧代帧迟到（重放/串代），丢弃：否则一帧陈旧的
+    /// 短文本会把正在增长的卡倒回去。
+    pub fn update_compact(&mut self, compact_id: &str, summary: String) {
+        let Some(card) = self.in_flight_compact.as_mut() else {
+            return;
+        };
+        if card.compact_id != compact_id || card.summary == summary {
+            return;
+        }
+        card.summary = summary;
+        self.bump();
+    }
+
+    /// 收卡（`CompactFinished`），返回被收掉的卡（`None` = 本地没有这张卡）。
+    pub fn finish_compact(&mut self, compact_id: &str) -> Option<InFlightCompact> {
+        if self
+            .in_flight_compact
+            .as_ref()
+            .is_some_and(|card| card.compact_id == compact_id)
+        {
+            self.in_flight_compact.take().inspect(|_| self.bump())
+        } else {
+            None
+        }
     }
 
     /// 某回合的权威墙钟（`None` = 未知）。
@@ -883,6 +960,8 @@ impl TimelineModel {
         // 新一代的回合之间。
         self.pending_turn_ms.clear();
         self.compaction_marks.clear();
+        // 瞬态压缩卡同理：快照是权威全量，跨代的「正在压」不得残留成一张永不收口的卡。
+        self.in_flight_compact = None;
         self.rebaseline_epoch = self.rebaseline_epoch.saturating_add(1);
         self.bump();
     }
@@ -1183,6 +1262,51 @@ mod tests {
         // 锚点回合被淘汰后，锚身份仍在（渲染侧据此顶到最前，而不是丢失）。
         m.cap_turns(0);
         assert_eq!(m.compaction_marks[1].after_turn_id.as_deref(), Some("t1"));
+    }
+
+    /// 压缩瞬态帧的模型语义：开卡幂等、串代帧丢弃、终态收卡，且权威事实与快照
+    /// 替换都能兜底把卡清掉（`CompactFinished` 是瞬态帧，断线期间会丢）。
+    #[test]
+    fn in_flight_compact_is_idempotent_and_cleared_by_the_durable_fact() {
+        let mut m = TimelineModel::default();
+        assert!(m.in_flight_compact.is_none());
+
+        m.begin_compact("c1".into(), 12, 3);
+        // 重连时 hub 从槽里重放最新一帧 → 同名 `CompactStarted` 再来一次：既不叠
+        // 第二张卡，也不 bump（没有可画的变化，bump 会白刷一帧）。
+        let version = m.version;
+        m.begin_compact("c1".into(), 12, 3);
+        assert_eq!(
+            m.in_flight_compact.as_ref().map(|card| card.turns_total),
+            Some(12)
+        );
+        assert_eq!(m.version, version, "幂等重放不改内容就不 bump");
+
+        // `delta` 是**累计全文**快照：整帧替换，不是追加。
+        m.update_compact("c1", "摘要一".into());
+        assert_eq!(m.in_flight_compact.as_ref().unwrap().summary, "摘要一");
+        // 旧代帧迟到：不得把正在增长的卡倒回去。
+        m.update_compact("c0", "陈年短文本".into());
+        assert_eq!(m.in_flight_compact.as_ref().unwrap().summary, "摘要一");
+
+        // 终态收卡：id 对不上不收，也不返回（调用方据此不弹 toast）。
+        assert!(m.finish_compact("c0").is_none());
+        let taken = m.finish_compact("c1").expect("卡收掉了");
+        assert_eq!(taken.turns_keeping, 3);
+        assert!(m.in_flight_compact.is_none());
+
+        // 兜底一：丢了 `CompactFinished` 时，权威 `CompactionApplied` 同样收卡。
+        m.begin_compact("c2".into(), 4, 1);
+        m.record_compaction(9);
+        assert!(
+            m.in_flight_compact.is_none(),
+            "durable fact 必须清掉 live 卡"
+        );
+
+        // 兜底二：快照整体替换 = 权威全量，跨代的「正在压」一律不残留。
+        m.begin_compact("c3".into(), 4, 1);
+        m.replace_from_page(&empty_page());
+        assert!(m.in_flight_compact.is_none());
     }
 
     /// 权威语义：`BlockCheckpoint.arg` 是**增量**，必须**追加**而不是覆盖。

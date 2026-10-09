@@ -14,14 +14,19 @@
 //! 切 wire 也**不许**顺手改写 baseUrl——那正是「改 maxTokens 后端点被改回预设」
 //! 那个缺陷的入口，webui 同批删除了 `applyEndpoint()`。
 
-use crate::protocol::{ConfigDto, ConfigPatch, SubagentPatch};
+use crate::protocol::{ConfigDto, ConfigPatch, ExecPatch, SubagentPatch};
 
 /// 后端 `validate` 允许的思考强度枚举。
 pub const REASONING_EFFORTS: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
 
-/// BYOK 的三条 wire（`ConfigPatch::validate` 的值域）。provider 目录已退役，
+/// BYOK 的四条 wire（`ConfigPatch::validate` 的值域）。provider 目录已退役，
 /// 协议没有可查的表，由用户在设置页直接声明。
-pub const WIRE_PROTOCOLS: [&str; 3] = ["openai", "responses", "anthropic"];
+///
+/// `gemini` 是 2026-10-08 后端 `Wire::Gemini` 落地后加的：它的 canonical path 带
+/// `{model}` 占位（`:generateContent` / 流式 `:streamGenerateContent`），且鉴权走
+/// `key` **查询参数**而不是 header——所以切到 gemini 时 baseUrl 的含义与前三个
+/// 不同，这正是本表刻意不连带改写 baseUrl 的原因（端点得由用户自己声明对）。
+pub const WIRE_PROTOCOLS: [&str; 4] = ["openai", "responses", "anthropic", "gemini"];
 
 /// 可聚焦字段的稳定标识（行序即 UI 顺序）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -36,16 +41,14 @@ pub enum FieldId {
     AutoCompactThreshold,
     PermissionLevel,
     ActiveProfile,
+    ExecDefaultShell,
+    SessionIdleUnloadSecs,
     SubModel,
     SubBaseUrl,
     SubMaxTokens,
     SubTimeoutSecs,
     SubApiKey,
     SubDefaultTools,
-    Lang,
-    Theme,
-    FontFamily,
-    NotificationsEnabled,
     ComplianceEnabled,
     TokenizerPath,
 }
@@ -138,6 +141,18 @@ pub const ROWS: &[Row] = &[
         section: "运行时",
     },
     Row {
+        id: FieldId::ExecDefaultShell,
+        label: "exec 默认壳",
+        kind: FieldKind::Text,
+        section: "运行时",
+    },
+    Row {
+        id: FieldId::SessionIdleUnloadSecs,
+        label: "空闲卸载(s)",
+        kind: FieldKind::Number,
+        section: "运行时",
+    },
+    Row {
         id: FieldId::SubModel,
         label: "子代理模型",
         kind: FieldKind::Text,
@@ -174,30 +189,6 @@ pub const ROWS: &[Row] = &[
         section: "子代理",
     },
     Row {
-        id: FieldId::Lang,
-        label: "语言",
-        kind: FieldKind::Text,
-        section: "通用",
-    },
-    Row {
-        id: FieldId::Theme,
-        label: "主题",
-        kind: FieldKind::Text,
-        section: "通用",
-    },
-    Row {
-        id: FieldId::FontFamily,
-        label: "字体",
-        kind: FieldKind::Text,
-        section: "通用",
-    },
-    Row {
-        id: FieldId::NotificationsEnabled,
-        label: "桌面通知",
-        kind: FieldKind::Toggle,
-        section: "通用",
-    },
-    Row {
         id: FieldId::ComplianceEnabled,
         label: "合规模式",
         kind: FieldKind::Toggle,
@@ -205,7 +196,9 @@ pub const ROWS: &[Row] = &[
     },
     Row {
         id: FieldId::TokenizerPath,
-        label: "tokenizer 路径",
+        // 后端把 tokenizer 装成进程级 OnceLock（只在 load 时初始化一次）：改了不重启
+        // daemon 不会生效。标签上写明白，免得用户以为保存就等于换成分词器。
+        label: "tokenizer(重启生效)",
         kind: FieldKind::Text,
         section: "通用",
     },
@@ -277,10 +270,12 @@ impl SettingsState {
             FieldId::ContextLength => self.draft.context_length.is_some(),
             FieldId::ReasoningEffort => self.draft.reasoning_effort.is_some(),
             FieldId::AutoCompactThreshold => self.draft.auto_compact_threshold.is_some(),
-            FieldId::Lang => self.draft.lang.is_some(),
-            FieldId::Theme => self.draft.theme.is_some(),
-            FieldId::FontFamily => self.draft.font_family.is_some(),
-            FieldId::NotificationsEnabled => self.draft.notifications_enabled.is_some(),
+            FieldId::ExecDefaultShell => self
+                .draft
+                .exec
+                .as_ref()
+                .is_some_and(|e| e.default_shell.is_some()),
+            FieldId::SessionIdleUnloadSecs => self.draft.session_idle_unload_secs.is_some(),
             FieldId::ComplianceEnabled => self.draft.compliance_enabled.is_some(),
             FieldId::TokenizerPath => self.draft.tokenizer_path.is_some(),
             FieldId::SubModel
@@ -341,7 +336,15 @@ impl SettingsState {
                 }
             }
             FieldId::PermissionLevel => loaded
-                .map(|c| format!("L{}（按 1-3 即时生效）", c.permission_level))
+                .map(|c| match c.permission_level {
+                    0..=3 => format!("L{}（按 1-3 即时生效）", c.permission_level),
+                    // 档位 4（SandboxRun）已在后端 `qaqh-policy` 落地，但写口
+                    // （`ConfigPatch::validate` 与 `config.set_permission_level`）仍是
+                    // 1..=3，本页**给不出**这个选项；daemon 侧要是报上来，只读展示，
+                    // 且不许按数字大小解释语义（ADR 2026-10-09 的单调性例外：4 数值
+                    // 最大，网络工具却仍然走审批）。
+                    n => format!("L{n}（daemon 侧档位，本页只读）"),
+                })
                 .unwrap_or_else(|| "…".into()),
             FieldId::ActiveProfile => {
                 let cur = self
@@ -360,6 +363,29 @@ impl SettingsState {
                         }
                     }
                     None => "…".into(),
+                }
+            }
+            FieldId::ExecDefaultShell => {
+                let v = d
+                    .exec
+                    .as_ref()
+                    .and_then(|e| e.default_shell.clone())
+                    .or_else(|| loaded.and_then(|c| c.exec.default_shell.clone()));
+                match v.as_deref() {
+                    None => "…".into(),
+                    // 空串与 "auto" 在后端是同一个语义：平台优先级自动探测。
+                    Some(s) if s.is_empty() || s.eq_ignore_ascii_case("auto") => "自动探测".into(),
+                    Some(s) => s.to_string(),
+                }
+            }
+            FieldId::SessionIdleUnloadSecs => {
+                match d
+                    .session_idle_unload_secs
+                    .or(loaded.map(|c| c.session_idle_unload_secs))
+                {
+                    None => "…".into(),
+                    Some(0) => "0（不卸载）".into(),
+                    Some(v) => v.to_string(),
                 }
             }
             FieldId::SubModel => sub_or(d, loaded, |s, c| (s.model.clone(), c.model.clone()), "—"),
@@ -402,19 +428,6 @@ impl SettingsState {
                     Some(v) => v.join(", "),
                 }
             }
-            FieldId::Lang => opt_str(d.lang.clone(), loaded.and_then(|c| c.lang.clone())),
-            FieldId::Theme => opt_str(d.theme.clone(), loaded.and_then(|c| c.theme.clone())),
-            FieldId::FontFamily => owned_or(
-                d.font_family.clone(),
-                loaded
-                    .map(|c| c.font_family.as_str())
-                    .filter(|s| !s.is_empty()),
-                "—",
-            ),
-            FieldId::NotificationsEnabled => toggle_str(
-                d.notifications_enabled,
-                loaded.map(|c| c.notifications_enabled),
-            ),
             FieldId::ComplianceEnabled => {
                 toggle_str(d.compliance_enabled, loaded.map(|c| c.compliance_enabled))
             }
@@ -446,21 +459,6 @@ impl SettingsState {
                     .as_ref()
                     .and_then(|s| s.base_url.clone())
                     .unwrap_or_else(|| c.subagent.base_url.clone())
-            }),
-            FieldId::Lang => self.effective(loaded, |d, c| {
-                d.lang
-                    .clone()
-                    .unwrap_or_else(|| c.lang.clone().unwrap_or_default())
-            }),
-            FieldId::Theme => self.effective(loaded, |d, c| {
-                d.theme
-                    .clone()
-                    .unwrap_or_else(|| c.theme.clone().unwrap_or_default())
-            }),
-            FieldId::FontFamily => self.effective(loaded, |d, c| {
-                d.font_family
-                    .clone()
-                    .unwrap_or_else(|| c.font_family.clone())
             }),
             FieldId::TokenizerPath => self.effective(loaded, |d, c| {
                 d.tokenizer_path
@@ -504,10 +502,20 @@ impl SettingsState {
                     v.join(", ")
                 }
             }),
+            FieldId::ExecDefaultShell => self.effective(loaded, |d, c| {
+                d.exec
+                    .as_ref()
+                    .and_then(|e| e.default_shell.clone())
+                    .unwrap_or_else(|| c.exec.default_shell.clone().unwrap_or_default())
+            }),
+            FieldId::SessionIdleUnloadSecs => self.effective(loaded, |d, c| {
+                d.session_idle_unload_secs
+                    .unwrap_or(c.session_idle_unload_secs)
+                    .to_string()
+            }),
             FieldId::ApiKey | FieldId::SubApiKey => String::new(),
             FieldId::Wire
             | FieldId::ReasoningEffort
-            | FieldId::NotificationsEnabled
             | FieldId::ComplianceEnabled
             | FieldId::PermissionLevel
             | FieldId::ActiveProfile => return None,
@@ -560,18 +568,8 @@ impl SettingsState {
                         .api_key = Some(text);
                 }
             }
-            FieldId::Lang | FieldId::Theme => {
-                // Some("") = 清除（跟随系统）。
-                let v = Some(text);
-                if id == FieldId::Lang {
-                    self.draft.lang = v;
-                } else {
-                    self.draft.theme = v;
-                }
-            }
             FieldId::Model => self.draft.model = Some(text),
             FieldId::BaseUrl => self.draft.base_url = Some(text),
-            FieldId::FontFamily => self.draft.font_family = Some(text),
             FieldId::TokenizerPath => self.draft.tokenizer_path = Some(text),
             FieldId::SubModel => {
                 self.draft
@@ -600,10 +598,22 @@ impl SettingsState {
                     .get_or_insert_with(SubagentPatch::default)
                     .default_tools = Some(tools);
             }
+            FieldId::ExecDefaultShell => {
+                // 空串 = 「自动探测」是**有意的取值**，不是「没填」，照原样写进草稿。
+                self.draft
+                    .exec
+                    .get_or_insert_with(ExecPatch::default)
+                    .default_shell = Some(text);
+            }
+            FieldId::SessionIdleUnloadSecs => {
+                // 与其它 Number 字段不同：**0 是合法值**（0 = 禁用空闲卸载，后端缺省），
+                // 所以不走上面那条「必须大于 0」的共用分支。
+                let v: u64 = text.parse().map_err(|_| format!("{text:?} 不是有效整数"))?;
+                self.draft.session_idle_unload_secs = Some(v);
+            }
             // 不可编辑字段：静默忽略（理论上不会到达）。
             FieldId::Wire
             | FieldId::ReasoningEffort
-            | FieldId::NotificationsEnabled
             | FieldId::ComplianceEnabled
             | FieldId::PermissionLevel
             | FieldId::ActiveProfile => {
@@ -631,15 +641,6 @@ impl SettingsState {
                     .unwrap_or(1);
                 let next = (idx as i32 + delta).rem_euclid(REASONING_EFFORTS.len() as i32) as usize;
                 self.draft.reasoning_effort = Some(REASONING_EFFORTS[next].to_string());
-                Ok(true)
-            }
-            FieldId::NotificationsEnabled => {
-                let cur = self
-                    .draft
-                    .notifications_enabled
-                    .or(loaded.map(|c| c.notifications_enabled))
-                    .unwrap_or(true);
-                self.draft.notifications_enabled = Some(!cur);
                 Ok(true)
             }
             FieldId::ComplianceEnabled => {
@@ -726,7 +727,7 @@ fn num_or(draft: Option<u64>, loaded: Option<u64>) -> String {
     }
 }
 
-/// lang/theme/tokenizer：None 或 Some("") 一律显示「跟随系统」语义。
+/// tokenizer：None 或 Some("") 一律显示「跟随系统」语义。
 fn opt_str(draft: Option<String>, loaded: Option<String>) -> String {
     let v = draft.or(loaded);
     match v {
@@ -865,11 +866,6 @@ mod tests {
         assert!(st.draft.api_key.is_none());
         st.commit_edit(Some(&c), buf("sk-new")).unwrap();
         assert_eq!(st.draft.api_key.as_deref(), Some("sk-new"));
-
-        // lang：Some("") = 清除（跟随系统）。
-        st.focus = row_index(FieldId::Lang);
-        st.commit_edit(Some(&c), buf("")).unwrap();
-        assert_eq!(st.draft.lang, Some(String::new()));
     }
 
     #[test]
@@ -884,22 +880,22 @@ mod tests {
         st.cycle(Some(&c), -1).unwrap();
         assert_eq!(st.draft.reasoning_effort.as_deref(), Some("high"));
 
-        st.focus = row_index(FieldId::NotificationsEnabled);
-        st.cycle(Some(&c), 1).unwrap();
-        assert_eq!(st.draft.notifications_enabled, Some(false));
-
-        // wire：三值循环（openai → responses → anthropic → openai），且切 wire
-        // **不许**连带改写 baseUrl——目录已退役，任何「顺手填端点」都是凭空发明。
+        // wire：四值循环（openai → responses → anthropic → gemini → openai）。
+        // `gemini` 是 2026-10-08 后端 `Wire::Gemini` 落地后补的第四值；切 wire 仍然
+        // **不许**连带改写 baseUrl——目录已退役，任何「顺手填端点」都是凭空发明
+        // （gemini 的端点形态还与前三者不同，更不能猜）。
         st.focus = row_index(FieldId::Wire);
         st.cycle(Some(&c), 1).unwrap();
         assert_eq!(st.draft.wire.as_deref(), Some("responses"));
         st.cycle(Some(&c), 1).unwrap();
         assert_eq!(st.draft.wire.as_deref(), Some("anthropic"));
         st.cycle(Some(&c), 1).unwrap();
+        assert_eq!(st.draft.wire.as_deref(), Some("gemini"));
+        st.cycle(Some(&c), 1).unwrap();
         assert_eq!(st.draft.wire.as_deref(), Some("openai"));
         assert_eq!(st.draft.base_url, None, "切 wire 不得落 baseUrl 草稿");
         st.cycle(Some(&c), -1).unwrap();
-        assert_eq!(st.draft.wire.as_deref(), Some("anthropic"));
+        assert_eq!(st.draft.wire.as_deref(), Some("gemini"));
         // 已加载的 wire 不在词表里（旧配置）：从表首开始，不 panic。
         st.draft.wire = Some("legacy".into());
         st.cycle(Some(&c), 1).unwrap();
@@ -912,6 +908,71 @@ mod tests {
         // 端口字段 cycle 返回 Ok(false)，由 App 层处理。
         st.focus = row_index(FieldId::ActiveProfile);
         assert!(!st.cycle(Some(&c), 1).unwrap());
+    }
+
+    /// 后端 2026-10-09 新开的两个可写字段：`exec.defaultShell` 与
+    /// `sessionIdleUnloadSecs`。各自要守住的语义不一样：
+    /// - exec 的**空串是有意义取值**（= 平台自动探测），不是「没填」；
+    /// - idle 的 **0 是合法值**（后端缺省，= 禁用空闲卸载），所以它不能走
+    ///   `maxTokens` 那条「必须大于 0」的共用数值校验。
+    #[test]
+    fn exec_shell_and_idle_unload_roundtrip() {
+        let c = cfg();
+        let buf = |s: &str| EditBuffer {
+            buf: s.chars().collect(),
+            cursor: s.chars().count(),
+        };
+        let mut st = SettingsState {
+            focus: row_index(FieldId::ExecDefaultShell),
+            ..Default::default()
+        };
+        st.commit_edit(Some(&c), buf("pwsh")).unwrap();
+        assert_eq!(
+            st.draft
+                .exec
+                .as_ref()
+                .and_then(|e| e.default_shell.as_deref()),
+            Some("pwsh")
+        );
+        assert!(st.dirty(FieldId::ExecDefaultShell));
+        assert_eq!(
+            st.display(Some(&c), FieldId::ExecDefaultShell),
+            "pwsh",
+            "草稿值必须盖过 loaded"
+        );
+
+        st.commit_edit(Some(&c), buf("")).unwrap();
+        assert_eq!(
+            st.draft
+                .exec
+                .as_ref()
+                .and_then(|e| e.default_shell.as_deref()),
+            Some("")
+        );
+        assert_eq!(
+            st.display(Some(&c), FieldId::ExecDefaultShell),
+            "自动探测",
+            "空串要显示成它的语义，而不是空白"
+        );
+
+        st.focus = row_index(FieldId::SessionIdleUnloadSecs);
+        st.commit_edit(Some(&c), buf("0")).unwrap();
+        assert_eq!(st.draft.session_idle_unload_secs, Some(0));
+        assert_eq!(
+            st.display(Some(&c), FieldId::SessionIdleUnloadSecs),
+            "0（不卸载）"
+        );
+        st.commit_edit(Some(&c), buf("900")).unwrap();
+        assert_eq!(st.draft.session_idle_unload_secs, Some(900));
+
+        // 非整数照旧拒绝。
+        assert!(st.commit_edit(Some(&c), buf("abc")).is_err());
+        // 反向确认：0 的限制没有被这两条分支互相污染。
+        st.focus = row_index(FieldId::MaxTokens);
+        assert!(
+            st.commit_edit(Some(&c), buf("0")).is_err(),
+            "maxTokens = 0 仍须被拒"
+        );
     }
 
     #[test]

@@ -159,6 +159,146 @@ impl TimelineLostReason {
     }
 }
 
+/// 远端直连目标（`qaqh_client::RemoteEndpoint` 的本仓载体）。
+///
+/// token **只在进程内**：不落盘、不写日志、不进 argv（`--token` 的值在进程表里是同机
+/// 任何进程都能读到的）。要长期复用请走环境变量 `QAQH_REMOTE_TOKEN`。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteTarget {
+    pub base_url: String,
+    pub token: String,
+}
+
+impl RemoteTarget {
+    /// 校验并归一化（去掉尾随 `/`）。
+    ///
+    /// **只放行 `http://`**：daemon 在非回环 bind 上用的是自签证书，而
+    /// `qaqh-client` 的 reqwest 走系统信任链——既没有 fingerprint pinning，也没有
+    /// 跳过校验的开关（`crates/qaqh-client/src/client.rs:228-231`）。所以 https
+    /// 只会得到一次「UnknownIssuer」握手失败，把它挡在输入阶段比让用户对着一个
+    /// 转圈的连接页猜原因要好。等客户端支持 pinning 再放开。
+    pub fn new(base_url: &str, token: &str) -> Result<Self, String> {
+        let base_url = base_url.trim().trim_end_matches('/');
+        if token.trim().is_empty() {
+            return Err("token 不能为空（远端 daemon 只认 Authorization: Bearer）".to_string());
+        }
+        let Some(authority) = base_url.strip_prefix("http://") else {
+            if base_url.starts_with("https://") {
+                return Err(
+                    "暂不支持 https://：daemon 的局域网证书是自签的，客户端没有指纹锚定能力。\
+                     请连 http://<ip>:<port>，或把 daemon 证书装进系统信任库后再用桌面端。"
+                        .to_string(),
+                );
+            }
+            return Err(format!("目标必须以 http:// 开头，收到 {base_url:?}"));
+        };
+        // 拒绝路径/查询/凭证内嵌：`RemoteEndpoint` 直接把 base_url 拼在请求路径前，
+        // 多出来的任何一段都会静默改变实际请求的地址。
+        if authority.contains('/') || authority.contains('?') || authority.contains('#') {
+            return Err(format!(
+                "目标只能含主机与端口，不要带路径/查询：{base_url:?}"
+            ));
+        }
+        if authority.contains('@') {
+            return Err(format!(
+                "目标不得内嵌凭证（token 走 --token）：{base_url:?}"
+            ));
+        }
+        if authority.contains('[') || authority.contains(']') {
+            return Err("暂不支持 IPv6 字面量目标（端口分隔符无法用冒号判定）".to_string());
+        }
+        let Some((host, port)) = authority.rsplit_once(':') else {
+            return Err(format!("目标必须显式带端口：{base_url:?}"));
+        };
+        if host.is_empty() {
+            return Err(format!("目标缺少主机：{base_url:?}"));
+        }
+        let port_number: u16 = port
+            .parse()
+            .map_err(|_| format!("端口不是有效整数：{port:?}"))?;
+        if port_number == 0 {
+            return Err("端口不能是 0".to_string());
+        }
+        Ok(Self {
+            base_url: base_url.to_string(),
+            token: token.trim().to_string(),
+        })
+    }
+
+    /// 界面展示用：token 永不外显。
+    pub fn masked(&self) -> String {
+        format!("{} · ●●●●", self.base_url)
+    }
+}
+
+/// 本客户端连的是谁。`Local` 与 `Remote` 的差异不止是地址：远端**不拉起 daemon**，
+/// 也不读 `daemon.json`，而且凭据不会自刷新（daemon 换 token/端口后必须手工重连）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConnectTarget {
+    Local { launch_daemon_if_missing: bool },
+    Remote(RemoteTarget),
+}
+
+impl ConnectTarget {
+    /// 状态栏与 /remote 页的连接说明行。
+    pub fn describe(&self) -> String {
+        match self {
+            Self::Local {
+                launch_daemon_if_missing: true,
+            } => "本地 daemon（可自动拉起）".to_string(),
+            Self::Local {
+                launch_daemon_if_missing: false,
+            } => "本地 daemon（仅连接已有实例）".to_string(),
+            Self::Remote(target) => format!("远端 {}", target.masked()),
+        }
+    }
+
+    fn remote(&self) -> Option<RemoteTarget> {
+        match self {
+            Self::Remote(target) => Some(target.clone()),
+            Self::Local { .. } => None,
+        }
+    }
+}
+
+/// 解析 `--remote/--token` 与 `QAQH_REMOTE_URL`/`QAQH_REMOTE_TOKEN`（CLI 优先）。
+///
+/// 与后端 `crates/qaqh-client/examples/remote_fs.rs` 用同一对环境变量名，一套脚本
+/// 两端可用。给了 URL 没给 token 一律报错：远端 daemon 只认 Bearer，缺 token 的
+/// 后果是连上就 401，不如在启动参数阶段就说清楚。
+pub fn resolve_remote_target(
+    args: &[String],
+    env_url: Option<&str>,
+    env_token: Option<&str>,
+) -> Result<Option<RemoteTarget>, String> {
+    let flag = |name: &str| -> Option<String> {
+        let mut iter = args.iter();
+        while let Some(arg) = iter.next() {
+            if arg == name {
+                return iter.next().cloned();
+            }
+            if let Some(value) = arg.strip_prefix(&format!("{name}=")) {
+                return Some(value.to_string());
+            }
+        }
+        None
+    };
+    let url = flag("--remote").or_else(|| env_url.map(str::to_string));
+    let token = flag("--token").or_else(|| env_token.map(str::to_string));
+    match (url, token) {
+        (None, None) => Ok(None),
+        (Some(_), None) => Err(
+            "--remote 需要配套凭据：给 --token <T>，或用环境变量 QAQH_REMOTE_TOKEN \
+             （推荐后者，argv 在同机进程表里可读）"
+                .to_string(),
+        ),
+        (None, Some(_)) => {
+            Err("--token 只与 --remote 同用（本地 daemon 的凭据来自 daemon.json）".to_string())
+        }
+        (Some(url), Some(token)) => Ok(Some(RemoteTarget::new(&url, &token)?)),
+    }
+}
+
 /// 生命周期属主。持有当前 `Client`（可在 T-03 手动重连时原地替换）。
 pub struct Runtime {
     /// 当前客户端。**只有测试替身**（[`Runtime::stub_for_test`]）会是 `None`：
@@ -172,7 +312,8 @@ pub struct Runtime {
     rebuilding: AtomicBool,
     /// 每次重建递增；旧订阅者据此退出（防止旧 session 的回调继续投递）。
     generation: AtomicU64,
-    launch_daemon_if_missing: bool,
+    /// 连的是谁（本地 / 远端）。`/remote` 页切换目标时改这里，再据此重建。
+    target: std::sync::Mutex<ConnectTarget>,
     /// 最近一次「有频道连上」的时刻（stall 判据）。
     last_open: Arc<std::sync::Mutex<Instant>>,
     stalled: Arc<AtomicBool>,
@@ -185,10 +326,10 @@ impl Runtime {
     /// 连接 daemon 并启动运行时。失败即返回（调用方决定如何提示）。
     pub async fn start(
         msg_tx: mpsc::UnboundedSender<RuntimeMsg>,
-        launch_daemon_if_missing: bool,
+        target: ConnectTarget,
     ) -> Result<Arc<Self>, ClientError> {
         let last_open = Arc::new(std::sync::Mutex::new(Instant::now()));
-        let client = Self::connect(&msg_tx, &last_open, launch_daemon_if_missing).await?;
+        let client = Self::connect(&msg_tx, &last_open, &target).await?;
 
         let runtime = Arc::new_cyclic(|weak| Self {
             client: RwLock::new(Some(client.clone())),
@@ -196,7 +337,7 @@ impl Runtime {
             tracked: std::sync::Mutex::new(HashSet::new()),
             rebuilding: AtomicBool::new(false),
             generation: AtomicU64::new(0),
-            launch_daemon_if_missing,
+            target: std::sync::Mutex::new(target),
             last_open: last_open.clone(),
             stalled: Arc::new(AtomicBool::new(false)),
             self_arc: weak.clone(),
@@ -219,18 +360,58 @@ impl Runtime {
     async fn connect(
         msg_tx: &mpsc::UnboundedSender<RuntimeMsg>,
         last_open: &Arc<std::sync::Mutex<Instant>>,
-        launch_daemon_if_missing: bool,
+        target: &ConnectTarget,
     ) -> Result<Arc<Client>, ClientError> {
         let handlers = build_handlers(msg_tx.clone(), last_open.clone());
+        let remote = target.remote().map(|t| qaqh_client::RemoteEndpoint {
+            base_url: t.base_url,
+            token: t.token,
+        });
+        // 远端模式下 `launch_daemon_if_missing` 必须为假：`qaqh-client` 在
+        // `remote = Some` 时本就不读 discovery、不判活、不拉起（client.rs:189-239），
+        // 这里显式写死，免得将来那层耦合被改动。
+        let launch_daemon_if_missing = match target {
+            ConnectTarget::Local {
+                launch_daemon_if_missing,
+            } => *launch_daemon_if_missing,
+            ConnectTarget::Remote(_) => false,
+        };
         Client::connect_async(ClientOptions {
             handlers,
             launch_daemon_if_missing,
             daemon_path: None,
             start_timeout: Duration::from_secs(8),
-            remote: None,
+            remote,
         })
         .await
         .map(Arc::new)
+    }
+
+    /// 当前连接目标（`/remote` 页与状态栏读它）。
+    pub fn current_target(&self) -> ConnectTarget {
+        self.target.lock().expect("target lock").clone()
+    }
+
+    /// 切换连接目标并重连（本地 ↔ 远端）。与 [`Runtime::rebuild`] 共用串行闸，
+    /// 并发切目标只会得到两个 Client、两套 SSE 流，所以必须挡。
+    pub async fn reconnect_to(&self, target: ConnectTarget) -> Result<(), String> {
+        if self
+            .rebuilding
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return Err("重连已在进行中".into());
+        }
+        let previous = self.current_target();
+        *self.target.lock().expect("target lock") = target;
+        let result = self.rebuild_inner().await;
+        if result.is_err() {
+            // 连不上就退回**原目标**：否则状态栏会说谎（记着一个没连上的地址），
+            // 而且自动拉起标志会被抹错。
+            *self.target.lock().expect("target lock") = previous;
+        }
+        self.rebuilding.store(false, Ordering::SeqCst);
+        result
     }
 
     /// 当前客户端（`spawn_api` 取用）。重建后拿到的是新实例。
@@ -257,6 +438,20 @@ impl Runtime {
     /// 起的任务照常运行、取用连接时才失败（返回 `Err`），不去碰真 daemon。
     #[cfg(test)]
     pub fn stub_for_test() -> Arc<Self> {
+        Self::stub_with_target(ConnectTarget::Local {
+            launch_daemon_if_missing: false,
+        })
+    }
+
+    /// 测试替身，但**指定连接目标**：`/remote` 页要按「当前是远端」渲染，而替身
+    /// 不会真去连任何东西。
+    #[cfg(test)]
+    pub fn stub_for_test_with_target(target: ConnectTarget) -> Arc<Self> {
+        Self::stub_with_target(target)
+    }
+
+    #[cfg(test)]
+    fn stub_with_target(target: ConnectTarget) -> Arc<Self> {
         let (msg_tx, _rx) = mpsc::unbounded_channel();
         Arc::new_cyclic(|weak| Self {
             client: RwLock::new(None),
@@ -264,7 +459,7 @@ impl Runtime {
             tracked: std::sync::Mutex::new(HashSet::new()),
             rebuilding: AtomicBool::new(false),
             generation: AtomicU64::new(0),
-            launch_daemon_if_missing: false,
+            target: std::sync::Mutex::new(target),
             last_open: Arc::new(std::sync::Mutex::new(Instant::now())),
             stalled: Arc::new(AtomicBool::new(false)),
             self_arc: weak.clone(),
@@ -331,7 +526,9 @@ impl Runtime {
         // 让旧任务先退出，避免两套流短暂并存。
         tokio::time::sleep(Duration::from_millis(80)).await;
 
-        let new = Self::connect(&self.msg_tx, &self.last_open, self.launch_daemon_if_missing)
+        // 目标在锁里取一份快照，连接动作在锁外做（持锁不碰 IO）。
+        let target = self.current_target();
+        let new = Self::connect(&self.msg_tx, &self.last_open, &target)
             .await
             .map_err(|e| e.to_string())?;
 

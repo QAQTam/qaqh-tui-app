@@ -35,6 +35,18 @@ impl App {
         });
     }
 
+    /// 上下文窗口分母：`ConfigDto.context_length`（daemon 本地压缩用的同源分母）。
+    ///
+    /// v2 conversation 投影上的 `context_limit` 已随后端 Info 面板一起删除，这里
+    /// 改吃全局配置——一个 daemon 一份，不在 `SessionState` 上留 per-session 副本
+    /// （副本会引出「忘了刷某个会话」这类不一致）。
+    pub fn context_limit(&self) -> Option<u32> {
+        self.config
+            .as_ref()
+            .map(|c| c.context_length.min(u32::MAX as u64) as u32)
+            .filter(|limit| *limit > 0)
+    }
+
     /// `config.save`：把设置页草稿作为 Merge Patch 发送（只发脏字段）。
     pub(super) fn save_settings(&mut self, st: &mut SettingsState) {
         if self.settings_saving {

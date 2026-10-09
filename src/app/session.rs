@@ -516,18 +516,19 @@ pub struct SessionState {
     pub title: Option<String>,
     pub mode: ConversationMode,
     pub timeline: TimelineModel,
-    /// bootstrap 的 conversation 快照视图（usage/model/context）。
-    /// conversation 频道快照的**类型化**视图（权威类型，本仓不再手解）。
-    ///
-    /// 仅作 `model` / `context_limit` / `usage` 的缓存——快照里其余字段由
-    /// `TimelineModel` 与实时事件承担。
+    /// bootstrap 的 conversation 快照视图（model）。
+    /// conversation 频道快照的**类型化**视图（权威类型，本仓不再手解）；快照里
+    /// 其余字段由 `TimelineModel` 与实时事件承担。
     pub conversation: Option<ConversationState>,
     /// canonical v2 会话状态机：epoch/log/cursor、reset、interaction、driver。
     pub ringing_v2: RingingV2SessionModel,
     pub activity: Option<ActivityState>,
+    /// **最近一次请求**的 provider 真值用量（`AssistantBlockSealed` /
+    /// `TurnFinished` 两条 delta 都带，逐条覆盖）。
     pub usage: Option<UsageInfo>,
+    /// 会话累计用量：`SessionMeta.usage_totals` 随 `session.list` 刷新，是后端
+    /// 唯一的聚合点（本仓不再自己按轮累加，避免与 daemon 口径漂移）。
     pub usage_totals: Option<UsageInfo>,
-    pub context_limit: Option<u32>,
     /// 最近**已结束**回合的 `(turn_id, 信封 ts_ms)`。
     ///
     /// 只服务「输出速率」这一个指标：tok/s 需要一个时长，而两端都必须是权威
@@ -578,7 +579,6 @@ impl SessionState {
             activity: None,
             usage: None,
             usage_totals: None,
-            context_limit: None,
             last_turn_finished: None,
             streaming: None,
             pending_ask: None,
@@ -762,22 +762,26 @@ pub fn activity_from_v2(activity: qaqh_client::ClientV2ActivityState) -> Activit
     }
 }
 
-/// 从 v2 conversation 投影抽出本仓 `conversation` 缓存（只保留 model/usage）。
+/// 从 v2 conversation 投影抽出本仓 `conversation` 缓存（只剩 model），另返回
+/// **最新** assistant block 的单次请求用量。
 ///
-/// v2 投影没有聚合的 `usage_totals` / `context_limit`：model/usage 取**最新**
-/// assistant block 的字段，其余留给实时 `UsageUpdated` 事件补全。
+/// 后端把投影上的 `usage_totals` / `context_limit` 删了（Info 面板时代的遗留视图
+/// 字段，全仓无生产者）。换源口径：累计用量取 `SessionMeta.usage_totals`（后端
+/// 明写的唯一聚合点，随 `session.list` 到达），上下文窗口分母取
+/// `ConfigDto.context_length`（daemon 本地压缩的同源分母）。
 pub fn conversation_cache_from_v2(
     snapshot: &qaqh_client::ClientV2ConversationState,
-) -> ConversationState {
+) -> (ConversationState, Option<UsageInfo>) {
     let mut cache = ConversationState::default();
+    let mut usage = None;
     for entry in snapshot.context.iter().rev() {
         if let qaqh_client::ClientV2ConversationContextKind::AssistantBlock(block) = &entry.kind {
             cache.model = Some(block.model.clone());
-            cache.usage = block.usage.clone();
+            usage = block.usage.clone();
             break;
         }
     }
-    cache
+    (cache, usage)
 }
 
 impl PermissionPanel {

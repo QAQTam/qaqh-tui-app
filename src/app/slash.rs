@@ -48,6 +48,12 @@ pub const SLASH_COMMANDS: &[SlashDef] = &[
         surface: SlashSurface::Workspace,
     },
     SlashDef {
+        name: "remote",
+        desc: "远端与配对",
+        hint: "/remote  直连远端 daemon、查看局域网面并生成手机配对码",
+        surface: SlashSurface::Workspace,
+    },
+    SlashDef {
         name: "history",
         desc: "历史回合",
         hint: "/history  按回合浏览当前会话（可查看/导出单个回合）",
@@ -81,15 +87,21 @@ pub const SLASH_COMMANDS: &[SlashDef] = &[
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SlashCmd {
-    New { cwd: Option<String> },
+    New {
+        cwd: Option<String>,
+    },
     Help,
     Sessions,
     Settings,
+    /// `/remote`：远端 daemon 直连 + 设备配对页。
+    Remote,
     History,
     Subagents,
     Workspace,
     Clear,
-    Export { path: Option<String> },
+    Export {
+        path: Option<String>,
+    },
     Unknown(String),
 }
 
@@ -127,6 +139,7 @@ pub fn parse(input: &str) -> Option<SlashCmd> {
         "help" => Some(SlashCmd::Help),
         "sessions" => Some(SlashCmd::Sessions),
         "settings" => Some(SlashCmd::Settings),
+        "remote" => Some(SlashCmd::Remote),
         "history" => Some(SlashCmd::History),
         "subagents" => Some(SlashCmd::Subagents),
         "workspace" => Some(SlashCmd::Workspace),

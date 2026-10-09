@@ -12,6 +12,7 @@ use ratatui::widgets::{Block, Clear, Paragraph, Wrap};
 use std::ops::Range;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
+use crate::app::remote::{RemoteField, RemoteState};
 use crate::app::render_line::edit_window;
 use crate::app::settings::{FieldKind, ROWS, SettingsState};
 use crate::app::{App, Overlay, WorkspaceHit};
@@ -49,6 +50,7 @@ pub fn draw(
         // 设置不再走全屏 Workspace：Overlay::Settings 在 terminal::agent::draw
         // 里被拦截成居中卡片（draw_settings_card），不会进入这里。
         WorkspaceRoute::Settings => {}
+        WorkspaceRoute::Remote => draw_remote(f, app, body, theme),
         WorkspaceRoute::Help => draw_help(f, body, theme),
         WorkspaceRoute::History {
             selected,
@@ -133,6 +135,7 @@ fn header_line(route: &WorkspaceRoute, app: &App, theme: &Theme) -> Line<'static
             },
         ),
         WorkspaceRoute::Settings => ("Settings", "daemon 配置".to_owned()),
+        WorkspaceRoute::Remote => ("Remote", "远端 daemon 与设备配对".to_owned()),
         WorkspaceRoute::Help => ("Help", "按键与斜杠命令".to_owned()),
         WorkspaceRoute::History {
             selected, detail, ..
@@ -202,6 +205,9 @@ fn footer_line(route: &WorkspaceRoute, theme: &Theme, back: ButtonVisual) -> Lin
             "↑↓ 选择 · Enter 打开 · n 新建 · x 归档 · u 恢复 · D 删除 · a 归档显示 · r 刷新"
         }
         WorkspaceRoute::Settings => "↑↓ 选择 · Enter 编辑/应用 · ←→ 切换 · s 保存 · r 刷新",
+        WorkspaceRoute::Remote => {
+            "Tab 切字段 · Enter 编辑/执行 · 1 连接 2 配对 · r 刷新设备 · x 吊销 · Esc 关闭"
+        }
         WorkspaceRoute::Help => "返回 Agent View",
         WorkspaceRoute::History { detail, .. } => {
             if *detail {
@@ -759,6 +765,270 @@ fn settings_value(
         }
     };
     (if dirty { format!("{value} *") } else { value }, style)
+}
+
+/// `/remote` 页：面板 0 = 直连目标；面板 1 = 局域网快照 + 配对码 + 设备表。
+///
+/// 只画状态、不做任何 IO：所有动作（连接 / 签发 / 拉列表）都在 `remote_ops` 里，
+/// 倒计时由 tick 写进 `RemoteState::ticket_countdown`，这里只读。
+fn draw_remote(f: &mut Frame, app: &App, area: Rect, theme: &Theme) {
+    let Some(Overlay::Remote(st)) = app.overlays.last() else {
+        return;
+    };
+    let width = usize::from(area.width).saturating_sub(2);
+    let dim = Style::new().fg(theme.text.dim);
+    let secondary = Style::new().fg(theme.text.secondary);
+    let mut lines: Vec<Line<'static>> = Vec::new();
+
+    lines.push(Line::from(Span::styled(
+        format!(" 当前连接：{}", app.runtime.current_target().describe()),
+        secondary,
+    )));
+    lines.push(Line::from(Span::styled(
+        format!(
+            " 面板 {}：{}",
+            st.panel + 1,
+            if st.panel == 0 {
+                "直连远端 daemon"
+            } else {
+                "局域网与设备配对"
+            }
+        ),
+        dim,
+    )));
+    lines.push(Line::default());
+
+    if st.panel == 0 {
+        lines.push(remote_row(
+            RemoteField::BaseUrl,
+            st,
+            "目标",
+            if st.draft_url.is_empty() {
+                "http://<ip>:<port>"
+            } else {
+                &st.draft_url
+            },
+            theme,
+        ));
+        lines.push(remote_row(
+            RemoteField::Token,
+            st,
+            "token",
+            if st.draft_token.is_empty() {
+                "（Enter 输入；不回显、不落盘）"
+            } else {
+                "●●●●"
+            },
+            theme,
+        ));
+        lines.push(remote_row(RemoteField::Connect, st, "连接", "", theme));
+        lines.push(remote_row(RemoteField::GoLocal, st, "回到本地", "", theme));
+        lines.push(Line::from(Span::styled(
+            " 只支持 http://：daemon 的局域网证书是自签的，客户端没有指纹锚定能力。",
+            dim,
+        )));
+    } else {
+        match st.lan.as_ref() {
+            None => lines.push(Line::from(Span::styled(
+                " 读不到 daemon.json（本机没有在跑的 daemon？）",
+                Style::new().fg(theme.accent.error),
+            ))),
+            Some(lan) => {
+                lines.push(Line::from(Span::styled(
+                    format!(" {:<12}{}", "回环面", lan.endpoint),
+                    dim,
+                )));
+                lines.push(Line::from(Span::styled(
+                    format!(
+                        " {:<12}{}",
+                        "局域网面",
+                        lan.lan_endpoint.as_deref().unwrap_or("未开启")
+                    ),
+                    secondary,
+                )));
+                lines.push(Line::from(Span::styled(
+                    format!(
+                        " {:<12}{} · daemon {} · pid {}",
+                        "证书指纹",
+                        short_fingerprint(lan.tls_fingerprint.as_deref()),
+                        lan.daemon_version,
+                        lan.pid
+                    ),
+                    dim,
+                )));
+                lines.push(Line::default());
+            }
+        }
+        lines.push(remote_row(
+            RemoteField::DeviceName,
+            st,
+            "设备名",
+            if st.device_name.is_empty() {
+                "（给手机起个名）"
+            } else {
+                &st.device_name
+            },
+            theme,
+        ));
+        lines.push(remote_row(
+            RemoteField::Scope,
+            st,
+            "档位 ←→",
+            crate::app::remote_ops::PAIR_SCOPE_LABELS
+                .get(st.scope_index)
+                .copied()
+                .unwrap_or(""),
+            theme,
+        ));
+        lines.push(remote_row(RemoteField::Issue, st, "生成配对码", "", theme));
+        lines.push(remote_row(
+            RemoteField::RefreshDevices,
+            st,
+            "设备 (r)",
+            &format!("{}", st.devices.len()),
+            theme,
+        ));
+
+        if let Some(ticket) = st.ticket.as_ref() {
+            lines.push(Line::default());
+            lines.push(Line::from(Span::styled(
+                format!(
+                    " 配对码 · {} · 档位 {} · {} 秒后过期",
+                    ticket.device_name,
+                    ticket.scope,
+                    st.ticket_countdown.unwrap_or(0)
+                ),
+                Style::new().fg(theme.accent.success),
+            )));
+            match crate::app::qr::render_semiblocks(&ticket.payload, width) {
+                Ok(qr) => {
+                    for row in qr {
+                        lines.push(Line::from(Span::styled(
+                            format!("  {row}"),
+                            Style::default(),
+                        )));
+                    }
+                }
+                Err(error) => {
+                    lines.push(Line::from(Span::styled(
+                        format!(" {error}"),
+                        Style::new().fg(theme.accent.error),
+                    )));
+                    // 画不出码不等于没签发：把载荷本身给出来，用户可以另处生成。
+                    lines.push(Line::from(Span::styled(
+                        format!(" 载荷：{}", ticket.payload),
+                        dim,
+                    )));
+                }
+            }
+        }
+
+        lines.push(Line::default());
+        if st.devices.is_empty() {
+            lines.push(Line::from(Span::styled(" 暂无已配对设备", dim)));
+        } else {
+            for (index, device) in st.devices.iter().enumerate() {
+                let mark = if index == st.device_sel { "▸ " } else { "  " };
+                lines.push(Line::from(Span::styled(
+                    format!(
+                        "  {mark}{:<20}{:<9}{:<9}{}",
+                        clip_width(&device.name, 20),
+                        device.platform,
+                        device.scope,
+                        device.device_id
+                    ),
+                    secondary,
+                )));
+            }
+            if let Some(armed) = st.revoke_armed.as_ref() {
+                lines.push(Line::from(Span::styled(
+                    format!(" 再按一次 x 确认吊销 {armed}"),
+                    Style::new().fg(theme.semantic.warning),
+                )));
+            }
+        }
+    }
+
+    if let Some(status) = st.status.as_ref() {
+        lines.push(Line::default());
+        lines.push(Line::from(Span::styled(
+            format!(" {status}"),
+            if st.status_is_error {
+                Style::new().fg(theme.accent.error)
+            } else {
+                dim
+            },
+        )));
+    }
+    if st.busy {
+        lines.push(Line::from(Span::styled(" 处理中…", dim)));
+    }
+
+    f.render_widget(Paragraph::new(lines).scroll((st.scroll as u16, 0)), area);
+}
+
+/// `/remote` 页的一行：`▸` 聚焦、`✎` 编辑中（编辑态显示缓冲而不是终值）。
+fn remote_row(
+    field: RemoteField,
+    st: &RemoteState,
+    name: &str,
+    value: &str,
+    theme: &Theme,
+) -> Line<'static> {
+    let editing = st.editing == Some(field);
+    let focused = !editing && st.focus() == field;
+    let marker = if editing {
+        "✎ "
+    } else if focused {
+        "▸ "
+    } else {
+        "  "
+    };
+    let shown = if editing {
+        edit_window(&st.buffer, st.cursor, 48).0
+    } else {
+        value.to_string()
+    };
+    Line::from(vec![
+        Span::styled(
+            marker,
+            Style::new().fg(if focused || editing {
+                theme.accent.user
+            } else {
+                theme.text.dim
+            }),
+        ),
+        Span::styled(format!("{name:<14}"), Style::new().fg(theme.text.secondary)),
+        Span::styled(shown, Style::new().fg(theme.text.primary)),
+    ])
+}
+
+/// 指纹只给短形式：全屏十六进制会把页面挤成一堵墙，全值在设备详情里另有出处。
+fn short_fingerprint(raw: Option<&str>) -> String {
+    match raw {
+        None => "无".to_string(),
+        Some("") => "无".to_string(),
+        Some(fp) => {
+            let body = fp.strip_prefix("sha256:").unwrap_or(fp);
+            format!("sha256:{}…", body.chars().take(8).collect::<String>())
+        }
+    }
+}
+
+/// 按显示宽度截断（设备名是用户自己起的，可能是中文）。
+fn clip_width(text: &str, columns: usize) -> String {
+    let mut out = String::new();
+    let mut used = 0usize;
+    for ch in text.chars() {
+        let w = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if used + w > columns.saturating_sub(1) {
+            out.push('…');
+            break;
+        }
+        out.push(ch);
+        used += w;
+    }
+    out
 }
 
 fn draw_help(f: &mut Frame, area: Rect, theme: &Theme) {

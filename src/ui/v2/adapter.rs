@@ -6,7 +6,9 @@
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
-use crate::app::timeline_model::{Block, CompactionMark, LineStats, TimelineModel, ToolCard, Turn};
+use crate::app::timeline_model::{
+    Block, CompactionMark, InFlightCompact, LineStats, TimelineModel, ToolCard, Turn,
+};
 use crate::ui::v2::transcript::{
     BlockId, BlockKind, BlockState, TODO_TOOL_NAME, TodoBlock, ToolBlock, ToolHeader, ToolState,
     ToolStreams, TranscriptBlock,
@@ -25,7 +27,8 @@ pub fn from_turns_with_expanded(
     from_turns_with_expanded_blocks(turns, expanded_tools, &HashSet::new())
 }
 
-/// 从**整个模型**取块：除回合内容外还要带上无损的窗口外状态（压缩分隔锚）。
+/// 从**整个模型**取块：除回合内容外还要带上无损的窗口外状态（压缩分隔锚）与
+/// 正在进行的压缩卡。
 ///
 /// 这是渲染路径的入口：`from_turns_*` 只看 `turns`，看不到
 /// `compaction_marks`，用它渲染会静默丢掉「此前已压缩」这条事实。
@@ -35,7 +38,55 @@ pub fn from_model_with_expanded_blocks(
     expanded_thinking: &HashSet<String>,
 ) -> Vec<TranscriptBlock> {
     let blocks = from_turns_with_expanded_blocks(&model.turns, expanded_tools, expanded_thinking);
-    splice_compaction_marks(blocks, &model.turns, &model.compaction_marks)
+    let blocks = splice_compaction_marks(blocks, &model.turns, &model.compaction_marks);
+    append_in_flight_compact(blocks, model.in_flight_compact.as_ref())
+}
+
+/// 把「正在压缩上下文」的卡接在 transcript **末尾**（正在发生的事在最下面）。
+///
+/// 与分隔条同款，用 `BlockKind::System` 承载，不新增块类型。`revision` 取摘要
+/// 字数：文本一长块键就变，全屏块缓存（`(block_id, revision)`）才会重画这张卡。
+fn append_in_flight_compact(
+    mut blocks: Vec<TranscriptBlock>,
+    card: Option<&InFlightCompact>,
+) -> Vec<TranscriptBlock> {
+    let Some(card) = card else {
+        return blocks;
+    };
+    let mut text = format!(
+        "正在压缩上下文 · 保留 {}/{} 回合",
+        card.turns_keeping, card.turns_total
+    );
+    let preview = compact_preview(&card.summary);
+    if !preview.is_empty() {
+        text.push('\n');
+        text.push_str(&preview);
+    }
+    blocks.push(TranscriptBlock {
+        id: BlockId::new(format!("compaction:{}:live", card.compact_id)),
+        turn_id: String::new(),
+        revision: card.summary.chars().count() as u64,
+        state: BlockState::Live,
+        kind: BlockKind::System { text },
+        at_ms: None,
+    });
+    blocks
+}
+
+/// 摘要预览：只取**尾部** `COMPACT_PREVIEW_CHARS` 个字符。
+///
+/// 流式压缩的新内容总在末尾，头部对「压到哪了」没有信息量；不限高的 live 卡会
+/// 把真实对话顶出屏幕，所以这里给死预算。
+fn compact_preview(summary: &str) -> String {
+    const BUDGET: usize = 220;
+    let chars: Vec<char> = summary.chars().collect();
+    let tail = chars.len().saturating_sub(BUDGET);
+    let mut out = String::with_capacity(chars.len().min(BUDGET) + 1);
+    if tail > 0 {
+        out.push('…');
+    }
+    out.extend(&chars[tail..]);
+    out
 }
 
 /// 把压缩分隔条插进块序列。
@@ -1194,6 +1245,71 @@ mod tests {
             panic!("divider missing");
         };
         assert!(text.contains("此前已压缩"), "{text}");
+    }
+
+    /// 「正在压缩」的 live 卡接在块序列**末尾**：表头给保留回合数，正文给摘要尾部；
+    /// 摘要增长会改块 `revision`——全屏块缓存的键是 `(block_id, revision)`，键不变
+    /// 这张卡就永远画的是第一帧。
+    #[test]
+    fn in_flight_compact_appends_a_live_card_at_the_tail() {
+        let mut model = TimelineModel::default();
+        model.turns = vec![turn(vec![block(
+            "a",
+            TimelineBlockKind::Text,
+            TimelineBlockState::Sealed,
+            "one",
+        )])];
+        model.begin_compact("c1".into(), 12, 3);
+
+        let blocks = tail_blocks(&model);
+        let last = blocks.last().expect("末尾挂着压缩卡");
+        assert_eq!(last.id.to_string(), "compaction:c1:live");
+        assert_eq!(last.state, BlockState::Live);
+        let text = tail_system_text(&model);
+        assert!(text.contains("保留 3/12 回合"), "{text}");
+        // 摘要还没开始：只有表头，不留空行。
+        assert!(!text.contains('\n'), "{text}");
+        assert_eq!(last.revision, 0);
+
+        // 摘要流式增长 → 文本进卡，`revision` 跟着字数走。
+        model.update_compact("c1", "摘要 abc".into());
+        let text = tail_system_text(&model);
+        assert!(text.contains("摘要 abc"), "{text}");
+        assert_eq!(tail_blocks(&model).last().unwrap().revision, 6);
+
+        // 超过预算只留**尾部**：头部对「压到哪了」没有信息量，一整段摘要会把真实
+        // 对话整个顶出屏幕。
+        model.update_compact("c1", format!("{}尾", "头".repeat(300)));
+        let text = tail_system_text(&model);
+        let preview = text.split_once('\n').expect("表头 + 摘要两行").1;
+        assert!(
+            preview.starts_with('…') && preview.ends_with('尾'),
+            "{preview}"
+        );
+        assert_eq!(preview.chars().count(), 221, "省略号 + 220 字预算");
+
+        // 收卡后卡不再出现。
+        model.finish_compact("c1");
+        assert!(
+            !tail_blocks(&model)
+                .iter()
+                .any(|b| b.id.to_string().ends_with(":live")),
+            "终态之后不得残留 live 卡"
+        );
+    }
+
+    /// 渲染入口取出的块序列（子代理预览那条 turns-only 路径不算）。
+    fn tail_blocks(model: &TimelineModel) -> Vec<TranscriptBlock> {
+        let empty = HashSet::new();
+        from_model_with_expanded_blocks(model, &empty, &empty)
+    }
+
+    /// 末块（压缩卡恒在末尾）的 `System` 文本。
+    fn tail_system_text(model: &TimelineModel) -> String {
+        match &tail_blocks(model).last().expect("末块存在").kind {
+            BlockKind::System { text } => text.clone(),
+            other => panic!("压缩卡必须用 System 块承载：{other:?}"),
+        }
     }
 
     /// display 契约的 exec 卡：头部是 Shell 命令、正文是 `\r` 归一后的输出，
