@@ -3,7 +3,7 @@ name = "qaqh-tui"
 version = "2.0.0-beta.2"
 edition = "2024"
 description = "Terminal UI client for the QAQ-Harness daemon (Ringing v2)"
-license = "MIT"
+license = "MIT OR Apache-2.0"
 
 [[bin]]
 name = "qaqh-tui"
