@@ -54,6 +54,12 @@ pub const SLASH_COMMANDS: &[SlashDef] = &[
         surface: SlashSurface::Workspace,
     },
     SlashDef {
+        name: "account",
+        desc: "账号登录",
+        hint: "/account  登录 ChatGPT 套餐或 DeepSeek 账号（凭据来源为账号档时可用）",
+        surface: SlashSurface::Workspace,
+    },
+    SlashDef {
         name: "history",
         desc: "历史回合",
         hint: "/history  按回合浏览当前会话（可查看/导出单个回合）",
@@ -93,6 +99,8 @@ pub enum SlashCmd {
     Help,
     Sessions,
     Settings,
+    /// `/account`：账号登录面板（ChatGPT 套餐 / DeepSeek 账号）。
+    Account,
     /// `/remote`：远端 daemon 直连 + 设备配对页。
     Remote,
     History,
@@ -139,6 +147,7 @@ pub fn parse(input: &str) -> Option<SlashCmd> {
         "help" => Some(SlashCmd::Help),
         "sessions" => Some(SlashCmd::Sessions),
         "settings" => Some(SlashCmd::Settings),
+        "account" => Some(SlashCmd::Account),
         "remote" => Some(SlashCmd::Remote),
         "history" => Some(SlashCmd::History),
         "subagents" => Some(SlashCmd::Subagents),

@@ -140,6 +140,27 @@ impl App {
                 self.open_remote();
                 true
             }
+            SlashCmd::Account => {
+                if let Some(sess) = self.active_session_mut() {
+                    sess.composer.clear();
+                }
+                self.slash_selected = 0;
+                // 口令入口按**当前生效的凭据来源**选档；BYOK 档明说没有登录这件事。
+                let credential = self
+                    .config
+                    .as_ref()
+                    .map(|c| c.credential.clone())
+                    .unwrap_or_default();
+                match crate::app::account::AccountKind::from_credential(&credential) {
+                    Some(kind) => self.open_account(kind),
+                    None => self.toast(
+                        NoticeLevel::Info,
+                        "当前凭据来源是 api_key（BYOK），无需登录；在设置页把凭据来源切到账号档"
+                            .to_string(),
+                    ),
+                }
+                true
+            }
             SlashCmd::History => {
                 if let Some(sess) = self.active_session_mut() {
                     sess.composer.clear();

@@ -221,6 +221,15 @@ fn from_block(turn_id: &str, turn_sealed: bool, block: &Block) -> Option<Transcr
     };
     let kind = match block.kind {
         TimelineBlockKind::Reasoning => {
+            // 加密思考（`encrypted_content`）与被安全策略抹除的思考是**协议状态**，
+            // 不是用户内容：`ReasoningKind::is_displayable()` 明说不该展示。整块丢弃
+            // 而不是画个空壳——空壳会让用户以为「模型什么都没想」。
+            if block
+                .reasoning_kind
+                .is_some_and(|kind| !kind.is_displayable())
+            {
+                return None;
+            }
             if block.text.is_empty() && state == BlockState::Sealed {
                 return None;
             }
@@ -228,6 +237,7 @@ fn from_block(turn_id: &str, turn_sealed: bool, block: &Block) -> Option<Transcr
                 text: block.text.clone(),
                 duration: None,
                 expanded: false,
+                kind: block.reasoning_kind,
             }
         }
         TimelineBlockKind::Text => BlockKind::Assistant {
@@ -980,6 +990,7 @@ mod tests {
             state,
             text: text.to_string(),
             tool: None,
+            reasoning_kind: None,
             last_fragment: 0,
             rev: 7,
         }
@@ -1057,6 +1068,56 @@ mod tests {
             "",
         )]));
         assert_eq!(blocks.len(), 1, "only user block remains");
+    }
+
+    /// `reasoning_kind` 的显示规则：加密/被抹除的思考**不进** view model，
+    /// 摘要则透传（渲染层据此在头部标注「摘要」）。
+    #[test]
+    fn non_displayable_reasoning_is_dropped_and_summary_passes_through() {
+        use qaqh_client::ReasoningKind;
+
+        let mut encrypted = block(
+            "r1",
+            TimelineBlockKind::Reasoning,
+            TimelineBlockState::Sealed,
+            "opaque",
+        );
+        encrypted.reasoning_kind = Some(ReasoningKind::Encrypted);
+        assert!(
+            from_block("t1", false, &encrypted).is_none(),
+            "加密思考是必须逐字回放的协议状态，不是给用户看的正文"
+        );
+
+        let mut redacted = block(
+            "r2",
+            TimelineBlockKind::Reasoning,
+            TimelineBlockState::Sealed,
+            "x",
+        );
+        redacted.reasoning_kind = Some(ReasoningKind::Redacted);
+        assert!(
+            from_block("t1", false, &redacted).is_none(),
+            "被安全策略抹除的思考不该画成空壳"
+        );
+
+        let mut summary = block(
+            "r3",
+            TimelineBlockKind::Reasoning,
+            TimelineBlockState::Open,
+            "服务端摘要",
+        );
+        summary.reasoning_kind = Some(ReasoningKind::Summary);
+        let projected = from_block("t1", false, &summary).expect("摘要可展示");
+        assert!(
+            matches!(
+                projected.kind,
+                BlockKind::Thinking {
+                    kind: Some(ReasoningKind::Summary),
+                    ..
+                }
+            ),
+            "摘要必须带类别到达渲染层，否则会被冒充成完整思考"
+        );
     }
 
     #[test]

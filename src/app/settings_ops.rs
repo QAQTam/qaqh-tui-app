@@ -19,13 +19,91 @@ impl App {
                 st.editing = st.start_edit(self.config.as_ref());
             }
             settings::FieldKind::Enum | settings::FieldKind::Toggle => {
-                if let Err(error) = st.cycle(self.config.as_ref(), 1) {
-                    self.toast(NoticeLevel::Error, error);
-                }
+                // 与键盘路径共用同一入口：换档后该重取的东西必须一起重取。
+                self.settings_cycle(&mut st, 1);
             }
             settings::FieldKind::Port => self.settings_port_activate(&mut st),
         }
         self.replace_overlay(Overlay::Settings(st));
+    }
+
+    /// 设置页字段循环的**唯一入口**（键盘 ←→/Enter 与鼠标共用）。
+    ///
+    /// 除了 `cycle` 本身，它还负责一件「跨档副作用」：凭据来源换档后，账号面
+    /// 状态与模型目录必须重取（品牌口径：切账户后必须重取模型目录；换档同理）。
+    /// 散落在各按键分支里就一定会漏一条路径。
+    pub(super) fn settings_cycle(&mut self, st: &mut SettingsState, delta: i32) {
+        let before = st.effective_credential(self.config.as_ref());
+        if let Err(error) = st.cycle(self.config.as_ref(), delta) {
+            self.toast(NoticeLevel::Error, error);
+            return;
+        }
+        let after = st.effective_credential(self.config.as_ref());
+        if before == after {
+            return;
+        }
+        if let Some(kind) = account::AccountKind::from_credential(&after) {
+            self.refresh_account(kind);
+        }
+        self.refresh_settings_account_summary();
+    }
+
+    /// 把账号快照写回设置页的「账号登录」行与模型候选（没有设置页时什么都不做）。
+    pub(super) fn refresh_settings_account_summary(&mut self) {
+        let credential = self
+            .overlays
+            .iter()
+            .rev()
+            .find_map(|overlay| match overlay {
+                Overlay::Settings(st) => Some(st.effective_credential(self.config.as_ref())),
+                _ => None,
+            });
+        let Some(credential) = credential else {
+            return;
+        };
+        let kind = account::AccountKind::from_credential(&credential);
+        let summary = kind
+            .map(|kind| self.account.summary(kind))
+            .unwrap_or_default();
+        let models = kind
+            .map(|kind| self.account.models_for(kind).to_vec())
+            .unwrap_or_default();
+        for overlay in self.overlays.iter_mut() {
+            if let Overlay::Settings(st) = overlay {
+                st.account_summary = summary.clone();
+                st.model_options = models.clone();
+            }
+        }
+    }
+
+    /// `config.load` 落地后的补课：设置页先打开、配置后到的那条路径。
+    ///
+    /// 只在这两个面板之一开着时才去取账号状态——否则每次配置刷新都顺手打三个
+    /// 网络请求，而用户根本没在看账号。
+    pub(super) fn after_config_loaded(&mut self) {
+        self.refresh_settings_account_summary();
+        let credential = self
+            .config
+            .as_ref()
+            .map(|c| c.credential.clone())
+            .unwrap_or_default();
+        let Some(kind) = account::AccountKind::from_credential(&credential) else {
+            return;
+        };
+        let watching = matches!(
+            self.overlays.last(),
+            Some(Overlay::Settings(_)) | Some(Overlay::Account(_))
+        );
+        if !watching {
+            return;
+        }
+        let missing = match kind {
+            account::AccountKind::ChatGptPlan => self.account.siwc.is_none(),
+            account::AccountKind::DeepSeekAccount => self.account.ds.is_none(),
+        };
+        if missing {
+            self.refresh_account(kind);
+        }
     }
 
     pub fn fetch_config(&mut self) {
@@ -86,6 +164,18 @@ impl App {
                     .or_else(|| self.config.as_ref().map(|c| c.active_profile.clone()));
                 if let Some(name) = name {
                     self.apply_profile(name);
+                }
+            }
+            settings::FieldId::Account => {
+                // 入口只对账号档有意义：BYOK 档没有登录这件事，说清楚而不是开一个空面板。
+                match account::AccountKind::from_credential(
+                    &st.effective_credential(self.config.as_ref()),
+                ) {
+                    Some(kind) => self.open_account(kind),
+                    None => self.toast(
+                        NoticeLevel::Info,
+                        "当前凭据来源是 api_key（BYOK），无需登录".to_string(),
+                    ),
                 }
             }
             _ => {}
@@ -151,6 +241,17 @@ impl App {
             }
             self.overlays
                 .push(Overlay::Settings(SettingsState::default()));
+            self.refresh_settings_account_summary();
+            // 账号档：打开设置页就顺手把状态/目录刷一次（本地 daemon，代价可忽略）。
+            // 没有这一下，「账号登录」行会一直停在「回车打开账号面板」直到用户点进去。
+            let credential = self
+                .config
+                .as_ref()
+                .map(|c| c.credential.clone())
+                .unwrap_or_default();
+            if let Some(kind) = account::AccountKind::from_credential(&credential) {
+                self.refresh_account(kind);
+            }
         }
     }
 }

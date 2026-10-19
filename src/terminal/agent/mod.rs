@@ -831,6 +831,7 @@ fn handle_workspace_scroll(app: &mut App, route: &route::WorkspaceRoute, up: boo
         }
         // 设置卡片：滚轮直接滚视口（内容在卡片里，会话视口没有意义）。
         route::WorkspaceRoute::Settings => app.settings_scroll(up, 3),
+        route::WorkspaceRoute::Account => app.account_scroll(up, 3),
         route::WorkspaceRoute::History { detail: true, .. } => {
             app.workspace_scroll_view(up, 3);
         }
@@ -1047,6 +1048,12 @@ fn draw(
             hit_map.set_suspended(false);
             dim_screen(frame, area, theme);
             workspace::draw_settings_card(frame, app, area, theme, hit_map);
+        }
+        ScreenRoute::Workspace(route::WorkspaceRoute::Account) => {
+            draw_fullscreen_agent(frame, app, theme, fullscreen_view, hit_map.suspended());
+            hit_map.set_suspended(false);
+            dim_screen(frame, area, theme);
+            workspace::draw_account_card(frame, app, area, theme);
         }
         ScreenRoute::Workspace(workspace_route) => {
             clear_screen(frame, theme);
@@ -1975,6 +1982,7 @@ mod tests {
                     state: TimelineBlockState::Sealed,
                     text: "answer".to_string(),
                     tool: None,
+                    reasoning_kind: None,
                 },
             },
         ));
@@ -2001,6 +2009,7 @@ mod tests {
                     state: TimelineBlockState::Sealed,
                     text: "first thought\nsecond thought".to_string(),
                     tool: None,
+                    reasoning_kind: None,
                 },
             },
         ));
@@ -2034,6 +2043,7 @@ mod tests {
                     kind: TimelineBlockKind::Tool,
                     state: TimelineBlockState::Sealed,
                     text: String::new(),
+                    reasoning_kind: None,
                     tool: Some(qaqh_client::TimelineTool {
                         exit_code: None,
                         completed_at_ms: None,
@@ -2070,6 +2080,7 @@ mod tests {
                     kind: TimelineBlockKind::Tool,
                     state: TimelineBlockState::Sealed,
                     text: String::new(),
+                    reasoning_kind: None,
                     tool: Some(qaqh_client::TimelineTool {
                         exit_code: None,
                         completed_at_ms: None,
@@ -2158,6 +2169,7 @@ mod tests {
                         kind: TimelineBlockKind::Tool,
                         state: TimelineBlockState::Sealed,
                         text: String::new(),
+                        reasoning_kind: None,
                         tool: Some(qaqh_client::TimelineTool {
                             exit_code: None,
                             completed_at_ms: None,
@@ -2692,6 +2704,7 @@ mod tests {
                         state: TimelineBlockState::Sealed,
                         text: format!("answer-{index}"),
                         tool: None,
+                        reasoning_kind: None,
                     },
                 },
             ));

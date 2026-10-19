@@ -12,6 +12,9 @@ pub enum WorkspaceRoute {
         show_archived: bool,
     },
     Settings,
+    /// 账号登录卡片（`Overlay::Account`）：与设置页同款居中浮层，
+    /// 但状态来自 `siwc.*` / `dsaccount.*` 服务面而不是 `config.load`。
+    Account,
     /// `/remote`：远端直连 + 设备配对页。
     Remote,
     Help,
@@ -77,6 +80,7 @@ pub fn resolve(app: &App) -> ScreenRoute {
                 });
             }
             Overlay::Settings(_) => return ScreenRoute::Workspace(WorkspaceRoute::Settings),
+            Overlay::Account(_) => return ScreenRoute::Workspace(WorkspaceRoute::Account),
             Overlay::Remote(_) => return ScreenRoute::Workspace(WorkspaceRoute::Remote),
             Overlay::Help => return ScreenRoute::Workspace(WorkspaceRoute::Help),
             Overlay::History {
@@ -275,5 +279,21 @@ mod tests {
     fn empty_state_stays_in_agent_view() {
         let (app, _rx) = App::new_for_test();
         assert_eq!(resolve(&app), ScreenRoute::Agent);
+    }
+
+    /// 账号面板是**全局** overlay（登录属于 daemon 身份，不绑定会话），
+    /// 路由必须把它送到自己的卡片，而不是落到设置页或 Agent 视图。
+    #[test]
+    fn account_overlay_gets_its_own_card_route() {
+        let (mut app, _rx) = App::new_for_test();
+        app.overlays
+            .push(Overlay::Account(crate::app::account::AccountState::new(
+                crate::app::account::AccountKind::DeepSeekAccount,
+            )));
+        assert_eq!(
+            resolve(&app),
+            ScreenRoute::Workspace(WorkspaceRoute::Account)
+        );
+        assert_eq!(app.overlays[0].bound_session_id(), None);
     }
 }

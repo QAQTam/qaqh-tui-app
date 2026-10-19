@@ -21,6 +21,9 @@ qaqh-client = { path = "../qaqh-backend/crates/qaqh-client" }
 # 取舍：直接吃权威类型，本仓不再手工镜像（阶段二 config 切片，T-11）。
 # 该 crate 只依赖 serde，不牵入 runtime/daemon 构建。
 qaqh-config-api = { path = "../qaqh-backend/crates/qaqh-config-api" }
+# 权威值类型（`Wire` / `CredentialSource` / `ReasoningKind`）从 `qaqh_client`
+# 出口取用（2026-10-19 后端 R4 落地：`crates/qaqh-client/src/lib.rs` 的
+# `pub use qaqh_types::{..}`），本仓不再直接 path 依赖 `qaqh-types`。
 ratatui = "0.30"
 crossterm = { version = "0.29", features = ["event-stream"] }
 tokio = { version = "1", features = [

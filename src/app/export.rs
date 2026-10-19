@@ -292,6 +292,7 @@ mod tests {
             state: TimelineBlockState::Sealed,
             text: text.into(),
             tool: None,
+            reasoning_kind: None,
             last_fragment: 0,
             rev: 1,
         }
@@ -305,6 +306,7 @@ mod tests {
             state: TimelineBlockState::Sealed,
             text: String::new(),
             tool: Some(tool),
+            reasoning_kind: None,
             last_fragment: 0,
             rev: 1,
         }

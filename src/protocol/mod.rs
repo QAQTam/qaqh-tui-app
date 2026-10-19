@@ -278,12 +278,26 @@ mod tests {
         };
         wire.validate().expect("anthropic 是合法 wire");
         assert_eq!(serde_json::to_value(&wire).unwrap()["wire"], "anthropic");
-        for bogus in ["openai-chat", "", "responses "] {
+        // 2026-10-19 后端 R3：写侧也收**规范名**（`chat` / `messages`），且判定前
+        // 先 trim。于是旧反例 `"responses "` 现在合法（折回 responses）——反例换成
+        // 真正无法归一化的拼写，免得这条闸门变成「测一个已经不存在的行为」。
+        for bogus in ["openai-chat", "", "gpt-5"] {
             let rejected = ConfigPatch {
                 wire: Some(bogus.into()),
                 ..Default::default()
             };
             assert!(rejected.validate().is_err(), "wire {bogus:?} 必须被拒");
+        }
+        // 规范名与旧名都收：本仓设置页照旧只写旧拼写（`settings::WIRE_PROTOCOLS`），
+        // 归一留在读侧（`settings::wire_daemon_spelling`）——那条归一在 R3 之后
+        // 是幂等的，不是遗留。
+        for canonical in ["chat", "responses", "messages", "gemini"] {
+            ConfigPatch {
+                wire: Some(canonical.into()),
+                ..Default::default()
+            }
+            .validate()
+            .unwrap_or_else(|e| panic!("规范名 {canonical} 必须被接受：{e}"));
         }
         assert!(
             ConfigPatch {

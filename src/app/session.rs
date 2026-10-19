@@ -784,6 +784,52 @@ pub fn conversation_cache_from_v2(
     (cache, usage)
 }
 
+/// 把一帧**流中 usage 采样**（`TimelineEvent::UsageSampled`）合进 HUD 的用量槽。
+///
+/// 语义是后端契约写的「有才更新」（`qaqh-domain/src/timeline.rs:499-508`）：采样由端点
+/// 随手报，**缺字段是常态**（Anthropic 的 `message_delta` 只带 output）。整包替换的
+/// 后果不是少一个数，而是**界面说谎**：刚拿到的 prompt/缓存值被打回 0，状态栏的
+/// 上下文占比突然变空、缓存命中率从「有」变成「没上报」。
+///
+/// `total_tokens` 单独处理：采样没给就按两个分项自洽地补，否则 HUD 会出现
+/// 「prompt 刚涨、总数还是旧的」这种自相矛盾。
+///
+/// 返回是否真的有字段变化——调用方据此决定要不要强制重绘（采样 ~1/s，不必帧帧重画）。
+pub fn merge_sampled_usage(slot: &mut Option<UsageInfo>, sample: &UsageInfo) -> bool {
+    let before = slot.clone();
+    let target = slot.get_or_insert_with(UsageInfo::default);
+    if sample.prompt_tokens != 0 {
+        target.prompt_tokens = sample.prompt_tokens;
+    }
+    if sample.completion_tokens != 0 {
+        target.completion_tokens = sample.completion_tokens;
+    }
+    if sample.prompt_cache_hit_tokens != 0 {
+        target.prompt_cache_hit_tokens = sample.prompt_cache_hit_tokens;
+    }
+    if sample.prompt_cache_miss_tokens != 0 {
+        target.prompt_cache_miss_tokens = sample.prompt_cache_miss_tokens;
+    }
+    if sample.reasoning_tokens != 0 {
+        target.reasoning_tokens = sample.reasoning_tokens;
+    }
+    // `cache_usage_reported` 是**粘性**开关：报过就在，没报（`None`）不代表"不支持"。
+    if let Some(reported) = sample.cache_usage_reported {
+        target.cache_usage_reported = Some(reported);
+    }
+    for (key, value) in &sample.extras {
+        target.extras.insert(key.clone(), *value);
+    }
+    if sample.total_tokens != 0 {
+        target.total_tokens = sample.total_tokens;
+    } else if target.prompt_tokens != 0 && target.completion_tokens != 0 {
+        target.total_tokens = target
+            .prompt_tokens
+            .saturating_add(target.completion_tokens);
+    }
+    *slot != before
+}
+
 impl PermissionPanel {
     /// 从 canonical permission interaction body 构造授权面板。
     ///
@@ -1043,6 +1089,7 @@ mod tests {
                 kind: TimelineBlockKind::Tool,
                 state: TimelineBlockState::Sealed,
                 text: String::new(),
+                reasoning_kind: None,
                 tool: Some(ToolCard {
                     exit_code: None,
                     completed_at_ms: None,
@@ -1096,6 +1143,7 @@ mod tests {
                 state: TimelineBlockState::Sealed,
                 text: "first\nsecond".into(),
                 tool: None,
+                reasoning_kind: None,
                 last_fragment: 0,
                 rev: 1,
             }],

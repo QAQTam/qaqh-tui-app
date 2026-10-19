@@ -42,6 +42,11 @@ pub(super) fn render_code_block(
     width: usize,
     theme: &Theme,
 ) -> Vec<Line<'static>> {
+    // 生成式 UI 围栏：后端 prompt 默认就会发它（`qaqh-ui v=0.2 format=tsx|jsonl`）。
+    // 本端不渲染 DSL，但**也不能把原文倒给用户**——那是模板语法，不是内容。
+    if let Some(info) = generative_ui_info(lang) {
+        return render_generative_ui_placeholder(text, &info, width, theme);
+    }
     let content_width = width.saturating_sub(CODE_INDENT.width()).max(1);
     let syntax_set = syntax_set();
     let syntax_theme = &theme_set().themes["base16-ocean.dark"];
@@ -75,6 +80,123 @@ pub(super) fn render_code_block(
         )));
     }
     out
+}
+
+/// 围栏 info string 是否属于生成式 UI（`qaqh-ui` / `qaqh-ui v=0.2 format=tsx`）。
+///
+/// 只认**第一个 token**（与 [`syntax_for`] 同一口径）：`qaqh-ui v=0.2 format=jsonl`
+/// 的第一个 token 是 `qaqh-ui`，大小写不敏感。
+fn generative_ui_info(lang: Option<&str>) -> Option<String> {
+    let lang = lang?;
+    let mut tokens = lang
+        .split(|ch: char| ch == ',' || ch.is_whitespace())
+        .filter(|token| !token.is_empty());
+    let first = tokens.next()?;
+    if !first.eq_ignore_ascii_case("qaqh-ui") {
+        return None;
+    }
+    let info = lang.trim();
+    Some(if info.is_empty() {
+        "qaqh-ui".to_string()
+    } else {
+        info.to_string()
+    })
+}
+
+/// 生成式 UI 围栏的**保底卡片**。
+///
+/// 取舍写在 handoff §6.2：本端暂时不支持渲染交互组件（组件目录、表达式求值、
+/// 动作回传都是项目级工作），但必须让用户知道「这里本来有界面」，而不是看到
+/// 一整段 `ui.surface(...)` 模板源码——那既不像内容，也不像错误。
+fn render_generative_ui_placeholder(
+    text: &str,
+    info: &str,
+    width: usize,
+    theme: &Theme,
+) -> Vec<Line<'static>> {
+    let content_width = width.saturating_sub(CODE_INDENT.width() + 3).max(8);
+    let rows = text.lines().filter(|line| !line.trim().is_empty()).count();
+    let heading = format!("生成式 UI（本端暂不支持渲染）· {info}");
+    let body = format!("交互组件已折叠（{rows} 行 DSL）。完整渲染能力尚未在本端落地。");
+    let mut out = Vec::new();
+    for (index, line) in [heading, body].into_iter().enumerate() {
+        let style = if index == 0 {
+            fg(theme.accent.assistant).add_modifier(Modifier::BOLD)
+        } else {
+            fg(theme.text.dim)
+        };
+        let rows = wrap_styled(&[StyledSpan::new(line, style)], content_width);
+        for (row_index, row) in rows.into_iter().enumerate() {
+            let mut spans = Vec::with_capacity(row.len() + 1);
+            // 只给首行画左边框：整段每行都画会显得像代码块，反而暗示"可以读"。
+            spans.push(Span::styled(
+                if index == 0 && row_index == 0 {
+                    format!("{CODE_INDENT}▛ ")
+                } else {
+                    format!("{CODE_INDENT}  ")
+                },
+                fg(theme.accent.assistant),
+            ));
+            spans.extend(row.into_iter().map(StyledSpan::into_span));
+            out.push(Line::from(spans));
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::theme::{ColorSupport, ThemeKind};
+
+    fn theme() -> Theme {
+        Theme::resolve(ThemeKind::QaqhNight, ColorSupport::TrueColor)
+    }
+
+    fn text_of(lines: &[Line<'static>]) -> String {
+        lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// 后端默认发的就是 v=0.2 围栏：两种 format 都必须被认出来，且**原文不上屏**。
+    #[test]
+    fn generative_ui_fences_fold_into_a_placeholder() {
+        for info in [
+            "qaqh-ui v=0.2 format=tsx",
+            "qaqh-ui v=0.2 format=jsonl",
+            "QAQH-UI",
+        ] {
+            let lines = render_code_block(
+                "ui.surface(\"main\", { root: \"card\" })\nui.end()",
+                Some(info),
+                70,
+                &theme(),
+            );
+            let text = text_of(&lines);
+            assert!(text.contains("生成式 UI"), "{info} → {text}");
+            assert!(!text.contains("ui.surface"), "DSL 原文不得上屏：{text}");
+            assert!(!text.contains("ui.end"), "DSL 原文不得上屏：{text}");
+        }
+    }
+
+    /// 普通代码块不受影响（尤其 `qaqh-ui2` 这类前缀相似的名字）。
+    #[test]
+    fn ordinary_code_blocks_still_highlight() {
+        let lines = render_code_block("let x = 1;", Some("rust"), 60, &theme());
+        let text = text_of(&lines);
+        assert!(text.contains("let x = 1;"));
+        assert!(!text.contains("生成式 UI"));
+        let near = render_code_block("x", Some("qaqh-ui-extra"), 60, &theme());
+        assert!(!text_of(&near).contains("生成式 UI"), "只认精确的 qaqh-ui");
+    }
 }
 
 /// ```lang 的 info string → 语法。

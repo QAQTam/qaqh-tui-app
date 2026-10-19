@@ -492,30 +492,20 @@ impl App {
                             st.editing = st.start_edit(self.config.as_ref());
                         }
                         FieldKind::Enum => {
-                            if let Err(e) = st.cycle(self.config.as_ref(), 1) {
-                                self.toast(NoticeLevel::Error, e);
-                            }
+                            self.settings_cycle(&mut st, 1);
                         }
                         FieldKind::Toggle => {
-                            let _ = st.cycle(self.config.as_ref(), 1);
+                            self.settings_cycle(&mut st, 1);
                         }
                         FieldKind::Port => self.settings_port_activate(&mut st),
                     },
                     KeyCode::Left => match kind {
                         FieldKind::Port => self.settings_port_cycle(&mut st, -1),
-                        _ => {
-                            if let Err(e) = st.cycle(self.config.as_ref(), -1) {
-                                self.toast(NoticeLevel::Error, e);
-                            }
-                        }
+                        _ => self.settings_cycle(&mut st, -1),
                     },
                     KeyCode::Right => match kind {
                         FieldKind::Port => self.settings_port_cycle(&mut st, 1),
-                        _ => {
-                            if let Err(e) = st.cycle(self.config.as_ref(), 1) {
-                                self.toast(NoticeLevel::Error, e);
-                            }
-                        }
+                        _ => self.settings_cycle(&mut st, 1),
                     },
                     KeyCode::Char('s') | KeyCode::Char('S') => self.save_settings(&mut st),
                     KeyCode::Char('r') => self.fetch_config(),
@@ -527,6 +517,127 @@ impl App {
                     _ => {}
                 }
                 self.replace_overlay(Overlay::Settings(st));
+                true
+            }
+            Overlay::Account(st) => {
+                use crate::app::account::AccountKind;
+                use ratatui::crossterm::event::KeyCode;
+
+                let kind = st.kind;
+                let selected = st.selected;
+                // 快照只读：本层不自己发请求，动作全部委托 `account_ops`。
+                let profiles = self.account.profiles.clone();
+                let count = profiles.as_ref().map(|p| p.profiles.len()).unwrap_or(0);
+                let usage_url = self
+                    .account
+                    .siwc
+                    .as_ref()
+                    .map(|s| s.usage_url.clone())
+                    .or_else(|| self.account.ds.as_ref().map(|s| s.usage_url.clone()))
+                    .unwrap_or_default();
+                let top_up_url = self
+                    .account
+                    .ds
+                    .as_ref()
+                    .map(|s| s.top_up_url.clone())
+                    .unwrap_or_default();
+
+                // 导航**直接改栈顶**：拿到的是入口时的克隆，写回会盖掉
+                // `account_ops` 在同一拍里刚写进去的 busy/flow（登录会立刻看起来没发生）。
+                match key.code {
+                    KeyCode::Esc | KeyCode::Char('q') => {
+                        // 关掉面板 = 放弃这次登录：daemon 侧留一个进行中的流程会把
+                        // 下一次 `sign_in.start` 挡在 connection_busy 上（spec §3.1），
+                        // 所以关面板必须先取消。结果回来时面板已不在栈上，
+                        // 只会刷新状态，不会 panic。
+                        if st.flow.is_pending() {
+                            self.toast(
+                                NoticeLevel::Warn,
+                                "已放弃本次登录（已请求 daemon 取消本次流程）".to_string(),
+                            );
+                            self.cancel_account_sign_in(kind);
+                        }
+                        self.overlays.pop();
+                        return true;
+                    }
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        if let Some(Overlay::Account(st)) = self.overlays.last_mut() {
+                            st.selected = st.selected.saturating_sub(1);
+                        }
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        if let Some(Overlay::Account(st)) = self.overlays.last_mut()
+                            && count > 0
+                        {
+                            st.selected = (st.selected + 1).min(count - 1);
+                        }
+                    }
+                    KeyCode::PageUp => {
+                        if let Some(Overlay::Account(st)) = self.overlays.last_mut() {
+                            st.scroll = st.scroll.saturating_sub(8);
+                        }
+                    }
+                    KeyCode::PageDown => {
+                        if let Some(Overlay::Account(st)) = self.overlays.last_mut() {
+                            st.scroll = st.scroll.saturating_add(8);
+                        }
+                    }
+                    KeyCode::Enter => {
+                        // 只有 ChatGPT 套餐档有「选账户」这件事；pending 条目选了也
+                        // 选不动（daemon 会回「注册尚未完成」），所以在这里就挡住。
+                        if kind == AccountKind::ChatGptPlan {
+                            match profiles.as_ref().and_then(|p| p.profiles.get(selected)) {
+                                Some(profile) if profile.pending => self.toast(
+                                    NoticeLevel::Warn,
+                                    "该账户注册尚未完成，请重新登录".to_string(),
+                                ),
+                                Some(profile) => {
+                                    let id = profile.id.clone();
+                                    self.select_account_profile(id);
+                                }
+                                None => {}
+                            }
+                        }
+                    }
+                    KeyCode::Char('l') | KeyCode::Char('L') => {
+                        self.start_account_sign_in(kind);
+                    }
+                    KeyCode::Char('c') | KeyCode::Char('C') => {
+                        self.cancel_account_sign_in(kind);
+                    }
+                    KeyCode::Char('x') | KeyCode::Char('X') => {
+                        self.sign_out_account(kind);
+                    }
+                    KeyCode::Char('r') => self.refresh_account(kind),
+                    KeyCode::Char('o') => match st.authorize_url.clone() {
+                        Some(url) => self.open_account_link(url),
+                        None => self.toast(
+                            NoticeLevel::Info,
+                            "本次流程还没有授权链接（先按 l 发起登录）".to_string(),
+                        ),
+                    },
+                    KeyCode::Char('u') => {
+                        if usage_url.is_empty() {
+                            self.toast(NoticeLevel::Info, "后端未提供用量链接".to_string());
+                        } else {
+                            self.open_account_link(usage_url);
+                        }
+                    }
+                    KeyCode::Char('b') if kind == AccountKind::DeepSeekAccount => {
+                        self.refresh_account_balance();
+                    }
+                    KeyCode::Char('t') if kind == AccountKind::DeepSeekAccount => {
+                        if top_up_url.is_empty() {
+                            self.toast(NoticeLevel::Info, "后端未提供充值链接".to_string());
+                        } else {
+                            self.open_account_link(top_up_url);
+                        }
+                    }
+                    KeyCode::Char('v') if kind == AccountKind::DeepSeekAccount => {
+                        self.verify_account_credential();
+                    }
+                    _ => {}
+                }
                 true
             }
             Overlay::AttachPath {
@@ -1307,5 +1418,61 @@ mod tests {
             None,
             "/new 的 cwd 输入此时还没有 session_id"
         );
+    }
+
+    /// 账号卡片的导航键**不得**写回入口时的克隆：那会盖掉同一拍里
+    /// `account_ops` 刚写进去的流程状态（登录看起来像没发生）。
+    #[test]
+    fn account_navigation_keeps_the_flow_state() {
+        use crate::app::account::{AccountKind, AccountState, Flow};
+
+        let (mut app, _rx) = App::new_for_test();
+        let mut state = AccountState::new(AccountKind::ChatGptPlan);
+        state.flow = Flow::Pending {
+            id: "f_1".into(),
+            deadline_ms: u64::MAX,
+        };
+        app.overlays.push(Overlay::Account(state));
+
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE));
+        match app.overlays.last() {
+            Some(Overlay::Account(state)) => {
+                assert_eq!(
+                    state.flow,
+                    Flow::Pending {
+                        id: "f_1".into(),
+                        deadline_ms: u64::MAX
+                    },
+                    "导航键不得清掉进行中的流程"
+                );
+                assert_eq!(state.scroll, 8);
+            }
+            other => panic!("账号 overlay 被换掉了：{other:?}"),
+        }
+
+        // 流程已结束（没有本终端发起的 id）时按 c：给提示，**不**瞎发 cancel
+        // ——那可能取消别的客户端发起的登录。
+        if let Some(Overlay::Account(state)) = app.overlays.last_mut() {
+            state.flow = Flow::Idle;
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE));
+        match app.overlays.last() {
+            Some(Overlay::Account(state)) => {
+                assert!(
+                    state
+                        .notice
+                        .as_deref()
+                        .unwrap_or_default()
+                        .contains("没有本终端发起"),
+                    "notice = {:?}",
+                    state.notice
+                );
+            }
+            other => panic!("账号 overlay 被换掉了：{other:?}"),
+        }
+
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.overlays.is_empty());
     }
 }

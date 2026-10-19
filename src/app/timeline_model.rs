@@ -7,6 +7,7 @@
 
 use std::collections::BTreeMap;
 
+use qaqh_client::ReasoningKind;
 use qaqh_client::{
     TimelineBlock, TimelineBlockKind, TimelineBlockState, TimelineEntry, TimelineFailure,
     TimelinePage, TimelineTool, TimelineToolState, TimelineTurn, TimelineTurnState,
@@ -272,6 +273,12 @@ pub struct Block {
     pub state: TimelineBlockState,
     pub text: String,
     pub tool: Option<ToolCard>,
+    /// 思考块类别（`qaqh-domain/src/timeline.rs` 的 `TimelineBlock.reasoning_kind`）。
+    ///
+    /// 只有 `kind == Reasoning` 时可能有值。**必须透传到渲染层**：订阅套餐路径只给
+    /// 服务端**摘要**，与模型完整思考长得一模一样，渲染成同一句话就是产品说谎
+    /// （见 `qaqh_client::ReasoningKind` 的模块注释）。
+    pub reasoning_kind: Option<ReasoningKind>,
     /// TextDelta 的单调 fragment 计数（BlockCheckpoint 不重置）。
     pub(crate) last_fragment: u64,
     /// 渲染修订号：**只要该块的可见内容可能变化就自增**。
@@ -291,6 +298,7 @@ impl Block {
             state: b.state,
             text: b.text,
             tool: b.tool.map(ToolCard::from),
+            reasoning_kind: b.reasoning_kind,
             last_fragment: 0,
             rev: 1,
         }
@@ -644,6 +652,18 @@ impl TimelineModel {
         use qaqh_client::TimelineEvent as E;
         let turn_id = entry.turn_id.as_str();
 
+        // 流中 usage 采样（后端旁路，发射方自带 ~1s 节流）与 `ToolEstimated` 同族：
+        // 瞬态、不改任何块/回合状态、不进快照。协议还明确它**不要求回合/块已开**
+        // （端点 `message_start` 就可能先报 usage），所以必须在 turn 查找**之前**
+        // 早退——否则每条采样都会把 `dropped_missing_turn` 记成契约异常。
+        // 官方 usage 的收口在对话频道 `AssistantBlockSealed` / `TurnFinished`
+        // （`app::mod` 写 `sess.usage`）；这条只服务 HUD 表盘的实时刷新，不属于
+        // transcript reducer 的状态域，接线在 `app::handle_runtime` 的 timeline 分支
+        // （`session::merge_sampled_usage`）。
+        if let E::UsageSampled { .. } = &entry.event {
+            return None;
+        }
+
         if let E::TurnOpened { user_text } = &entry.event {
             // 用索引而非 `find_turn_mut` 的借用：reopen 分支改完字段后还要
             // 调 `self.bump()`，借用必须在该调用前结束。
@@ -886,6 +906,8 @@ impl TimelineModel {
                     changed = false;
                 }
             }
+            // 上方已早退（HUD 旁路，不进 transcript 状态）。
+            E::UsageSampled { .. } => unreachable!("UsageSampled 在 apply 入口已早退"),
             E::BlockSealed { block_id } => {
                 let round_num = entry.round_num.unwrap_or(0);
                 let round = Self::find_round_mut(turn, round_num);
@@ -1339,6 +1361,7 @@ mod tests {
                     state: TimelineBlockState::Open,
                     text: String::new(),
                     tool: None,
+                    reasoning_kind: None,
                 },
             },
         ));
@@ -1412,6 +1435,7 @@ mod tests {
                     state: TimelineBlockState::Open,
                     text: String::new(),
                     tool: None,
+                    reasoning_kind: None,
                 },
             },
         ));
@@ -1480,6 +1504,7 @@ mod tests {
             state: TimelineBlockState::Open,
             text: String::new(),
             tool: None,
+            reasoning_kind: None,
         }
     }
 
@@ -1648,6 +1673,7 @@ mod tests {
                     state: TimelineBlockState::Open,
                     text: String::new(),
                     tool: None,
+                    reasoning_kind: None,
                 },
             },
         ));
@@ -1704,6 +1730,7 @@ mod tests {
                     kind: TimelineBlockKind::Tool,
                     state: TimelineBlockState::Open,
                     text: String::new(),
+                    reasoning_kind: None,
                     tool: Some(TimelineTool {
                         exit_code: None,
                         completed_at_ms: None,
@@ -2057,6 +2084,7 @@ mod tests {
                     kind: TimelineBlockKind::Tool,
                     state: TimelineBlockState::Open,
                     text: String::new(),
+                    reasoning_kind: None,
                     tool: Some(TimelineTool {
                         exit_code: None,
                         completed_at_ms: None,
@@ -2116,6 +2144,7 @@ mod tests {
                     kind: TimelineBlockKind::Tool,
                     state: TimelineBlockState::Open,
                     text: String::new(),
+                    reasoning_kind: None,
                     tool: Some(TimelineTool {
                         exit_code: None,
                         completed_at_ms: None,
@@ -2182,6 +2211,7 @@ mod tests {
                     kind: TimelineBlockKind::Tool,
                     state: TimelineBlockState::Open,
                     text: String::new(),
+                    reasoning_kind: None,
                     tool: Some(tool),
                 },
             },
@@ -2361,6 +2391,7 @@ mod tests {
                         kind: TimelineBlockKind::Tool,
                         state: TimelineBlockState::Open,
                         text: String::new(),
+                        reasoning_kind: None,
                         tool: Some(TimelineTool {
                             exit_code: None,
                             completed_at_ms: None,
@@ -2460,6 +2491,7 @@ mod tests {
                             kind: TimelineBlockKind::Tool,
                             state: TimelineBlockState::Sealed,
                             text: String::new(),
+                            reasoning_kind: None,
                             tool: Some(TimelineTool {
                                 exit_code: None,
                                 completed_at_ms: None,
@@ -2520,6 +2552,7 @@ mod tests {
                     state: TimelineBlockState::Open,
                     text: String::new(),
                     tool: None,
+                    reasoning_kind: None,
                 },
             },
         ));
@@ -2566,6 +2599,7 @@ mod tests {
                     state: TimelineBlockState::Open,
                     text: String::new(),
                     tool: None,
+                    reasoning_kind: None,
                 },
             },
         ));
@@ -2619,6 +2653,7 @@ mod tests {
                             state: TimelineBlockState::Open,
                             text: "快照内容".into(),
                             tool: None,
+                            reasoning_kind: None,
                         }],
                     }],
                 }],
@@ -2698,6 +2733,7 @@ mod tests {
                     state: TimelineBlockState::Open,
                     text: String::new(),
                     tool: None,
+                    reasoning_kind: None,
                 },
             },
         ));
@@ -2910,6 +2946,7 @@ mod tests {
                     state: TimelineBlockState::Open,
                     text: String::new(),
                     tool: None,
+                    reasoning_kind: None,
                 },
             },
         ));
@@ -2977,6 +3014,7 @@ mod tests {
                     state: TimelineBlockState::Sealed,
                     text: "重放的思考\n两行".into(),
                     tool: None,
+                    reasoning_kind: None,
                 }],
             }],
         };
@@ -3098,6 +3136,7 @@ mod tests {
                     state: TimelineBlockState::Sealed,
                     text: String::new(),
                     tool: Some(card),
+                    reasoning_kind: None,
                     last_fragment: 0,
                     rev: 1,
                 }],

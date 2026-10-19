@@ -17,6 +17,8 @@ use crate::theme::Theme;
 
 use super::display_tool_name;
 
+/// 思考类别（摘要 / 完整 / 加密 / 已抹除）：显示规则的单一真源在 `qaqh_client`。
+pub use qaqh_client::ReasoningKind;
 /// Path 头部的操作语义（动词事实源）。直接吃权威 wire 类型，本仓不手抄镜像
 /// ——纪律同 protocol/mod.rs。
 pub use qaqh_client::TimelinePathOp as PathOp;
@@ -361,6 +363,11 @@ pub enum BlockKind {
         text: String,
         duration: Option<Duration>,
         expanded: bool,
+        /// 思考类别；`None` = 后端未标注（本字段引入前的历史块）。
+        ///
+        /// `Encrypted` / `Redacted` 不该出现在这里（adapter 依
+        /// `ReasoningKind::is_displayable()` 直接丢弃），留着只为类型完整。
+        kind: Option<ReasoningKind>,
     },
     Tool(Box<ToolBlock>),
     System {
@@ -475,9 +482,11 @@ pub fn render_block(block: &TranscriptBlock, width: usize, theme: &Theme) -> Vec
             text,
             duration,
             expanded,
+            kind,
         } => render_thinking(
             text,
             *duration,
+            *kind,
             block.state == BlockState::Live,
             *expanded,
             width,
@@ -546,6 +555,7 @@ fn render_assistant(text: &str, width: usize, theme: &Theme) -> Vec<Line<'static
 fn render_thinking(
     text: &str,
     duration: Option<Duration>,
+    kind: Option<ReasoningKind>,
     live: bool,
     expanded: bool,
     width: usize,
@@ -555,11 +565,18 @@ fn render_thinking(
     let prefix = format!("{} ", theme.glyph.thinking);
     let continuation = " ".repeat(prefix.width());
     let mut lines = Vec::new();
+    // 订阅套餐路径只给服务端**摘要**。把它渲染成和完整思考一模一样的一句话，
+    // 就是替上游撒谎——所以摘要必须在头部明说（标记沿用中文提示的既有风格）。
+    let tag = if matches!(kind, Some(ReasoningKind::Summary)) {
+        " · 摘要"
+    } else {
+        ""
+    };
 
     if live {
         lines.push(Line::from(vec![
             Span::styled(prefix.clone(), fg(theme.accent.thinking)),
-            Span::styled("Thinking…", fg(theme.accent.thinking)),
+            Span::styled(format!("Thinking…{tag}"), fg(theme.accent.thinking)),
         ]));
         if let Some(latest) = text.lines().rev().find(|line| !line.trim().is_empty()) {
             let body_width = width.saturating_sub(continuation.width() + 2).max(1);
@@ -585,7 +602,7 @@ fn render_thinking(
         };
         lines.push(Line::from(vec![
             Span::styled(prefix, fg(theme.accent.thinking)),
-            Span::styled(format!("{label}{hint}"), fg(theme.text.muted)),
+            Span::styled(format!("{label}{tag}{hint}"), fg(theme.text.muted)),
         ]));
         if expanded {
             let body_width = width.saturating_sub(continuation.width() + 2).max(1);
@@ -1190,18 +1207,37 @@ fn typed_header_rest(header: &ToolHeader) -> String {
     }
 }
 
+/// 用户 home 目录：`HOME`（Unix）→ `USERPROFILE`（Windows）。
+///
+/// 少了 Windows 分支的后果不是"少个优化"：Windows 上 `HOME` 通常未设，头部路径
+/// 永远换不成 `~`，长路径白吃宽度预算；同一条差异还会让测试随环境红绿
+/// （`tool_header_shortens_paths_but_body_keeps_them` 本机就是红的）。
+fn home_dir() -> Option<String> {
+    ["HOME", "USERPROFILE"]
+        .iter()
+        .filter_map(|key| std::env::var(key).ok())
+        .find(|value| !value.is_empty())
+}
+
 /// 头部里的长路径缩短：home 前缀换 `~`，仍然过长的路径中段省略。
 ///
 /// **只作用于头部摘要**，不动正文——正文是工具的真实输出，改了就不再是证据。
 fn shorten_header_paths(text: &str, budget: usize) -> String {
-    let home = std::env::var("HOME").ok().filter(|home| !home.is_empty());
+    shorten_header_paths_with_home(text, budget, home_dir().as_deref())
+}
+
+/// 缩短逻辑本体：`home` **显式传入**，渲染路径与测试走同一段代码。
+///
+/// 环境变量只在上面的薄壳里读一次——测试可以钉住 `~` 语义而不必改进程环境
+/// （`set_var` 在 2024 edition 是 unsafe，且与并行测试天然冲突）。
+fn shorten_header_paths_with_home(text: &str, budget: usize, home: Option<&str>) -> String {
     let mut out = String::new();
     for (idx, token) in text.split(' ').enumerate() {
         if idx > 0 {
             out.push(' ');
         }
         let mut token = token.to_owned();
-        if let Some(home) = home.as_deref()
+        if let Some(home) = home
             && let Some(rest) = token.strip_prefix(home)
             && (rest.is_empty() || rest.starts_with('/'))
         {
@@ -2025,6 +2061,7 @@ mod tests {
                     text: "思考链第一行\n第二行更长的思考内容".into(),
                     duration: None,
                     expanded: true,
+                    kind: None,
                 },
             ),
             TranscriptBlock::new(
@@ -2097,12 +2134,41 @@ mod tests {
                 text: "first\nlatest thought".to_string(),
                 duration: None,
                 expanded: false,
+                kind: None,
             },
         );
         let text = text_of(&render_block(&block, 40, &theme()));
         assert!(text.contains("Thinking…"));
         assert!(text.contains("latest thought"));
         assert!(!text.contains("first"));
+    }
+
+    /// 订阅套餐路径只给服务端**摘要**：头部必须说出来，与完整思考区分。
+    /// （`reasoning_kind` 从 timeline wire 透传到渲染层的另一侧见 adapter 测试。）
+    #[test]
+    fn summary_reasoning_is_labelled_and_plain_text_is_not() {
+        let render = |kind: Option<ReasoningKind>| {
+            let block = TranscriptBlock::new(
+                "thinking-summary",
+                BlockKind::Thinking {
+                    text: "服务端摘要".to_string(),
+                    duration: None,
+                    expanded: false,
+                    kind,
+                },
+            )
+            .with_state(BlockState::Sealed);
+            text_of(&render_block(&block, 40, &theme()))
+        };
+        assert!(
+            render(Some(ReasoningKind::Summary)).contains("摘要"),
+            "摘要不给标记 = 把服务端摘要冒充成模型完整思考"
+        );
+        assert!(
+            !render(Some(ReasoningKind::Text)).contains("摘要"),
+            "完整思考不该被叫成摘要"
+        );
+        assert!(!render(None).contains("摘要"), "本字段引入前的历史块不标注");
     }
 
     #[test]
@@ -2113,6 +2179,7 @@ mod tests {
                 text: "first line\nsecond line".to_string(),
                 duration: Some(Duration::from_millis(1200)),
                 expanded: true,
+                kind: None,
             },
         )
         .with_state(BlockState::Sealed);
@@ -2279,11 +2346,15 @@ more context follows"
     }
 
     /// 头部路径缩短：home 前缀换 `~`，过长中段省略；**正文不动**（正文是证据）。
+    ///
+    /// 与环境无关：home 取自渲染路径同一处（`HOME` → `USERPROFILE`）。取不到就只验
+    /// 那两条不依赖它的断言——测试不该因为机器缺某个环境变量而红。
     #[test]
     fn tool_header_shortens_paths_but_body_keeps_them() {
         let theme = theme();
-        let home = std::env::var("HOME").unwrap_or_else(|_| "/home/u".into());
-        let long = format!("{home}/projects/very/deep/tree/with/many/segments/file.txt");
+        let home = home_dir();
+        let root = home.clone().unwrap_or_else(|| "/home/u".into());
+        let long = format!("{root}/projects/very/deep/tree/with/many/segments/file.txt");
         // 现行 wire：write 走 typed Path 头（op=Write）；summary 为 None → 正文无逐字去重。
         let mut tool = tool_block("write", None, ToolState::Success);
         tool.header = Some(ToolHeader::Path {
@@ -2302,21 +2373,46 @@ more context follows"
             "{text}"
         );
         assert!(header.contains("Wrote"), "op 是动词事实源：{header}");
-        assert!(
-            !header.contains(&format!("{home}/projects")),
-            "头部应把 home 换成 ~：{header}"
-        );
+        if let Some(home) = home.as_deref() {
+            assert!(
+                !header.contains(&format!("{home}/projects")),
+                "头部应把 home 换成 ~：{header}"
+            );
+        }
         assert!(header.contains('…'), "头部过长路径应中段省略：{header}");
         // 正文照旧完整（它是对齐/复制的依据，不能被缩写出错）。正文按宽度折行，
-        // 折行位置随终端宽度与 HOME 长度变化，所以剥掉空白后再比对。
+        // 折行位置随终端宽度与 home 长度变化，所以剥掉空白后再比对。
         let unwrapped: String = text.chars().filter(|ch| !ch.is_whitespace()).collect();
         assert!(
-            unwrapped.contains(&format!("{home}/projects/very")),
+            unwrapped.contains(&format!("{root}/projects/very")),
             "正文不得被缩短（home 前缀应原样保留）：\n{text}"
         );
         assert!(
             unwrapped.contains("file.txt"),
             "正文不得被缩短（尾部应原样保留）：\n{text}"
+        );
+    }
+
+    /// `~` 语义的**确定性**断言：home 显式注入，不读进程环境。
+    ///
+    /// 同时钉住边界：`/home/uu` 不是 `/home/u` 的子路径，不得被缩成 `~u/...`。
+    #[test]
+    fn header_shortening_tilde_is_explicit_and_boundary_safe() {
+        let shortened = shorten_header_paths_with_home(
+            "/home/u/projects/very/deep/tree/with/many/segments/file.txt",
+            24,
+            Some("/home/u"),
+        );
+        assert!(shortened.starts_with('~'), "{shortened}");
+        assert!(
+            !shortened.contains("/home/u"),
+            "home 前缀必须已经换成 ~：{shortened}"
+        );
+        assert!(shortened.contains('…'), "仍过长就该中段省略：{shortened}");
+        assert_eq!(
+            shorten_header_paths_with_home("/home/uu/x.txt", 40, Some("/home/u")),
+            "/home/uu/x.txt",
+            "前缀相似但不是目录边界：不得误缩"
         );
     }
 
@@ -2626,6 +2722,7 @@ more context follows"
                     text: String::new(),
                     duration: Some(Duration::from_millis(1200)),
                     expanded: false,
+                    kind: None,
                 },
             )
             .with_state(BlockState::Sealed),

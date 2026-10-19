@@ -3,7 +3,12 @@
 //! 事件驱动（无轮询泵）：所有后端状态变化经 runtime 消息到达后立即生效，
 //! UI 在同一帧内重绘。
 
+/// 账号面（ChatGPT 套餐 / DeepSeek 账号）的纯状态与判定逻辑。
+pub mod account;
+mod account_ops;
 pub(crate) mod anim;
+/// 用系统浏览器打开授权页（只放行 http(s)）。
+pub mod browser;
 mod composer_ops;
 pub(crate) mod export;
 mod interaction;
@@ -146,6 +151,11 @@ pub enum ActionResult {
         session_id: String,
         result: Result<qaqh_client::ClientV2TeamResponse, String>,
     },
+    /// 账号面（`siwc.*` / `dsaccount.*`）的一次服务调用结果。
+    ///
+    /// 载荷保持 `Value`：typed DTO 在 `account_ops` 里落地（解析失败必须可见，
+    /// 而不是在这一层悄悄换成默认值）。
+    Account(account_ops::AccountResult),
 }
 
 // 小变体（Key/Mouse/Tick）与大负载变体混排；Box 化推迟到独立性能任务。
@@ -406,6 +416,22 @@ impl ApiCtx {
             .map_err(|e| e.to_string())
     }
 
+    /// 服务面直调（`siwc.*` / `dsaccount.*` 等账号面方法）。
+    ///
+    /// 方法名在 `qaqh_client::SERVICE_METHODS` 白名单里，越界在客户端就拒
+    /// （一个请求都不发）；失败保留 daemon 的 `{ code, message }` 形状——错误文案
+    /// 里的 `profile_not_found` 正是「登录被顶掉」的判据（见 `account::is_superseded_error`）。
+    pub async fn service_call(
+        &self,
+        method: &str,
+        params: serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        self.client()?
+            .service_call(method, params)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
     /// 命令回执轮询（ACK ≠ 完成）。
     pub async fn command_status(&self, command_id: &str) -> Result<ClientV2CommandStatus, String> {
         self.client()?
@@ -626,6 +652,11 @@ pub enum Overlay {
         scroll: usize,
         body: String,
     },
+    /// 账号登录面板（ChatGPT 套餐 / DeepSeek 账号）。
+    ///
+    /// **全局** overlay：登录是 daemon 级身份，与活动会话无关（spec §0.1：
+    /// 登录类方法不要求 seed、不要求 attach）。
+    Account(account::AccountState),
 }
 
 impl ConfirmAction {
@@ -666,6 +697,7 @@ impl Overlay {
             // 切标签时让它跟着走，不关掉（与 SessionList/Settings 同属全局面）。
             Overlay::SessionList { .. }
             | Overlay::Settings(_)
+            | Overlay::Account(_)
             | Overlay::Remote(_)
             | Overlay::Help
             | Overlay::History { .. }
@@ -819,6 +851,8 @@ pub struct App {
     dashboard_fetching: HashSet<String>,
     /// config.load 的 typed 快照（ConfigDto 镜像；ConfigChanged 到达时重拉）。
     pub config: Option<ConfigDto>,
+    /// 两种账号档的最近快照（登录面板关闭后设置页仍要能显示状态与模型目录）。
+    pub account: account::AccountBook,
     /// 进程启动时的连接目标。`/remote` 页「回到本地」要恢复的是**这个**里的拉起
     /// 标志，而不是硬编码 `true`——`--no-spawn` 启动的进程不该因为切一趟远端就
     /// 获得拉 daemon 的权力。
@@ -1005,6 +1039,7 @@ impl App {
             activity_cache: HashMap::new(),
             dashboard_fetching: HashSet::new(),
             config: None,
+            account: account::AccountBook::default(),
             startup_target,
             remote_pending: None,
             settings_saving: false,
@@ -1063,6 +1098,8 @@ impl App {
             self.replace_overlay(Overlay::Remote(st));
             self.force_redraw = true;
         }
+        // 账号登录的轮询/超时：判定在 `account::next_poll`（纯函数），这里只发请求。
+        self.tick_account();
         // 过期 toast / 未命中的 create 关联。
         while let Some(front) = self.toasts.front() {
             if front.at.elapsed() > Duration::from_secs(6) {
@@ -1208,6 +1245,14 @@ impl App {
                 // 对话频道 TurnCompleted（两条独立 SSE，可能乱序或丢失）。
                 let turn_sealed =
                     matches!(&entry.event, qaqh_client::TimelineEvent::TurnSealed { .. });
+                // 流中 usage 采样（后端 ~1s 节流）：这条是 **HUD 旁路**——transcript
+                // reducer 明确丢弃它（`timeline_model::apply` 入口早退），实时刷新只能在
+                // 这里接。权威收口仍是对话频道的 `AssistantBlockSealed` / `TurnFinished`。
+                if let qaqh_client::TimelineEvent::UsageSampled { usage } = &entry.event
+                    && session::merge_sampled_usage(&mut sess.usage, usage)
+                {
+                    self.force_redraw = true;
+                }
                 if let Some(terminal) = sess.timeline.apply(&entry) {
                     streaming_done(sess, Some(&terminal.turn_id));
                 }
@@ -2402,8 +2447,14 @@ impl App {
             | ActionResult::Devices(..)
             | ActionResult::DeviceRevoked { .. }
             | ActionResult::RemoteReconnect { .. }) => self.handle_remote_result(ev),
+            ActionResult::Account(result) => self.handle_account_result(result),
             ActionResult::ConfigLoaded(Ok(v)) => match serde_json::from_value::<ConfigDto>(v) {
-                Ok(dto) => self.config = Some(dto),
+                Ok(dto) => {
+                    self.config = Some(dto);
+                    // 设置页可能先于 config.load 打开：凭据来源在这里才第一次知道，
+                    // 账号行摘要/模型候选要跟着补一次（否则账号档会显示成 BYOK）。
+                    self.after_config_loaded();
+                }
                 Err(e) => self.toast(NoticeLevel::Error, format!("config.load 解析失败: {e}")),
             },
             ActionResult::ConfigLoaded(Err(e)) => {
@@ -3665,6 +3716,66 @@ mod tests {
         });
 
         assert!(app.force_redraw, "timeline 终态也必须触发下一帧强制重绘");
+    }
+
+    /// 流中 usage 采样（`UsageSampled`）是 HUD 旁路：必须**立刻**进 `sess.usage`，
+    /// 且缺字段的帧不能把已有值抹掉（端点只报 output 是常态）。
+    ///
+    /// 还要钉住一条契约细节：这条事件**不要求回合已开**（端点 `message_start` 就可能
+    /// 先报），所以它不能落进 `dropped_missing_turn` 那个契约异常计数器。
+    #[test]
+    fn usage_sample_updates_hud_and_missing_fields_are_kept() {
+        let (mut app, _rx) = App::new_for_test();
+        app.sessions
+            .insert("session".into(), SessionState::new("session".into()));
+
+        let sample = |usage: qaqh_client::UsageInfo| RuntimeMsg::Timeline {
+            session_id: "session".into(),
+            entry: Box::new(qaqh_client::TimelineEntry {
+                timeline_seq: 1,
+                // 刻意用一个**还没开**的回合：采样不依赖它。
+                turn_id: "turn-not-opened".into(),
+                round_num: Some(0),
+                event: qaqh_client::TimelineEvent::UsageSampled { usage },
+            }),
+        };
+
+        app.handle_runtime(sample(qaqh_client::UsageInfo {
+            prompt_tokens: 1_200,
+            completion_tokens: 300,
+            total_tokens: 1_500,
+            cache_usage_reported: Some(true),
+            ..Default::default()
+        }));
+        let usage = app.sessions["session"]
+            .usage
+            .clone()
+            .expect("流中采样必须落进 HUD 槽");
+        assert_eq!(usage.prompt_tokens, 1_200);
+        assert_eq!(usage.total_tokens, 1_500);
+        assert!(app.force_redraw, "采样改动了表盘就必须触发重绘");
+        assert_eq!(
+            app.sessions["session"].timeline.dropped_missing_turn, 0,
+            "采样不要求回合已开：不得记进契约异常计数器"
+        );
+
+        // 第二帧只报 output（Anthropic `message_delta` 的真实形状）。
+        app.handle_runtime(sample(qaqh_client::UsageInfo {
+            completion_tokens: 500,
+            ..Default::default()
+        }));
+        let usage = app.sessions["session"].usage.clone().unwrap();
+        assert_eq!(usage.prompt_tokens, 1_200, "缺报字段不得被打回 0");
+        assert_eq!(usage.completion_tokens, 500);
+        assert_eq!(
+            usage.total_tokens, 1_700,
+            "total 缺报时按分项自洽，别让表盘自相矛盾"
+        );
+        assert_eq!(
+            usage.cache_usage_reported,
+            Some(true),
+            "缓存上报标记是粘性的"
+        );
     }
 
     /// 回归（长会话 spinner 卡死）：timeline 的终态条目丢失时，对话频道的

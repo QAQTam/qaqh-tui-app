@@ -50,6 +50,8 @@ pub fn draw(
         // 设置不再走全屏 Workspace：Overlay::Settings 在 terminal::agent::draw
         // 里被拦截成居中卡片（draw_settings_card），不会进入这里。
         WorkspaceRoute::Settings => {}
+        // 账号面板同款：居中卡片（draw_account_card），不是全屏页。
+        WorkspaceRoute::Account => {}
         WorkspaceRoute::Remote => draw_remote(f, app, body, theme),
         WorkspaceRoute::Help => draw_help(f, body, theme),
         WorkspaceRoute::History {
@@ -135,6 +137,7 @@ fn header_line(route: &WorkspaceRoute, app: &App, theme: &Theme) -> Line<'static
             },
         ),
         WorkspaceRoute::Settings => ("Settings", "daemon 配置".to_owned()),
+        WorkspaceRoute::Account => ("Account", "账号登录与用量".to_owned()),
         WorkspaceRoute::Remote => ("Remote", "远端 daemon 与设备配对".to_owned()),
         WorkspaceRoute::Help => ("Help", "按键与斜杠命令".to_owned()),
         WorkspaceRoute::History {
@@ -205,6 +208,7 @@ fn footer_line(route: &WorkspaceRoute, theme: &Theme, back: ButtonVisual) -> Lin
             "↑↓ 选择 · Enter 打开 · n 新建 · x 归档 · u 恢复 · D 删除 · a 归档显示 · r 刷新"
         }
         WorkspaceRoute::Settings => "↑↓ 选择 · Enter 编辑/应用 · ←→ 切换 · s 保存 · r 刷新",
+        WorkspaceRoute::Account => "l 登录 · c 取消 · x 登出 · r 刷新 · u 用量 · Esc 关闭",
         WorkspaceRoute::Remote => {
             "Tab 切字段 · Enter 编辑/执行 · 1 连接 2 配对 · r 刷新设备 · x 吊销 · Esc 关闭"
         }
@@ -643,6 +647,291 @@ pub fn draw_settings_card(
             }
         }
     }
+}
+
+/// 账号登录卡片：与设置卡片同款居中浮层，但状态来自服务面（`siwc.*` / `dsaccount.*`）。
+///
+/// 与 `draw_settings_card` 一样不登记命中区：鼠标在这张卡片上没有语义目标，
+/// 键位写在 footer 里（`/remote` 页同款取舍）。
+pub fn draw_account_card(f: &mut Frame, app: &App, area: Rect, theme: &Theme) {
+    let Some(Overlay::Account(state)) = app.overlays.last() else {
+        return;
+    };
+    const CARD_WIDTH: u16 = 82;
+    const FOOTER_ROWS: u16 = 1;
+    let width = CARD_WIDTH.min(area.width.saturating_sub(4));
+    let max_height = area.height.saturating_sub(4);
+    if width < 24 || max_height < 6 {
+        return;
+    }
+    let title = if state.flow.is_pending() {
+        format!(" ⏳ {} · 等待授权 ", state.kind.title())
+    } else {
+        format!(" 👤 {} ", state.kind.title())
+    };
+    let inner_width = usize::from(width.saturating_sub(2));
+    let lines = account_lines(state, &app.account, inner_width, theme);
+    let card_height = (lines.len() as u16 + FOOTER_ROWS + 2).clamp(8, max_height);
+    let rect = centered_card_rect(width, card_height, area);
+    let inner = Rect {
+        x: rect.x + 1,
+        y: rect.y + 1,
+        width: rect.width.saturating_sub(2),
+        height: rect.height.saturating_sub(2),
+    };
+    f.render_widget(Clear, rect);
+    f.render_widget(
+        crate::ui::v2::modal::settings_card_block(
+            title,
+            Style::new().fg(theme.chrome.border_active),
+        ),
+        rect,
+    );
+    let [content_area, footer_area] =
+        Layout::vertical([Constraint::Min(1), Constraint::Length(FOOTER_ROWS)]).areas(inner);
+    let height = usize::from(content_area.height).max(1);
+    let total = lines.len();
+    let scroll = state.scroll.min(total.saturating_sub(height));
+    let visible: Vec<Line<'static>> = lines.into_iter().skip(scroll).take(height).collect();
+    f.render_widget(Paragraph::new(visible), content_area);
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            if state.kind == crate::app::account::AccountKind::ChatGptPlan {
+                " l 登录 · c 取消 · x 登出 · ↑↓/Enter 选账户 · u 用量 · o 重开授权页 · r 刷新 "
+            } else {
+                " l 登录 · c 取消 · x 登出 · b 余额 · v 校验 · t 充值 · u 用量 · r 刷新 "
+            },
+            Style::new().fg(theme.text.dim),
+        ))),
+        footer_area,
+    );
+}
+
+fn account_lines(
+    state: &crate::app::account::AccountState,
+    book: &crate::app::account::AccountBook,
+    width: usize,
+    theme: &Theme,
+) -> Vec<Line<'static>> {
+    use crate::app::account::{AccountKind, Flow, ds_view, siwc_view};
+
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let accent = Style::new()
+        .fg(theme.accent.assistant)
+        .add_modifier(Modifier::BOLD);
+    let dim = Style::new().fg(theme.text.dim);
+    let secondary = Style::new().fg(theme.text.secondary);
+    let primary = Style::new().fg(theme.text.primary);
+    let body_width = width.saturating_sub(3).max(8);
+
+    // 顶部：错误 > 提示 > 在途动作（顺序即优先级：错误不能被提示盖住）。
+    if let Some(error) = state.error.as_ref() {
+        lines.push(Line::from(Span::styled(
+            format!(" ✗ {}", fit_width(error, body_width)),
+            Style::new().fg(theme.accent.error),
+        )));
+    }
+    if let Some(notice) = state.notice.as_ref() {
+        lines.push(Line::from(Span::styled(
+            format!(" ✓ {}", fit_width(notice, body_width)),
+            Style::new().fg(theme.accent.success),
+        )));
+    }
+    if let Some(busy) = state.busy {
+        lines.push(Line::from(Span::styled(format!(" … {busy}"), dim)));
+    }
+
+    let section = |lines: &mut Vec<Line<'static>>, name: &str| {
+        if !lines.is_empty() {
+            lines.push(Line::default());
+        }
+        lines.push(Line::from(Span::styled(format!(" ── {name}"), accent)));
+    };
+
+    section(&mut lines, "账户");
+    match state.kind {
+        AccountKind::ChatGptPlan => {
+            match book.siwc.as_ref() {
+                None => lines.push(Line::from(Span::styled(" 读取中…", dim))),
+                Some(status) => {
+                    let view = siwc_view(status);
+                    lines.push(Line::from(Span::styled(
+                        format!(" ▶ {}", fit_width(&view.headline, body_width)),
+                        primary.add_modifier(Modifier::BOLD),
+                    )));
+                    if let Some(detail) = view.detail.as_ref() {
+                        lines.push(Line::from(Span::styled(
+                            format!("   {}", fit_width(detail, body_width)),
+                            secondary,
+                        )));
+                    }
+                    if view.plan_badge {
+                        // 只有 connected+sharing 才能说「在用套餐」——这是计费事实陈述。
+                        lines.push(Line::from(Span::styled(
+                            "   ● 在用 ChatGPT 套餐（按套餐额度计费）",
+                            accent,
+                        )));
+                    } else if status.status == qaqh_client::SiwcConnectionState::Connected {
+                        lines.push(Line::from(Span::styled(
+                            "   ○ 已登录但套餐未启用（不使用套餐额度）",
+                            Style::new().fg(theme.semantic.warning),
+                        )));
+                    }
+                }
+            }
+
+            // 账户列表（active 标记 + pending 段）。
+            if let Some(profiles) = book.profiles.as_ref() {
+                if !profiles.profiles.is_empty() {
+                    section(&mut lines, "账户列表（Enter 切换）");
+                    for (index, profile) in profiles.profiles.iter().enumerate() {
+                        let active = profiles.active.as_deref() == Some(profile.id.as_str());
+                        let marker = if index == state.selected { "▶" } else { " " };
+                        let mut text = format!(
+                            " {marker} {} {}{}",
+                            if active { "●" } else { "○" },
+                            profile.label,
+                            if profile.sharing {
+                                ""
+                            } else {
+                                " · 套餐未启用"
+                            },
+                        );
+                        if let Some(email) = profile.email.as_ref() {
+                            text.push_str(&format!(" ({email})"));
+                        }
+                        lines.push(Line::from(Span::styled(
+                            fit_width(&text, width),
+                            if active { primary } else { secondary },
+                        )));
+                    }
+                }
+                if !profiles.pending.is_empty() {
+                    section(&mut lines, "注册未完成");
+                    for profile in &profiles.pending {
+                        lines.push(Line::from(Span::styled(
+                            fit_width(
+                                &format!("   ○ {}（选它没用：请重新登录）", profile.label),
+                                width,
+                            ),
+                            dim,
+                        )));
+                    }
+                }
+            }
+        }
+        AccountKind::DeepSeekAccount => match book.ds.as_ref() {
+            None => lines.push(Line::from(Span::styled(" 读取中…", dim))),
+            Some(status) => {
+                let view = ds_view(status);
+                lines.push(Line::from(Span::styled(
+                    format!(" ▶ {}", fit_width(&view.headline, body_width)),
+                    if view.storage_broken {
+                        Style::new().fg(theme.semantic.warning)
+                    } else {
+                        primary.add_modifier(Modifier::BOLD)
+                    },
+                )));
+                if let Some(detail) = view.detail.as_ref() {
+                    lines.push(Line::from(Span::styled(
+                        format!("   {}", fit_width(detail, body_width)),
+                        secondary,
+                    )));
+                }
+                // 撤销结局只在本进程内存里（daemon 侧同款）：有话说，就诚实说。
+                if status.revoke.state == "failed" {
+                    lines.push(Line::from(Span::styled(
+                        format!(
+                            "   ⚠ 远端撤销未确认（第 {} 次）{}",
+                            status.revoke.attempts,
+                            status.revoke.message.clone().unwrap_or_default()
+                        ),
+                        Style::new().fg(theme.semantic.warning),
+                    )));
+                }
+            }
+        },
+    }
+
+    // 余额：充值 / 赠金分开（促销额度不得冒充充值，spec §2.2）。
+    if state.kind == AccountKind::DeepSeekAccount
+        && let Some(balance) = book.balance.as_ref()
+    {
+        if !balance.recharge.is_empty() {
+            section(&mut lines, "余额（充值）");
+            for wallet in &balance.recharge {
+                lines.push(Line::from(Span::styled(
+                    format!(
+                        "   {} {}（可用额度{}）",
+                        wallet.currency,
+                        wallet.balance,
+                        if balance.has_usable_balance {
+                            "充足"
+                        } else {
+                            "不足"
+                        }
+                    ),
+                    if balance.has_usable_balance {
+                        primary
+                    } else {
+                        Style::new().fg(theme.semantic.warning)
+                    },
+                )));
+            }
+        }
+        if !balance.bonus.is_empty() {
+            section(&mut lines, "赠金（不计入充值余额）");
+            for wallet in &balance.bonus {
+                lines.push(Line::from(Span::styled(
+                    format!("   {} {}", wallet.currency, wallet.balance),
+                    secondary,
+                )));
+            }
+        }
+        if !balance.total_cost.is_empty() {
+            section(&mut lines, "累计消费");
+            for cost in &balance.total_cost {
+                lines.push(Line::from(Span::styled(
+                    format!("   {} {}", cost.currency, cost.amount),
+                    secondary,
+                )));
+            }
+        }
+    }
+
+    section(&mut lines, "登录流程");
+    let (flow_text, flow_style) = match &state.flow {
+        Flow::Idle => ("空闲（按 l 发起登录）".to_string(), dim),
+        Flow::Starting => ("正在发起登录…".to_string(), secondary),
+        Flow::Pending { .. } => (
+            "等待浏览器授权…（按 c 取消；关掉标签页可按 o 重开授权页）".to_string(),
+            Style::new().fg(theme.accent.user),
+        ),
+        Flow::Done => ("已完成".to_string(), Style::new().fg(theme.accent.success)),
+        Flow::Superseded => (
+            "已被新的登录流程取代（已停止等待）".to_string(),
+            Style::new().fg(theme.semantic.warning),
+        ),
+        Flow::Failed { code, message } => (
+            format!("{code}: {message}"),
+            Style::new().fg(theme.accent.error),
+        ),
+    };
+    lines.push(Line::from(Span::styled(
+        format!("   {}", fit_width(&flow_text, body_width)),
+        flow_style,
+    )));
+
+    section(&mut lines, "操作");
+    lines.push(Line::from(Span::styled(
+        if state.kind == AccountKind::ChatGptPlan {
+            "   l 登录 / 追加账户 · c 取消 · x 登出 · u 管理用量"
+        } else {
+            "   l 登录 · c 取消 · x 登出 · b 刷新余额 · v 校验凭据 · t 充值"
+        },
+        dim,
+    )));
+    lines
 }
 
 /// 居中卡片的几何（宽高已定）。
@@ -1718,6 +2007,7 @@ mod tests {
                         state: TimelineBlockState::Sealed,
                         text: "第一回合的回答".into(),
                         tool: None,
+                        reasoning_kind: None,
                         last_fragment: 0,
                         rev: 0,
                     }],
@@ -1745,12 +2035,14 @@ mod tests {
                             state: TimelineBlockState::Sealed,
                             text: "第二回合的回答".into(),
                             tool: None,
+                            reasoning_kind: None,
                             last_fragment: 0,
                             rev: 0,
                         },
                         Block {
                             block_id: "b3".into(),
                             block_order: 1,
+                            reasoning_kind: None,
                             kind: TimelineBlockKind::Tool,
                             state: TimelineBlockState::Sealed,
                             text: String::new(),
@@ -2060,6 +2352,53 @@ mod tests {
             text.contains("▼"),
             "16 行终端上设置内容必然溢出，必须出现 ▼ 徽标：{text}"
         );
+    }
+
+    /// 账号卡片：状态文案按品牌口径走，`sharing=false` 时**不得**出现计费事实陈述；
+    /// 同时它不该 panic（没有命中区，绘制路径只有这一段）。
+    #[test]
+    fn account_card_never_fakes_the_plan_badge() {
+        use crate::app::account::{AccountKind, AccountState};
+
+        let (mut app, _rx) = App::new_for_test();
+        let mut state = AccountState::new(AccountKind::ChatGptPlan);
+        state.notice = Some("已取消本次登录".into());
+        app.overlays.push(Overlay::Account(state));
+        app.account.siwc = Some(
+            serde_json::from_value(serde_json::json!({
+                "status": "connected",
+                "sharing": false,
+                "profiles": 1,
+                "usageUrl": "https://chatgpt.com/codex/settings/usage",
+                "apiBase": "https://api.openai.com/v1",
+                "profileId": "p_1",
+                "label": "工作",
+                "email": "a@b.c"
+            }))
+            .expect("siwc.status fixture"),
+        );
+
+        let backend = TestBackend::new(100, 24);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| draw_account_card(frame, &app, frame.area(), &theme()))
+            .expect("draw account card");
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        // 宽字符在 buffer 里占两格（第二格是占位空格），先去掉空白再比对。
+        let compact: String = text.chars().filter(|ch| !ch.is_whitespace()).collect();
+        assert!(compact.contains("已登录·套餐未启用"), "{text}");
+        assert!(
+            !compact.contains("在用ChatGPT套餐"),
+            "sharing=false 是「登录了但没授权套餐」，不得出现计费事实陈述：{text}"
+        );
+        assert!(compact.contains("已取消本次登录"), "{text}");
+        assert!(compact.contains("登录流程"), "{text}");
     }
 
     fn app_with_todo_tasks() -> App {
