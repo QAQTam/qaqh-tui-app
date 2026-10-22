@@ -30,6 +30,12 @@ pub const REASONING_EFFORTS: [&str; 6] = ["low", "medium", "high", "xhigh", "max
 /// 手改 `config.toml`）看到的是同一件事，不会出现「UI 说开着、daemon 说没开」。
 pub const CREDENTIALS: [&str; 3] = ["api_key", "chatgpt_plan", "deepseek_account"];
 
+/// 是否处于账号额度模式（ChatGPT 套餐 或 DeepSeek 账号）。
+/// 与桌面端 `isAccountCredential` 保持严格同源。
+pub fn is_account_credential(credential: &str) -> bool {
+    matches!(credential.trim(), "chatgpt_plan" | "deepseek_account")
+}
+
 /// BYOK 的四条 wire（`ConfigPatch::validate` 的值域）。provider 目录已退役，
 /// 协议没有可查的表，由用户在设置页直接声明。
 ///
@@ -400,6 +406,16 @@ impl SettingsState {
             .unwrap_or_else(|| "api_key".to_string())
     }
 
+    /// 判定字段在当前生效凭据下是否被禁用（由账号模式接管端点与密钥）。
+    pub fn is_field_disabled(&self, id: FieldId, loaded: Option<&ConfigDto>) -> bool {
+        let cred = self.effective_credential(loaded);
+        if is_account_credential(&cred) {
+            matches!(id, FieldId::BaseUrl | FieldId::Wire | FieldId::ApiKey)
+        } else {
+            false
+        }
+    }
+
     fn credential_now(&self, loaded: Option<&ConfigDto>) -> String {
         self.effective_credential(loaded)
     }
@@ -598,6 +614,9 @@ impl SettingsState {
     /// 开始编辑：Text/Secret/Number/Float 返回预填缓冲（Secret 恒空），
     /// Enum/Toggle/Port 返回 None（由 cycle/端口逻辑处理）。
     pub fn start_edit(&self, loaded: Option<&ConfigDto>) -> Option<EditBuffer> {
+        if self.is_field_disabled(self.row().id, loaded) {
+            return None;
+        }
         let session_id = match self.row().id {
             FieldId::Model => self.effective(loaded, |d, c| {
                 d.model.clone().unwrap_or_else(|| c.model.clone())
@@ -854,6 +873,9 @@ impl SettingsState {
                 Ok(true)
             }
             FieldId::Wire => {
+                if self.is_field_disabled(FieldId::Wire, loaded) {
+                    return Err("账号额度模式下 wire 协议由账号服务商接管，无需配置".into());
+                }
                 // BYOK：协议由用户声明，daemon 不给目录，所以词表就是本地常量。
                 // 刻意**不**跟着改 baseUrl——切 wire 只切 wire。
                 //
@@ -1438,5 +1460,28 @@ mod tests {
         st.draft.model = Some("legacy-slug".into());
         st.cycle(Some(&c), 1).unwrap();
         assert_eq!(st.draft.model.as_deref(), Some("gpt-5"));
+    }
+
+    #[test]
+    fn byok_fields_disabled_in_account_mode() {
+        let mut c = cfg();
+        c.credential = "chatgpt_plan".into();
+        let mut st = SettingsState::default();
+        assert!(st.is_field_disabled(FieldId::BaseUrl, Some(&c)));
+        assert!(st.is_field_disabled(FieldId::Wire, Some(&c)));
+        assert!(st.is_field_disabled(FieldId::ApiKey, Some(&c)));
+        assert!(!st.is_field_disabled(FieldId::Model, Some(&c)));
+
+        st.focus = row_index(FieldId::BaseUrl);
+        assert!(st.start_edit(Some(&c)).is_none(), "禁用字段禁止进入编辑态");
+
+        st.focus = row_index(FieldId::Wire);
+        assert!(st.cycle(Some(&c), 1).is_err(), "禁用字段禁止切换");
+
+        c.credential = "api_key".into();
+        assert!(!st.is_field_disabled(FieldId::BaseUrl, Some(&c)));
+        assert!(!st.is_field_disabled(FieldId::Wire, Some(&c)));
+        assert!(!st.is_field_disabled(FieldId::ApiKey, Some(&c)));
+        assert!(st.start_edit(Some(&c)).is_some());
     }
 }

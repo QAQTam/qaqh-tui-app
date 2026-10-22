@@ -68,6 +68,10 @@ ratatui-crossterm = { path = "../ratatui/ratatui-crossterm" }
 ratatui-macros = { path = "../ratatui/ratatui-macros" }
 ratatui-widgets = { path = "../ratatui/ratatui-widgets" }
 
+[profile.dev]
+# 仅保留行号信息以供 panic backtrace 查错，大幅削减 2C2T 生成与链接巨大 DWARF 符号的开销
+debug = 1
+
 [profile.release]
 lto = "thin"
 strip = "symbols"

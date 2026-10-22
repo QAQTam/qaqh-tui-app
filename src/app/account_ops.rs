@@ -55,6 +55,7 @@ impl App {
             A::Cancel => self.cancel_account_sign_in(kind),
             A::SignOut => self.sign_out_account(kind),
             A::Refresh => self.refresh_account(kind),
+            A::RefreshModels => self.spawn_account_models(kind),
             A::OpenAuthorize => {
                 if let Some(url) = authorize_url {
                     self.open_account_link(url);
@@ -105,6 +106,12 @@ impl App {
                     self.select_account_profile(id);
                 }
             }
+            A::SelectModel(index) => {
+                if let Some(model) = self.account.models_for(kind).get(index) {
+                    let slug = model.value.clone();
+                    self.save_config_model(slug);
+                }
+            }
             A::Close => {
                 if st.flow == Flow::Starting {
                     if let Some(st) = self.account_overlay_mut(kind) {
@@ -146,6 +153,8 @@ impl App {
                 self.spawn_account_models(kind);
             }
             AccountKind::DeepSeekAccount => {
+                // 补齐：DeepSeek 账号模式下拉取官方平台模型目录
+                self.spawn_account_models(kind);
                 // 余额只在已登录时才有意义；状态还没回来时先不猜。
                 if self
                     .account
@@ -242,6 +251,27 @@ impl App {
         }
     }
 
+    /// 切换并持久化当前模型设置（单字段更新）。
+    pub fn save_config_model(&mut self, model: String) {
+        let payload = json!({ "model": model });
+        self.spawn_api(move |api, tx| async move {
+            let result = api
+                .action(ActionRequest::ConfigSave { fields: payload })
+                .await;
+            let _ = tx.send(AppMsg::Action(ActionResult::ConfigWrite {
+                label: "模型",
+                result,
+            }));
+        });
+        for overlay in self.overlays.iter_mut() {
+            if let Overlay::Settings(st) = overlay {
+                st.draft.model = Some(model.clone());
+            }
+        }
+        self.toast(NoticeLevel::Info, format!("正在切换模型为: {model}"));
+        self.redraw_requested = true;
+    }
+
     // ───────────────────────── 发送 ─────────────────────────
 
     fn spawn_account(
@@ -270,7 +300,7 @@ impl App {
         self.spawn_account(kind, AccountOp::Profiles, "profiles", json!({}));
     }
 
-    fn spawn_account_models(&self, kind: AccountKind) {
+    pub(super) fn spawn_account_models(&self, kind: AccountKind) {
         self.spawn_account(kind, AccountOp::Models, "models", json!({}));
     }
 
@@ -431,6 +461,9 @@ impl App {
                         self.account.ds = Some(status);
                         if signed_in {
                             self.spawn_account_balance(kind);
+                            if self.account.models_for(kind).is_empty() {
+                                self.spawn_account_models(kind);
+                            }
                         }
                     }
                     Err(error) => self.account_parse_error(kind, "dsaccount.status", &error),

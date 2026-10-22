@@ -503,7 +503,14 @@ impl App {
                         | FieldKind::Secret
                         | FieldKind::Number
                         | FieldKind::Float => {
-                            st.editing = st.start_edit(self.config.as_ref());
+                            if st.is_field_disabled(st.row().id, self.config.as_ref()) {
+                                self.toast(
+                                    NoticeLevel::Info,
+                                    "当前处于账号额度模式，端点与密钥由账号统一接管，无需配置 BYOK",
+                                );
+                            } else {
+                                st.editing = st.start_edit(self.config.as_ref());
+                            }
                         }
                         FieldKind::Enum => {
                             self.settings_cycle(&mut st, 1);
@@ -596,6 +603,9 @@ impl App {
                         self.account_action(A::SignOut);
                     }
                     KeyCode::Char('r') => self.account_action(A::Refresh),
+                    KeyCode::Char('m') | KeyCode::Char('M') => {
+                        self.account_action(A::RefreshModels);
+                    }
                     KeyCode::Char('o') => self.account_action(A::OpenAuthorize),
                     KeyCode::Char('y') => self.account_action(A::CopyAuthorize),
                     KeyCode::Char('u') => self.account_action(A::Usage),

@@ -27,6 +27,14 @@ impl App {
         st.focus = index.min(settings::ROWS.len().saturating_sub(1));
         st.editing = None;
         let row = st.row();
+        if st.is_field_disabled(row.id, self.config.as_ref()) {
+            self.replace_overlay(Overlay::Settings(st));
+            self.toast(
+                NoticeLevel::Info,
+                "当前处于账号额度模式，端点与密钥由账号统一接管，无需配置 BYOK",
+            );
+            return;
+        }
         match row.kind {
             settings::FieldKind::Text
             | settings::FieldKind::Secret
@@ -124,6 +132,8 @@ impl App {
         };
         if missing {
             self.refresh_account(kind);
+        } else if self.account.models_for(kind).is_empty() {
+            self.spawn_account_models(kind);
         }
     }
 

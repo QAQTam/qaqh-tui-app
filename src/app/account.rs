@@ -57,6 +57,7 @@ pub enum AccountAction {
     Cancel,
     SignOut,
     Refresh,
+    RefreshModels,
     OpenAuthorize,
     CopyAuthorize,
     Usage,
@@ -64,6 +65,7 @@ pub enum AccountAction {
     Verify,
     TopUp,
     SelectProfile(usize),
+    SelectModel(usize),
     Close,
 }
 
@@ -222,7 +224,7 @@ impl AccountState {
             AccountAction::Login => available && !running,
             AccountAction::Cancel => available && self.flow.is_pending(),
             AccountAction::SignOut => available && !running && signed_in,
-            AccountAction::Refresh => available,
+            AccountAction::Refresh | AccountAction::RefreshModels => available,
             AccountAction::OpenAuthorize | AccountAction::CopyAuthorize => {
                 self.flow.is_pending()
                     && self
@@ -254,6 +256,11 @@ impl AccountState {
                         .as_ref()
                         .and_then(|p| p.profiles.get(index))
                         .is_some_and(|profile| !profile.pending)
+            }
+            AccountAction::SelectModel(index) => {
+                available
+                    && !running
+                    && book.models_for(self.kind).get(index).is_some()
             }
             AccountAction::Close => true,
         }
@@ -1009,5 +1016,24 @@ mod tests {
         };
         assert!(error.requires_reauth);
         assert_eq!(ds_profile().user_id, "u_1");
+    }
+
+    #[test]
+    fn refresh_models_and_select_model_actions() {
+        let mut book = AccountBook::default();
+        let kind = AccountKind::ChatGptPlan;
+        let state = AccountState::new(kind);
+        assert!(state.action_enabled(&book, AccountAction::RefreshModels));
+        assert!(!state.action_enabled(&book, AccountAction::SelectModel(0)));
+
+        book.store_models(
+            kind,
+            vec![ModelOption {
+                value: "gpt-4o".into(),
+                label: "GPT-4o (gpt-4o)".into(),
+            }],
+        );
+        assert!(state.action_enabled(&book, AccountAction::SelectModel(0)));
+        assert!(!state.action_enabled(&book, AccountAction::SelectModel(1)));
     }
 }

@@ -752,6 +752,7 @@ pub fn draw_account_card(
         let anchor_line = if matches!(
             control.action,
             crate::app::account::AccountAction::SelectProfile(_)
+                | crate::app::account::AccountAction::SelectModel(_)
         ) {
             lines[control.line].clone()
         } else {
@@ -883,6 +884,7 @@ fn account_lines(
         (A::Cancel, "取消 c"),
         (A::SignOut, "登出 x"),
         (A::Refresh, "刷新 r"),
+        (A::RefreshModels, "刷新模型 m"),
         (A::OpenAuthorize, "授权页 o"),
         (A::CopyAuthorize, "复制链接 y"),
         (A::Usage, "用量 u"),
@@ -1084,6 +1086,45 @@ fn account_lines(
         }
     }
 
+    // 权威模型列表：严格按后端返回的 siwc.models / dsaccount.models 渲染，绝不虚构。
+    let models = book.models_for(state.kind);
+    if !models.is_empty() {
+        section(&mut lines, "可用模型（点击切换）");
+        let cur_model = app.config.as_ref().map(|c| c.model.as_str()).unwrap_or_default();
+        for (index, opt) in models.iter().enumerate() {
+            let is_active = cur_model == opt.value;
+            let action = A::SelectModel(index);
+            let visual = account_visual(app, state, action, is_active);
+            controls.push(AccountControl {
+                line: lines.len(),
+                column: 0,
+                width: width as u16,
+                action,
+            });
+            let marker = if is_active { "●" } else { "○" };
+            let line_text = format!("   {marker} {}", opt.label);
+            lines.push(Line::from(Span::styled(
+                fit_width(&line_text, width),
+                visual
+                    .foreground(theme)
+                    .patch(visual.surface_style(theme, theme.surface.highlight)),
+            )));
+        }
+    } else {
+        section(&mut lines, "可用模型");
+        let hint = match state.kind {
+            AccountKind::ChatGptPlan => "未拉取到模型列表（可按 m 或点击「刷新模型」重试）",
+            AccountKind::DeepSeekAccount => {
+                if book.ds.as_ref().is_some_and(|s| s.signed_in) {
+                    "未拉取到模型列表（可按 m 或点击「刷新模型」重试）"
+                } else {
+                    "登录完成后将拉取并展示官方模型列表"
+                }
+            }
+        };
+        lines.push(Line::from(Span::styled(format!("   {hint}"), dim)));
+    }
+
     section(&mut lines, "登录流程");
     let (flow_text, flow_style) = match &state.flow {
         Flow::Idle => ("空闲（按 l 发起登录）".to_string(), dim),
@@ -1179,6 +1220,14 @@ fn settings_lines(
         } else {
             settings_value(state, loaded, row.id, value_width, theme)
         };
+        let disabled = state.is_field_disabled(row.id, loaded);
+        let label_style = if disabled {
+            Style::new().fg(theme.text.dim)
+        } else if focused {
+            Style::new().fg(theme.text.primary).add_modifier(Modifier::BOLD)
+        } else {
+            Style::new().fg(theme.text.secondary)
+        };
         lines.push(Line::from(vec![
             Span::styled(
                 format!("{marker} "),
@@ -1188,20 +1237,7 @@ fn settings_lines(
                     theme.text.dim
                 }),
             ),
-            Span::styled(
-                label,
-                Style::new()
-                    .fg(if focused {
-                        theme.text.primary
-                    } else {
-                        theme.text.secondary
-                    })
-                    .add_modifier(if focused {
-                        Modifier::BOLD
-                    } else {
-                        Modifier::empty()
-                    }),
-            ),
+            Span::styled(label, label_style),
             Span::styled("  ", Style::new()),
             Span::styled(value, value_style),
         ]));
@@ -1216,6 +1252,11 @@ fn settings_value(
     width: usize,
     theme: &Theme,
 ) -> (String, Style) {
+    if state.is_field_disabled(id, loaded) {
+        let raw = state.display(loaded, id);
+        let text = format!("{raw} (由账号接管)");
+        return (fit_width(&text, width), Style::new().fg(theme.text.dim));
+    }
     let dirty = state.dirty(id);
     let value = fit_width(
         &state.display(loaded, id),
