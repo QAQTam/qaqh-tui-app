@@ -129,11 +129,14 @@ fn header_line(route: &WorkspaceRoute, app: &App, theme: &Theme) -> Line<'static
         WorkspaceRoute::Sessions { show_archived, .. } => (
             "Sessions",
             if let Some(cwd) = app.session_cwd_filter.as_deref() {
-                format!("当前 cwd · {}", crate::app::truncate_str(cwd, 48))
+                format!(
+                    "当前工作区 · {} (按 c 显示全部)",
+                    crate::app::truncate_str(cwd, 36)
+                )
             } else if *show_archived {
-                "含归档".to_owned()
+                "全部工作区 · 含归档 (按 c 仅看当前)".to_owned()
             } else {
-                "活动会话".to_owned()
+                "全部工作区 · 活动会话 (按 c 仅看当前)".to_owned()
             },
         ),
         WorkspaceRoute::Settings => ("Settings", "daemon 配置".to_owned()),
@@ -205,7 +208,7 @@ fn header_line(route: &WorkspaceRoute, app: &App, theme: &Theme) -> Line<'static
 fn footer_line(route: &WorkspaceRoute, theme: &Theme, back: ButtonVisual) -> Line<'static> {
     let hint = match route {
         WorkspaceRoute::Sessions { .. } => {
-            "↑↓ 选择 · Enter 打开 · n 新建 · x 归档 · u 恢复 · D 删除 · a 归档显示 · r 刷新"
+            "↑↓ 选择 · Enter 打开 · n 新建 · x 归档 · u 恢复 · D 删除 · a 归档显示 · c 工作区过滤 · r 刷新"
         }
         WorkspaceRoute::Settings => "↑↓ 选择 · Enter 编辑/应用 · ←→ 切换 · s 保存 · r 刷新",
         WorkspaceRoute::Account => "l 登录 · c 取消 · x 登出 · r 刷新 · u 用量 · Esc 关闭",
@@ -295,9 +298,11 @@ fn draw_sessions(
         )));
     } else {
         let width = usize::from(area.width);
+        let show_ws_col = width >= 60;
+        let ws_width = if show_ws_col { 14 } else { 0 };
         for (index, meta) in entries.iter().enumerate().skip(start).take(height) {
             let is_selected = index == selected;
-            let title_width = width.saturating_sub(38).max(12);
+            let title_width = width.saturating_sub(38 + ws_width).max(12);
             let title = fit_width(&meta.meta.display_title(), title_width);
             let updated = chrono::DateTime::from_timestamp_millis(meta.meta.updated_at as i64)
                 .map(|time| {
@@ -319,29 +324,50 @@ fn draw_sessions(
                 .get(&meta.meta.session_id)
                 .map(|value| format!("{value:?}"))
                 .unwrap_or_default();
-            let line = Line::from(vec![
-                Span::styled(
-                    format!(" {marker} {open} "),
-                    Style::new().fg(if open != " " {
-                        theme.accent.assistant
-                    } else {
-                        theme.text.dim
-                    }),
-                ),
-                Span::styled(
-                    pad_width(&title, title_width),
-                    Style::new().fg(theme.text.primary),
-                ),
-                Span::styled(
-                    format!("  {}", pad_width(&fit_width(&activity, 12), 12)),
-                    Style::new().fg(theme.text.dim),
-                ),
-                Span::styled(format!(" {updated}"), Style::new().fg(theme.text.muted)),
-                Span::styled(
-                    format!("  #{}", meta.meta.session_id),
-                    Style::new().fg(theme.text.dim),
-                ),
-            ]);
+            let mut spans = vec![Span::styled(
+                format!(" {marker} {open} "),
+                Style::new().fg(if open != " " {
+                    theme.accent.assistant
+                } else {
+                    theme.text.dim
+                }),
+            )];
+            if show_ws_col {
+                let ws_name = meta
+                    .meta
+                    .cwd
+                    .as_deref()
+                    .and_then(|cwd| {
+                        let trimmed = cwd.trim_end_matches(['/', '\\']);
+                        std::path::Path::new(trimmed)
+                            .file_name()
+                            .map(|n| n.to_string_lossy().into_owned())
+                            .filter(|s| !s.is_empty())
+                    })
+                    .unwrap_or_else(|| "未分组".to_string());
+                let ws_tag = format!("[{}] ", fit_width(&ws_name, ws_width.saturating_sub(3)));
+                spans.push(Span::styled(
+                    pad_width(&ws_tag, ws_width),
+                    Style::new().fg(theme.semantic.path),
+                ));
+            }
+            spans.push(Span::styled(
+                pad_width(&title, title_width),
+                Style::new().fg(theme.text.primary),
+            ));
+            spans.push(Span::styled(
+                format!("  {}", pad_width(&fit_width(&activity, 12), 12)),
+                Style::new().fg(theme.text.dim),
+            ));
+            spans.push(Span::styled(
+                format!(" {updated}"),
+                Style::new().fg(theme.text.muted),
+            ));
+            spans.push(Span::styled(
+                format!("  #{}", meta.meta.session_id),
+                Style::new().fg(theme.text.dim),
+            ));
+            let line = Line::from(spans);
             let visual = workspace_visual(app, WorkspaceHit::SessionRow(index), is_selected);
             let line = line
                 .patch_style(visual.surface_style(theme, theme.chrome.selection))
@@ -534,7 +560,7 @@ pub fn draw_settings_card(
         return;
     }
     // 内容行数（含分区头与空行）决定卡片高度，向可用高度收口。
-    let title = if state.draft.is_empty() {
+    let title = if !state.has_changes() {
         " ⚙ 设置 ".to_owned()
     } else {
         " ⚙ 设置 · ● 未保存（Esc 丢弃） ".to_owned()
@@ -651,9 +677,14 @@ pub fn draw_settings_card(
 
 /// 账号登录卡片：与设置卡片同款居中浮层，但状态来自服务面（`siwc.*` / `dsaccount.*`）。
 ///
-/// 与 `draw_settings_card` 一样不登记命中区：鼠标在这张卡片上没有语义目标，
-/// 键位写在 footer 里（`/remote` 页同款取舍）。
-pub fn draw_account_card(f: &mut Frame, app: &App, area: Rect, theme: &Theme) {
+/// 操作按钮与账户行在绘制位置登记命中区，屏外内容不参与点击。
+pub fn draw_account_card(
+    f: &mut Frame,
+    app: &App,
+    area: Rect,
+    theme: &Theme,
+    hit_map: &mut HitMapBuilder,
+) {
     let Some(Overlay::Account(state)) = app.overlays.last() else {
         return;
     };
@@ -661,7 +692,23 @@ pub fn draw_account_card(f: &mut Frame, app: &App, area: Rect, theme: &Theme) {
     const FOOTER_ROWS: u16 = 1;
     let width = CARD_WIDTH.min(area.width.saturating_sub(4));
     let max_height = area.height.saturating_sub(4);
-    if width < 24 || max_height < 6 {
+    if width < 16 || max_height < 8 {
+        // 极小视口也必须能用鼠标关闭，不能留下无响应的空白遮罩。
+        let close = WorkspaceHit::Account(crate::app::account::AccountAction::Close);
+        let line = Line::from(Span::styled(
+            "[ 返回 ]",
+            workspace_visual(app, close, false).surface_style(theme, Color::Reset),
+        ));
+        let rect = Rect::new(area.x, area.y, area.width.min(8), area.height.min(1));
+        register_workspace_region(
+            hit_map,
+            rect,
+            area,
+            WorkspaceHit::Account(crate::app::account::AccountAction::Close),
+            z::WORKSPACE_FOOTER,
+            &line,
+        );
+        f.render_widget(Paragraph::new(line), rect);
         return;
     }
     let title = if state.flow.is_pending() {
@@ -670,7 +717,7 @@ pub fn draw_account_card(f: &mut Frame, app: &App, area: Rect, theme: &Theme) {
         format!(" 👤 {} ", state.kind.title())
     };
     let inner_width = usize::from(width.saturating_sub(2));
-    let lines = account_lines(state, &app.account, inner_width, theme);
+    let (lines, controls) = account_lines(state, app, inner_width, theme);
     let card_height = (lines.len() as u16 + FOOTER_ROWS + 2).clamp(8, max_height);
     let rect = centered_card_rect(width, card_height, area);
     let inner = Rect {
@@ -692,30 +739,112 @@ pub fn draw_account_card(f: &mut Frame, app: &App, area: Rect, theme: &Theme) {
     let height = usize::from(content_area.height).max(1);
     let total = lines.len();
     let scroll = state.scroll.min(total.saturating_sub(height));
+    for control in controls {
+        if control.line < scroll || control.line >= scroll + height {
+            continue;
+        }
+        let rect = Rect::new(
+            content_area.x + control.column,
+            content_area.y + (control.line - scroll) as u16,
+            control.width,
+            1,
+        );
+        let anchor_line = if matches!(
+            control.action,
+            crate::app::account::AccountAction::SelectProfile(_)
+        ) {
+            lines[control.line].clone()
+        } else {
+            Line::from("[")
+        };
+        if let Some(region) = line_region(
+            rect,
+            content_area,
+            PointerTarget::Workspace(WorkspaceHit::Account(control.action)),
+            MouseButton::Left,
+            state.action_enabled(&app.account, control.action),
+            z::WORKSPACE_ROW,
+            &anchor_line,
+        ) {
+            hit_map.push(region);
+        }
+    }
     let visible: Vec<Line<'static>> = lines.into_iter().skip(scroll).take(height).collect();
     f.render_widget(Paragraph::new(visible), content_area);
+    let close = WorkspaceHit::Account(crate::app::account::AccountAction::Close);
+    let line = Line::from(Span::styled(
+        "[ 返回 ]",
+        workspace_visual(app, close, false).surface_style(theme, Color::Reset),
+    ));
+    let close_area = Rect::new(
+        footer_area.x,
+        footer_area.y,
+        8.min(footer_area.width),
+        footer_area.height,
+    );
+    register_workspace_region(
+        hit_map,
+        close_area,
+        footer_area,
+        close,
+        z::WORKSPACE_FOOTER,
+        &line,
+    );
+    f.render_widget(Paragraph::new(line), close_area);
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
-            if state.kind == crate::app::account::AccountKind::ChatGptPlan {
-                " l 登录 · c 取消 · x 登出 · ↑↓/Enter 选账户 · u 用量 · o 重开授权页 · r 刷新 "
-            } else {
-                " l 登录 · c 取消 · x 登出 · b 余额 · v 校验 · t 充值 · u 用量 · r 刷新 "
-            },
+            format!(
+                " 点击操作 · 滚轮浏览 · Esc 返回{}",
+                if total > height {
+                    " · 有更多内容"
+                } else {
+                    ""
+                }
+            ),
             Style::new().fg(theme.text.dim),
         ))),
-        footer_area,
+        Rect::new(
+            close_area.right(),
+            footer_area.y,
+            footer_area.width.saturating_sub(close_area.width),
+            footer_area.height,
+        ),
     );
+}
+
+struct AccountControl {
+    line: usize,
+    column: u16,
+    width: u16,
+    action: crate::app::account::AccountAction,
+}
+
+fn account_visual(
+    app: &App,
+    state: &crate::app::account::AccountState,
+    action: crate::app::account::AccountAction,
+    focused: bool,
+) -> ButtonVisual {
+    let target = WorkspaceHit::Account(action);
+    ButtonVisual::derive(
+        state.action_enabled(&app.account, action),
+        focused,
+        app.workspace_hover == Some(target),
+        app.workspace_pressed == Some(target),
+    )
 }
 
 fn account_lines(
     state: &crate::app::account::AccountState,
-    book: &crate::app::account::AccountBook,
+    app: &App,
     width: usize,
     theme: &Theme,
-) -> Vec<Line<'static>> {
-    use crate::app::account::{AccountKind, Flow, ds_view, siwc_view};
+) -> (Vec<Line<'static>>, Vec<AccountControl>) {
+    use crate::app::account::{AccountAction as A, AccountKind, Flow, ds_view, siwc_view};
 
+    let book = &app.account;
     let mut lines: Vec<Line<'static>> = Vec::new();
+    let mut controls = Vec::new();
     let accent = Style::new()
         .fg(theme.accent.assistant)
         .add_modifier(Modifier::BOLD);
@@ -747,6 +876,52 @@ fn account_lines(
         }
         lines.push(Line::from(Span::styled(format!(" ── {name}"), accent)));
     };
+
+    section(&mut lines, "账号操作");
+    let mut actions = vec![
+        (A::Login, "登录 l"),
+        (A::Cancel, "取消 c"),
+        (A::SignOut, "登出 x"),
+        (A::Refresh, "刷新 r"),
+        (A::OpenAuthorize, "授权页 o"),
+        (A::CopyAuthorize, "复制链接 y"),
+        (A::Usage, "用量 u"),
+    ];
+    if state.kind == AccountKind::DeepSeekAccount {
+        actions.extend([
+            (A::Balance, "余额 b"),
+            (A::Verify, "校验 v"),
+            (A::TopUp, "充值 t"),
+        ]);
+    }
+    let mut spans = Vec::new();
+    let mut column = 0;
+    for (action, label) in actions {
+        let text = fit_width(&format!("[ {label} ]"), width);
+        let button_width = text.width();
+        if column > 0 && column + button_width > width {
+            lines.push(Line::from(std::mem::take(&mut spans)));
+            column = 0;
+        }
+        let visual = account_visual(app, state, action, false);
+        controls.push(AccountControl {
+            line: lines.len(),
+            column: column as u16,
+            width: button_width as u16,
+            action,
+        });
+        spans.push(Span::styled(
+            text,
+            visual
+                .foreground(theme)
+                .patch(visual.surface_style(theme, Color::Reset)),
+        ));
+        spans.push(Span::raw(" "));
+        column += button_width + 1;
+    }
+    if !spans.is_empty() {
+        lines.push(Line::from(spans));
+    }
 
     section(&mut lines, "账户");
     match state.kind {
@@ -800,9 +975,19 @@ fn account_lines(
                         if let Some(email) = profile.email.as_ref() {
                             text.push_str(&format!(" ({email})"));
                         }
+                        let action = A::SelectProfile(index);
+                        let visual = account_visual(app, state, action, index == state.selected);
+                        controls.push(AccountControl {
+                            line: lines.len(),
+                            column: 0,
+                            width: width as u16,
+                            action,
+                        });
                         lines.push(Line::from(Span::styled(
                             fit_width(&text, width),
-                            if active { primary } else { secondary },
+                            visual
+                                .foreground(theme)
+                                .patch(visual.surface_style(theme, theme.surface.highlight)),
                         )));
                     }
                 }
@@ -922,16 +1107,7 @@ fn account_lines(
         flow_style,
     )));
 
-    section(&mut lines, "操作");
-    lines.push(Line::from(Span::styled(
-        if state.kind == AccountKind::ChatGptPlan {
-            "   l 登录 / 追加账户 · c 取消 · x 登出 · u 管理用量"
-        } else {
-            "   l 登录 · c 取消 · x 登出 · b 刷新余额 · v 校验凭据 · t 充值"
-        },
-        dim,
-    )));
-    lines
+    (lines, controls)
 }
 
 /// 居中卡片的几何（宽高已定）。
@@ -1324,7 +1500,10 @@ fn draw_help(f: &mut Frame, area: Rect, theme: &Theme) {
     let entries = [
         ("F1 / /help", "打开本帮助 Workspace"),
         ("Ctrl+L / /sessions", "打开会话列表 Workspace"),
-        ("Ctrl+, / F10 / /settings", "打开设置 Workspace"),
+        (
+            "F10 / /settings / Ctrl+,",
+            "打开设置（渲染：动效 / 性能模式）",
+        ),
         ("F4 / /workspace", "打开 todo Workspace"),
         ("Ctrl+↑", "进入子代理只读观测"),
         ("Ctrl+↓ / Esc", "返回父会话 / Agent View"),
@@ -1895,6 +2074,111 @@ mod tests {
         (map, terminal.backend().clone())
     }
 
+    fn draw_account_to_map(app: &App, width: u16, height: u16) -> (FrameHitMap, TestBackend) {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        let mut builder = scratch_map(&WorkspaceRoute::Account, width, height);
+        terminal
+            .draw(|frame| {
+                draw_account_card(frame, app, frame.area(), &theme(), &mut builder);
+            })
+            .unwrap();
+        let map = builder.finish();
+        map.validate().expect("账号控件几何不应重叠或越界");
+        map.probe(terminal.backend().buffer(), map.frame_id, &map.route)
+            .expect("账号控件锚点必须与实际绘制相符");
+        (map, terminal.backend().clone())
+    }
+
+    #[test]
+    fn account_mouse_controls_wrap_clip_and_keep_close_reachable() {
+        use crate::app::account::{AccountAction as A, AccountKind, AccountState, Flow};
+        for kind in [AccountKind::ChatGptPlan, AccountKind::DeepSeekAccount] {
+            let (mut app, _rx) = App::new_for_test();
+            let mut state = AccountState::new(kind);
+            state.flow = Flow::Pending {
+                id: "flow".into(),
+                deadline_ms: u64::MAX,
+            };
+            state.authorize_url = Some("https://example.com/authorize".into());
+            app.overlays.push(Overlay::Account(state));
+            for (width, height) in [(100, 40), (80, 24), (40, 12), (24, 10), (12, 5)] {
+                let (map, backend) = draw_account_to_map(&app, width, height);
+                assert_region_reachable(&map, &WorkspaceHit::Account(A::Close));
+                assert_anchors_non_empty(&backend, &map);
+                let mut reached = std::collections::HashSet::new();
+                for scroll in [0, 3, 8, 20, usize::MAX] {
+                    if let Some(Overlay::Account(state)) = app.overlays.last_mut() {
+                        state.scroll = scroll;
+                    }
+                    let (map, _) = draw_account_to_map(&app, width, height);
+                    for region in &map.regions {
+                        if let PointerTarget::Workspace(WorkspaceHit::Account(action)) =
+                            region.target
+                        {
+                            reached.insert(format!("{action:?}"));
+                            if region.enabled {
+                                assert_region_reachable(&map, &WorkspaceHit::Account(action));
+                            }
+                        }
+                    }
+                }
+                if width >= 24 && height >= 12 {
+                    for action in [
+                        A::Login,
+                        A::Cancel,
+                        A::OpenAuthorize,
+                        A::CopyAuthorize,
+                        A::Refresh,
+                    ] {
+                        assert!(
+                            reached.contains(&format!("{action:?}")),
+                            "{width}x{height} 未渲染 {action:?}"
+                        );
+                    }
+                }
+                if let Some(Overlay::Account(state)) = app.overlays.last_mut() {
+                    state.scroll = 0;
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn account_buttons_show_hover_pressed_and_disabled_feedback() {
+        use crate::app::account::{AccountAction as A, AccountKind, AccountState};
+        let (mut app, _rx) = App::new_for_test();
+        app.overlays.push(Overlay::Account(AccountState::new(
+            AccountKind::ChatGptPlan,
+        )));
+        let target = WorkspaceHit::Account(A::Login);
+        let (idle_map, idle) = draw_account_to_map(&app, 100, 30);
+        let rect = region_for(&idle_map, &target).rect;
+        app.workspace_hover = Some(target);
+        let (_, hovered) = draw_account_to_map(&app, 100, 30);
+        app.workspace_pressed = Some(target);
+        let (_, pressed) = draw_account_to_map(&app, 100, 30);
+        assert_ne!(
+            idle.buffer()[(rect.x, rect.y)].bg,
+            hovered.buffer()[(rect.x, rect.y)].bg
+        );
+        assert_ne!(
+            hovered.buffer()[(rect.x, rect.y)].bg,
+            pressed.buffer()[(rect.x, rect.y)].bg
+        );
+        let cancel = region_for(&idle_map, &WorkspaceHit::Account(A::Cancel));
+        assert!(!cancel.enabled);
+        assert!(
+            idle_map
+                .resolve(cancel.rect.x, cancel.rect.y, MouseButton::Left)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            idle.buffer()[(cancel.rect.x, cancel.rect.y)].fg,
+            theme().text.dim
+        );
+    }
+
     fn region_for<'a>(
         map: &'a FrameHitMap,
         target: &WorkspaceHit,
@@ -2381,7 +2665,10 @@ mod tests {
         let backend = TestBackend::new(100, 24);
         let mut terminal = Terminal::new(backend).expect("terminal");
         terminal
-            .draw(|frame| draw_account_card(frame, &app, frame.area(), &theme()))
+            .draw(|frame| {
+                let mut map = scratch_map(&WorkspaceRoute::Account, 100, 40);
+                draw_account_card(frame, &app, frame.area(), &theme(), &mut map);
+            })
             .expect("draw account card");
         let text: String = terminal
             .backend()

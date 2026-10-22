@@ -3,6 +3,13 @@
 QAQ-Harness 的终端前端（ratatui + tokio），基于 `qaqh.Ringing` v2 单流协议直连本地 daemon。
 当前唯一 UI 是 **V2 Fullscreen**；旧 TUI v1 全屏与 V2 inline 设计已删除。
 
+## 下载 2.0.0
+
+在 [GitHub Releases](https://github.com/QAQTam/qaqh-tui-app/releases) 下载对应平台包：
+Windows x64、Linux x64、macOS Intel、macOS ARM64。只打包 TUI，daemon 需自行准备。
+F10 / `/settings` 可切换本地渲染模式。发布构建由 GitHub Actions 完成，见
+[发布流程](release/README.md) 和 [2.0.0 发布说明](release/notes/2.0.0.md)。
+
 ## 运行
 
 ```bash
@@ -37,7 +44,33 @@ TUI 自身默认不落日志。设了 `QAQH_TUI_LOG=<path>` 后才安装一个�
 一句「断开，1000ms 后重连」，具体原因只在日志里（`ReconnectReason` 只覆盖服务端
 主动终止流，普通 HTTP 错误如 401 不带 reason）。
 
-### V2 Fullscreen
+### TUI 本地性能模式
+
+`F10`（或 `/settings`、`Ctrl+,`）打开设置，在 **TUI 本地（不发送 daemon）→ 渲染**
+选择 **动效模式 / 性能模式**，
+用 `Enter` / `←→` 切换，按 `s` 保存并立即生效；`Esc` 丢弃未保存草稿。
+默认关闭，不自动改变现有动画风格。
+
+开启后，工作提示参考 Claude Code 的 reduced-motion：固定 `●` 每秒切换
+正常/暗色（两秒一周期）；关闭文字扫光、首页入场扫光、选中渐显和平滑滚动。
+装饰动画不再维持 60ms 快速 tick；正文、键盘、鼠标仍按事件及时更新，不限制内容流。
+`QAQH_TUI_ANIM=0` 仍优先关闭圆点闪动，保留静态工作提示。
+
+配置由 **TUI 独立管理**，与 daemon 的配置、远端连接目标无关：
+
+- Linux/macOS：`${XDG_CONFIG_HOME:-$HOME/.config}/qaqh-tui/config.toml`
+- Windows：`%APPDATA%\qaqh-tui\config.toml`
+
+```toml
+performance_mode = true
+```
+
+只保存此项不会调用 daemon 的 `config.save` / `config.load`，也不进入协议
+`ConfigPatch`。该文件不是 daemon 的 `config.toml`，不要把服务端凭据放在这里。
+保存采用同目录临时文件替换，拒绝未知字段、错误格式、文件符号链接和超大文件；
+读取失败会显示提示，不会静默覆盖。手工修改后重启 TUI 读取。
+
+### 启动全屏界面
 
 ```bash
 cargo run
@@ -53,6 +86,12 @@ Workspace/Modal、会话选择器、设置、权限/ask/plan 共用 v2 路由层
 - 助手消息菜单：复制 Markdown、撤销
 - permission / ask / plan 按钮 hover / 按下 / 点击
 - Settings 行点击
+- 账号卡片：登录 / 取消 / 登出 / 刷新 / 授权页 / 复制链接 / 用量按钮、账户行选择与返回；
+  DeepSeek 另有余额 / 校验 / 充值按钮，统一 hover / 按下 / 禁用反馈
+
+账号入口在设置页的「账号登录」行（凭据来源选 `chatgpt_plan` 或
+`deepseek_account`），`/account` 保留为快捷入口。卡片可滚轮浏览，小终端按钮自动换行。
+复制授权链接使用 OSC 52，需要终端允许剪贴板写入；授权仍在系统浏览器完成。
 
 Fullscreen 会启用鼠标捕获；需要终端原生选择/复制时按住 `Shift` 拖选（tmux
 中同样用 `Shift` 绕过应用的 mouse tracking，或使用 `prefix + [` 的 copy-mode）。
@@ -179,18 +218,23 @@ opencode v2（`anomalyco/opencode` 的 `packages/tui`，SolidJS + Bun）采用
 todo 经 `todo.updated` 事件按 sessionID 入 store。但其全局 store 中的历史消息
 **从不回收**。本 TUI 在其基础上做了更进一步的内存纪律：
 
-- **渲染缓存只保 active**：非 active 标签的 `RenderedTranscript` 一律丢弃，
-  聚焦时按需重建（宽度键控，一次渲染成本）；
-- **LRU transcript 逐出**：保留最近 4 个焦点标签的 timeline 模型，超出者
-  只存轻状态（标题/用量/挂起交互/dashboard），transcript 丢弃并标记
-  `needs_rebaseline`，重新聚焦时自动 re-baseline（服务端是权威历史）；
-- **回合内存不设硬上限**：内存边界由两层机制提供——后端 seal 后 offload 壳化
-  （正文截断 + 全文落 sidecar）与前端 `SegmentCache` 只保视口附近段。历史上的
+- **渲染缓存 LRU**：保留 active + 最近切走的 3 个会话（共 4 个），切回命中；
+  逐出的是渲染结果，不是 `SessionState` 的 timeline 模型；
+- **块行共享与窗口输出**：块渲染行由 `Arc` 共享，不另存深拷贝的整份历史数组；
+  只复制可见窗口，命中登记跳过屏外块；
+- **按需适配**：版本变化只扫描轻量借用源，命中块不复制正文/工具输出，不重跑
+  adapter 归一化；变化块才物化和渲染。仍有 O(块数) 的元数据扫描，非完全虚拟化；
+- **回合内存不设硬上限**：后端 seal 后 offload 壳化（正文截断 + 全文落 sidecar）
+  与前端 LRU 节省内存，但当前没有活跃会话字节预算。历史上的
   400 回合计数切片已删除（整回合消失违反「丢弃必须可见」，且是性能悬崖）；
   `cap_turns` 作为兜底能力保留但**无生产调用者**；
 - **会话隔离**：transcript/滚动/composer/挂起交互/dashboard 全部按 `session_id`
   持有（`SessionState`），全局仅连接级身份与 toast 共享；每会话一条 canonical
   单流互不串扰。
+
+普通用量/团队/压缩进度/面板更新只请求 ratatui 差分绘制，不再清屏重画；
+真正的终端重建（例如退出外部分页器）仍保留生命周期恢复。进行中的长 Markdown
+和代码块目前仍可能整块重解析，是后续工作态优化目标。
 
 ## workspace 侧栏与 todo 的数据面
 

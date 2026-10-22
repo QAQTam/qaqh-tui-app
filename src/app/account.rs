@@ -50,6 +50,23 @@ pub enum AccountKind {
     DeepSeekAccount,
 }
 
+/// 鼠标与键盘共用的账号操作；不携带屏幕坐标。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccountAction {
+    Login,
+    Cancel,
+    SignOut,
+    Refresh,
+    OpenAuthorize,
+    CopyAuthorize,
+    Usage,
+    Balance,
+    Verify,
+    TopUp,
+    SelectProfile(usize),
+    Close,
+}
+
 impl AccountKind {
     pub fn from_credential(raw: &str) -> Option<Self> {
         match raw.trim() {
@@ -185,9 +202,63 @@ pub struct AccountState {
     /// 只在这里留一份**展示用**的 URL：token 与 code 从不经过壳层
     /// （投影里就没有这些字段，spec §3.5）。
     pub authorize_url: Option<String>,
+    /// start 请求尚未返回 id 时关闭：保留面板，拿到 id 后取消，不打开浏览器。
+    pub close_when_started: bool,
 }
 
 impl AccountState {
+    /// 绘制禁用态与事件执行使用同一个判据，旧帧点击也必须重新校验。
+    pub fn action_enabled(&self, book: &AccountBook, action: AccountAction) -> bool {
+        let running = self.flow.is_pending() || self.flow == Flow::Starting;
+        let available = self.busy.is_none();
+        let signed_in = match self.kind {
+            AccountKind::ChatGptPlan => book
+                .siwc
+                .as_ref()
+                .is_some_and(|status| status.status == SiwcConnectionState::Connected),
+            AccountKind::DeepSeekAccount => book.ds.as_ref().is_some_and(|status| status.signed_in),
+        };
+        match action {
+            AccountAction::Login => available && !running,
+            AccountAction::Cancel => available && self.flow.is_pending(),
+            AccountAction::SignOut => available && !running && signed_in,
+            AccountAction::Refresh => available,
+            AccountAction::OpenAuthorize | AccountAction::CopyAuthorize => {
+                self.flow.is_pending()
+                    && self
+                        .authorize_url
+                        .as_ref()
+                        .is_some_and(|url| !url.is_empty())
+            }
+            AccountAction::Usage => match self.kind {
+                AccountKind::ChatGptPlan => {
+                    book.siwc.as_ref().is_some_and(|s| !s.usage_url.is_empty())
+                }
+                AccountKind::DeepSeekAccount => {
+                    book.ds.as_ref().is_some_and(|s| !s.usage_url.is_empty())
+                }
+            },
+            AccountAction::Balance | AccountAction::Verify => {
+                self.kind == AccountKind::DeepSeekAccount && available && !running && signed_in
+            }
+            AccountAction::TopUp => {
+                self.kind == AccountKind::DeepSeekAccount
+                    && book.ds.as_ref().is_some_and(|s| !s.top_up_url.is_empty())
+            }
+            AccountAction::SelectProfile(index) => {
+                self.kind == AccountKind::ChatGptPlan
+                    && available
+                    && !running
+                    && book
+                        .profiles
+                        .as_ref()
+                        .and_then(|p| p.profiles.get(index))
+                        .is_some_and(|profile| !profile.pending)
+            }
+            AccountAction::Close => true,
+        }
+    }
+
     pub fn new(kind: AccountKind) -> Self {
         Self {
             kind,
@@ -199,6 +270,7 @@ impl AccountState {
             scroll: 0,
             last_poll_ms: 0,
             authorize_url: None,
+            close_when_started: false,
         }
     }
 
@@ -503,6 +575,46 @@ pub fn ds_view(status: &DsAccountStatus) -> DsView {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn account_action_availability_tracks_flow_and_provider() {
+        use AccountAction as A;
+        let book = AccountBook::default();
+        for kind in [AccountKind::ChatGptPlan, AccountKind::DeepSeekAccount] {
+            let mut state = AccountState::new(kind);
+            assert!(state.action_enabled(&book, A::Login));
+            for action in [
+                A::Cancel,
+                A::SignOut,
+                A::SelectProfile(0),
+                A::Balance,
+                A::Verify,
+                A::OpenAuthorize,
+                A::CopyAuthorize,
+                A::Usage,
+                A::TopUp,
+            ] {
+                assert!(!state.action_enabled(&book, action), "{kind:?}: {action:?}");
+            }
+            state.flow = Flow::Pending {
+                id: "mine".into(),
+                deadline_ms: u64::MAX,
+            };
+            state.authorize_url = Some("https://example.com/auth".into());
+            assert!(!state.action_enabled(&book, A::Login));
+            for action in [A::Cancel, A::OpenAuthorize, A::CopyAuthorize, A::Close] {
+                assert!(state.action_enabled(&book, action));
+            }
+            state.busy = Some("取消登录");
+            assert!(!state.action_enabled(&book, A::Cancel));
+            assert!(state.action_enabled(&book, A::Close));
+            state.flow = Flow::Done;
+            assert!(
+                !state.action_enabled(&book, A::OpenAuthorize),
+                "完成后旧授权页不能重开"
+            );
+        }
+    }
     use qaqh_client::{DsAccountFlow, DsAccountProfile, DsRevokeOutcome, ServiceError};
     use serde_json::json;
 

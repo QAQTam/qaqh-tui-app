@@ -712,6 +712,8 @@ impl TimelineModel {
                     // 清 rounds 同时丢弃 per-block `last_fragment`——等价于后端
                     // 重置 `next_fragment`，使续流复用块 id 时 seq=0 不被拒。
                     turn.rounds.clear();
+                    // 同 id 回合重开会复用 user/block id，旧缓存不得跨代复活。
+                    self.rebaseline_epoch = self.rebaseline_epoch.saturating_add(1);
                     self.bump();
                 }
                 // 运行中的重复 `TurnOpened`：后端不会发出（会返回 `DuplicateTurn`），
@@ -741,13 +743,16 @@ impl TimelineModel {
             E::TurnOpened { .. } => unreachable!(),
             E::BlockOpened { block } => {
                 let round = Self::find_round_mut(turn, entry.round_num.unwrap_or(0));
-                let wire = Block::from_wire(block.clone());
+                let mut wire = Block::from_wire(block.clone());
                 match round
                     .blocks
                     .iter()
                     .position(|b| b.block_id == wire.block_id)
                 {
-                    Some(idx) => round.blocks[idx] = wire,
+                    Some(idx) => {
+                        wire.rev = round.blocks[idx].rev.wrapping_add(1);
+                        round.blocks[idx] = wire;
+                    }
                     None => {
                         // 按 block_order 插入，保持块序稳定。
                         let pos = round

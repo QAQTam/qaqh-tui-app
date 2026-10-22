@@ -28,18 +28,26 @@ use crate::ui::v2::hit::{
     AgentTarget, HitMapBuilder, PointerTarget, VisualAnchor, anchor_region, z,
 };
 
-/// 侧栏宽度（状态 glyph + 标题）。
-pub const RAIL_WIDTH: u16 = 22;
+/// 侧栏标准宽度（状态 glyph + 标题）。
+pub const RAIL_WIDTH: u16 = 28;
 /// 终端总宽低于该值时侧栏自动隐藏，给正文让路。
 pub const RAIL_MIN_TOTAL_WIDTH: u16 = 90;
 
-/// 本帧侧栏宽度；0 = 不显示。
+/// 本帧侧栏宽度；0 = 不显示。根据终端总宽度自适应：
+/// - < 90: 隐藏 (0 列)，给正文完整空间
+/// - 90..120: 紧凑档 (24 列)
+/// - 120..160: 标准舒适档 (28 列)
+/// - >= 160: 宽屏扩展档 (32 列)
 #[must_use]
 pub fn rail_width(total_width: u16) -> u16 {
-    if total_width >= RAIL_MIN_TOTAL_WIDTH {
-        RAIL_WIDTH
-    } else {
+    if total_width < RAIL_MIN_TOTAL_WIDTH {
         0
+    } else if total_width < 120 {
+        24
+    } else if total_width < 160 {
+        28
+    } else {
+        32
     }
 }
 
@@ -100,20 +108,18 @@ pub fn draw(
             pointer.sidebar_hover == Some(index),
             pointer.sidebar_pressed == Some(index),
         );
-        let (glyph, glyph_style) = status_glyph(row.activity, row.loaded, frame_no, theme);
-        // ▣ = 已在 tab 集里（点击即切换、零加载）；与 workspace 列表同词汇。
-        let open_marker = if row.is_open { "▣" } else { " " };
-        let title = fit_width(&row.title, width.saturating_sub(5));
+        let (glyph, glyph_style) = if app.local_config.performance_mode
+            && matches!(
+                row.activity,
+                Some(DomainActivityState::Working | DomainActivityState::Starting)
+            ) {
+            anim::working_indicator(true, app.local_dot_dim, frame_no, theme.accent.running)
+        } else {
+            status_glyph(row.activity, row.loaded, frame_no, theme)
+        };
+        let title = fit_width(&row.title, width.saturating_sub(3));
         let mut line = Line::from(vec![
             Span::styled(format!(" {glyph} "), glyph_style),
-            Span::styled(
-                format!("{open_marker} "),
-                Style::new().fg(if row.is_open {
-                    theme.accent.assistant
-                } else {
-                    theme.text.dim
-                }),
-            ),
             Span::styled(title, Style::new().fg(theme.text.primary)),
         ])
         .patch_style(visual.surface_style(theme, theme.chrome.selection));
@@ -122,6 +128,7 @@ pub fn draw(
         // 瞬切，零开销。
         if row.is_active
             && crate::app::anim::enabled()
+            && !app.local_config.performance_mode
             && let Some(at) = app.active_switch
         {
             let t = (at.elapsed().as_secs_f32() * 1000.0 / crate::app::anim::TAB_FADE_MS as f32)
@@ -243,7 +250,9 @@ mod tests {
     #[test]
     fn rail_width_hides_on_narrow_terminals() {
         assert_eq!(rail_width(89), 0);
-        assert_eq!(rail_width(90), RAIL_WIDTH);
+        assert_eq!(rail_width(90), 24);
+        assert_eq!(rail_width(120), 28);
+        assert_eq!(rail_width(160), 32);
     }
 
     /// 会话栏整列铺 `surface.light`，与右侧不铺底色的消息区形成竖向分界。
@@ -288,6 +297,8 @@ mod tests {
             .unwrap();
 
         let buffer = terminal.backend().buffer();
+        assert_eq!(buffer[(3, 0)].symbol(), "s", "状态标记后直接显示标题");
+        assert!(!buffer.content().iter().any(|cell| cell.symbol() == "▣"));
         assert_eq!(
             buffer[(1, 0)].bg,
             theme.chrome.selection,

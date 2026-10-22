@@ -32,6 +32,7 @@ pub fn from_turns_with_expanded(
 ///
 /// 这是渲染路径的入口：`from_turns_*` 只看 `turns`，看不到
 /// `compaction_marks`，用它渲染会静默丢掉「此前已压缩」这条事实。
+#[cfg(test)] // 全量参考实现，生产全屏走借用源 + cache miss 物化。
 pub fn from_model_with_expanded_blocks(
     model: &TimelineModel,
     expanded_tools: &HashSet<String>,
@@ -40,6 +41,256 @@ pub fn from_model_with_expanded_blocks(
     let blocks = from_turns_with_expanded_blocks(&model.turns, expanded_tools, expanded_thinking);
     let blocks = splice_compaction_marks(blocks, &model.turns, &model.compaction_marks);
     append_in_flight_compact(blocks, model.in_flight_compact.as_ref())
+}
+
+/// 生产全屏缓存的借用输入：热路径只读取身份、revision 与展开状态。
+/// 历史正文/工具输出只在渲染缓存 miss 时才转换为 owned 视图。
+pub(crate) enum BlockSource<'a> {
+    User(&'a Turn),
+    Block {
+        turn: &'a Turn,
+        block: &'a Block,
+        expanded: bool,
+    },
+    System(TranscriptBlock),
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum SourceKind {
+    User,
+    Assistant,
+    Thinking,
+    Tool,
+    System,
+}
+
+impl BlockSource<'_> {
+    pub(crate) fn kind(&self) -> SourceKind {
+        match self {
+            Self::User(_) => SourceKind::User,
+            Self::System(_) => SourceKind::System,
+            Self::Block { block, .. } => match block.kind {
+                TimelineBlockKind::Text => SourceKind::Assistant,
+                TimelineBlockKind::Reasoning => SourceKind::Thinking,
+                TimelineBlockKind::Tool => SourceKind::Tool,
+                TimelineBlockKind::Notice => SourceKind::System,
+            },
+        }
+    }
+
+    /// 系统卡是小且有界的合成显示，不能只按摘要字数缓存（等长改写也必须更新）。
+    pub(crate) fn system_text(&self) -> Option<&str> {
+        match self {
+            Self::System(TranscriptBlock {
+                kind: BlockKind::System { text },
+                ..
+            }) => Some(text),
+            _ => None,
+        }
+    }
+    pub(crate) fn turn_id(&self) -> &str {
+        match self {
+            Self::User(turn) | Self::Block { turn, .. } => &turn.turn_id,
+            Self::System(block) => &block.turn_id,
+        }
+    }
+
+    pub(crate) fn id(&self) -> std::borrow::Cow<'_, str> {
+        match self {
+            Self::User(turn) => format!("{}:user", turn.turn_id).into(),
+            Self::Block { block, .. } => block.block_id.as_str().into(),
+            Self::System(block) => block.id.to_string().into(),
+        }
+    }
+
+    pub(crate) fn revision(&self) -> u64 {
+        match self {
+            Self::User(_) => 1,
+            Self::Block { block, .. } => block.rev,
+            Self::System(block) => block.revision,
+        }
+    }
+
+    pub(crate) fn state(&self) -> BlockState {
+        match self {
+            Self::User(_) => BlockState::Sealed,
+            Self::Block { turn, block, .. } => block_state(turn.sealed, block),
+            Self::System(block) => block.state,
+        }
+    }
+
+    pub(crate) fn expanded(&self) -> bool {
+        matches!(self, Self::Block { expanded: true, .. })
+    }
+
+    pub(crate) fn at_ms(&self) -> Option<u64> {
+        match self {
+            Self::User(turn) => turn.started_at_ms,
+            Self::System(block) => block.at_ms,
+            _ => None,
+        }
+    }
+
+    pub(crate) fn materialize(&self) -> TranscriptBlock {
+        match self {
+            Self::User(turn) => user_block(turn),
+            Self::Block {
+                turn,
+                block,
+                expanded,
+            } => {
+                let mut view =
+                    from_block(&turn.turn_id, turn.sealed, block).expect("visible source");
+                set_expanded(&mut view, *expanded);
+                view
+            }
+            Self::System(block) => block.clone(),
+        }
+    }
+
+    pub(crate) fn lookup_key(&self) -> Option<(&str, &str)> {
+        let Self::Block {
+            turn,
+            block,
+            expanded,
+        } = self
+        else {
+            return None;
+        };
+        if block.kind != TimelineBlockKind::Tool {
+            return None;
+        }
+        let tool = block.tool.as_ref()?;
+        let body_truncated = tool
+            .display
+            .as_ref()
+            .and_then(|d| d.body.as_ref())
+            .is_some_and(|body| match body {
+                TimelineToolBody::Text { truncated, .. }
+                | TimelineToolBody::Shell { truncated, .. }
+                | TimelineToolBody::Streams { truncated, .. } => *truncated,
+                _ => false,
+            });
+        let truncated = body_truncated
+            || tool
+                .display
+                .as_ref()
+                .and_then(|d| d.outcome.as_ref())
+                .and_then(|o| o.truncated)
+                .unwrap_or(false);
+        super::transcript::lookup_group_key(
+            &turn.turn_id,
+            &tool.name,
+            tool_state(tool.state),
+            *expanded,
+            truncated,
+        )
+    }
+}
+
+pub(crate) fn fullscreen_sources<'a>(
+    model: &'a TimelineModel,
+    expanded_tools: &HashSet<String>,
+    expanded_thinking: &HashSet<String>,
+) -> Vec<BlockSource<'a>> {
+    let mut sources = Vec::new();
+    for turn in &model.turns {
+        if !turn.user_text.is_empty() {
+            sources.push(BlockSource::User(turn));
+        }
+        for block in turn.rounds.iter().flat_map(|round| &round.blocks) {
+            let state = block_state(turn.sealed, block);
+            if !block_visible(block, state) {
+                continue;
+            }
+            let expanded = match block.kind {
+                TimelineBlockKind::Tool => expanded_tools.contains(&block.block_id),
+                TimelineBlockKind::Reasoning => expanded_thinking.contains(&block.block_id),
+                _ => false,
+            };
+            sources.push(BlockSource::Block {
+                turn,
+                block,
+                expanded,
+            });
+        }
+    }
+    // 与 splice_compaction_marks 一致：相同插入位置按原 mark 顺序稳定排列。
+    let mut insertions: Vec<_> = model
+        .compaction_marks
+        .iter()
+        .enumerate()
+        .map(|(i, mark)| {
+            let at = mark
+                .after_turn_id
+                .as_deref()
+                .and_then(|id| sources.iter().rposition(|source| source.turn_id() == id))
+                .map_or(0, |index| index + 1);
+            (at, i)
+        })
+        .collect();
+    insertions.sort_by(|a, b| b.0.cmp(&a.0).then(b.1.cmp(&a.1)));
+    for (at, i) in insertions {
+        sources.insert(
+            at,
+            BlockSource::System(compaction_block(&model.compaction_marks[i])),
+        );
+    }
+    sources.extend(
+        append_in_flight_compact(Vec::new(), model.in_flight_compact.as_ref())
+            .into_iter()
+            .map(BlockSource::System),
+    );
+    // 必须在压缩锚定位之后过滤，与原全量路径一致；锚可能落在仅含 live reasoning 的回合。
+    sources.retain(|source| {
+        !matches!(source, BlockSource::Block { block, .. }
+        if block.kind == TimelineBlockKind::Reasoning && source.state() == BlockState::Live)
+    });
+    sources
+}
+
+fn set_expanded(block: &mut TranscriptBlock, expanded: bool) {
+    match &mut block.kind {
+        BlockKind::Tool(tool) => tool.expanded = expanded,
+        BlockKind::Thinking {
+            expanded: value, ..
+        } => *value = expanded,
+        _ => {}
+    }
+}
+
+fn user_block(turn: &Turn) -> TranscriptBlock {
+    TranscriptBlock {
+        id: BlockId::new(format!("{}:user", turn.turn_id)),
+        turn_id: turn.turn_id.clone(),
+        revision: 1,
+        state: BlockState::Sealed,
+        kind: BlockKind::User {
+            text: turn.user_text.clone(),
+        },
+        at_ms: turn.started_at_ms,
+    }
+}
+
+fn block_state(turn_sealed: bool, block: &Block) -> BlockState {
+    if turn_sealed || block.state == TimelineBlockState::Sealed {
+        BlockState::Sealed
+    } else {
+        BlockState::Live
+    }
+}
+
+fn block_visible(block: &Block, state: BlockState) -> bool {
+    match block.kind {
+        TimelineBlockKind::Reasoning => {
+            !block
+                .reasoning_kind
+                .is_some_and(|kind| !kind.is_displayable())
+                && !(block.text.is_empty() && state == BlockState::Sealed)
+        }
+        TimelineBlockKind::Tool => block.tool.is_some(),
+        _ => true,
+    }
 }
 
 /// 把「正在压缩上下文」的卡接在 transcript **末尾**（正在发生的事在最下面）。
@@ -97,6 +348,7 @@ fn compact_preview(summary: &str) -> String {
 ///
 /// 分隔条用 `BlockKind::System` 承载：它本来就是「非对话的系统陈述」，不需要为
 /// 一个分隔条再造一种块类型（那会波及命中测试、导出、缓存键三处）。
+#[cfg(test)]
 pub fn splice_compaction_marks(
     mut blocks: Vec<TranscriptBlock>,
     turns: &[Turn],
@@ -183,17 +435,7 @@ pub fn from_turns_with_expanded_blocks(
 pub fn from_turn(turn: &Turn) -> Vec<TranscriptBlock> {
     let mut blocks = Vec::new();
     if !turn.user_text.is_empty() {
-        blocks.push(TranscriptBlock {
-            id: BlockId::new(format!("{}:user", turn.turn_id)),
-            turn_id: turn.turn_id.clone(),
-            revision: 1,
-            state: BlockState::Sealed,
-            kind: BlockKind::User {
-                text: turn.user_text.clone(),
-            },
-            // 权威源 fact 墙钟由 v2 信封回填到回合上（见 `Turn::started_at_ms`）。
-            at_ms: turn.started_at_ms,
-        });
+        blocks.push(user_block(turn));
     }
     for round in &turn.rounds {
         for block in &round.blocks {
@@ -206,14 +448,10 @@ pub fn from_turn(turn: &Turn) -> Vec<TranscriptBlock> {
 }
 
 fn from_block(turn_id: &str, turn_sealed: bool, block: &Block) -> Option<TranscriptBlock> {
-    let state = if turn_sealed {
-        BlockState::Sealed
-    } else {
-        match block.state {
-            TimelineBlockState::Open => BlockState::Live,
-            TimelineBlockState::Sealed => BlockState::Sealed,
-        }
-    };
+    let state = block_state(turn_sealed, block);
+    if !block_visible(block, state) {
+        return None;
+    }
     // 工具块带终态墙钟（runtime 盖戳）；其余块缺席保持 None。
     let tool_at_ms = match block.kind {
         TimelineBlockKind::Tool => block.tool.as_ref().and_then(|tool| tool.completed_at_ms),
@@ -224,15 +462,6 @@ fn from_block(turn_id: &str, turn_sealed: bool, block: &Block) -> Option<Transcr
             // 加密思考（`encrypted_content`）与被安全策略抹除的思考是**协议状态**，
             // 不是用户内容：`ReasoningKind::is_displayable()` 明说不该展示。整块丢弃
             // 而不是画个空壳——空壳会让用户以为「模型什么都没想」。
-            if block
-                .reasoning_kind
-                .is_some_and(|kind| !kind.is_displayable())
-            {
-                return None;
-            }
-            if block.text.is_empty() && state == BlockState::Sealed {
-                return None;
-            }
             BlockKind::Thinking {
                 text: block.text.clone(),
                 duration: None,

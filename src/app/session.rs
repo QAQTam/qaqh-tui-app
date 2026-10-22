@@ -44,6 +44,9 @@ pub struct StreamingState {
     pub armed_at: Instant,
 }
 
+/// 工作提示的反闪烁窗口；动画禁用时仍需在越过该边界后显示静态提示。
+pub(crate) const STREAM_ANTI_FLASH: Duration = Duration::from_millis(400);
+
 // ───────────────────────── 挂起交互面板 ─────────────────────────
 
 /// ask_user 面板（每个问题可选预设项或自定义输入）。
@@ -547,6 +550,9 @@ pub struct SessionState {
     pub last_error: Option<DomainError>,
     pub composer: Composer,
     pub scroll: ScrollState,
+    /// 本地发送等待权威 TurnOpened；绑定后按回合 user 行吸顶，不随流输出滚走。
+    pub pending_user_pin: Option<String>,
+    pub pinned_user_turn: Option<String>,
     /// 用户显式展开的工具卡 block id。
     pub expanded_tools: HashSet<String>,
     /// 展开态版本；渲染缓存用它失效。
@@ -593,6 +599,8 @@ impl SessionState {
                 offset: 0,
                 tween: None,
             },
+            pending_user_pin: None,
+            pinned_user_turn: None,
             expanded_tools: HashSet::new(),
             expanded_tools_revision: 0,
             expanded_thinking: HashSet::new(),

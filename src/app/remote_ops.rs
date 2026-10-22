@@ -142,7 +142,7 @@ impl App {
         if consumed {
             self.replace_overlay(Overlay::Remote(st));
             // 状态行/票据倒计时都要立刻可见。
-            self.force_redraw = true;
+            self.redraw_requested = true;
         }
         consumed
     }
@@ -471,7 +471,7 @@ impl App {
         if let Some(Overlay::Remote(mut st)) = self.overlays.last().cloned() {
             f(&mut st);
             self.replace_overlay(Overlay::Remote(st));
-            self.force_redraw = true;
+            self.redraw_requested = true;
         }
     }
 

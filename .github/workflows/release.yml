@@ -1,0 +1,196 @@
+name: Release TUI
+
+"on":
+  push:
+    tags: ['[0-9]*.[0-9]*.[0-9]*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing release tag, e.g. 2.0.0 (must match Cargo.toml)'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tui-release-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+      rust: ${{ steps.meta.outputs.rust }}
+      backend_repository: ${{ steps.meta.outputs.backend_repository }}
+      backend_revision: ${{ steps.meta.outputs.backend_revision }}
+      ratatui_repository: ${{ steps.meta.outputs.ratatui_repository }}
+      ratatui_revision: ${{ steps.meta.outputs.ratatui_revision }}
+    steps:
+      - name: Resolve existing tag
+        id: tag
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          if [[ ! "$RELEASE_TAG" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            printf 'Invalid release tag: %s\n' "$RELEASE_TAG" >&2
+            exit 1
+          fi
+          printf 'tag=%s\n' "$RELEASE_TAG" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@v4
+        with:
+          ref: refs/tags/${{ steps.tag.outputs.tag }}
+          path: tui
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Validate release tag and script
+        working-directory: tui
+        env:
+          RELEASE_TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          python scripts/release.py check-tag --tag "$RELEASE_TAG"
+          python -m unittest discover -s scripts -p 'test_*.py' -v
+      - name: Read pinned build inputs
+        id: meta
+        working-directory: tui
+        run: python scripts/release.py metadata --github-output "$GITHUB_OUTPUT"
+      - name: Checkout client library sources (not daemon binaries)
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ steps.meta.outputs.backend_repository }}
+          ref: ${{ steps.meta.outputs.backend_revision }}
+          path: qaqh-backend
+          token: ${{ secrets.RELEASE_DEPENDENCY_TOKEN || github.token }}
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ steps.meta.outputs.ratatui_repository }}
+          ref: ${{ steps.meta.outputs.ratatui_revision }}
+          path: ratatui
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ steps.meta.outputs.rust }}
+          components: rustfmt
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: tui -> target
+          key: release-tests
+      - name: Test tagged TUI
+        working-directory: tui
+        run: |
+          cargo fmt -- --check
+          cargo test --locked --bin qaqh-tui -- --test-threads=1
+
+  build:
+    needs: verify
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-2022
+            target: x86_64-pc-windows-msvc
+            package: windows-x64
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            package: linux-x64
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+            package: macos-intel
+          - os: macos-14
+            target: aarch64-apple-darwin
+            package: macos-arm64
+    runs-on: ${{ matrix.os }}
+    env:
+      MACOSX_DEPLOYMENT_TARGET: '13.0'
+      CARGO_TERM_COLOR: always
+    defaults:
+      run:
+        shell: bash
+        working-directory: tui
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: refs/tags/${{ needs.verify.outputs.tag }}
+          path: tui
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ needs.verify.outputs.backend_repository }}
+          ref: ${{ needs.verify.outputs.backend_revision }}
+          path: qaqh-backend
+          token: ${{ secrets.RELEASE_DEPENDENCY_TOKEN || github.token }}
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ needs.verify.outputs.ratatui_repository }}
+          ref: ${{ needs.verify.outputs.ratatui_revision }}
+          path: ratatui
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ needs.verify.outputs.rust }}
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: tui -> target
+          key: release-${{ matrix.target }}
+      - name: Build, smoke test, and package only TUI
+        env:
+          RELEASE_TAG: ${{ needs.verify.outputs.tag }}
+          BUILD_TARGET: ${{ matrix.target }}
+        run: python scripts/release.py build --target "$BUILD_TARGET" --tag "$RELEASE_TAG" --out dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tui-${{ matrix.package }}
+          path: tui/dist/*
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    needs: [verify, build]
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: refs/tags/${{ needs.verify.outputs.tag }}
+          path: tui
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: tui-*
+          path: tui/dist
+          merge-multiple: true
+      - name: Verify exactly four packages and checksums
+        working-directory: tui
+        env:
+          RELEASE_TAG: ${{ needs.verify.outputs.tag }}
+        run: python scripts/release.py collect --tag "$RELEASE_TAG" --out dist
+      - name: Publish release (only after all four builds succeed)
+        working-directory: tui
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ needs.verify.outputs.tag }}
+        run: |
+          if ! gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release create "$RELEASE_TAG" --verify-tag --draft --title "qaqh-tui $RELEASE_TAG" --notes-file "release/notes/$RELEASE_TAG.md"
+          fi
+          gh release upload "$RELEASE_TAG" dist/*.zip dist/*.tar.gz dist/SHA256SUMS.txt --clobber
+          gh release edit "$RELEASE_TAG" --draft=false

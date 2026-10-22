@@ -97,6 +97,7 @@ pub enum FieldId {
     SubDefaultTools,
     ComplianceEnabled,
     TokenizerPath,
+    PerformanceMode,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -137,6 +138,12 @@ pub const ROWS: &[Row] = &[
         label: "账号登录",
         kind: FieldKind::Port,
         section: "凭据来源",
+    },
+    Row {
+        id: FieldId::PerformanceMode,
+        label: "渲染",
+        kind: FieldKind::Enum,
+        section: "TUI 本地（不发送 daemon）",
     },
     Row {
         id: FieldId::BaseUrl,
@@ -276,6 +283,9 @@ pub struct SettingsState {
     pub editing: Option<EditBuffer>,
     /// 脏字段累积器（K3：只发改过的字段）。
     pub draft: ConfigPatch,
+    /// 与协议 ConfigPatch 分离，本机配置永不序列化进 daemon 写请求。
+    pub local_loaded: crate::local_config::LocalConfig,
+    pub performance_draft: Option<bool>,
     /// Profile 端口的候选名（None = 展示服务端现值）。
     pub profile_sel: Option<String>,
     /// 「账号登录」行的一行摘要。
@@ -295,6 +305,10 @@ pub struct SettingsState {
 }
 
 impl SettingsState {
+    pub fn has_changes(&self) -> bool {
+        !self.draft.is_empty() || self.performance_draft.is_some()
+    }
+
     pub fn row(&self) -> &'static Row {
         &ROWS[self.focus.min(ROWS.len() - 1)]
     }
@@ -330,6 +344,7 @@ impl SettingsState {
     /// 当前字段是否已有未保存草稿值。
     pub fn dirty(&self, id: FieldId) -> bool {
         match id {
+            FieldId::PerformanceMode => self.performance_draft.is_some(),
             FieldId::Credential => self.draft.credential.is_some(),
             FieldId::BaseUrl => self.draft.base_url.is_some(),
             FieldId::Wire => self.draft.wire.is_some(),
@@ -406,6 +421,12 @@ impl SettingsState {
     pub fn display(&self, loaded: Option<&ConfigDto>, id: FieldId) -> String {
         let d = &self.draft;
         match id {
+            FieldId::PerformanceMode => {
+                let on = self
+                    .performance_draft
+                    .unwrap_or(self.local_loaded.performance_mode);
+                if on { "性能模式" } else { "动效模式" }.into()
+            }
             FieldId::BaseUrl => {
                 owned_or(d.base_url.clone(), loaded.map(|c| c.base_url.as_str()), "—")
             }
@@ -656,6 +677,7 @@ impl SettingsState {
             | FieldId::ReasoningEffort
             | FieldId::ComplianceEnabled
             | FieldId::PermissionLevel
+            | FieldId::PerformanceMode
             | FieldId::ActiveProfile => return None,
         };
         let cursor = session_id.chars().count();
@@ -757,6 +779,7 @@ impl SettingsState {
             | FieldId::ReasoningEffort
             | FieldId::ComplianceEnabled
             | FieldId::PermissionLevel
+            | FieldId::PerformanceMode
             | FieldId::ActiveProfile => {
                 let _ = loaded;
             }
@@ -769,6 +792,14 @@ impl SettingsState {
     pub fn cycle(&mut self, loaded: Option<&ConfigDto>, delta: i32) -> Result<bool, String> {
         let id = self.row().id;
         match id {
+            FieldId::PerformanceMode => {
+                let next = !self
+                    .performance_draft
+                    .unwrap_or(self.local_loaded.performance_mode);
+                self.performance_draft =
+                    (next != self.local_loaded.performance_mode).then_some(next);
+                Ok(true)
+            }
             FieldId::ReasoningEffort => {
                 let cur = self
                     .draft

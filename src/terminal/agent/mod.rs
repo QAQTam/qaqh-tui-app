@@ -38,7 +38,7 @@ use crate::ui::v2::hit::{
 use crate::ui::v2::modal;
 use crate::ui::v2::route::{self, ModalRoute, ScreenRoute};
 use crate::ui::v2::scrollbar::ScrollbarMetrics;
-use crate::ui::v2::transcript::{BlockKind, BlockState, TranscriptBlock};
+use crate::ui::v2::transcript::BlockState;
 use crate::ui::v2::workspace;
 use qaqh_client::{ConversationMode, NoticeLevel, TimelineBlockKind};
 
@@ -87,6 +87,7 @@ pub async fn run(no_spawn: bool, resume: bool, remote: Option<RemoteTarget>) -> 
         .context("连接 daemon 失败")?;
 
     let mut app = App::new(runtime.clone(), app_tx.clone());
+    app.load_local_settings();
     app.show_workspace = false;
     app.fetch_session_list();
     // 首页信息行要展示当前模型 / BYOK 密钥状态：启动即拉，不等设置页打开。
@@ -233,9 +234,7 @@ async fn run_loop(
     let mut frames = FramePublisher::default();
     // `QAQH_HIT_PROBE=1|strict`（spec §8.1）；默认关闭。
     let probe = HitProbe::from_env();
-    // B2 绘制门控：上一轮迭代是否处理过消息。Tick 不是消息——纯 tick 醒来
-    // 且没有动画/活动在跑时，本轮跳过绘制（见 `App::needs_draw`）。
-    let mut processed_messages = true;
+    let mut draw_gate = DrawGate::default();
     loop {
         if app.quit {
             break;
@@ -257,6 +256,7 @@ async fn run_loop(
         }
         let size = terminal.terminal.size()?;
         if terminal.note_terminal_size(size.width, size.height) {
+            draw_gate.dirty = true;
             fullscreen_view.close_menu();
             terminal.terminal.autoresize()?;
             // resize 后旧坐标不再对应屏幕上的任何东西。
@@ -264,14 +264,12 @@ async fn run_loop(
             reset_pointer_state(app, fullscreen_view, PointerEvent::Resized);
         }
 
-        if app.force_redraw {
-            terminal.terminal.clear()?;
-            app.force_redraw = false;
-        }
+        // 普通状态变化只走 ratatui 差分，不能清屏再画（usage/team/compact 会高频到达）。
+        // 真正的终端恢复由 resize / run_pager 生命周期路径负责。
         // 首轮必画（冷启动画面），此后按门控判定。
-        if processed_messages || app.needs_draw() {
+        if draw_gate.should_draw(app.needs_draw()) {
             draw_and_publish(
-                terminal,
+                &mut terminal.terminal,
                 &mut frames,
                 app,
                 theme,
@@ -279,7 +277,8 @@ async fn run_loop(
                 fullscreen_view,
                 probe,
             )?;
-            app.last_drawn_frame = crate::app::anim::frame_now();
+            draw_gate.did_draw(app.is_animating());
+            app.redraw_requested = false;
         }
         if route == ScreenRoute::Agent {
             fullscreen_view.clamp_scroll(app);
@@ -288,10 +287,9 @@ async fn run_loop(
         let Some(msg) = app_rx.recv().await else {
             break;
         };
-        handle_message(app, msg, &mut frames, fullscreen_view);
-        processed_messages = true;
+        draw_gate.dirty |= handle_message(app, msg, &mut frames, fullscreen_view);
         while let Ok(msg) = app_rx.try_recv() {
-            handle_message(app, msg, &mut frames, fullscreen_view);
+            draw_gate.dirty |= handle_message(app, msg, &mut frames, fullscreen_view);
             if app.quit {
                 break;
             }
@@ -303,10 +301,37 @@ async fn run_loop(
             // pager 销毁并重建了 alternate screen，旧帧不再对应任何画面。
             frames.invalidate();
             clear_pointer_state(app, fullscreen_view);
+            draw_gate.dirty = true;
             result?;
         }
     }
     Ok(())
+}
+
+/// 首帧必画；消息批次只累积 dirty。动画停止后补一帧，避免滚动/渐显停在半途。
+struct DrawGate {
+    dirty: bool,
+    was_animating: bool,
+}
+
+impl Default for DrawGate {
+    fn default() -> Self {
+        Self {
+            dirty: true,
+            was_animating: false,
+        }
+    }
+}
+
+impl DrawGate {
+    fn should_draw(&self, requested: bool) -> bool {
+        self.dirty || requested || self.was_animating
+    }
+
+    fn did_draw(&mut self, animating: bool) {
+        self.dirty = false;
+        self.was_animating = animating;
+    }
 }
 
 /// 已发布帧的持有者。
@@ -385,24 +410,27 @@ impl FramePublisher {
     }
 }
 
-fn draw_and_publish(
-    terminal: &mut TerminalHost,
+fn draw_and_publish<B>(
+    terminal: &mut ratatui::Terminal<B>,
     frames: &mut FramePublisher,
     app: &App,
     theme: &Theme,
     route: &ScreenRoute,
     fullscreen_view: &mut FullscreenView,
     probe: HitProbe,
-) -> Result<()> {
-    let size = terminal.terminal.size()?;
+) -> Result<()>
+where
+    B: ratatui::backend::Backend,
+    B::Error: Send + Sync + 'static,
+{
+    let size = terminal.size()?;
     let mut hit_map = frames.begin(
         route.clone(),
         Size::new(size.width, size.height),
         frame_scroll_offset(app, route),
     );
-    let completed = terminal
-        .terminal
-        .draw(|frame| draw(frame, app, theme, route, fullscreen_view, &mut hit_map))?;
+    let completed =
+        terminal.draw(|frame| draw(frame, app, theme, route, fullscreen_view, &mut hit_map))?;
     match frames.publish(hit_map.finish(), completed.buffer, probe, route) {
         Ok(()) => Ok(()),
         Err(failures) => {
@@ -447,15 +475,16 @@ fn handle_message(
     msg: AppMsg,
     frames: &mut FramePublisher,
     fullscreen_view: &mut FullscreenView,
-) {
+) -> bool {
     // 每条消息都重新解析 route：批次里前面那条键可能已经切了页，后面的消息
     // 不能再用批次开始时的旧 route（spec §3.3 / P0-C-3）。
     let route = route::resolve(app);
 
     // 焦点丢失 = 合成 Leave：指针状态作废，但屏幕内容没变，帧仍然可信。
     if matches!(msg, AppMsg::FocusLost) {
+        let changed = fullscreen_view.pointer_state.visual() != Default::default();
         reset_pointer_state(app, fullscreen_view, PointerEvent::FocusLost);
-        return;
+        return changed;
     }
 
     if let AppMsg::Mouse(mouse) = msg {
@@ -464,13 +493,13 @@ fn handle_message(
         if frames.route() != Some(&route) {
             frames.invalidate();
             reset_pointer_state(app, fullscreen_view, PointerEvent::RouteChanged);
-            return;
+            return true;
         }
-        handle_pointer(app, frames, fullscreen_view, &route, mouse);
-        return;
+        return handle_pointer(app, frames, fullscreen_view, &route, mouse);
     }
 
     let is_key = matches!(msg, AppMsg::Key(_));
+    let changed = !matches!(msg, AppMsg::Tick);
     handle_non_mouse_message(app, msg, &route, fullscreen_view);
     // 键可能改路由 / 滚动 / 模态；后端消息可能开新 overlay。只要画面可能变了，
     // 已发布帧立刻作废，后续鼠标等下一次重绘（spec §3.3 / P0-C-2）。
@@ -478,6 +507,7 @@ fn handle_message(
         frames.invalidate();
         clear_pointer_state(app, fullscreen_view);
     }
+    changed
 }
 
 /// 帧失效时一并清掉指针的瞬时视觉状态：旧帧的 hover/pressed 不允许残留到新画面。
@@ -596,7 +626,7 @@ fn handle_pointer(
     fullscreen_view: &mut FullscreenView,
     route: &ScreenRoute,
     mouse: MouseEvent,
-) {
+) -> bool {
     let event = match mouse.kind {
         MouseEventKind::Moved => PointerEvent::Moved {
             column: mouse.column,
@@ -625,13 +655,15 @@ fn handle_pointer(
             column: mouse.column,
             row: mouse.row,
         },
-        _ => return,
+        _ => return false,
     };
     let action = fullscreen_view
         .pointer_state
         .handle(frames.current(), event);
+    let changed = action != PointerAction::None;
     dispatch_pointer_action(app, frames, fullscreen_view, route, action);
     sync_pointer_visual(app, fullscreen_view);
+    changed
 }
 
 fn dispatch_pointer_action(
@@ -798,13 +830,19 @@ fn scrollbar_metrics(app: &App, view: &FullscreenView) -> Option<ScrollbarMetric
         view.transcripts.len_for(&session.session_id),
         usize::from(view.body_height),
         session.scroll.follow,
-        session.scroll.visual_offset(),
+        if session.pinned_user_turn.is_some() {
+            view.viewport_offset
+        } else {
+            session.scroll.visual_offset()
+        },
     )
 }
 
 fn set_scroll_offset(app: &mut App, view: &FullscreenView, offset: usize) {
     let max = view.max_offset(app);
     if let Some(session) = app.active_session_mut() {
+        session.pending_user_pin = None;
+        session.pinned_user_turn = None;
         session.scroll.follow = false;
         session.scroll.offset = offset.min(max);
     }
@@ -855,6 +893,7 @@ fn dispatch_workspace_hit(app: &mut App, hit: WorkspaceHit) {
         WorkspaceHit::TodoTask(_) => app.workspace_toggle_todo_detail(),
         WorkspaceHit::SubagentRow(index) => app.workspace_open_subagent(index),
         WorkspaceHit::SettingsRow(index) => app.mouse_settings_row(index),
+        WorkspaceHit::Account(action) => app.account_action(action),
         WorkspaceHit::Back => app.workspace_back(),
     }
 }
@@ -1053,7 +1092,7 @@ fn draw(
             draw_fullscreen_agent(frame, app, theme, fullscreen_view, hit_map.suspended());
             hit_map.set_suspended(false);
             dim_screen(frame, area, theme);
-            workspace::draw_account_card(frame, app, area, theme);
+            workspace::draw_account_card(frame, app, area, theme, hit_map);
         }
         ScreenRoute::Workspace(workspace_route) => {
             clear_screen(frame, theme);
@@ -1165,9 +1204,14 @@ fn composer_visual_rows(
 ///   正文，也不能把“正在工作”信号关掉。
 /// - 文本只取 reasoning 当前行的尾部窗口；换行后只显示新行。
 /// - 正文走 Codex 式节律扫光（见 [`shimmer_spans`]），不是每帧全亮。
-fn thinking_line(session: &SessionState, width: u16, theme: &Theme) -> Line<'static> {
+fn thinking_line(app: &App, session: &SessionState, width: u16, theme: &Theme) -> Line<'static> {
     let frame = crate::app::anim::frame_now();
-    let spinner = crate::app::anim::claude_spinner_glyph(frame);
+    let (spinner, spinner_style) = crate::app::anim::working_indicator(
+        app.local_config.performance_mode,
+        app.local_dot_dim,
+        frame,
+        theme.accent.thinking,
+    );
     let prefix = format!("{spinner} ");
     let prefix_width = spinner.width() + 1;
     let budget = usize::from(width).saturating_sub(prefix_width).max(1);
@@ -1181,8 +1225,8 @@ fn thinking_line(session: &SessionState, width: u16, theme: &Theme) -> Line<'sta
     });
     let shown = tail_cols(&text, budget);
 
-    let mut spans = vec![Span::styled(prefix, Style::new().fg(theme.accent.thinking))];
-    if crate::app::anim::enabled() {
+    let mut spans = vec![Span::styled(prefix, spinner_style)];
+    if crate::app::anim::enabled() && !app.local_config.performance_mode {
         spans.extend(shimmer_spans(&shown, frame, theme));
     } else {
         spans.push(Span::styled(shown, Style::new().fg(theme.text.dim)));
@@ -1195,7 +1239,7 @@ fn thinking_line(session: &SessionState, width: u16, theme: &Theme) -> Line<'sta
 /// 快问快答的回合（<400ms 结束）菊花闪一下就消失，比不出现更扎眼——
 /// opencode `startup-loading` 的同款哲学（延迟 500ms 才显示）。「在干活」
 /// 仍由状态行活动文案与侧栏菊花表达；reasoning 正文一到立即恢复。
-const STREAM_ANTI_FLASH: Duration = Duration::from_millis(400);
+use crate::app::session::STREAM_ANTI_FLASH;
 
 fn thinking_line_suppressed(session: &SessionState) -> bool {
     session
@@ -1777,9 +1821,140 @@ mod tests {
     use ratatui::backend::TestBackend;
     use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton};
     use ratatui::layout::Rect;
+    use std::time::Instant;
 
     fn test_theme() -> Theme {
         Theme::resolve(ThemeKind::QaqhNight, ColorSupport::TrueColor)
+    }
+
+    #[tokio::test]
+    async fn idle_ticks_do_not_draw_but_input_and_timer_changes_do() {
+        let (mut app, _rx) = App::new_for_test();
+        app.tabs.push("idle".into());
+        app.sessions
+            .insert("idle".into(), SessionState::new("idle".into()));
+        app.session_list_at = Some(Instant::now());
+        let mut frames = FramePublisher::default();
+        let mut view = FullscreenView::default();
+        let mut gate = DrawGate::default();
+        assert!(gate.should_draw(app.needs_draw()), "首帧必画");
+        gate.did_draw(false);
+        let minute_before = chrono::Local::now().timestamp().div_euclid(60);
+        for _ in 0..5 {
+            gate.dirty |= handle_message(&mut app, AppMsg::Tick, &mut frames, &mut view);
+            assert!(!gate.dirty, "Tick 本身不得置脏");
+        }
+        // 跨越旧的 120ms 全局帧量子，验证不是仅在同一时刻“不绘制”。
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        gate.dirty |= handle_message(&mut app, AppMsg::Tick, &mut frames, &mut view);
+        let minute_after = chrono::Local::now().timestamp().div_euclid(60);
+        if minute_before == minute_after {
+            assert!(!gate.should_draw(app.needs_draw()));
+        } else {
+            assert!(app.redraw_requested, "跨分钟时钟应合法置脏");
+        }
+        gate.dirty |= handle_message(
+            &mut app,
+            AppMsg::Key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE)),
+            &mut frames,
+            &mut view,
+        );
+        // 紧接的 Tick 不能覆盖同批次已置脏的输入。
+        gate.dirty |= handle_message(&mut app, AppMsg::Tick, &mut frames, &mut view);
+        assert!(gate.should_draw(app.needs_draw()));
+        gate.did_draw(false);
+        app.toast(NoticeLevel::Info, "temporary");
+        app.toasts.back_mut().unwrap().at = Instant::now() - Duration::from_secs(7);
+        app.redraw_requested = false;
+        gate.dirty |= handle_message(&mut app, AppMsg::Tick, &mut frames, &mut view);
+        assert!(gate.should_draw(app.needs_draw()), "Tick 仍能送达过期变化");
+    }
+
+    #[test]
+    fn animation_gets_one_final_frame_then_stops() {
+        let mut gate = DrawGate::default();
+        gate.did_draw(true);
+        assert!(gate.should_draw(false));
+        gate.did_draw(false);
+        assert!(!gate.should_draw(false));
+    }
+
+    #[test]
+    fn normal_updates_emit_diffs_without_terminal_clear_sequences() {
+        use ratatui::backend::CrosstermBackend;
+        let mut app = app_with_model(model_with_sealed_answer());
+        app.local_config.performance_mode = true;
+        let mut bytes = Vec::<u8>::new();
+        let backend = CrosstermBackend::new(&mut bytes);
+        let mut terminal = Terminal::with_options(
+            backend,
+            ratatui::TerminalOptions {
+                viewport: ratatui::Viewport::Fixed(Rect::new(0, 0, 80, 24)),
+            },
+        )
+        .unwrap();
+        let mut frames = FramePublisher::default();
+        let mut view = FullscreenView::default();
+        for i in 0..3 {
+            app.toast(NoticeLevel::Info, format!("status update {i}"));
+            assert!(app.redraw_requested);
+            draw_and_publish(
+                &mut terminal,
+                &mut frames,
+                &app,
+                &test_theme(),
+                &ScreenRoute::Agent,
+                &mut view,
+                HitProbe::Strict,
+            )
+            .unwrap();
+            app.redraw_requested = false;
+            assert!(frames.current().is_some(), "差分帧仍须发布鼠标命中图");
+        }
+        drop(terminal);
+        let output = String::from_utf8_lossy(&bytes);
+        assert!(
+            !output.contains("\x1b[2J") && !output.contains("\x1b[3J"),
+            "普通状态更新不能擦除整个屏幕"
+        );
+        assert!(
+            output.len() < 15000,
+            "小状态更新不应重复输出三份完整画面：{} bytes",
+            output.len()
+        );
+    }
+
+    #[test]
+    fn performance_thinking_line_has_one_dot_and_plain_text() {
+        let (mut app, _rx) = App::new_for_test();
+        app.local_config.performance_mode = true;
+        let session = SessionState::new("dot".into());
+        for dim in [false, true] {
+            app.local_dot_dim = dim;
+            let line = thinking_line(&app, &session, 80, &test_theme());
+            assert_eq!(line.spans.len(), 2, "性能模式不得生成逐字符扫光 span");
+            assert_eq!(line.spans[0].content, "● ");
+            assert_eq!(line.spans[1].content, "working…");
+            assert_eq!(
+                line.spans[0].style.add_modifier.contains(Modifier::DIM),
+                dim && crate::app::anim::enabled()
+            );
+        }
+    }
+
+    #[test]
+    fn unchanged_mouse_hover_does_not_request_another_frame() {
+        let mut app = app_with_model(TimelineModel::default());
+        let mut view = FullscreenView::default();
+        let mut frames = publish_frame(&app, &mut view, 80, 24);
+        let mouse = left_mouse(MouseEventKind::Moved, 79, 0);
+        handle_message(&mut app, AppMsg::Mouse(mouse), &mut frames, &mut view);
+        assert!(!handle_message(
+            &mut app,
+            AppMsg::Mouse(mouse),
+            &mut frames,
+            &mut view
+        ));
     }
 
     /// 测试用：跑一帧 Agent 绘制（HitMap 丢弃；只看画面）。
@@ -2892,6 +3067,49 @@ mod tests {
         assert!(app.active_session().expect("session").scroll.follow);
     }
 
+    #[test]
+    fn pinned_user_message_hit_map_and_scrollbar_follow_the_same_viewport() {
+        let mut app = app_with_model(model_with_many_sealed_turns(30));
+        app.show_workspace = false;
+        let id = app.sessions["session-1"]
+            .timeline
+            .turns
+            .last()
+            .unwrap()
+            .turn_id
+            .clone();
+        let session = app.sessions.get_mut("session-1").unwrap();
+        session.pinned_user_turn = Some(id.clone());
+        session.scroll.follow = false;
+        // 有历史分页按钮时也不能覆盖吸顶用户消息。
+        session.timeline.has_more = true;
+        let mut view = FullscreenView::default();
+        let frames = publish_frame(&app, &mut view, 80, 24);
+        let user = frames.current().unwrap().regions.iter().find(|region| matches!(
+            &region.target,
+            PointerTarget::Agent(AgentTarget::Message { turn_id, role: MessageRole::User, .. }) if turn_id == &id
+        )).expect("吸顶消息必须可点击");
+        assert_eq!(user.rect.y, view.body_area.y);
+        assert!(
+            frames
+                .current()
+                .unwrap()
+                .regions
+                .iter()
+                .all(|region| !matches!(
+                    region.target,
+                    PointerTarget::Agent(AgentTarget::LoadOlder)
+                ))
+        );
+        view.clamp_scroll(&mut app);
+        assert_eq!(
+            app.sessions["session-1"].scroll.offset,
+            view.viewport_offset
+        );
+        set_scroll_offset(&mut app, &view, 0);
+        assert!(app.sessions["session-1"].pinned_user_turn.is_none());
+    }
+
     #[tokio::test]
     async fn fullscreen_page_up_requests_older_at_top() {
         let mut app = app_with_model(model_with_many_sealed_turns(30));
@@ -2949,6 +3167,208 @@ mod tests {
             before + 1,
             "only the changed block should render again"
         );
+    }
+
+    fn assert_lazy_matches_reference(
+        session: &SessionState,
+        cache: &mut FullscreenTranscriptCache,
+        width: u16,
+    ) {
+        let theme = test_theme();
+        let blocks: Vec<_> = crate::ui::v2::adapter::from_model_with_expanded_blocks(
+            &session.timeline,
+            &session.expanded_tools,
+            &session.expanded_thinking,
+        )
+        .into_iter()
+        .filter(|block| {
+            !(block.state == BlockState::Live
+                && matches!(
+                    block.kind,
+                    crate::ui::v2::transcript::BlockKind::Thinking { .. }
+                ))
+        })
+        .collect();
+        let expected = crate::ui::v2::transcript::render_transcript(&blocks, width, &theme);
+        cache.sync(session, width, &theme);
+        assert_eq!(
+            cache.rendered_lines(),
+            expected,
+            "按需与原全量输出必须逐行逐样式一致"
+        );
+    }
+
+    #[test]
+    fn lazy_adapter_matches_full_render_for_groups_expansion_and_compaction() {
+        let app = app_with_model(model_with_consecutive_reads());
+        let mut session = app.sessions["session-1"].clone();
+        let mut cache = FullscreenTranscriptCache::default();
+        assert_lazy_matches_reference(&session, &mut cache, 79);
+        session.toggle_tool_expanded("read-1");
+        assert_lazy_matches_reference(&session, &mut cache, 79);
+        session.toggle_tool_expanded("read-1");
+        session.timeline.record_compaction(1);
+        session.timeline.begin_compact("compact".into(), 3, 1);
+        session.timeline.update_compact("compact", "aaaa".into());
+        assert_lazy_matches_reference(&session, &mut cache, 79);
+        // 等长摘要改写不能被字数 revision 键误判命中。
+        session.timeline.update_compact("compact", "bbbb".into());
+        assert_lazy_matches_reference(&session, &mut cache, 79);
+        assert_lazy_matches_reference(&session, &mut cache, 35);
+        let app = app_with_model(model_with_thinking_history());
+        session = app.sessions["session-1"].clone();
+        cache = FullscreenTranscriptCache::default();
+        session.toggle_thinking_expanded("thinking-1");
+        assert_lazy_matches_reference(&session, &mut cache, 79);
+    }
+
+    #[test]
+    fn lazy_cache_invalidates_wall_clock_block_replacement_and_reopened_turn() {
+        let app = app_with_model(model_with_sealed_answer());
+        let mut session = app.sessions["session-1"].clone();
+        let mut cache = FullscreenTranscriptCache::default();
+        assert_lazy_matches_reference(&session, &mut cache, 79);
+        session
+            .timeline
+            .record_turn_time("turn-1", Some(1_700_000_000_000));
+        assert_lazy_matches_reference(&session, &mut cache, 79);
+        session.timeline.apply(&entry(
+            3,
+            "turn-1",
+            TimelineEvent::BlockOpened {
+                block: TimelineBlock {
+                    block_id: "b1".into(),
+                    block_order: 0,
+                    kind: TimelineBlockKind::Text,
+                    state: TimelineBlockState::Sealed,
+                    text: "replacement, same ID".into(),
+                    tool: None,
+                    reasoning_kind: None,
+                },
+            },
+        ));
+        assert_lazy_matches_reference(&session, &mut cache, 79);
+        session.timeline.apply(&entry(
+            4,
+            "turn-1",
+            TimelineEvent::TurnSealed {
+                state: qaqh_client::TimelineTurnState::Completed,
+                failure: None,
+            },
+        ));
+        session.timeline.apply(&entry(
+            5,
+            "turn-1",
+            TimelineEvent::TurnOpened {
+                user_text: "reopened prompt".into(),
+            },
+        ));
+        assert_lazy_matches_reference(&session, &mut cache, 79);
+    }
+
+    #[test]
+    fn lazy_cache_invalidates_same_revision_snapshot_and_preserves_paging() {
+        let app = app_with_model(model_with_sealed_answer());
+        let mut session = app.sessions["session-1"].clone();
+        let mut cache = FullscreenTranscriptCache::default();
+        assert_lazy_matches_reference(&session, &mut cache, 79);
+        let mut page = qaqh_client::TimelinePage {
+            schema: "qaqh.Ringing".into(),
+            version: 1,
+            server_epoch: "ep".into(),
+            session_id: "session-1".into(),
+            has_more: true,
+            total_turns: 1,
+            truncated_before: false,
+            snapshot: qaqh_client::TimelineSnapshot {
+                watermark: 100,
+                turns: vec![qaqh_client::TimelineTurn {
+                    turn_id: "turn-1".into(),
+                    turn_index: Some(1),
+                    created_seq: 1,
+                    user_text: "new snapshot prompt".into(),
+                    sealed: true,
+                    offloaded: false,
+                    state: qaqh_client::TimelineTurnState::Completed,
+                    failure: None,
+                    rounds: vec![qaqh_client::TimelineRound {
+                        round_num: 0,
+                        sealed: true,
+                        is_final: true,
+                        blocks: vec![TimelineBlock {
+                            block_id: "b1".into(),
+                            block_order: 0,
+                            kind: TimelineBlockKind::Text,
+                            state: TimelineBlockState::Sealed,
+                            text: "new snapshot answer".into(),
+                            tool: None,
+                            reasoning_kind: None,
+                        }],
+                    }],
+                }],
+            },
+        };
+        session.timeline.replace_from_page(&page);
+        assert_lazy_matches_reference(&session, &mut cache, 79);
+        page.snapshot.turns[0].turn_id = "older".into();
+        page.snapshot.turns[0].rounds[0].blocks[0].block_id = "older-block".into();
+        page.total_turns = 2;
+        session.timeline.prepend_older(&page);
+        assert_lazy_matches_reference(&session, &mut cache, 79);
+    }
+
+    #[test]
+    fn borrowed_group_predicate_matches_typed_truncation_and_live_reasoning_anchor() {
+        let app = app_with_model(model_with_consecutive_reads());
+        let mut session = app.sessions["session-1"].clone();
+        let mut cache = FullscreenTranscriptCache::default();
+        for body in [
+            qaqh_client::TimelineToolBody::Text {
+                text: String::new(),
+                truncated: true,
+            },
+            qaqh_client::TimelineToolBody::Streams {
+                stdout: "out".into(),
+                stderr: "err".into(),
+                exit_code: Some(0),
+                truncated: true,
+                interleaved: false,
+            },
+            qaqh_client::TimelineToolBody::Diff {
+                unified: "diff".into(),
+                files: vec![],
+            },
+        ] {
+            let block = &mut session.timeline.turns[0].rounds[0].blocks[1];
+            block.tool.as_mut().unwrap().display.as_mut().unwrap().body = Some(body);
+            block.touch();
+            session.timeline.version += 1;
+            assert_lazy_matches_reference(&session, &mut cache, 79);
+        }
+        session.timeline.apply(&entry(
+            20,
+            "only-reasoning",
+            TimelineEvent::TurnOpened {
+                user_text: String::new(),
+            },
+        ));
+        session.timeline.apply(&entry(
+            21,
+            "only-reasoning",
+            TimelineEvent::BlockOpened {
+                block: TimelineBlock {
+                    block_id: "live-thought".into(),
+                    block_order: 0,
+                    kind: TimelineBlockKind::Reasoning,
+                    state: TimelineBlockState::Open,
+                    text: "not in transcript".into(),
+                    tool: None,
+                    reasoning_kind: None,
+                },
+            },
+        ));
+        session.timeline.record_compaction(17);
+        assert_lazy_matches_reference(&session, &mut cache, 79);
     }
 
     #[test]
@@ -4172,6 +4592,179 @@ mod tests {
                 |region| region.target == PointerTarget::Workspace(WorkspaceHit::SessionRow(0))
             ),
             "会话行必须登记"
+        );
+    }
+
+    #[tokio::test]
+    async fn account_mouse_login_disabled_controls_and_close_use_presented_frame() {
+        use crate::app::account::{AccountAction as A, AccountKind, AccountState, Flow};
+        let (mut app, _rx) = App::new_for_test();
+        app.overlays.push(Overlay::Account(AccountState::new(
+            AccountKind::ChatGptPlan,
+        )));
+        let mut view = FullscreenView::default();
+        let mut frames = publish_frame(&app, &mut view, 100, 30);
+        let control = |frames: &FramePublisher, action| {
+            frames
+                .current()
+                .unwrap()
+                .regions
+                .iter()
+                .find(|region| {
+                    region.target == PointerTarget::Workspace(WorkspaceHit::Account(action))
+                })
+                .unwrap()
+                .rect
+        };
+        assert!(
+            frames.current().unwrap().regions.iter().all(|region| {
+                matches!(
+                    region.target,
+                    PointerTarget::Workspace(WorkspaceHit::Account(_))
+                )
+            }),
+            "账号页不得登记背景会话目标"
+        );
+        let login = control(&frames, A::Login);
+        // 按下后在外部松开，不发起登录。
+        for (kind, x, y) in [
+            (MouseEventKind::Down(MouseButton::Left), login.x, login.y),
+            (MouseEventKind::Up(MouseButton::Left), 0, 0),
+        ] {
+            handle_message(
+                &mut app,
+                AppMsg::Mouse(left_mouse(kind, x, y)),
+                &mut frames,
+                &mut view,
+            );
+        }
+        assert!(matches!(app.overlays.last(), Some(Overlay::Account(st)) if st.flow == Flow::Idle));
+        for kind in [
+            MouseEventKind::Down(MouseButton::Left),
+            MouseEventKind::Up(MouseButton::Left),
+        ] {
+            handle_message(
+                &mut app,
+                AppMsg::Mouse(left_mouse(kind, login.x, login.y)),
+                &mut frames,
+                &mut view,
+            );
+        }
+        assert!(
+            matches!(app.overlays.last(), Some(Overlay::Account(st)) if st.flow == Flow::Starting)
+        );
+        frames = publish_frame(&app, &mut view, 100, 30);
+        let cancel = control(&frames, A::Cancel);
+        for kind in [
+            MouseEventKind::Down(MouseButton::Left),
+            MouseEventKind::Up(MouseButton::Left),
+        ] {
+            handle_message(
+                &mut app,
+                AppMsg::Mouse(left_mouse(kind, cancel.x, cancel.y)),
+                &mut frames,
+                &mut view,
+            );
+        }
+        assert!(
+            matches!(app.overlays.last(), Some(Overlay::Account(st)) if st.flow == Flow::Starting),
+            "没有流程 id 时取消按钮不可操作"
+        );
+        let close = control(&frames, A::Close);
+        for kind in [
+            MouseEventKind::Down(MouseButton::Left),
+            MouseEventKind::Up(MouseButton::Left),
+        ] {
+            handle_message(
+                &mut app,
+                AppMsg::Mouse(left_mouse(kind, close.x, close.y)),
+                &mut frames,
+                &mut view,
+            );
+        }
+        assert!(
+            matches!(app.overlays.last(), Some(Overlay::Account(st)) if st.close_when_started),
+            "start 在途时先记录关闭意图，拿到 id 后才取消"
+        );
+    }
+
+    #[tokio::test]
+    async fn account_mouse_selects_profile_and_close_cancels_pending_flow() {
+        use crate::app::account::{AccountAction as A, AccountKind, AccountState, Flow};
+        let (mut app, _rx) = App::new_for_test();
+        app.account.profiles = Some(
+            serde_json::from_value(serde_json::json!({
+                "active": "p1",
+                "profiles": [
+                    {"id": "p1", "label": "账户一", "status": "connected", "sharing": true},
+                    {"id": "p2", "label": "账户二", "status": "connected", "sharing": false}
+                ]
+            }))
+            .unwrap(),
+        );
+        app.overlays.push(Overlay::Account(AccountState::new(
+            AccountKind::ChatGptPlan,
+        )));
+        let mut view = FullscreenView::default();
+        let mut frames = publish_frame(&app, &mut view, 100, 40);
+        let profile = frames
+            .current()
+            .unwrap()
+            .regions
+            .iter()
+            .find(|region| {
+                region.target
+                    == PointerTarget::Workspace(WorkspaceHit::Account(A::SelectProfile(1)))
+            })
+            .unwrap()
+            .rect;
+        for kind in [
+            MouseEventKind::Down(MouseButton::Left),
+            MouseEventKind::Up(MouseButton::Left),
+        ] {
+            handle_message(
+                &mut app,
+                AppMsg::Mouse(left_mouse(kind, profile.x + 1, profile.y)),
+                &mut frames,
+                &mut view,
+            );
+        }
+        assert!(
+            matches!(app.overlays.last(), Some(Overlay::Account(st)) if st.selected == 1 && st.busy == Some("切换账户"))
+        );
+        if let Some(Overlay::Account(st)) = app.overlays.last_mut() {
+            st.busy = None;
+            st.flow = Flow::Pending {
+                id: "mine".into(),
+                deadline_ms: u64::MAX,
+            };
+        }
+        frames = publish_frame(&app, &mut view, 100, 40);
+        let close = frames
+            .current()
+            .unwrap()
+            .regions
+            .iter()
+            .find(|region| {
+                region.target == PointerTarget::Workspace(WorkspaceHit::Account(A::Close))
+            })
+            .unwrap()
+            .rect;
+        for kind in [
+            MouseEventKind::Down(MouseButton::Left),
+            MouseEventKind::Up(MouseButton::Left),
+        ] {
+            handle_message(
+                &mut app,
+                AppMsg::Mouse(left_mouse(kind, close.x, close.y)),
+                &mut frames,
+                &mut view,
+            );
+        }
+        assert!(app.overlays.is_empty());
+        assert!(
+            frames.current().is_none(),
+            "返回后不能保留旧账号页的可点击帧"
         );
     }
 

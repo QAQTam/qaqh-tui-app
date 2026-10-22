@@ -3,6 +3,22 @@
 use super::*;
 
 impl App {
+    pub(crate) fn load_local_settings(&mut self) {
+        match crate::local_config::Store::discover() {
+            Ok(store) => {
+                match store.load() {
+                    Ok(config) => self.local_config = config,
+                    Err(error) => self.toast(
+                        NoticeLevel::Error,
+                        format!("本地配置 {}: {error}", store.path().display()),
+                    ),
+                }
+                self.local_store = Some(store);
+            }
+            Err(error) => self.toast(NoticeLevel::Error, error),
+        }
+    }
+
     /// 设置页鼠标点击一行：先聚焦，再执行与 Enter 相同的语义。
     pub fn mouse_settings_row(&mut self, index: usize) {
         let Some(Overlay::Settings(mut st)) = self.overlays.last().cloned() else {
@@ -22,7 +38,12 @@ impl App {
                 // 与键盘路径共用同一入口：换档后该重取的东西必须一起重取。
                 self.settings_cycle(&mut st, 1);
             }
-            settings::FieldKind::Port => self.settings_port_activate(&mut st),
+            settings::FieldKind::Port => {
+                // 先提交设置状态，再导航；否则会覆盖刚压栈的账号卡片。
+                self.replace_overlay(Overlay::Settings(st.clone()));
+                self.settings_port_activate(&mut st);
+                return;
+            }
         }
         self.replace_overlay(Overlay::Settings(st));
     }
@@ -130,12 +151,39 @@ impl App {
         if self.settings_saving {
             return;
         }
-        if st.draft.is_empty() {
+        if !st.has_changes() {
             self.toast(NoticeLevel::Info, "设置无改动");
             return;
         }
         if let Err(e) = st.draft.validate() {
             self.toast(NoticeLevel::Error, format!("校验失败：{e}"));
+            return;
+        }
+        if let Some(on) = st.performance_draft {
+            let local = crate::local_config::LocalConfig {
+                performance_mode: on,
+            };
+            let result = self
+                .local_store
+                .as_ref()
+                .ok_or_else(|| "TUI 本地配置目录不可用".to_string())
+                .and_then(|store| store.save(local));
+            if let Err(error) = result {
+                self.toast(NoticeLevel::Error, format!("本地配置保存失败：{error}"));
+                return;
+            }
+            self.local_config = local;
+            st.local_loaded = local;
+            st.performance_draft = None;
+            // 即时停止在途缓动，保持正文与命中位置一致。
+            for session in self.sessions.values_mut() {
+                session.scroll.tween = None;
+            }
+            self.redraw_requested = true;
+            self.toast(NoticeLevel::Info, "TUI 本地设置已保存（仅本地文件）");
+        }
+        // 本地-only 保存到此结束：不 spawn API，不 config.save，不 config.load。
+        if st.draft.is_empty() {
             return;
         }
         self.settings_saving = true;
@@ -239,8 +287,10 @@ impl App {
             if self.config.is_none() {
                 self.fetch_config();
             }
-            self.overlays
-                .push(Overlay::Settings(SettingsState::default()));
+            self.overlays.push(Overlay::Settings(SettingsState {
+                local_loaded: self.local_config,
+                ..SettingsState::default()
+            }));
             self.refresh_settings_account_summary();
             // 账号档：打开设置页就顺手把状态/目录刷一次（本地 daemon，代价可忽略）。
             // 没有这一下，「账号登录」行会一直停在「回车打开账号面板」直到用户点进去。
@@ -253,5 +303,152 @@ impl App {
                 self.refresh_account(kind);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn account_settings_mouse_and_keyboard_keep_the_new_overlay() {
+        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let row = settings::ROWS
+            .iter()
+            .position(|r| r.id == settings::FieldId::Account)
+            .unwrap();
+        for mouse in [false, true] {
+            let (mut app, _rx) = App::new_for_test();
+            let mut st = SettingsState::default();
+            st.focus = row;
+            st.draft.credential = Some("chatgpt_plan".into());
+            app.overlays.push(Overlay::Settings(st));
+            if mouse {
+                app.mouse_settings_row(row);
+            } else {
+                app.handle(AppMsg::Key(KeyEvent::new(
+                    KeyCode::Enter,
+                    KeyModifiers::NONE,
+                )));
+            }
+            assert!(matches!(
+                app.overlays.as_slice(),
+                [Overlay::Settings(_), Overlay::Account(_)]
+            ));
+            app.account_action(account::AccountAction::Close);
+            let Some(Overlay::Settings(st)) = app.overlays.last() else {
+                panic!("返回必须回到设置")
+            };
+            assert_eq!(st.draft.credential.as_deref(), Some("chatgpt_plan"));
+        }
+    }
+
+    #[tokio::test]
+    async fn f10_render_choice_can_be_saved_without_control_comma() {
+        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let root = std::env::temp_dir().join(format!("qaqh-f10-{}", uuid::Uuid::new_v4()));
+        let (mut app, mut rx) = App::new_for_test();
+        app.config = Some(ConfigDto::default());
+        app.local_store = Some(crate::local_config::Store::for_test(&root));
+        let press =
+            |app: &mut App, code| app.handle(AppMsg::Key(KeyEvent::new(code, KeyModifiers::NONE)));
+        press(&mut app, KeyCode::F(10));
+        let row = settings::ROWS
+            .iter()
+            .position(|row| row.id == settings::FieldId::PerformanceMode)
+            .unwrap();
+        for _ in 0..row {
+            press(&mut app, KeyCode::Down);
+        }
+        let Some(Overlay::Settings(st)) = app.overlays.last() else {
+            panic!("F10 must open settings")
+        };
+        assert_eq!(st.row().label, "渲染");
+        assert_eq!(st.display(app.config.as_ref(), st.row().id), "动效模式");
+        press(&mut app, KeyCode::Right);
+        let Some(Overlay::Settings(st)) = app.overlays.last() else {
+            panic!("settings")
+        };
+        assert_eq!(st.display(app.config.as_ref(), st.row().id), "性能模式");
+        assert!(st.draft.is_empty());
+        press(&mut app, KeyCode::Char('s'));
+        assert!(app.local_config.performance_mode);
+        press(&mut app, KeyCode::F(10));
+        press(&mut app, KeyCode::F(10));
+        let Some(Overlay::Settings(st)) = app.overlays.last() else {
+            panic!("settings")
+        };
+        assert_eq!(
+            st.display(app.config.as_ref(), settings::FieldId::PerformanceMode),
+            "性能模式"
+        );
+        for _ in 0..row {
+            press(&mut app, KeyCode::Down);
+        }
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Esc);
+        assert!(
+            app.local_config.performance_mode,
+            "Esc discards the unsaved choice"
+        );
+        tokio::task::yield_now().await;
+        assert!(rx.try_recv().is_err(), "本地渲染选择不得调用 daemon");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn performance_only_save_is_local_and_sends_no_runtime_message() {
+        let root = std::env::temp_dir().join(format!("qaqh-settings-{}", uuid::Uuid::new_v4()));
+        let (mut app, mut rx) = App::new_for_test();
+        app.local_store = Some(crate::local_config::Store::for_test(&root));
+        let mut st = SettingsState::default();
+        st.focus = settings::ROWS
+            .iter()
+            .position(|r| r.id == settings::FieldId::PerformanceMode)
+            .unwrap();
+        st.cycle(None, 1).unwrap();
+        assert!(st.draft.is_empty(), "本地配置不能污染 daemon patch");
+        assert!(st.has_changes());
+        app.save_settings(&mut st);
+        assert!(app.local_config.performance_mode);
+        assert!(!app.settings_saving);
+        assert!(!st.has_changes());
+        assert_eq!(
+            app.local_store.as_ref().unwrap().load().unwrap(),
+            app.local_config
+        );
+        tokio::task::yield_now().await;
+        assert!(
+            rx.try_recv().is_err(),
+            "不得发送 config.save/config.load 请求"
+        );
+        // 再次保存可以原子替换既有文件。
+        st.cycle(None, 1).unwrap();
+        app.save_settings(&mut st);
+        assert!(!app.local_config.performance_mode);
+        assert!(
+            !app.local_store
+                .as_ref()
+                .unwrap()
+                .load()
+                .unwrap()
+                .performance_mode
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn local_save_failure_keeps_draft_and_runtime_mode() {
+        let (mut app, mut rx) = App::new_for_test();
+        let mut st = SettingsState {
+            performance_draft: Some(true),
+            ..SettingsState::default()
+        };
+        app.save_settings(&mut st);
+        assert!(!app.local_config.performance_mode);
+        assert_eq!(st.performance_draft, Some(true));
+        assert!(app.toasts.back().unwrap().text.contains("本地配置保存失败"));
+        tokio::task::yield_now().await;
+        assert!(rx.try_recv().is_err());
     }
 }

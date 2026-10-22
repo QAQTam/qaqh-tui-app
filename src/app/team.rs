@@ -327,7 +327,7 @@ impl App {
             .is_some_and(|state| state.apply_delta(delta));
         if applied {
             self.reconcile_team_tracking(&root);
-            self.force_redraw = true;
+            self.redraw_requested = true;
         }
     }
 
@@ -361,7 +361,7 @@ impl App {
             .is_some_and(|state| state.apply_status_hint(child, status));
         if applied {
             self.reconcile_team_tracking(&root);
-            self.force_redraw = true;
+            self.redraw_requested = true;
             self.flush_pending_team_status();
         }
     }
@@ -389,7 +389,7 @@ impl App {
                 .is_some_and(|state| state.apply_status_hint(&agent_id, status));
             if applied {
                 self.reconcile_team_tracking(&root);
-                self.force_redraw = true;
+                self.redraw_requested = true;
             }
         }
     }
@@ -497,7 +497,7 @@ impl App {
             self.overlays.pop();
         }
         self.inspect = Some(agent_id);
-        self.force_redraw = true;
+        self.redraw_requested = true;
     }
 
     /// Complete the `@` token immediately before the composer cursor.

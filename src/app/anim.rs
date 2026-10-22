@@ -18,6 +18,9 @@ pub(crate) const FRAME_MILLIS: u64 = 120;
 /// 切换不做位移（行高恒为 1），做**颜色插值**（surface 底 → selection 底）。
 pub(crate) const TAB_FADE_MS: u128 = 120;
 
+/// 首页示例轮换周期；渲染与 tick 置脏必须使用相同边界。
+pub(crate) const BRAND_EXAMPLE_ROTATE_MS: u128 = 6000;
+
 // ───────────────────────── 全局动画开关 ─────────────────────────
 
 static ANIMATIONS: OnceLock<bool> = OnceLock::new();
@@ -67,10 +70,55 @@ pub(crate) fn mix_rgb(a: Color, b: Color, t: f32) -> Option<Color> {
 
 /// 当前动画帧号（FRAME_MILLIS/帧）。
 pub(crate) fn frame_now() -> u64 {
+    wall_millis() / FRAME_MILLIS
+}
+
+pub(crate) fn wall_millis() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64 / FRAME_MILLIS)
+        .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+/// 参考 Claude Code SpinnerGlyph reducedMotion：固定 ●，1s 正常 + 1s 暗色。
+pub(crate) fn reduced_dot_dim(millis: u64) -> bool {
+    (millis / 1000) % 2 == 1
+}
+
+/// 将颜色按比例主动变暗，避免特定终端（如 Konsole）在真彩模式下忽略 SGR 2 (DIM)。
+pub(crate) fn dim_color(c: Color) -> Color {
+    match c {
+        Color::Rgb(r, g, b) => Color::Rgb(
+            (f32::from(r) * 0.35).round() as u8,
+            (f32::from(g) * 0.35).round() as u8,
+            (f32::from(b) * 0.35).round() as u8,
+        ),
+        other => other,
+    }
+}
+
+pub(crate) fn working_indicator(
+    performance: bool,
+    dim: bool,
+    frame: u64,
+    color: Color,
+) -> (&'static str, ratatui::style::Style) {
+    if performance {
+        if enabled() && dim {
+            // 双重保障：
+            // 1. 显式将真彩色前景色衰减 65%，Konsole/Alacritty 等终端即使忽略 SGR 2 也必然变暗；
+            // 2. 同时追加 Modifier::DIM，在不支持真彩色的 8/16 色调色板终端上同样生效。
+            let dimmed_fg = dim_color(color);
+            let style = ratatui::style::Style::new()
+                .fg(dimmed_fg)
+                .add_modifier(ratatui::style::Modifier::DIM);
+            ("●", style)
+        } else {
+            ("●", ratatui::style::Style::new().fg(color))
+        }
+    } else {
+        (claude_spinner_glyph(frame), ratatui::style::Style::new().fg(color))
+    }
 }
 
 /// Claude 风格星芒的六个基础字形。
@@ -138,6 +186,26 @@ fn spinner_glyph_at(frame: u64) -> &'static str {
 mod tests {
     use super::{base_frames, ease_out_quad, mix_rgb, parse_anim_flag, spinner_glyph_at};
     use ratatui::style::Color;
+
+    #[test]
+    fn reduced_dot_has_one_second_phases_and_never_changes_width() {
+        use super::{reduced_dot_dim, working_indicator};
+        use unicode_width::UnicodeWidthStr;
+        assert!(!reduced_dot_dim(0));
+        assert!(!reduced_dot_dim(999));
+        assert!(reduced_dot_dim(1000));
+        assert!(reduced_dot_dim(1999));
+        assert!(!reduced_dot_dim(2000));
+        for dim in [false, true] {
+            let (glyph, style) = working_indicator(true, dim, 123, Color::Cyan);
+            assert_eq!(glyph, "●");
+            assert_eq!(glyph.width(), 1);
+            assert_eq!(
+                style.add_modifier.contains(ratatui::style::Modifier::DIM),
+                dim && super::enabled()
+            );
+        }
+    }
 
     /// 开关解析：缺省开；`0`/`false`/`off` 关；大小写与空白不敏感。
     #[test]

@@ -13,7 +13,7 @@ impl App {
             .get_mut(&session_id)
             .is_some_and(|session| session.toggle_tool_expanded(block_id));
         if changed {
-            self.force_redraw = true;
+            self.redraw_requested = true;
         }
         changed
     }
@@ -28,7 +28,7 @@ impl App {
             .get_mut(&session_id)
             .is_some_and(|session| session.toggle_thinking_expanded(block_id));
         if changed {
-            self.force_redraw = true;
+            self.redraw_requested = true;
         }
         changed
     }
@@ -92,6 +92,11 @@ impl App {
             return;
         }
         let (text, attachments) = sess.composer.take();
+        sess.pending_user_pin = (!text.is_empty()).then(|| text.clone());
+        sess.pinned_user_turn = None;
+        sess.scroll.follow = false;
+        sess.scroll.offset = 0;
+        sess.scroll.tween = None;
         // 手动发送即视为首屏草稿已处置：清掉自动发送标记，防止 seat 稍后落地
         // 时对空 composer 触发一次幽灵补发（send_message 对空输入会静默返回，
         // 标记却会一直挂着）。
@@ -436,9 +441,16 @@ impl App {
             return;
         };
         // 交互滚动（wheel/PageUp）：视觉偏移缓动收敛到新目标。
+        sess.pending_user_pin = None;
+        sess.pinned_user_turn = None;
         sess.scroll.follow = false;
         let target = sess.scroll.offset.saturating_add(lines);
-        sess.scroll.scroll_to(target);
+        if self.local_config.performance_mode {
+            sess.scroll.offset = target;
+            sess.scroll.tween = None;
+        } else {
+            sess.scroll.scroll_to(target);
+        }
     }
 
     pub fn scroll_down(&mut self, lines: usize) {
@@ -448,13 +460,20 @@ impl App {
         let Some(sess) = self.sessions.get_mut(&session_id) else {
             return;
         };
+        sess.pending_user_pin = None;
+        sess.pinned_user_turn = None;
         if sess.scroll.offset <= lines {
             // 重新咬住底部是语义跳变：follow 分支直接画底，无需缓动。
             sess.scroll.offset = 0;
             sess.scroll.follow = true;
         } else {
             let target = sess.scroll.offset - lines;
-            sess.scroll.scroll_to(target);
+            if self.local_config.performance_mode {
+                sess.scroll.offset = target;
+                sess.scroll.tween = None;
+            } else {
+                sess.scroll.scroll_to(target);
+            }
         }
     }
 
@@ -463,6 +482,8 @@ impl App {
             return;
         };
         if let Some(sess) = self.sessions.get_mut(&session_id) {
+            sess.pending_user_pin = None;
+            sess.pinned_user_turn = None;
             sess.scroll.follow = false;
             sess.scroll.offset = usize::MAX / 2; // 渲染时 clamp
         }
@@ -473,6 +494,8 @@ impl App {
             return;
         };
         if let Some(sess) = self.sessions.get_mut(&session_id) {
+            sess.pending_user_pin = None;
+            sess.pinned_user_turn = None;
             sess.scroll.follow = true;
             sess.scroll.offset = 0;
         }

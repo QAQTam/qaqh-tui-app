@@ -521,14 +521,28 @@ fn render_user(at_ms: Option<u64>, text: &str, width: usize, theme: &Theme) -> V
         .unwrap_or_default();
     let first_prefix = format!("{outer}{stamp}{} ", theme.glyph.user);
     let continuation = " ".repeat(first_prefix.width());
-    render_prefixed_text(
+    let mut lines = render_prefixed_text(
         &text,
         width,
         &first_prefix,
         &continuation,
         fg(theme.accent.user),
         fg(theme.text.primary),
-    )
+    );
+    // 发出的文字延续输入带的底色，包括换行后的缩进和行尾空白。
+    for line in &mut lines {
+        let padding = width.saturating_sub(line.width());
+        for span in &mut line.spans {
+            span.style = span.style.bg(theme.chrome.composer_bg);
+        }
+        // Paragraph 不会用 Line 的背景填满行尾，必须显式铺到内容区边界。
+        line.spans.push(Span::styled(
+            " ".repeat(padding),
+            Style::new().bg(theme.chrome.composer_bg),
+        ));
+        line.style = line.style.bg(theme.chrome.composer_bg);
+    }
+    lines
 }
 
 /// 权威墙钟（epoch ms）→ 本地 `MM-DD HH:MM`。
@@ -714,6 +728,18 @@ fn is_lookup_tool(name: &str) -> bool {
     )
 }
 
+/// 借用源与已物化视图共用分组资格，避免缓存热路径复制工具正文才能判组。
+pub(crate) fn lookup_group_key<'a>(
+    turn_id: &'a str,
+    name: &'a str,
+    state: ToolState,
+    expanded: bool,
+    truncated: bool,
+) -> Option<(&'a str, &'a str)> {
+    (is_lookup_tool(name) && state == ToolState::Success && !expanded && !truncated)
+        .then_some((turn_id, name))
+}
+
 /// 连续查询族的合并长度；`<2` 表示不合并。
 ///
 /// 只合并**同回合、同工具、全部成功、都未展开、都没被截断**的连续块：这正是
@@ -726,22 +752,32 @@ pub fn lookup_group_len(blocks: &[TranscriptBlock]) -> usize {
     let Some(head) = tool_of(first) else {
         return 0;
     };
-    if !is_lookup_tool(&head.name) || !groupable(head) {
+    let key = lookup_group_key(
+        &first.turn_id,
+        &head.name,
+        head.state,
+        head.expanded,
+        head.truncated,
+    );
+    if key.is_none() {
         return 0;
     }
     let mut len = 1;
     for block in &blocks[1..] {
         let Some(tool) = tool_of(block) else { break };
-        if block.turn_id != first.turn_id || tool.name != head.name || !groupable(tool) {
+        if lookup_group_key(
+            &block.turn_id,
+            &tool.name,
+            tool.state,
+            tool.expanded,
+            tool.truncated,
+        ) != key
+        {
             break;
         }
         len += 1;
     }
     if len < 2 { 0 } else { len }
-}
-
-fn groupable(tool: &ToolBlock) -> bool {
-    tool.state == ToolState::Success && !tool.expanded && !tool.truncated
 }
 
 /// 连续查询族合并成一张卡。
@@ -2033,6 +2069,45 @@ mod tests {
         assert!(lines.iter().all(|line| line.width() <= 24));
     }
 
+    #[test]
+    fn sent_user_band_matches_composer_including_blank_lines_and_trailing_cells() {
+        use ratatui::{Terminal, backend::TestBackend, style::Color, widgets::Paragraph};
+        for kind in [
+            ThemeKind::QaqhNight,
+            ThemeKind::QaqhDay,
+            ThemeKind::Terminal,
+        ] {
+            let theme = Theme::resolve(kind, ColorSupport::TrueColor);
+            let block = TranscriptBlock::new(
+                "u",
+                BlockKind::User {
+                    text: "hello 中文\n\n长消息换行测试测试测试".into(),
+                },
+            );
+            let lines = render_block(&block, 24, &theme);
+            assert!(lines.len() > 2);
+            let mut terminal = Terminal::new(TestBackend::new(24, lines.len() as u16 + 1)).unwrap();
+            terminal
+                .draw(|frame| frame.render_widget(Paragraph::new(lines.clone()), frame.area()))
+                .unwrap();
+            for y in 0..lines.len() as u16 {
+                // 宽字符的尾格由 ratatui 复位为占位；检查字形起格与行尾空白。
+                for x in [0, 4, 22] {
+                    assert_eq!(
+                        terminal.backend().buffer()[(x, y)].bg,
+                        theme.chrome.composer_bg,
+                        "{kind:?} cell ({x},{y}), line {:?}",
+                        lines[usize::from(y)]
+                    );
+                }
+            }
+            assert_eq!(
+                terminal.backend().buffer()[(23, lines.len() as u16)].bg,
+                Color::Reset
+            );
+        }
+    }
+
     /// 全宽度扫描：1..=60 列逐列渲染各块型，断言不 panic 且不超出预算。
     ///
     /// `MIN_WIDTH=20` 钳制的契约：终端窄于 20 列时仍按 20 列渲染，横向超出
@@ -2745,8 +2820,11 @@ more context follows"
         ];
         assert_eq!(
             text_of(&render_transcript(&blocks, 40, &theme())),
-            "  ❯ hello 世界\n\n◆ Title\n  \n  body\n\n◇ Thought for 1.2s\n\n\
-             ✓ Read plan.md\n  └ line one\n    line two\n\n· note"
+            format!(
+                "  ❯ hello 世界{}\n\n◆ Title\n  \n  body\n\n◇ Thought for 1.2s\n\n\
+             ✓ Read plan.md\n  └ line one\n    line two\n\n· note",
+                " ".repeat(40 - "  ❯ hello 世界".width())
+            )
         );
     }
 }

@@ -1,0 +1,11 @@
+{
+  "rust": "1.99.1",
+  "backend": {
+    "repository": "QAQTam/qaqh-backend",
+    "revision": "80ddb3c785a0af4dfe217169119c1940bb53f7eb"
+  },
+  "ratatui": {
+    "repository": "ratatui/ratatui",
+    "revision": "f57b06ffb72085644b35e71d296fd90b777dc073"
+  }
+}

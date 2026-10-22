@@ -39,6 +39,90 @@ pub struct AccountResult {
 }
 
 impl App {
+    /// 账号卡片的共享动作入口；鼠标和快捷键都在这里重新检查可用性。
+    pub fn account_action(&mut self, action: account::AccountAction) {
+        use account::AccountAction as A;
+        let Some(Overlay::Account(st)) = self.overlays.last() else {
+            return;
+        };
+        if !st.action_enabled(&self.account, action) {
+            return;
+        }
+        let kind = st.kind;
+        let authorize_url = st.authorize_url.clone();
+        match action {
+            A::Login => self.start_account_sign_in(kind),
+            A::Cancel => self.cancel_account_sign_in(kind),
+            A::SignOut => self.sign_out_account(kind),
+            A::Refresh => self.refresh_account(kind),
+            A::OpenAuthorize => {
+                if let Some(url) = authorize_url {
+                    self.open_account_link(url);
+                }
+            }
+            A::CopyAuthorize => {
+                if let Some(url) = authorize_url {
+                    match crate::terminal::clipboard::copy_osc52(&url) {
+                        Ok(()) => self.toast(
+                            NoticeLevel::Info,
+                            "已发送授权链接到终端剪贴板（需终端支持 OSC 52）",
+                        ),
+                        Err(error) => self.toast(NoticeLevel::Error, format!("复制失败：{error}")),
+                    }
+                }
+            }
+            A::Usage => {
+                let url = match kind {
+                    AccountKind::ChatGptPlan => {
+                        self.account.siwc.as_ref().map(|s| s.usage_url.clone())
+                    }
+                    AccountKind::DeepSeekAccount => {
+                        self.account.ds.as_ref().map(|s| s.usage_url.clone())
+                    }
+                };
+                if let Some(url) = url {
+                    self.open_account_link(url);
+                }
+            }
+            A::Balance => self.refresh_account_balance(),
+            A::Verify => self.verify_account_credential(),
+            A::TopUp => {
+                if let Some(status) = &self.account.ds {
+                    self.open_account_link(status.top_up_url.clone());
+                }
+            }
+            A::SelectProfile(index) => {
+                if let Some(profile) = self
+                    .account
+                    .profiles
+                    .as_ref()
+                    .and_then(|p| p.profiles.get(index))
+                {
+                    let id = profile.id.clone();
+                    if let Some(st) = self.account_overlay_mut(kind) {
+                        st.selected = index;
+                    }
+                    self.select_account_profile(id);
+                }
+            }
+            A::Close => {
+                if st.flow == Flow::Starting {
+                    if let Some(st) = self.account_overlay_mut(kind) {
+                        st.close_when_started = true;
+                        st.notice = Some("正在等待流程 id，收到后将取消并返回".into());
+                    }
+                    self.redraw_requested = true;
+                    return;
+                }
+                if st.flow.is_pending() {
+                    self.cancel_account_sign_in(kind);
+                }
+                self.overlays.pop();
+            }
+        }
+        self.redraw_requested = true;
+    }
+
     /// 打开账号面板（`kind` 由设置页按**当前生效的 credential** 给出）。
     pub fn open_account(&mut self, kind: AccountKind) {
         match self.overlays.last() {
@@ -91,6 +175,8 @@ impl App {
             st.error = None;
             st.notice = None;
             st.flow = Flow::Starting;
+            st.close_when_started = false;
+            st.authorize_url = None;
         }
         self.spawn_account(kind, AccountOp::SignInStart, "sign_in.start", json!({}));
     }
@@ -241,7 +327,7 @@ impl App {
                     state.busy = None;
                 }
                 self.toast(NoticeLevel::Warn, "登录超时，已取消本次流程".to_string());
-                self.force_redraw = true;
+                self.redraw_requested = true;
             }
         }
     }
@@ -250,12 +336,39 @@ impl App {
 
     pub(super) fn handle_account_result(&mut self, result: AccountResult) {
         let AccountResult { kind, op, result } = result;
-        if let Some(st) = self.account_overlay_mut(kind) {
+        // 轮询响应只属于它发起时的流程，不能覆盖取消/重试后的新状态。
+        if let AccountOp::SignInPoll { id } = &op
+            && !self
+                .account_overlay_mut(kind)
+                .is_some_and(|st| st.flow.pending_id() == Some(id.as_str()))
+        {
+            return;
+        }
+        // 状态/目录的后台读取可能晚于动作返回，不能清掉在途动作的忙碌标记。
+        if matches!(
+            op,
+            AccountOp::SignInStart
+                | AccountOp::SignInCancel
+                | AccountOp::SignOut
+                | AccountOp::SelectProfile
+                | AccountOp::Verify
+        ) && let Some(st) = self.account_overlay_mut(kind)
+        {
             st.busy = None;
         }
         let value = match result {
             Ok(value) => value,
             Err(error) => {
+                if op == AccountOp::SignInStart
+                    && self
+                        .account_overlay_mut(kind)
+                        .is_some_and(|st| st.close_when_started)
+                {
+                    self.overlays.pop();
+                    self.toast(NoticeLevel::Error, format!("{}: {error}", kind.title()));
+                    self.redraw_requested = true;
+                    return;
+                }
                 let polling = matches!(op, AccountOp::SignInPoll { .. });
                 self.account_failed(kind, polling, error);
                 return;
@@ -266,7 +379,7 @@ impl App {
             AccountOp::Profiles => match serde_json::from_value(value) {
                 Ok(profiles) => {
                     self.account.profiles = Some(profiles);
-                    self.force_redraw = true;
+                    self.redraw_requested = true;
                 }
                 Err(error) => self.account_parse_error(kind, "siwc.profiles", &error),
             },
@@ -282,7 +395,7 @@ impl App {
                     st.error = None;
                 }
                 self.spawn_account_status(kind);
-                self.force_redraw = true;
+                self.redraw_requested = true;
             }
             AccountOp::SignOut => self.apply_sign_out(kind, value),
             AccountOp::SelectProfile => {
@@ -293,7 +406,7 @@ impl App {
             AccountOp::Balance => match serde_json::from_value(value) {
                 Ok(balance) => {
                     self.account.balance = Some(balance);
-                    self.force_redraw = true;
+                    self.redraw_requested = true;
                 }
                 Err(error) => self.account_parse_error(kind, "dsaccount.balance", &error),
             },
@@ -324,7 +437,7 @@ impl App {
                 }
             }
         }
-        self.force_redraw = true;
+        self.redraw_requested = true;
     }
 
     fn apply_account_models(&mut self, kind: AccountKind, value: Value) {
@@ -369,7 +482,7 @@ impl App {
                         st.model_options = models;
                     }
                 }
-                self.force_redraw = true;
+                self.redraw_requested = true;
             }
             Err(message) => {
                 if let Some(st) = self.account_overlay_mut(kind) {
@@ -390,7 +503,7 @@ impl App {
                             st.started(start.flow_id.clone(), start.expires_at_ms, now);
                             st.authorize_url = Some(start.authorize_url.clone());
                         }
-                        self.open_authorize_url(&start.authorize_url);
+                        self.finish_sign_in_start(kind, &start.authorize_url);
                     }
                     Err(error) => self.account_parse_error(kind, "siwc.sign_in.start", &error),
                 }
@@ -404,13 +517,25 @@ impl App {
                             st.started(start.attempt_id.clone(), deadline, now);
                             st.authorize_url = Some(start.authorize_url.clone());
                         }
-                        self.open_authorize_url(&start.authorize_url);
+                        self.finish_sign_in_start(kind, &start.authorize_url);
                     }
                     Err(error) => self.account_parse_error(kind, "dsaccount.sign_in.start", &error),
                 }
             }
         }
-        self.force_redraw = true;
+        self.redraw_requested = true;
+    }
+
+    fn finish_sign_in_start(&mut self, kind: AccountKind, url: &str) {
+        if self
+            .account_overlay_mut(kind)
+            .is_some_and(|st| st.close_when_started)
+        {
+            self.cancel_account_sign_in(kind);
+            self.overlays.pop();
+        } else {
+            self.open_authorize_url(url);
+        }
     }
 
     fn open_authorize_url(&mut self, url: &str) {
@@ -428,7 +553,7 @@ impl App {
                 }) {
                     st.error = Some(format!("{error}（可复制授权链接手动打开：{url}）"));
                 }
-                self.force_redraw = true;
+                self.redraw_requested = true;
             }
         }
     }
@@ -467,7 +592,7 @@ impl App {
     fn finish_flow(&mut self, kind: AccountKind, outcome: FlowOutcome) {
         match outcome {
             FlowOutcome::Continue => {
-                self.force_redraw = true;
+                self.redraw_requested = true;
             }
             FlowOutcome::Completed { .. } => {
                 let who = kind.title();
@@ -494,7 +619,7 @@ impl App {
                 if let Some(st) = self.account_overlay_mut(kind) {
                     st.notice = Some("本次登录已被新的登录流程取代（已停止等待）".into());
                 }
-                self.force_redraw = true;
+                self.redraw_requested = true;
             }
         }
     }
@@ -559,7 +684,7 @@ impl App {
             }
             Err(error) => self.account_parse_error(AccountKind::DeepSeekAccount, "verify", &error),
         }
-        self.force_redraw = true;
+        self.redraw_requested = true;
     }
 
     fn account_failed(&mut self, kind: AccountKind, polling: bool, error: String) {
@@ -570,7 +695,7 @@ impl App {
                 st.notice = Some("本次登录已被新的登录流程取代（已停止等待）".into());
                 st.error = None;
             }
-            self.force_redraw = true;
+            self.redraw_requested = true;
             return;
         }
         // 轮询每秒一拍：同一条错误不该每拍弹一次 toast（把用户的提示栏刷成瀑布）。
@@ -588,7 +713,7 @@ impl App {
         if !repeated {
             self.toast(NoticeLevel::Error, format!("{}: {error}", kind.title()));
         }
-        self.force_redraw = true;
+        self.redraw_requested = true;
     }
 
     fn account_parse_error(&mut self, kind: AccountKind, method: &str, error: &serde_json::Error) {
@@ -597,7 +722,7 @@ impl App {
             st.error = Some(message.clone());
         }
         self.toast(NoticeLevel::Error, message);
-        self.force_redraw = true;
+        self.redraw_requested = true;
     }
 
     /// 账号卡片自由滚动（滚轮/PgUp/PgDn；焦点跟随由绘制层收口）。
@@ -608,7 +733,7 @@ impl App {
             } else {
                 st.scroll.saturating_add(lines)
             };
-            self.force_redraw = true;
+            self.redraw_requested = true;
         }
     }
 
@@ -617,5 +742,109 @@ impl App {
             Some(Overlay::Account(st)) if st.kind == kind => Some(st),
             _ => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use account::AccountAction as A;
+
+    #[tokio::test]
+    async fn account_close_during_start_cancels_after_id_without_opening_browser() {
+        for kind in [AccountKind::ChatGptPlan, AccountKind::DeepSeekAccount] {
+            let (mut app, _rx) = App::new_for_test();
+            let mut state = AccountState::new(kind);
+            state.flow = Flow::Starting;
+            app.overlays.push(Overlay::Account(state));
+            app.account_action(A::Close);
+            assert!(
+                matches!(app.overlays.last(), Some(Overlay::Account(st)) if st.close_when_started)
+            );
+            let start = match kind {
+                AccountKind::ChatGptPlan => json!({
+                    "flowId": "mine", "authorizeUrl": "https://example.com/auth",
+                    "redirectUri": "http://127.0.0.1:1234/callback", "expiresAtMs": u64::MAX,
+                    "usageUrl": "https://example.com/usage"
+                }),
+                AccountKind::DeepSeekAccount => json!({
+                    "attemptId": "mine", "authorizeUrl": "https://example.com/auth", "expiresIn": 60,
+                    "redirectUri": "http://127.0.0.1:1234/callback"
+                }),
+            };
+            app.apply_sign_in_start(kind, start);
+            assert!(app.overlays.is_empty());
+            assert!(
+                !app.toasts
+                    .iter()
+                    .any(|toast| toast.text.contains("已在浏览器"))
+            );
+        }
+    }
+
+    #[test]
+    fn account_actions_reject_stale_or_disabled_targets() {
+        let (mut app, _rx) = App::new_for_test();
+        let mut state = AccountState::new(AccountKind::ChatGptPlan);
+        state.flow = Flow::Starting;
+        app.overlays.push(Overlay::Account(state));
+        // 不需 runtime；若禁用动作漏过判据，就会尝试 spawn 并 panic。
+        for action in [A::Login, A::Cancel, A::SignOut, A::SelectProfile(999)] {
+            app.account_action(action);
+        }
+        assert!(
+            matches!(app.overlays.last(), Some(Overlay::Account(st)) if st.flow == Flow::Starting)
+        );
+        app.overlays.clear();
+        app.account_action(A::Login);
+        assert!(app.overlays.is_empty());
+    }
+
+    #[test]
+    fn account_background_responses_do_not_clear_busy_or_finish_a_new_flow() {
+        let (mut app, _rx) = App::new_for_test();
+        let kind = AccountKind::ChatGptPlan;
+        let mut state = AccountState::new(kind);
+        state.flow = Flow::Starting;
+        state.busy = Some("发起登录");
+        app.overlays.push(Overlay::Account(state));
+        app.handle_account_result(AccountResult {
+            kind,
+            op: AccountOp::Profiles,
+            result: Ok(json!({"active": null, "profiles": [], "pending": []})),
+        });
+        assert!(
+            matches!(app.overlays.last(), Some(Overlay::Account(st)) if st.busy == Some("发起登录"))
+        );
+        app.handle_account_result(AccountResult {
+            kind,
+            op: AccountOp::SignInPoll { id: "old".into() },
+            result: Ok(json!({"flowId": "old", "state": "completed", "profileId": "old-profile"})),
+        });
+        assert!(
+            matches!(app.overlays.last(), Some(Overlay::Account(st)) if st.flow == Flow::Starting)
+        );
+    }
+
+    #[test]
+    fn account_close_during_start_failure_returns_to_previous_page() {
+        let (mut app, _rx) = App::new_for_test();
+        let kind = AccountKind::ChatGptPlan;
+        let mut state = AccountState::new(kind);
+        state.flow = Flow::Starting;
+        app.overlays.push(Overlay::Settings(Default::default()));
+        app.overlays.push(Overlay::Account(state));
+        app.account_action(A::Close);
+        app.handle_account_result(AccountResult {
+            kind,
+            op: AccountOp::SignInStart,
+            result: Err("connection failed".into()),
+        });
+        assert!(matches!(app.overlays.as_slice(), [Overlay::Settings(_)]));
+        assert!(
+            app.toasts
+                .iter()
+                .any(|toast| toast.text.contains("connection failed"))
+        );
     }
 }

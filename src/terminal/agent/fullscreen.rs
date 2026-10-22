@@ -18,6 +18,8 @@ use crate::ui::v2::transcript::{TodoBlock, compose_todo_panel};
 use ratatui::crossterm::event::MouseButton;
 
 const NARROW_VIEWPORT_WIDTH: u16 = 40;
+/// 消息视口与输入区之间的固定留白，不属于可滚动历史或输入框内边距。
+const TRANSCRIPT_INPUT_GAP: u16 = 2;
 
 /// 子代理预览条的最低可用宽度。
 ///
@@ -222,7 +224,11 @@ pub(super) fn draw_fullscreen_agent_inner(
     {
         let transcript_len = view.transcripts.len_for(&session.session_id);
         // 滚动条与正文必须用同一个视觉偏移：tween 进行中两者同步滑行。
-        let visual_offset = session.scroll.visual_offset();
+        let visual_offset = if session.pinned_user_turn.is_some() {
+            view.viewport_offset
+        } else {
+            session.scroll.visual_offset()
+        };
         ui_fullscreen::draw_scrollbar(
             frame,
             body,
@@ -302,7 +308,7 @@ pub(super) fn draw_fullscreen_agent_inner(
         let loading = session.loading_older;
         let has_more = session.timeline.has_more;
         let truncated = session.timeline.truncated_before;
-        if loading || has_more || truncated {
+        if (loading || has_more || truncated) && session.pinned_user_turn.is_none() {
             let label = if loading {
                 " ⋯ 正在加载更早消息… "
             } else if has_more {
@@ -359,13 +365,20 @@ fn register_agent_messages(
     let visible_end = view
         .visible_start
         .saturating_add(usize::from(view.body_height));
-    for span in &cache.spans {
+    // 命中区同样只走访可见窗口，避免鼠标/动画帧扫描整个历史。
+    let first = cache
+        .spans
+        .partition_point(|span| span.end <= view.visible_start);
+    for span in cache.spans[first..]
+        .iter()
+        .take_while(|span| span.start < visible_end)
+    {
         let start = span.start.max(view.visible_start);
         let end = span.end.min(visible_end);
         if start >= end {
             continue;
         }
-        let Some(line) = cache.lines.get(start) else {
+        let Some(line) = cache.line_at(start) else {
             continue;
         };
         let target = match span.kind {
@@ -474,6 +487,13 @@ fn render_fullscreen_agent(
         &mut view.transcripts,
     );
     view.visible_start = visible_start;
+    // 底部偏移仅为滚动条/主动滚动的镜像；吸顶真值仍是 user span 的语义锚。
+    view.viewport_offset = app.active_session_id().map_or(0, |id| {
+        view.transcripts
+            .len_for(&id)
+            .saturating_sub(usize::from(body_area.height))
+            .saturating_sub(visible_start)
+    });
     while lines.len() < usize::from(body_area.height) {
         lines.push(Line::default());
     }
@@ -486,21 +506,25 @@ fn render_fullscreen_agent(
         theme,
         view.current_todo.as_ref(),
     );
-    // 预览条的行号是**块内相对**的，换算到整帧时加上历史区高度。
+    // 预览条的行号是**块内相对**的，换算时包含历史区与固定留白。
     let subagent_strip = bottom.subagent_strip.map(|strip| Rect {
         x: strip.x,
-        y: body_area.height.saturating_add(strip.y),
+        y: bottom_area.y.saturating_add(strip.y),
         width: strip.width,
         height: 1,
     });
+    lines.extend(std::iter::repeat_n(
+        Line::default(),
+        usize::from(bottom_area.y.saturating_sub(body_area.bottom())),
+    ));
     lines.extend(bottom.lines);
     lines.truncate(usize::from(area.height));
 
     let cursor = bottom.cursor.map(|cursor| {
         Position::new(
             cursor.x,
-            body_area
-                .height
+            bottom_area
+                .y
                 .saturating_add(cursor.y)
                 .min(area.height.saturating_sub(1)),
         )
@@ -530,13 +554,22 @@ fn fullscreen_layout(
         u16::try_from(fullscreen_chrome_layout(app, area.width, max_bottom, theme, todo).height())
             .unwrap_or(u16::MAX);
     let bottom_height = desired_bottom.clamp(1, max_bottom);
-    let body_height = area.height.saturating_sub(bottom_height);
+    // 极矮终端优先保留一行消息和一行输入，其余空间才用来留白。
+    let gap = TRANSCRIPT_INPUT_GAP.min(
+        area.height
+            .saturating_sub(bottom_height)
+            .saturating_sub(reserve_body),
+    );
+    let body_height = area
+        .height
+        .saturating_sub(bottom_height)
+        .saturating_sub(gap);
 
     (
         Rect::new(area.x, area.y, area.width, body_height),
         Rect::new(
             area.x,
-            area.y.saturating_add(body_height),
+            area.y.saturating_add(body_height).saturating_add(gap),
             area.width,
             bottom_height,
         ),
@@ -643,7 +676,7 @@ fn render_fullscreen_chrome(
     );
     let mut lines = slash_menu_lines(app, width, theme, layout.slash_rows);
     if layout.thinking_rows > 0 {
-        lines.push(thinking_line(session, width, theme));
+        lines.push(thinking_line(app, session, width, theme));
     }
     if layout.todo_rows > 0
         && let Some(todo) = todo
@@ -740,6 +773,7 @@ pub(super) struct FullscreenView {
     pub(super) body_area: Rect,
     pub(super) visible_start: usize,
     pub(super) body_height: u16,
+    pub(super) viewport_offset: usize,
     pub(super) menu: Option<MessageMenu>,
     /// 当前生效的待办清单（最后一次成功 `todo_write` 的入参）。
     ///
@@ -809,11 +843,13 @@ impl FullscreenView {
             app.scroll_bottom();
             return;
         }
+        self.release_user_pin(app);
         app.scroll_up(lines);
         self.clamp_scroll(app);
     }
 
     pub(super) fn scroll_down(&mut self, app: &mut App, lines: usize) {
+        self.release_user_pin(app);
         app.scroll_down(lines);
         self.clamp_scroll(app);
     }
@@ -837,6 +873,11 @@ impl FullscreenView {
             return;
         };
         if let Some(session) = app.sessions.get_mut(&session_id) {
+            if session.pending_user_pin.is_some() || session.pinned_user_turn.is_some() {
+                session.scroll.offset = self.viewport_offset;
+                session.scroll.tween = None;
+                return;
+            }
             if max_offset == 0 {
                 session.scroll.follow = true;
                 session.scroll.offset = 0;
@@ -847,16 +888,36 @@ impl FullscreenView {
             }
         }
     }
+
+    fn release_user_pin(&self, app: &mut App) {
+        if let Some(session) = app.active_session_mut()
+            && (session.pending_user_pin.is_some() || session.pinned_user_turn.is_some())
+        {
+            session.scroll.offset = self.viewport_offset;
+            session.scroll.tween = None;
+        }
+    }
 }
 
 #[derive(Debug, Default)]
 pub(super) struct FullscreenTranscriptCache {
     key: Option<FullscreenTranscriptKey>,
-    blocks: HashMap<FullscreenBlockKey, Vec<Line<'static>>>,
+    blocks: HashMap<FullscreenBlockKey, Arc<Vec<Line<'static>>>>,
     spans: Vec<FullscreenBlockSpan>,
-    lines: Vec<Line<'static>>,
+    /// 与块缓存共享正文，只保存段起点；不再另存一份深拷贝的完整历史。
+    segments: Vec<FullscreenLineSegment>,
+    total_lines: usize,
+    blank_line: Line<'static>,
     #[cfg(test)]
     pub(super) render_misses: usize,
+    #[cfg(test)]
+    materialized_blocks: usize,
+}
+
+#[derive(Debug)]
+struct FullscreenLineSegment {
+    start: usize,
+    lines: Arc<Vec<Line<'static>>>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -882,6 +943,7 @@ struct FullscreenTranscriptKey {
     width: u16,
     expanded_tools_revision: u64,
     expanded_thinking_revision: u64,
+    rebaseline_epoch: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -895,12 +957,61 @@ struct FullscreenBlockKey {
     /// 展开不改 rev，键里没有它的话逐块缓存永远命中折叠渲染。
     expanded: bool,
     content_hash: u64,
+    rebaseline_epoch: u64,
+    at_ms: Option<u64>,
 }
 
 impl FullscreenTranscriptCache {
+    /// 行索引只在段起点上二分；段间的一行间隔是隐式空行。
+    fn line_at(&self, index: usize) -> Option<&Line<'static>> {
+        if index >= self.total_lines {
+            return None;
+        }
+        let next = self
+            .segments
+            .partition_point(|segment| segment.start <= index);
+        let segment = &self.segments[next.checked_sub(1)?];
+        Some(
+            segment
+                .lines
+                .get(index - segment.start)
+                .unwrap_or(&self.blank_line),
+        )
+    }
+
+    /// 只复制可见窗口。先二分定位首段，再顺序走访相交段，成本与窗口而非历史行数相关。
+    fn window(&self, start: usize, height: usize) -> Vec<Line<'static>> {
+        let end = start.saturating_add(height).min(self.total_lines);
+        if start >= end {
+            return Vec::new();
+        }
+        let mut out = Vec::with_capacity(end - start);
+        let mut index = self
+            .segments
+            .partition_point(|segment| segment.start <= start)
+            .saturating_sub(1);
+        let mut row = start;
+        while row < end {
+            let segment = &self.segments[index];
+            let segment_end = segment.start + segment.lines.len();
+            if row < segment_end {
+                let until = segment_end.min(end);
+                out.extend_from_slice(&segment.lines[row - segment.start..until - segment.start]);
+                row = until;
+            } else {
+                out.push(Line::default());
+                row += 1;
+            }
+            if index + 1 < self.segments.len() && row >= self.segments[index + 1].start {
+                index += 1;
+            }
+        }
+        out
+    }
+
     #[cfg(test)]
-    pub(super) fn rendered_lines(&self) -> &[Line<'static>] {
-        &self.lines
+    pub(super) fn rendered_lines(&self) -> Vec<Line<'static>> {
+        self.window(0, self.total_lines)
     }
 
     /// 工具类命中区域（`block_id`, start, end）——测试用，不暴露内部结构。
@@ -920,6 +1031,7 @@ impl FullscreenTranscriptCache {
             width,
             expanded_tools_revision: session.expanded_tools_revision,
             expanded_thinking_revision: session.expanded_thinking_revision,
+            rebaseline_epoch: session.timeline.rebaseline_epoch,
         };
         if self.key.as_ref() == Some(&key) {
             return;
@@ -930,43 +1042,56 @@ impl FullscreenTranscriptCache {
         // 模式下只能看到最后一行。
         // 走**整个模型**而不是只有 `turns`：压缩分隔锚（W3/D10）与回合墙钟都在
         // 模型上，只读 turns 会把它们静默丢掉。
-        let blocks: Vec<_> = adapter::from_model_with_expanded_blocks(
+        let blocks = adapter::fullscreen_sources(
             &session.timeline,
             &session.expanded_tools,
             &session.expanded_thinking,
-        )
-        .into_iter()
-        .filter(|block| {
-            !(block.state == BlockState::Live && matches!(block.kind, BlockKind::Thinking { .. }))
-        })
-        .collect();
+        );
 
         let mut used = HashSet::with_capacity(blocks.len());
         let mut spans = Vec::with_capacity(blocks.len());
-        let mut lines = Vec::new();
+        let mut segments = Vec::with_capacity(blocks.len());
+        let mut total_lines = 0;
         let mut index = 0;
         while index < blocks.len() {
             if index > 0 {
-                lines.push(Line::default());
+                total_lines += 1;
             }
-            let start = lines.len();
+            let start = total_lines;
             // 连续查询族合并成一张卡（与 `render_transcript` 同一条规则，
             // 免得子代理视图和全屏视图长得不一样）。
-            let group = crate::ui::v2::transcript::lookup_group_len(&blocks[index..]);
+            let lookup_key = blocks[index].lookup_key();
+            let group = if lookup_key.is_some() {
+                blocks[index..]
+                    .iter()
+                    .take_while(|source| source.lookup_key() == lookup_key)
+                    .count()
+            } else {
+                0
+            };
             let (span, rendered) = if group >= 2 {
                 let members = &blocks[index..index + group];
-                let block_key = FullscreenBlockKey::from_group(members, width);
+                let block_key = FullscreenBlockKey::from_group(
+                    members,
+                    width,
+                    session.timeline.rebaseline_epoch,
+                );
                 used.insert(block_key.clone());
                 let rendered = self.blocks.entry(block_key).or_insert_with(|| {
                     #[cfg(test)]
                     {
                         self.render_misses = self.render_misses.saturating_add(1);
+                        self.materialized_blocks += members.len();
                     }
-                    crate::ui::v2::transcript::render_lookup_group(
-                        members,
+                    let materialized: Vec<_> = members
+                        .iter()
+                        .map(adapter::BlockSource::materialize)
+                        .collect();
+                    Arc::new(crate::ui::v2::transcript::render_lookup_group(
+                        &materialized,
                         usize::from(width),
                         theme,
-                    )
+                    ))
                 });
                 // 合并卡只有一个命中区域，指向**首成员**：点它即展开，而展开态会
                 // 让 `lookup_group_len` 归零——卡片自己拆回 N 张独立卡，正好是
@@ -975,8 +1100,8 @@ impl FullscreenTranscriptCache {
                 index += group;
                 (
                     Some(FullscreenBlockSpan {
-                        turn_id: head.turn_id.clone(),
-                        block_id: head.id.to_string(),
+                        turn_id: head.turn_id().to_string(),
+                        block_id: head.id().into_owned(),
                         kind: SpanKind::Tool,
                         start,
                         end: start + rendered.len(),
@@ -985,25 +1110,36 @@ impl FullscreenTranscriptCache {
                 )
             } else {
                 let block = &blocks[index];
-                let block_key = FullscreenBlockKey::from_block(block, width);
+                let block_key = FullscreenBlockKey::from_source(
+                    block,
+                    width,
+                    session.timeline.rebaseline_epoch,
+                );
                 used.insert(block_key.clone());
                 let rendered = self.blocks.entry(block_key).or_insert_with(|| {
                     #[cfg(test)]
                     {
                         self.render_misses = self.render_misses.saturating_add(1);
+                        self.materialized_blocks += 1;
                     }
-                    crate::ui::v2::transcript::render_block(block, usize::from(width), theme)
+                    Arc::new(crate::ui::v2::transcript::render_block(
+                        &block.materialize(),
+                        usize::from(width),
+                        theme,
+                    ))
                 });
-                let kind = match &block.kind {
-                    BlockKind::User { .. } => Some(SpanKind::Message(MessageRole::User)),
-                    BlockKind::Assistant { .. } => Some(SpanKind::Message(MessageRole::Assistant)),
-                    BlockKind::Thinking { .. } => Some(SpanKind::Thinking),
-                    BlockKind::Tool(_) => Some(SpanKind::Tool),
-                    _ => None,
+                let kind = match block.kind() {
+                    adapter::SourceKind::User => Some(SpanKind::Message(MessageRole::User)),
+                    adapter::SourceKind::Assistant => {
+                        Some(SpanKind::Message(MessageRole::Assistant))
+                    }
+                    adapter::SourceKind::Thinking => Some(SpanKind::Thinking),
+                    adapter::SourceKind::Tool => Some(SpanKind::Tool),
+                    adapter::SourceKind::System => None,
                 };
                 let span = kind.map(|kind| FullscreenBlockSpan {
-                    turn_id: block.turn_id.clone(),
-                    block_id: block.id.to_string(),
+                    turn_id: block.turn_id().to_string(),
+                    block_id: block.id().into_owned(),
                     kind,
                     start,
                     end: start + rendered.len(),
@@ -1011,55 +1147,59 @@ impl FullscreenTranscriptCache {
                 index += 1;
                 (span, rendered)
             };
-            lines.extend(rendered.iter().cloned());
+            total_lines += rendered.len();
+            segments.push(FullscreenLineSegment {
+                start,
+                lines: Arc::clone(rendered),
+            });
             if let Some(span) = span {
                 spans.push(span);
             }
         }
         self.blocks.retain(|key, _| used.contains(key));
         self.spans = spans;
-        self.lines = lines;
+        self.segments = segments;
+        self.total_lines = total_lines;
         self.key = Some(key);
     }
 }
 
 impl FullscreenBlockKey {
-    fn from_block(block: &TranscriptBlock, width: u16) -> Self {
+    fn from_source(block: &adapter::BlockSource<'_>, width: u16, rebaseline_epoch: u64) -> Self {
         // 展开标志必须在键里（点击展开 bug 的根因）：`ceaf7ae` 把键改成
         // (block_id, revision) 后，展开翻转不动 rev——逐块缓存全部命中旧的
         // 折叠渲染，外层重建空转，表现为「点击后闪一下但没展开」。
-        let expanded = match &block.kind {
-            BlockKind::Tool(tool) => tool.expanded,
-            BlockKind::Thinking { expanded, .. } => *expanded,
-            _ => false,
-        };
+        let mut hasher = DefaultHasher::new();
+        block.system_text().hash(&mut hasher);
         Self {
-            turn_id: block.turn_id.clone(),
-            block_id: block.id.to_string(),
-            revision: block.revision,
-            state: block.state,
+            turn_id: block.turn_id().to_string(),
+            block_id: block.id().into_owned(),
+            revision: block.revision(),
+            state: block.state(),
             width,
-            expanded,
+            expanded: block.expanded(),
             // 内容身份由 (block_id, revision) 承担：rev 是「可见内容可能变化
             // 即自增」的权威计数（timeline_model::Block::touch），缓存键不再
             // 哈希块内容——那曾要求 BlockKind/ToolBlock derive Hash。
-            content_hash: 0,
+            content_hash: hasher.finish(),
+            rebaseline_epoch,
+            at_ms: block.at_ms(),
         }
     }
 
     /// 合并卡的缓存键：没有单一 block，就把**每个成员**的 id 与内容都揉进去，
     /// 任何一个成员变了都会 miss 重渲（缓存命中率不受影响——同一次同步里
     /// 逐帧比对的是同一组成员）。
-    fn from_group(members: &[TranscriptBlock], width: u16) -> Self {
+    fn from_group(members: &[adapter::BlockSource<'_>], width: u16, rebaseline_epoch: u64) -> Self {
         let mut hasher = DefaultHasher::new();
         let mut revision = 0u64;
         let mut ids = Vec::with_capacity(members.len());
         for block in members {
             // 逐成员 revision（而不是 max）：max 不动的成员更新也要 miss。
-            block.revision.hash(&mut hasher);
-            block.state.hash(&mut hasher);
-            revision = revision.max(block.revision);
-            ids.push(block.id.to_string());
+            block.revision().hash(&mut hasher);
+            block.state().hash(&mut hasher);
+            revision = revision.max(block.revision());
+            ids.push(block.id().into_owned());
         }
         // 合并卡只在全员折叠时存在（`groupable` 要求 `!expanded`），展开态下
         // 成员拆回独立卡、各自走 `from_block`——这里恒为 false 即可，但显式
@@ -1067,17 +1207,19 @@ impl FullscreenBlockKey {
         Self {
             turn_id: members
                 .first()
-                .map(|block| block.turn_id.clone())
+                .map(|block| block.turn_id().to_string())
                 .unwrap_or_default(),
             block_id: ids.join("\u{1}"),
             revision,
             state: members
                 .first()
-                .map(|block| block.state)
+                .map(|block| block.state())
                 .unwrap_or(BlockState::Sealed),
             width,
             expanded: false,
             content_hash: hasher.finish(),
+            rebaseline_epoch,
+            at_ms: None,
         }
     }
 }
@@ -1100,15 +1242,28 @@ fn render_fullscreen_history(
 
     let cache = caches.touch(&session.session_id);
     cache.sync(session, width, theme);
-    let total = cache.lines.len();
-    let top = crate::ui::viewport_top(
-        total,
-        height,
-        session.scroll.follow,
-        session.scroll.visual_offset(),
-    );
-    let end = top.saturating_add(height).min(total);
-    (cache.lines[top.min(total)..end].to_vec(), top)
+    let total = cache.total_lines;
+    let top = session
+        .pinned_user_turn
+        .as_ref()
+        .and_then(|id| {
+            cache
+                .spans
+                .iter()
+                .find(|span| {
+                    span.turn_id == *id && matches!(span.kind, SpanKind::Message(MessageRole::User))
+                })
+                .map(|span| span.start)
+        })
+        .unwrap_or_else(|| {
+            crate::ui::viewport_top(
+                total,
+                height,
+                session.scroll.follow,
+                session.scroll.visual_offset(),
+            )
+        });
+    (cache.window(top, height), top)
 }
 
 /// 每会话独立的 transcript 渲染缓存（秒切的核心）。
@@ -1154,17 +1309,17 @@ impl TranscriptCaches {
     pub(super) fn len_for(&self, session_id: &str) -> usize {
         self.entries
             .get(session_id)
-            .map(|cache| cache.lines.len())
+            .map(|cache| cache.total_lines)
             .unwrap_or(0)
     }
 
     /// 测试用：某会话已渲染行的纯文本视图（点击展开的端到端断言用）。
     #[cfg(test)]
-    pub(super) fn lines_for_test(&self, session_id: &str) -> &[Line<'static>] {
+    pub(super) fn lines_for_test(&self, session_id: &str) -> Vec<Line<'static>> {
         self.entries
             .get(session_id)
             .map(|cache| cache.rendered_lines())
-            .unwrap_or(&[])
+            .unwrap_or_default()
     }
 
     /// 测试用：某会话缓存的累计重建次数。
@@ -1327,16 +1482,16 @@ const BRAND_EXAMPLES: [&str; 5] = [
     "审查最近的改动，找出潜在 bug",
     "把 README 的安装一节翻译成英文",
 ];
-const BRAND_EXAMPLE_ROTATE_MS: u128 = 6000;
 
 fn brand_example_spans(app: &App, theme: &Theme, budget_cols: usize) -> Vec<Span<'static>> {
     let elapsed = app.brand_shown_at.elapsed().as_millis();
-    let index = (elapsed / BRAND_EXAMPLE_ROTATE_MS) % BRAND_EXAMPLES.len() as u128;
+    let index =
+        (elapsed / crate::app::anim::BRAND_EXAMPLE_ROTATE_MS) % BRAND_EXAMPLES.len() as u128;
     let text = BRAND_EXAMPLES[index as usize];
     // 示例以 CJK 为主：按列预算折半成字符预算，超宽截断（预算列溢出比截断
     // 难看，宁可短两个字）。
     let shown = crate::app::truncate_str(text, (budget_cols / 2).max(4));
-    if !crate::app::anim::enabled() {
+    if !crate::app::anim::enabled() || app.local_config.performance_mode {
         return vec![Span::styled(shown, Style::new().fg(theme.text.dim))];
     }
     super::shimmer_spans(&shown, crate::app::anim::frame_now(), theme)
@@ -1346,7 +1501,7 @@ fn brand_example_spans(app: &App, theme: &Theme, budget_cols: usize) -> Vec<Span
 const BRAND_SWEEP_MS: u128 = 900;
 
 fn brand_sweep_t(app: &App) -> Option<f32> {
-    if !crate::app::anim::enabled() {
+    if !crate::app::anim::enabled() || app.local_config.performance_mode {
         return None;
     }
     let ms = app.brand_shown_at.elapsed().as_millis();
@@ -1475,6 +1630,249 @@ fn centered_line(text: &str, width: usize, style: Style) -> Line<'static> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn conversation_app() -> App {
+        let (mut app, _rx) = App::new_for_test();
+        app.tabs.push("layout".into());
+        app.sessions
+            .insert("layout".into(), SessionState::new("layout".into()));
+        app.show_workspace = false;
+        app
+    }
+
+    fn open_turn(app: &mut App, id: &str, text: &str, seq: u64) {
+        app.sessions
+            .get_mut("layout")
+            .unwrap()
+            .timeline
+            .apply(&qaqh_client::TimelineEntry {
+                timeline_seq: seq,
+                turn_id: id.into(),
+                round_num: Some(0),
+                event: qaqh_client::TimelineEvent::TurnOpened {
+                    user_text: text.into(),
+                },
+            });
+    }
+
+    #[test]
+    fn history_has_two_blank_rows_before_input_and_gap_is_not_clickable() {
+        let theme = Theme::current();
+        let mut app = conversation_app();
+        open_turn(&mut app, "long", &"用户长消息\n".repeat(100), 1);
+        for (width, height) in [(80, 24), (38, 18), (120, 35)] {
+            let mut view = FullscreenView::default();
+            let rendered = render_fullscreen_agent(&app, width, height, &theme, &mut view);
+            let (body, bottom) =
+                fullscreen_layout(&app, Rect::new(0, 0, width, height), &theme, None);
+            assert_eq!(bottom.y - body.bottom(), 2);
+            for row in body.bottom()..bottom.y {
+                assert_eq!(
+                    rendered.lines[usize::from(row)].width(),
+                    0,
+                    "留白不能染上用户消息背景"
+                );
+            }
+            let mut builder = HitMapBuilder::new(
+                crate::ui::v2::hit::FrameId::new(1),
+                ScreenRoute::Agent,
+                Size::new(width, height),
+                0,
+            );
+            register_agent_messages(&mut builder, body, &view, "layout");
+            let map = builder.finish();
+            for row in body.bottom()..bottom.y {
+                assert!(map.resolve(3, row, MouseButton::Left).unwrap().is_none());
+            }
+        }
+        for height in 1..10 {
+            let (body, bottom) = fullscreen_layout(&app, Rect::new(0, 0, 25, height), &theme, None);
+            assert_eq!(bottom.bottom(), height);
+            assert!(body.bottom() <= bottom.y);
+        }
+    }
+
+    #[test]
+    fn sent_user_anchor_stays_at_top_through_stream_growth_and_resize() {
+        let theme = Theme::current();
+        let mut app = conversation_app();
+        open_turn(&mut app, "old", "previous", 1);
+        open_turn(&mut app, "mine", "这是刚发送的消息", 2);
+        app.sessions.get_mut("layout").unwrap().pinned_user_turn = Some("mine".into());
+        let mut view = FullscreenView::default();
+        let before = render_fullscreen_agent(&app, 80, 24, &theme, &mut view);
+        assert!(
+            before.lines[0]
+                .spans
+                .iter()
+                .any(|s| s.content.contains("这是刚发送的消息"))
+        );
+        let first_top = view.visible_start;
+        app.sessions
+            .get_mut("layout")
+            .unwrap()
+            .timeline
+            .apply(&qaqh_client::TimelineEntry {
+                timeline_seq: 3,
+                turn_id: "mine".into(),
+                round_num: Some(0),
+                event: qaqh_client::TimelineEvent::BlockOpened {
+                    block: qaqh_client::TimelineBlock {
+                        block_id: "answer".into(),
+                        block_order: 0,
+                        kind: TimelineBlockKind::Text,
+                        state: qaqh_client::TimelineBlockState::Open,
+                        text: "long assistant output\n".repeat(100),
+                        tool: None,
+                        reasoning_kind: None,
+                    },
+                },
+            });
+        for (width, height) in [(80, 24), (32, 18), (100, 40)] {
+            let rendered = render_fullscreen_agent(&app, width, height, &theme, &mut view);
+            assert!(
+                rendered.lines[0]
+                    .spans
+                    .iter()
+                    .any(|s| s.content.contains("刚发送"))
+            );
+            if width == 80 {
+                assert_eq!(view.visible_start, first_top);
+            }
+            view.clamp_scroll(&mut app);
+            assert!(app.sessions["layout"].pinned_user_turn.is_some());
+        }
+        app.local_config.performance_mode = true;
+        view.scroll_down(&mut app, 3);
+        assert!(app.sessions["layout"].pinned_user_turn.is_none());
+        app.scroll_bottom();
+        let rendered = render_fullscreen_agent(&app, 80, 24, &theme, &mut view);
+        assert!(
+            !rendered.lines[0]
+                .spans
+                .iter()
+                .any(|s| s.content.contains("刚发送"))
+        );
+        assert!(app.sessions["layout"].scroll.follow);
+    }
+
+    /// 与原先“全量平铺再切片”逐行比较，包含空段、段间空行和溢出边界。
+    #[test]
+    fn segmented_windows_match_flattened_lines_at_every_boundary() {
+        for lengths in [
+            vec![],
+            vec![0],
+            vec![0, 0],
+            vec![2, 0, 3],
+            vec![0, 3, 0],
+            vec![1, 1, 1],
+        ] {
+            let mut cache = FullscreenTranscriptCache::default();
+            let mut flat = Vec::new();
+            for (block, len) in lengths.into_iter().enumerate() {
+                if block > 0 {
+                    flat.push(Line::default());
+                }
+                let lines: Vec<_> = (0..len)
+                    .map(|row| Line::from(format!("{block}:{row}")))
+                    .collect();
+                cache.segments.push(FullscreenLineSegment {
+                    start: flat.len(),
+                    lines: Arc::new(lines.clone()),
+                });
+                flat.extend(lines);
+            }
+            cache.total_lines = flat.len();
+            for start in 0..=flat.len() + 1 {
+                assert_eq!(cache.line_at(start), flat.get(start));
+                for height in [0, 1, 2, 5, usize::MAX] {
+                    let from = start.min(flat.len());
+                    let end = start.saturating_add(height).min(flat.len());
+                    assert_eq!(cache.window(start, height), flat[from..end]);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn transcript_update_reuses_history_line_allocations() {
+        let theme = Theme::resolve(
+            crate::theme::ThemeKind::QaqhNight,
+            crate::theme::ColorSupport::TrueColor,
+        );
+        let mut session = SessionState::new("shared".into());
+        let mut seq = 0;
+        for i in 0..100 {
+            let turn_id = format!("turn-{i}");
+            seq += 1;
+            session.timeline.apply(&qaqh_client::TimelineEntry {
+                timeline_seq: seq,
+                turn_id: turn_id.clone(),
+                round_num: Some(0),
+                event: qaqh_client::TimelineEvent::TurnOpened {
+                    user_text: format!("question-{i}"),
+                },
+            });
+            seq += 1;
+            session.timeline.apply(&qaqh_client::TimelineEntry {
+                timeline_seq: seq,
+                turn_id,
+                round_num: Some(0),
+                event: qaqh_client::TimelineEvent::BlockOpened {
+                    block: qaqh_client::TimelineBlock {
+                        block_id: format!("answer-{i}"),
+                        block_order: 0,
+                        kind: TimelineBlockKind::Text,
+                        state: qaqh_client::TimelineBlockState::Open,
+                        text: "a sizeable historical answer\n\n".repeat(20),
+                        tool: None,
+                        reasoning_kind: None,
+                    },
+                },
+            });
+        }
+        let mut cache = FullscreenTranscriptCache::default();
+        cache.sync(&session, 79, &theme);
+        let previous: Vec<_> = cache
+            .segments
+            .iter()
+            .map(|s| Arc::clone(&s.lines))
+            .collect();
+        assert_eq!(previous.len(), 200);
+        assert_eq!(cache.materialized_blocks, 200);
+        let misses = cache.render_misses;
+        session.timeline.apply(&qaqh_client::TimelineEntry {
+            timeline_seq: seq + 1,
+            turn_id: "turn-99".into(),
+            round_num: Some(0),
+            event: qaqh_client::TimelineEvent::TextDelta {
+                block_id: "answer-99".into(),
+                fragment_seq: 1,
+                delta: "new tail".into(),
+            },
+        });
+        cache.sync(&session, 79, &theme);
+        assert_eq!(cache.render_misses, misses + 1);
+        assert_eq!(
+            cache.materialized_blocks, 201,
+            "尾部增量只物化一块，不能全历史适配"
+        );
+        for (i, segment) in cache.segments.iter().enumerate() {
+            assert_eq!(
+                Arc::ptr_eq(&previous[i], &segment.lines),
+                i < previous.len() - 1
+            );
+        }
+        // 段与块缓存共享同一份行，生产路径没有深拷贝的全历史数组。
+        assert!(
+            cache
+                .blocks
+                .values()
+                .all(|lines| cache.segments.iter().any(|s| Arc::ptr_eq(lines, &s.lines)))
+        );
+        assert_eq!(cache.window(0, 12).len(), 12);
+        assert!(cache.total_lines > 2000);
+    }
 
     fn layout() -> AgentLayout {
         AgentLayout {

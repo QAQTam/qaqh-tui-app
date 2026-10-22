@@ -66,11 +66,12 @@ use team::TeamState;
 //
 // 历史上这里有个 `TURNS_CAP = 400` 的计数切片。删除它的理由：
 //
-// 1. **内存边界已由两层机制提供**：
+// 1. **已有内存节省机制，但不是活跃会话字节数的硬上限**：
 //    - 后端：seal 后 offload 壳化（正文截 512、`tool.output`/`diff` 清空、
 //      全文落 `ringing-offload` sidecar）。实测 daemon 快照 5e34cca4：
 //      102 回合 / 71 已 offload，每回合 140KB → 10KB（14×）。
-//    - 前端：`SegmentCache` 只保留视口附近段的渲染结果，其余退化为估算高度。
+//    - 前端：最近 4 会话渲染缓存 LRU；块行 Arc 共享、只复制可见窗口。
+//      当前仍缓存已加载块的渲染结果，不是“只保视口附近段”的完全虚拟化。
 // 2. **计数切片会丢数据且违反「丢弃必须可见」**：整回合消失，比后端 offload
 //    的「保留 512 字符预览 + 全文可回取」差。
 // 3. **它是性能悬崖**：`cap_turns` 每回合从头部丢 1 个，配合旧的
@@ -794,6 +795,7 @@ pub enum WorkspaceHit {
     TodoTask(usize),
     SubagentRow(usize),
     SettingsRow(usize),
+    Account(account::AccountAction),
     Back,
 }
 
@@ -840,6 +842,7 @@ pub struct App {
     pub pending_creates: HashMap<String, Instant>,
     pub session_list_cache: Vec<SessionListEntry>,
     pub session_list_at: Option<Instant>,
+    session_list_refresh: session_ops::SessionListRefresh,
     /// `qaqh-tui resume` 的当前 cwd 过滤；普通启动为 `None`。
     pub session_cwd_filter: Option<String>,
     /// 无活动会话时的品牌首屏输入框。提交后才创建会话。
@@ -851,6 +854,9 @@ pub struct App {
     dashboard_fetching: HashSet<String>,
     /// config.load 的 typed 快照（ConfigDto 镜像；ConfigChanged 到达时重拉）。
     pub config: Option<ConfigDto>,
+    pub local_config: crate::local_config::LocalConfig,
+    pub(crate) local_store: Option<crate::local_config::Store>,
+    pub(crate) local_dot_dim: bool,
     /// 两种账号档的最近快照（登录面板关闭后设置页仍要能显示状态与模型目录）。
     pub account: account::AccountBook,
     /// 进程启动时的连接目标。`/remote` 页「回到本地」要恢复的是**这个**里的拉起
@@ -885,10 +891,9 @@ pub struct App {
     /// M4（T15）：待交给 `$PAGER` 的文本——Ctrl+T 浮层按 `e` 置位；
     /// main.rs 主循环在帧间消费（挂起终端 → 分页器 → 恢复）。
     pub pending_pager: Option<String>,
-    /// 后端回合终态到达时置位；主循环下一帧清 viewport 后强制重绘。
-    pub force_redraw: bool,
-    /// 上一次实际绘制的动画帧号（B2 绘制门控用）。
-    pub(crate) last_drawn_frame: u64,
+    /// 普通画面变化只请求差分绘制，不清空终端。生命周期恢复由 terminal 层负责。
+    pub(crate) redraw_requested: bool,
+    status_minute: i64,
     /// 激活标签切换时刻（选中底色渐显用）；未切换时为 None。
     pub(crate) active_switch: Option<Instant>,
     /// 首页品牌画面的出现时刻：logo 入场扫光与示例 prompt 轮换的时间锚。
@@ -896,34 +901,31 @@ pub struct App {
 }
 
 impl App {
-    /// 空闲 tick 是否需要重绘（B2 绘制门控）。
-    ///
-    /// run_loop 曾对每个 200ms tick **无条件**整屏重画（5fps 恒定负载，动画还
-    /// 被同一量子锁死）。现在的契约：
-    /// - 有任何会话在流式 / working / 动画（菊花、sidebar 余晖）→ 持续重绘，
-    ///   动画因此能走自己的相位（帧号变化即重绘）；
-    /// - toast 在显示窗口内（淡出肉眼可见）→ 重绘；
-    /// - 首页会话列表自动刷新的过期判定也要画面跟随（旧实现依赖每帧重画兜底）；
-    /// - 其余空闲 tick 跳过绘制，帧率负载降为 0。
-    ///
-    /// 键/鼠标/后端消息路径照旧每条消息后必重绘一次（run_loop 的下一轮迭代），
-    /// 本判定只管「没有消息、只有 tick」的空闲分支。
-    pub fn needs_draw(&self) -> bool {
-        if self.force_redraw {
-            return true;
-        }
-        // 动画帧号变了（菊花相位推进）。
-        if crate::app::anim::frame_now() != self.last_drawn_frame {
-            return true;
-        }
-        self.is_animating()
+    pub(crate) fn has_work_indicator(&self) -> bool {
+        self.sessions.values().any(|session| {
+            session.streaming.is_some()
+                || matches!(
+                    session.activity,
+                    Some(ActivityState::Working | ActivityState::Starting)
+                )
+        }) || self
+            .activity_cache
+            .values()
+            .any(|state| matches!(state, ActivityState::Working | ActivityState::Starting))
     }
 
-    /// 画面上是否有**正在动的东西**：决定 tick 的节奏（动画期 60ms、空闲
-    /// 200ms）与空闲重绘。菊花/shimmer 只在工作会话上转，平滑滚动在收敛，
-    /// 选中底色在渐显，toast 在淡出，首页列表要跟随刷新——这些都在 App
-    /// 状态里可见。
+    /// Tick 本身不是画面变化；全局动画时钟前进也不意味着需要绘制。
+    /// 定时状态变化由 handle_tick 显式置脏，动画结束的收尾帧由 shell 保证。
+    pub fn needs_draw(&self) -> bool {
+        self.redraw_requested || self.is_animating()
+    }
+
+    /// 只为真正的动画保持快速 tick。Toast 是静态文案，列表刷新是异步结果驱动，
+    /// 都不需要持续绘制；禁用动画时也不应为了 working 状态空转。
     pub fn is_animating(&self) -> bool {
+        if !anim::enabled() || self.local_config.performance_mode {
+            return false;
+        }
         // 任何会话仍在工作或流式（菊花/正文都在动），或有滚动 tween 未收敛。
         if self.sessions.values().any(|session| {
             session.streaming.is_some()
@@ -939,12 +941,16 @@ impl App {
         {
             return true;
         }
-        // toast 有 6s 显示窗：淡出前画面必须持续刷新。
-        if !self.toasts.is_empty() {
+        // 侧栏也可能展示未打开标签的 working / starting 会话。
+        if self
+            .activity_cache
+            .values()
+            .any(|state| matches!(state, ActivityState::Working | ActivityState::Starting))
+        {
             return true;
         }
-        // 首页自动刷新兜底：无 tab / 有在途 create 时列表可能悄悄变化。
-        if self.tabs.is_empty() || !self.pending_creates.is_empty() {
+        // 首页有 logo 入场与示例 prompt 扫光。
+        if self.tabs.is_empty() {
             return true;
         }
         false
@@ -1032,6 +1038,7 @@ impl App {
             pending_creates: HashMap::new(),
             session_list_cache: Vec::new(),
             session_list_at: None,
+            session_list_refresh: session_ops::SessionListRefresh::default(),
             session_cwd_filter: None,
             draft_composer: Composer::default(),
             pending_initial_prompt: None,
@@ -1039,6 +1046,9 @@ impl App {
             activity_cache: HashMap::new(),
             dashboard_fetching: HashSet::new(),
             config: None,
+            local_config: crate::local_config::LocalConfig::default(),
+            local_store: None,
+            local_dot_dim: false,
             account: account::AccountBook::default(),
             startup_target,
             remote_pending: None,
@@ -1056,8 +1066,8 @@ impl App {
             inspect: None,
             subagent_session_ids: HashSet::new(),
             pending_pager: None,
-            force_redraw: false,
-            last_drawn_frame: 0,
+            redraw_requested: false,
+            status_minute: chrono::Local::now().timestamp().div_euclid(60),
             active_switch: None,
             brand_shown_at: Instant::now(),
         }
@@ -1089,14 +1099,50 @@ impl App {
     }
 
     fn handle_tick(&mut self) {
+        let previous_tick = self.last_tick;
         self.last_tick = Instant::now();
+        let dot_dim = anim::reduced_dot_dim(anim::wall_millis());
+        if dot_dim != self.local_dot_dim {
+            self.local_dot_dim = dot_dim;
+            if self.local_config.performance_mode && anim::enabled() && self.has_work_indicator() {
+                self.redraw_requested = true;
+            }
+        }
+        // 反闪烁等待不是动画：即使 ANIM=0，工作开始 400ms 后也要补出静态提示。
+        if self.active_session().is_some_and(|session| {
+            session.streaming.as_ref().is_some_and(|stream| {
+                let due = stream.armed_at + session::STREAM_ANTI_FLASH;
+                previous_tick < due && self.last_tick >= due
+            })
+        }) {
+            self.redraw_requested = true;
+        }
+        let minute = chrono::Local::now().timestamp().div_euclid(60);
+        if minute != self.status_minute {
+            self.status_minute = minute;
+            self.redraw_requested = true;
+        }
+        // 动画关闭时首页示例仍每 6s 轮换，但不必为此每拍重绘。
+        if self.tabs.is_empty()
+            && previous_tick
+                .saturating_duration_since(self.brand_shown_at)
+                .as_millis()
+                / anim::BRAND_EXAMPLE_ROTATE_MS
+                != self
+                    .last_tick
+                    .saturating_duration_since(self.brand_shown_at)
+                    .as_millis()
+                    / anim::BRAND_EXAMPLE_ROTATE_MS
+        {
+            self.redraw_requested = true;
+        }
         // 配对码倒计时由 tick 推，渲染层不读时钟（draw 保持纯函数）。秒数变了才
         // 置重绘——B3 的绘制门控会丢弃「什么都没变」的帧。
         if let Some(Overlay::Remote(mut st)) = self.overlays.last().cloned()
             && st.advance_clock(self.last_tick)
         {
             self.replace_overlay(Overlay::Remote(st));
-            self.force_redraw = true;
+            self.redraw_requested = true;
         }
         // 账号登录的轮询/超时：判定在 `account::next_poll`（纯函数），这里只发请求。
         self.tick_account();
@@ -1104,6 +1150,7 @@ impl App {
         while let Some(front) = self.toasts.front() {
             if front.at.elapsed() > Duration::from_secs(6) {
                 self.toasts.pop_front();
+                self.redraw_requested = true;
             } else {
                 break;
             }
@@ -1122,6 +1169,7 @@ impl App {
             && armed.elapsed() > Duration::from_secs(3)
         {
             self.quit_armed = None;
+            self.redraw_requested = true;
         }
         // 首页自动刷新：无 tab 时保持列表新鲜（对齐 opencode Home 的常驻列表感）。
         // 有在途 create 时**同样**刷新：新会话的落地结果靠列表兜底发现，
@@ -1138,6 +1186,7 @@ impl App {
             let count = self.filtered_sessions(self.home_show_archived).len();
             if count > 0 && self.home_selected >= count {
                 self.home_selected = count - 1;
+                self.redraw_requested = true;
             }
         } else {
             // 侧栏低速刷新（会话进行中）：实时状态由 D::Activity 推送覆盖，
@@ -1251,18 +1300,26 @@ impl App {
                 if let qaqh_client::TimelineEvent::UsageSampled { usage } = &entry.event
                     && session::merge_sampled_usage(&mut sess.usage, usage)
                 {
-                    self.force_redraw = true;
+                    self.redraw_requested = true;
                 }
                 if let Some(terminal) = sess.timeline.apply(&entry) {
                     streaming_done(sess, Some(&terminal.turn_id));
                 }
                 sync_streaming_from_timeline(sess);
+                if let qaqh_client::TimelineEvent::TurnOpened { user_text } = &entry.event
+                    && sess.pending_user_pin.as_deref() == Some(user_text.as_str())
+                {
+                    sess.pending_user_pin = None;
+                    sess.pinned_user_turn = Some(entry.turn_id.clone());
+                    sess.scroll.follow = false;
+                    sess.scroll.tween = None;
+                }
                 if !sess.scroll.follow {
                     // 非跟随模式：内容增长等价于视口上移。
                     sess.scroll.offset = sess.scroll.offset.saturating_add(0);
                 }
                 if turn_sealed {
-                    self.force_redraw = true;
+                    self.redraw_requested = true;
                 }
                 if todo_tool_touched {
                     // v2 投影没有 dashboard 增量；todo 工具的 timeline 更新是
@@ -1280,7 +1337,26 @@ impl App {
                     sess.timeline.replace_from_page(&page);
                     sess.ready = true;
                     sync_streaming_from_timeline(sess);
-                    if first_load || was_follow {
+                    if let Some(text) = &sess.pending_user_pin
+                        && let Some(turn) = sess
+                            .timeline
+                            .turns
+                            .iter()
+                            .rev()
+                            .find(|turn| turn.user_text == *text)
+                    {
+                        sess.pinned_user_turn = Some(turn.turn_id.clone());
+                        sess.pending_user_pin = None;
+                    }
+                    if sess.pinned_user_turn.as_ref().is_some_and(|id| {
+                        !sess.timeline.turns.iter().any(|turn| turn.turn_id == *id)
+                    }) {
+                        sess.pinned_user_turn = None;
+                    }
+                    if (first_load || was_follow)
+                        && sess.pinned_user_turn.is_none()
+                        && sess.pending_user_pin.is_none()
+                    {
                         sess.scroll.follow = true;
                         sess.scroll.offset = 0;
                     }
@@ -1649,7 +1725,7 @@ impl App {
                         });
                 match outcome {
                     ringing_v2::DriverOutcome::Applied => {
-                        self.force_redraw = true;
+                        self.redraw_requested = true;
                         // driver seat 落地是首屏草稿的自动发送信号之一：
                         // transfer 时会话多半还没就绪（只读），seat 到手后补发。
                         self.maybe_autosend_pending_prompt(&session_id);
@@ -2030,7 +2106,7 @@ impl App {
         let Some(sess) = self.sessions.get_mut(&session_id) else {
             return;
         };
-        let mut force_redraw = false;
+        let mut redraw_requested = false;
         // `sess` 借用了 `self.sessions`，toast 必须等 match 结束、借用释放后再发。
         let mut compact_toast: Option<(NoticeLevel, String)> = None;
         match delta {
@@ -2046,8 +2122,10 @@ impl App {
                     armed_at: Instant::now(),
                 });
                 sess.last_error = None;
-                sess.scroll.follow = true;
-                sess.scroll.offset = 0;
+                if sess.pending_user_pin.is_none() && sess.pinned_user_turn.is_none() {
+                    sess.scroll.follow = true;
+                    sess.scroll.offset = 0;
+                }
             }
             D::ToolCallDeclared { tool_name, .. } => {
                 if let Some(s) = sess.streaming.as_mut() {
@@ -2086,7 +2164,7 @@ impl App {
                 if let Some(ts_ms) = ts_ms {
                     sess.last_turn_finished = Some((turn_id.as_str().to_string(), ts_ms));
                 }
-                force_redraw = true;
+                redraw_requested = true;
                 if let Some(u) = usage {
                     sess.usage = Some(u);
                 }
@@ -2103,7 +2181,7 @@ impl App {
                 if let Some(ts_ms) = ts_ms {
                     sess.last_turn_finished = Some((turn_id.as_str().to_string(), ts_ms));
                 }
-                force_redraw = true;
+                redraw_requested = true;
             }
             D::CompactionApplied {
                 context_revision, ..
@@ -2113,7 +2191,7 @@ impl App {
                 // transcript 上可见，否则用户看到的是「上下文凭空变短」。
                 // 锚定「事件到达时窗口最后一个回合之后」，与 webui 同口径。
                 sess.timeline.record_compaction(context_revision);
-                force_redraw = true;
+                redraw_requested = true;
             }
             // 以下三帧是**瞬态**镜像（不入 fact 链、不进快照）：它们只负责让「正在
             // 压缩」这件事可见。口径见 `timeline_model::InFlightCompact` 的注释。
@@ -2125,7 +2203,7 @@ impl App {
             } => {
                 sess.timeline
                     .begin_compact(compact_id, turns_total, turns_keeping);
-                force_redraw = true;
+                redraw_requested = true;
             }
             D::CompactProgress {
                 compact_id, delta, ..
@@ -2134,7 +2212,7 @@ impl App {
                 // 增量，这里不需要按 `revision` 排序：迟到的旧帧只会让文本短暂回退，
                 // 下一帧就自愈（与后端的幂等设计同口径）。
                 sess.timeline.update_compact(&compact_id, delta);
-                force_redraw = true;
+                redraw_requested = true;
             }
             D::CompactFinished {
                 compact_id,
@@ -2147,15 +2225,15 @@ impl App {
                 if sess.timeline.finish_compact(&compact_id).is_some() {
                     compact_toast = Some(Self::compact_finished_notice(status, turns_compacted));
                 }
-                force_redraw = true;
+                redraw_requested = true;
             }
             D::InputAccepted { .. } => {}
         }
         if let Some((level, text)) = compact_toast {
             self.toast(level, text);
         }
-        if force_redraw {
-            self.force_redraw = true;
+        if redraw_requested {
+            self.redraw_requested = true;
         }
     }
 
@@ -2362,6 +2440,10 @@ impl App {
                         if let Some(session_id) = session_id
                             && let Some(sess) = self.sessions.get_mut(&session_id)
                         {
+                            if label == "发送" {
+                                sess.pending_user_pin = None;
+                                sess.pinned_user_turn = None;
+                            }
                             sess.composer.input = msg.chars().collect(); // 不丢内容
                             sess.composer.cursor = sess.composer.input.len();
                         }
@@ -2372,6 +2454,13 @@ impl App {
                         self.abort_pending_create(format!("{label}: {e}"));
                         return;
                     }
+                    if label == "发送"
+                        && let Some(sess) =
+                            session_id.as_ref().and_then(|id| self.sessions.get_mut(id))
+                    {
+                        sess.pending_user_pin = None;
+                        sess.pinned_user_turn = None;
+                    }
                     let lease_dead = e.contains("lease");
                     self.toast(NoticeLevel::Error, format!("{label}: {e}"));
                     if lease_dead {
@@ -2380,6 +2469,8 @@ impl App {
                 }
             },
             ActionResult::SessionList(Ok(list)) => {
+                self.session_list_refresh
+                    .list_completed(true, Instant::now());
                 // 新建会话的**兜底发现**：`Ctrl+N` 后不能只等
                 // `SessionStateEvent::Created` 那条可靠事件——实测（真 daemon，
                 // 锚点 b77c251）daemon 侧收据 state=succeeded、journal 里
@@ -2418,7 +2509,9 @@ impl App {
                 }
             }
             ActionResult::SessionList(Err(e)) => {
-                self.toast(NoticeLevel::Error, format!("session.list: {e}"))
+                self.session_list_refresh
+                    .list_completed(false, Instant::now());
+                self.toast(NoticeLevel::Error, format!("session.list: {e}"));
             }
             // 权威类型 `SessionActivity`（生产者本就是 `Vec<SessionActivity>`）：
             // 此前这里是 `item.get("seed")` + `item.get("state")` 手取两个键，
@@ -2426,6 +2519,7 @@ impl App {
             // （引号里的 `"seed"` 是**当时的 wire 键名**，已随后端 identity 迁移
             //   退场；这里保留原样，免得把历史读成现状。）
             ActionResult::SessionActivity(Ok(items)) => {
+                self.session_list_refresh.finish();
                 for item in items {
                     let previous = self
                         .activity_cache
@@ -2441,7 +2535,7 @@ impl App {
                     }
                 }
             }
-            ActionResult::SessionActivity(Err(_)) => {}
+            ActionResult::SessionActivity(Err(_)) => self.session_list_refresh.finish(),
             // `/remote` 页的三类结果：状态机都在 remote_ops 里，避免把这个 match 撑大。
             ev @ (ActionResult::PairTicket(..)
             | ActionResult::Devices(..)
@@ -2508,6 +2602,8 @@ impl App {
             ActionResult::Rebaseline { session_id, result } => {
                 if let (Some(sess), Ok(page)) = (self.sessions.get_mut(&session_id), result) {
                     sess.timeline.replace_from_page(&page);
+                    sess.pending_user_pin = None;
+                    sess.pinned_user_turn = None;
                     sess.scroll.follow = true;
                     sess.scroll.offset = 0;
                 }
@@ -2564,7 +2660,7 @@ impl App {
                         .replace_from_snapshot(snapshot);
                     self.reconcile_team_tracking(&session_id);
                     self.flush_pending_team_status();
-                    self.force_redraw = true;
+                    self.redraw_requested = true;
                 }
                 Err(error) => {
                     log::warn!("team snapshot for {session_id} failed: {error}");
@@ -2604,6 +2700,7 @@ impl App {
     }
 
     pub fn toast(&mut self, level: NoticeLevel, text: impl Into<String>) {
+        self.redraw_requested = true;
         self.toasts.push_back(Toast {
             level,
             text: text.into(),
@@ -2688,6 +2785,8 @@ impl App {
 
     fn handle_key(&mut self, key: KeyEvent) {
         use ratatui::crossterm::event::KeyModifiers;
+
+        let key = keymap::normalize_key(key);
 
         // 粘贴护栏：记录按键节拍（洪流判定与抑制在 composer_key 的 Enter 路径）。
         self.paste_guard.observe(Instant::now());
@@ -3077,7 +3176,7 @@ mod tests {
     }
 
     #[test]
-    fn sidebar_rows_mark_open_and_active_tabs() {
+    fn sidebar_rows_mark_active_tab() {
         let (mut app, _rx) = App::new_for_test();
         app.session_list_cache = vec![list_entry("s-1", 1), list_entry("s-2", 2)];
         app.tabs.push("s-1".into());
@@ -3085,7 +3184,6 @@ mod tests {
         app.active = 1;
 
         let rows = app.sidebar_rows();
-        assert!(rows.iter().all(|row| row.is_open));
         let active = rows
             .iter()
             .find(|row| row.is_active)
@@ -3297,7 +3395,7 @@ mod tests {
     }
 
     #[test]
-    fn turn_completed_requests_forced_redraw() {
+    fn turn_completed_requests_diff_redraw() {
         let (mut app, _rx) = App::new_for_test();
         app.sessions
             .insert("session".into(), SessionState::new("session".into()));
@@ -3316,7 +3414,7 @@ mod tests {
             ),
         )));
 
-        assert!(app.force_redraw, "回合终态必须触发下一帧强制重绘");
+        assert!(app.redraw_requested, "回合终态必须请求差分重绘");
     }
 
     /// 压缩三态帧的 App 层接线：开卡 → 累计快照换文本 → 收卡并弹**一条**终态 toast。
@@ -3368,6 +3466,7 @@ mod tests {
                 revision: 3,
                 compact_id: "c1".into(),
                 status: CS::Completed,
+                reason: None,
                 summary_chars: Some(6),
                 turns_compacted: Some(9),
                 turns_removed: Some(9),
@@ -3389,6 +3488,7 @@ mod tests {
                 revision: 4,
                 compact_id: "c1".into(),
                 status: CS::Failed,
+                reason: None,
                 summary_chars: None,
                 turns_compacted: None,
                 turns_removed: None,
@@ -3495,11 +3595,11 @@ mod tests {
             0,
             payload.clone(),
         )));
-        assert!(app.force_redraw, "first reliable event must dispatch");
-        app.force_redraw = false;
+        assert!(app.redraw_requested, "first reliable event must dispatch");
+        app.redraw_requested = false;
         app.handle(AppMsg::Runtime(v2_reliable_event("session", 1, 0, payload)));
         assert!(
-            !app.force_redraw,
+            !app.redraw_requested,
             "duplicate (fact_seq, projection_index) must be dropped before dispatch"
         );
     }
@@ -3579,6 +3679,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn local_send_pins_only_matching_authoritative_user_turn_and_scroll_releases_it() {
+        let (mut app, _rx) = app_with_tabs(&["session"], 0);
+        app.sessions
+            .get_mut("session")
+            .unwrap()
+            .composer
+            .insert_str("my prompt");
+        app.send_message();
+        assert_eq!(
+            app.sessions["session"].pending_user_pin.as_deref(),
+            Some("my prompt")
+        );
+        for (seq, turn, text) in [(1, "other", "another client"), (2, "mine", "my prompt")] {
+            app.handle(AppMsg::Runtime(RuntimeMsg::Timeline {
+                session_id: "session".into(),
+                entry: Box::new(qaqh_client::TimelineEntry {
+                    timeline_seq: seq,
+                    turn_id: turn.into(),
+                    round_num: Some(0),
+                    event: qaqh_client::TimelineEvent::TurnOpened {
+                        user_text: text.into(),
+                    },
+                }),
+            }));
+            if seq == 1 {
+                assert!(app.sessions["session"].pinned_user_turn.is_none());
+            }
+        }
+        assert_eq!(
+            app.sessions["session"].pinned_user_turn.as_deref(),
+            Some("mine")
+        );
+        assert!(app.sessions["session"].pending_user_pin.is_none());
+        assert!(!app.sessions["session"].scroll.follow);
+        app.scroll_down(3);
+        assert!(app.sessions["session"].pinned_user_turn.is_none());
+    }
+
+    #[tokio::test]
+    async fn failed_send_does_not_leave_a_pending_user_pin() {
+        let (mut app, _rx) = app_with_tabs(&["session"], 0);
+        app.sessions
+            .get_mut("session")
+            .unwrap()
+            .composer
+            .insert_str("my prompt");
+        app.send_message();
+        app.handle(AppMsg::Action(ActionResult::CommandAck {
+            session_id: Some("session".into()),
+            label: "发送",
+            result: Err("offline".into()),
+        }));
+        assert!(app.sessions["session"].pending_user_pin.is_none());
+        assert!(app.sessions["session"].pinned_user_turn.is_none());
+    }
+
+    #[tokio::test]
     async fn reset_blocks_events_until_new_bootstrap() {
         let (mut app, _rx) = App::new_for_test();
         app.sessions
@@ -3599,7 +3756,7 @@ mod tests {
         });
         assert!(app.sessions["session"].ringing_v2.is_reset_pending());
 
-        app.force_redraw = false;
+        app.redraw_requested = false;
         app.handle(AppMsg::Runtime(v2_reliable_event(
             "session",
             1,
@@ -3615,7 +3772,7 @@ mod tests {
             ),
         )));
         assert!(
-            !app.force_redraw,
+            !app.redraw_requested,
             "events must stay blocked until reset bootstrap replaces the model"
         );
     }
@@ -3675,7 +3832,7 @@ mod tests {
         );
         assert_eq!(app.v2_client_session_id.as_deref(), Some("cs-1"));
 
-        app.force_redraw = false;
+        app.redraw_requested = false;
         app.handle(AppMsg::Runtime(v2_reliable_event(
             "session",
             3,
@@ -3691,13 +3848,13 @@ mod tests {
             ),
         )));
         assert!(
-            !app.force_redraw,
+            !app.redraw_requested,
             "old-epoch frame must be dropped after the reset rebaseline"
         );
     }
 
     #[test]
-    fn timeline_turn_sealed_requests_forced_redraw() {
+    fn timeline_turn_sealed_requests_diff_redraw() {
         let (mut app, _rx) = App::new_for_test();
         app.sessions
             .insert("session".into(), SessionState::new("session".into()));
@@ -3715,7 +3872,7 @@ mod tests {
             }),
         });
 
-        assert!(app.force_redraw, "timeline 终态也必须触发下一帧强制重绘");
+        assert!(app.redraw_requested, "timeline 终态也必须请求差分重绘");
     }
 
     /// 流中 usage 采样（`UsageSampled`）是 HUD 旁路：必须**立刻**进 `sess.usage`，
@@ -3753,7 +3910,7 @@ mod tests {
             .expect("流中采样必须落进 HUD 槽");
         assert_eq!(usage.prompt_tokens, 1_200);
         assert_eq!(usage.total_tokens, 1_500);
-        assert!(app.force_redraw, "采样改动了表盘就必须触发重绘");
+        assert!(app.redraw_requested, "采样改动了表盘就必须触发重绘");
         assert_eq!(
             app.sessions["session"].timeline.dropped_missing_turn, 0,
             "采样不要求回合已开：不得记进契约异常计数器"
@@ -4432,6 +4589,71 @@ mod tests {
         AppMsg::Key(KeyEvent::new(code, modifiers))
     }
 
+    fn backspace_encodings() -> [(KeyCode, KeyModifiers); 4] {
+        [
+            (KeyCode::Char('h'), KeyModifiers::CONTROL), // legacy BS (0x08)
+            (KeyCode::Char('\x08'), KeyModifiers::NONE),
+            (KeyCode::Char('\x7f'), KeyModifiers::NONE),
+            (KeyCode::Backspace, KeyModifiers::NONE),
+        ]
+    }
+
+    #[test]
+    fn terminal_backspace_encodings_edit_draft_at_cursor() {
+        for (code, modifiers) in backspace_encodings() {
+            let (mut app, _rx) = App::new_for_test();
+            app.draft_composer.insert_str("a中b");
+            app.draft_composer.left();
+
+            app.handle(key(code, modifiers));
+            assert_eq!(app.draft_composer.value(), "ab", "{code:?}");
+            assert_eq!(app.draft_composer.cursor, 1);
+
+            // 行首和空输入上退格应为无操作，不插入控制字符。
+            app.draft_composer.home();
+            app.handle(key(code, modifiers));
+            assert_eq!(app.draft_composer.value(), "ab");
+            app.draft_composer.clear();
+            app.handle(key(code, modifiers));
+            assert!(app.draft_composer.is_empty());
+        }
+    }
+
+    #[test]
+    fn terminal_backspace_encodings_edit_session_at_cursor() {
+        for (code, modifiers) in backspace_encodings() {
+            let (mut app, _rx) = app_with_tabs(&["A"], 0);
+            let composer = &mut app.sessions.get_mut("A").unwrap().composer;
+            composer.insert_str("a中b");
+            composer.left();
+
+            app.handle(key(code, modifiers));
+            let composer = &app.sessions["A"].composer;
+            assert_eq!(composer.value(), "ab", "{code:?}");
+            assert_eq!(composer.cursor, 1);
+        }
+    }
+
+    #[test]
+    fn terminal_backspace_encodings_edit_overlay_not_draft() {
+        for (code, modifiers) in backspace_encodings() {
+            let (mut app, _rx) = App::new_for_test();
+            app.draft_composer.insert_str("keep");
+            app.overlays.push(Overlay::CwdInput {
+                input: "a中b".chars().collect(),
+                cursor: 2,
+            });
+
+            app.handle(key(code, modifiers));
+            let Some(Overlay::CwdInput { input, cursor }) = app.overlays.last() else {
+                panic!("CwdInput must stay open");
+            };
+            assert_eq!(input.iter().collect::<String>(), "ab", "{code:?}");
+            assert_eq!(*cursor, 1);
+            assert_eq!(app.draft_composer.value(), "keep");
+        }
+    }
+
     fn app_with_tabs(
         session_ids: &[&str],
         active: usize,
@@ -4617,23 +4839,15 @@ mod tests {
         assert!(!app.subagent_session_ids.contains(&sub));
     }
 
-    /// B2 绘制门控：完全空闲（无流式/无 working/无 toast/单 tab/无 create）
-    /// 且动画帧号没变 → 不需要重绘；任一条件翻转 → 需要。
-    ///
-    /// 旧 run_loop 对每个 200ms tick 无条件整屏重画（恒定 5fps 负载）；
-    /// 本测试锁住 `needs_draw` 的空闲为假，防回退。
+    /// 空闲与墙钟动画帧号无关，不能再靠“刚同步帧号”才能通过测试。
     #[test]
     fn needs_draw_is_false_when_fully_idle() {
-        let (mut app, _rx) = app_with_tabs(&["s1"], 0);
-        app.last_drawn_frame = crate::app::anim::frame_now();
-        assert!(
-            !app.needs_draw(),
-            "完全空闲且帧号同步时不得要求重绘（B2 门控）"
-        );
+        let (app, _rx) = app_with_tabs(&["s1"], 0);
+        assert!(!app.needs_draw(), "完全空闲时不得要求重绘");
     }
 
     #[test]
-    fn needs_draw_is_true_when_streaming_or_frame_advances() {
+    fn needs_draw_tracks_animation_and_explicit_changes() {
         let (mut app, _rx) = app_with_tabs(&["s1"], 0);
         // 1) 有会话在流式 → 持续重绘。
         app.sessions.get_mut("s1").expect("session").streaming =
@@ -4644,17 +4858,78 @@ mod tests {
                 tool_name: None,
                 armed_at: Instant::now(),
             });
-        assert!(app.needs_draw(), "流式会话必须持续重绘");
+        assert_eq!(app.needs_draw(), anim::enabled());
         app.sessions.get_mut("s1").expect("session").streaming = None;
 
-        // 2) 动画帧号推进（模拟时间流逝）→ 重绘菊花相位。
-        app.last_drawn_frame = crate::app::anim::frame_now().wrapping_sub(7);
-        assert!(app.needs_draw(), "动画帧号变化必须重绘");
-
-        // 3) force_redraw 依旧最高优先。
-        app.last_drawn_frame = crate::app::anim::frame_now();
-        app.force_redraw = true;
+        assert!(!app.needs_draw());
+        app.redraw_requested = true;
         assert!(app.needs_draw());
+        app.redraw_requested = false;
+        assert!(!app.needs_draw());
+    }
+
+    #[tokio::test]
+    async fn tick_redraws_expired_toast_and_changed_minute() {
+        let (mut app, _rx) = app_with_tabs(&["s1"], 0);
+        app.session_list_at = Some(Instant::now());
+        app.toast(NoticeLevel::Info, "temporary");
+        app.toasts.back_mut().unwrap().at = Instant::now() - Duration::from_secs(7);
+        app.redraw_requested = false;
+        app.handle(AppMsg::Tick);
+        assert!(app.toasts.is_empty());
+        assert!(app.redraw_requested, "toast 消失必须置脏");
+
+        app.redraw_requested = false;
+        app.status_minute = i64::MIN;
+        app.handle(AppMsg::Tick);
+        assert!(app.redraw_requested, "分钟时钟变化必须置脏");
+    }
+
+    #[test]
+    fn static_toast_and_pending_create_do_not_enable_animation() {
+        let (mut app, _rx) = app_with_tabs(&["s1"], 0);
+        app.toast(NoticeLevel::Info, "temporary");
+        app.pending_creates.insert("pending".into(), Instant::now());
+        app.redraw_requested = false;
+        assert!(!app.is_animating());
+        assert!(!app.needs_draw());
+    }
+
+    #[tokio::test]
+    async fn performance_mode_uses_slow_tick_and_scroll_is_instant() {
+        let (mut app, _rx) = app_with_tabs(&["s1"], 0);
+        app.local_config.performance_mode = true;
+        app.session_list_at = Some(Instant::now());
+        app.sessions.get_mut("s1").unwrap().activity = Some(ActivityState::Working);
+        assert!(!app.is_animating(), "工作状态不能强制 60ms tick");
+        assert!(!app.needs_draw(), "圆点仅在秒相位变化时置脏");
+        app.scroll_up(20);
+        let scroll = &app.sessions["s1"].scroll;
+        assert_eq!(scroll.offset, 20);
+        assert_eq!(scroll.visual_offset(), 20);
+        assert!(!scroll.tween_active());
+        app.local_dot_dim = !anim::reduced_dot_dim(anim::wall_millis());
+        app.handle(AppMsg::Tick);
+        assert_eq!(app.redraw_requested, anim::enabled());
+    }
+
+    #[tokio::test]
+    async fn tick_marks_delayed_working_hint_dirty_once() {
+        let (mut app, _rx) = app_with_tabs(&["s1"], 0);
+        app.session_list_at = Some(Instant::now());
+        app.last_tick = Instant::now() - Duration::from_secs(1);
+        app.sessions.get_mut("s1").unwrap().streaming = Some(session::StreamingState {
+            turn_id: "t1".into(),
+            phase: StreamPhase::Thinking,
+            round_num: 1,
+            tool_name: None,
+            armed_at: app.last_tick,
+        });
+        app.handle(AppMsg::Tick);
+        assert!(app.redraw_requested);
+        app.redraw_requested = false;
+        app.handle(AppMsg::Tick);
+        assert!(!app.redraw_requested, "跨过等待边界后不持续置脏");
     }
 
     #[test]

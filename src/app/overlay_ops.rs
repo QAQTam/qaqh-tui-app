@@ -318,6 +318,20 @@ impl App {
                 self.home_selected = 0;
                 return true;
             }
+            KeyCode::Char('c') => {
+                if self.session_cwd_filter.is_some() {
+                    self.session_cwd_filter = None;
+                } else {
+                    self.session_cwd_filter = self.initial_cwd.clone().map(|cwd| {
+                        std::fs::canonicalize(&cwd)
+                            .ok()
+                            .map(|path| path.to_string_lossy().into_owned())
+                            .unwrap_or(cwd)
+                    });
+                }
+                self.home_selected = 0;
+                return true;
+            }
             KeyCode::Char('x') => {
                 if let Some(&idx) = items.get(self.home_selected) {
                     let session_id = self.session_list_cache[idx].meta.session_id.clone();
@@ -497,7 +511,11 @@ impl App {
                         FieldKind::Toggle => {
                             self.settings_cycle(&mut st, 1);
                         }
-                        FieldKind::Port => self.settings_port_activate(&mut st),
+                        FieldKind::Port => {
+                            self.replace_overlay(Overlay::Settings(st.clone()));
+                            self.settings_port_activate(&mut st);
+                            return true;
+                        }
                     },
                     KeyCode::Left => match kind {
                         FieldKind::Port => self.settings_port_cycle(&mut st, -1),
@@ -520,44 +538,22 @@ impl App {
                 true
             }
             Overlay::Account(st) => {
-                use crate::app::account::AccountKind;
+                use crate::app::account::AccountAction as A;
                 use ratatui::crossterm::event::KeyCode;
 
-                let kind = st.kind;
                 let selected = st.selected;
-                // 快照只读：本层不自己发请求，动作全部委托 `account_ops`。
-                let profiles = self.account.profiles.clone();
-                let count = profiles.as_ref().map(|p| p.profiles.len()).unwrap_or(0);
-                let usage_url = self
+                let count = self
                     .account
-                    .siwc
+                    .profiles
                     .as_ref()
-                    .map(|s| s.usage_url.clone())
-                    .or_else(|| self.account.ds.as_ref().map(|s| s.usage_url.clone()))
-                    .unwrap_or_default();
-                let top_up_url = self
-                    .account
-                    .ds
-                    .as_ref()
-                    .map(|s| s.top_up_url.clone())
-                    .unwrap_or_default();
+                    .map(|p| p.profiles.len())
+                    .unwrap_or(0);
 
                 // 导航**直接改栈顶**：拿到的是入口时的克隆，写回会盖掉
                 // `account_ops` 在同一拍里刚写进去的 busy/flow（登录会立刻看起来没发生）。
                 match key.code {
                     KeyCode::Esc | KeyCode::Char('q') => {
-                        // 关掉面板 = 放弃这次登录：daemon 侧留一个进行中的流程会把
-                        // 下一次 `sign_in.start` 挡在 connection_busy 上（spec §3.1），
-                        // 所以关面板必须先取消。结果回来时面板已不在栈上，
-                        // 只会刷新状态，不会 panic。
-                        if st.flow.is_pending() {
-                            self.toast(
-                                NoticeLevel::Warn,
-                                "已放弃本次登录（已请求 daemon 取消本次流程）".to_string(),
-                            );
-                            self.cancel_account_sign_in(kind);
-                        }
-                        self.overlays.pop();
+                        self.account_action(A::Close);
                         return true;
                     }
                     KeyCode::Up | KeyCode::Char('k') => {
@@ -583,59 +579,29 @@ impl App {
                         }
                     }
                     KeyCode::Enter => {
-                        // 只有 ChatGPT 套餐档有「选账户」这件事；pending 条目选了也
-                        // 选不动（daemon 会回「注册尚未完成」），所以在这里就挡住。
-                        if kind == AccountKind::ChatGptPlan {
-                            match profiles.as_ref().and_then(|p| p.profiles.get(selected)) {
-                                Some(profile) if profile.pending => self.toast(
-                                    NoticeLevel::Warn,
-                                    "该账户注册尚未完成，请重新登录".to_string(),
-                                ),
-                                Some(profile) => {
-                                    let id = profile.id.clone();
-                                    self.select_account_profile(id);
-                                }
-                                None => {}
-                            }
-                        }
+                        self.account_action(A::SelectProfile(selected));
                     }
                     KeyCode::Char('l') | KeyCode::Char('L') => {
-                        self.start_account_sign_in(kind);
+                        self.account_action(A::Login);
                     }
                     KeyCode::Char('c') | KeyCode::Char('C') => {
-                        self.cancel_account_sign_in(kind);
+                        if st.flow.pending_id().is_none() {
+                            // 保留无本地流程时的说明，绝不取消其它客户端的尝试。
+                            self.cancel_account_sign_in(st.kind);
+                        } else {
+                            self.account_action(A::Cancel);
+                        }
                     }
                     KeyCode::Char('x') | KeyCode::Char('X') => {
-                        self.sign_out_account(kind);
+                        self.account_action(A::SignOut);
                     }
-                    KeyCode::Char('r') => self.refresh_account(kind),
-                    KeyCode::Char('o') => match st.authorize_url.clone() {
-                        Some(url) => self.open_account_link(url),
-                        None => self.toast(
-                            NoticeLevel::Info,
-                            "本次流程还没有授权链接（先按 l 发起登录）".to_string(),
-                        ),
-                    },
-                    KeyCode::Char('u') => {
-                        if usage_url.is_empty() {
-                            self.toast(NoticeLevel::Info, "后端未提供用量链接".to_string());
-                        } else {
-                            self.open_account_link(usage_url);
-                        }
-                    }
-                    KeyCode::Char('b') if kind == AccountKind::DeepSeekAccount => {
-                        self.refresh_account_balance();
-                    }
-                    KeyCode::Char('t') if kind == AccountKind::DeepSeekAccount => {
-                        if top_up_url.is_empty() {
-                            self.toast(NoticeLevel::Info, "后端未提供充值链接".to_string());
-                        } else {
-                            self.open_account_link(top_up_url);
-                        }
-                    }
-                    KeyCode::Char('v') if kind == AccountKind::DeepSeekAccount => {
-                        self.verify_account_credential();
-                    }
+                    KeyCode::Char('r') => self.account_action(A::Refresh),
+                    KeyCode::Char('o') => self.account_action(A::OpenAuthorize),
+                    KeyCode::Char('y') => self.account_action(A::CopyAuthorize),
+                    KeyCode::Char('u') => self.account_action(A::Usage),
+                    KeyCode::Char('b') => self.account_action(A::Balance),
+                    KeyCode::Char('t') => self.account_action(A::TopUp),
+                    KeyCode::Char('v') => self.account_action(A::Verify),
                     _ => {}
                 }
                 true
@@ -938,6 +904,22 @@ impl App {
                         self.replace_overlay(Overlay::SessionList {
                             selected,
                             show_archived: !show_archived,
+                        });
+                    }
+                    KeyCode::Char('c') => {
+                        if self.session_cwd_filter.is_some() {
+                            self.session_cwd_filter = None;
+                        } else {
+                            self.session_cwd_filter = self.initial_cwd.clone().map(|cwd| {
+                                std::fs::canonicalize(&cwd)
+                                    .ok()
+                                    .map(|path| path.to_string_lossy().into_owned())
+                                    .unwrap_or(cwd)
+                            });
+                        }
+                        self.replace_overlay(Overlay::SessionList {
+                            selected: 0,
+                            show_archived,
                         });
                     }
                     KeyCode::Char('r') => self.fetch_session_list(),

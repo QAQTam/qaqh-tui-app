@@ -5,6 +5,47 @@ use super::*;
 /// 首页「继续上次」块最多显示的会话数（超过的去 Ctrl+L 列表里翻）。
 const HOME_RECENT_SESSIONS: usize = 5;
 
+/// 一次刷新包含 list + activity，两者都完成前不再排队。
+/// 失败后 3/6/12/24/30s 退避，避免过期判定在每个 tick 上重发。
+#[derive(Debug, Default)]
+pub(super) struct SessionListRefresh {
+    in_flight: bool,
+    failures: u32,
+    retry_at: Option<Instant>,
+}
+
+impl SessionListRefresh {
+    fn begin(&mut self, now: Instant) -> bool {
+        if self.in_flight || self.retry_at.is_some_and(|at| now < at) {
+            return false;
+        }
+        self.in_flight = true;
+        true
+    }
+
+    pub(super) fn list_completed(&mut self, success: bool, now: Instant) {
+        if success {
+            self.failures = 0;
+            self.retry_at = None;
+        } else {
+            self.failures = self.failures.saturating_add(1);
+            let seconds = (3u64 << self.failures.saturating_sub(1).min(4)).min(30);
+            self.retry_at = Some(now + Duration::from_secs(seconds));
+        }
+    }
+
+    pub(super) fn finish(&mut self) {
+        self.in_flight = false;
+    }
+}
+
+/// 仅限制后台只读刷新，不改变 compact/undo 等合法长耗时命令的行为。
+async fn refresh_query(api: &ApiCtx, request: QueryRequest) -> Result<serde_json::Value, String> {
+    tokio::time::timeout(Duration::from_secs(10), api.query(request))
+        .await
+        .unwrap_or_else(|_| Err("会话列表刷新超时（10s）".to_string()))
+}
+
 /// 左侧会话栏的一行（渲染与点击共用同一份数据事实源）。
 #[derive(Debug)]
 pub struct SidebarRow {
@@ -17,8 +58,6 @@ pub struct SidebarRow {
     /// 「daemon 本进程是否加载了该会话」这一个闸门判据（`!= NotRunning`）；
     /// 渲染仍优先走 `activity`，状态词表的细分留给 glyph 升级。
     pub loaded: bool,
-    /// 已在当前 tab 集里。
-    pub is_open: bool,
     /// 当前 active tab。
     pub is_active: bool,
 }
@@ -104,7 +143,6 @@ impl App {
             .map(|entry| {
                 let session_id = entry.meta.session_id.clone();
                 SidebarRow {
-                    is_open: self.tabs.contains(&session_id),
                     is_active: self
                         .tabs
                         .get(self.active)
@@ -403,25 +441,29 @@ impl App {
     // ───────────────────────── 命令发送 ─────────────────────────
 
     pub fn fetch_session_list(&mut self) {
+        if !self.session_list_refresh.begin(Instant::now()) {
+            return;
+        }
         self.spawn_api(move |api, tx| async move {
             // session.list 回数组，逐项解析为**权威类型**（G2）。
             // 仍逐项宽松：单条形状不符只跳过该条，不让整个列表失败——
             // 与 G1 同款「解析失败一律降级而不是崩」的契约。
-            let list = api.query(QueryRequest::SessionList).await.and_then(|v| {
-                v.as_array()
-                    .map(|arr| {
-                        arr.iter()
-                            .filter_map(|item| {
-                                serde_json::from_value::<SessionListEntry>(item.clone()).ok()
-                            })
-                            .collect()
-                    })
-                    .ok_or_else(|| "session.list 应返回数组".to_string())
-            });
+            let list = refresh_query(&api, QueryRequest::SessionList)
+                .await
+                .and_then(|v| {
+                    v.as_array()
+                        .map(|arr| {
+                            arr.iter()
+                                .filter_map(|item| {
+                                    serde_json::from_value::<SessionListEntry>(item.clone()).ok()
+                                })
+                                .collect()
+                        })
+                        .ok_or_else(|| "session.list 应返回数组".to_string())
+                });
             let _ = tx.send(AppMsg::Action(ActionResult::SessionList(list)));
             // 权威类型：逐项宽松解析（单条形状不符只跳过该条，与 session.list 同款）。
-            let activity = api
-                .query(QueryRequest::SessionActivity)
+            let activity = refresh_query(&api, QueryRequest::SessionActivity)
                 .await
                 .and_then(|v| {
                     v.as_array()
@@ -673,6 +715,53 @@ pub(super) fn apply_rejected_ack(
 mod tests {
     use super::*;
     use qaqh_client::{ClientV2CommandAck, RingingCommandAckStatus};
+
+    #[test]
+    fn session_refresh_waits_for_both_results_and_backs_off() {
+        let now = Instant::now();
+        let mut refresh = SessionListRefresh::default();
+        assert!(refresh.begin(now));
+        assert!(!refresh.begin(now));
+        refresh.list_completed(true, now);
+        assert!(!refresh.begin(now), "activity 仍在途，不能再次刷新");
+        refresh.finish();
+
+        for delay in [3, 6, 12, 24, 30, 30] {
+            assert!(refresh.begin(now));
+            refresh.list_completed(false, now);
+            refresh.finish();
+            assert!(!refresh.begin(now + Duration::from_secs(delay - 1)));
+            assert_eq!(refresh.retry_at, Some(now + Duration::from_secs(delay)));
+            assert!(refresh.begin(now + Duration::from_secs(delay)));
+            refresh.finish();
+            // 只重置时限来测试下一次连续失败，保留 failures。
+            refresh.retry_at = None;
+        }
+        refresh.list_completed(true, now);
+        assert_eq!(refresh.failures, 0);
+        assert!(refresh.begin(now));
+    }
+
+    #[tokio::test]
+    async fn session_refresh_handler_releases_guard_after_activity_error() {
+        let (mut app, mut rx) = App::new_for_test();
+        app.fetch_session_list();
+        app.fetch_session_list();
+        assert!(app.session_list_refresh.in_flight);
+        let first = rx.recv().await.unwrap();
+        assert!(matches!(
+            &first,
+            AppMsg::Action(ActionResult::SessionList(Err(_)))
+        ));
+        app.handle(first);
+        assert!(app.session_list_refresh.in_flight);
+        app.handle(rx.recv().await.unwrap());
+        assert!(!app.session_list_refresh.in_flight);
+        assert!(app.session_list_refresh.retry_at.is_some());
+        app.fetch_session_list();
+        tokio::task::yield_now().await;
+        assert!(rx.try_recv().is_err(), "重复请求与退避期不得产生任务");
+    }
 
     // 覆盖分层（见 `apply_rejected_ack` 的「测试分层」小节）：本模块只锁函数本身，
     // **调用点**由 `app::tests::rejected_create_ack_from_handler_clears_pending_create`

@@ -7,6 +7,24 @@
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
+/// 在路由前统一终端的退格编码，供 composer、overlay 和交互弹窗共用。
+///
+/// legacy 终端发送的 BS (0x08 / ^H) 被 crossterm 解为 Ctrl+H，而 DEL
+/// (0x7f / ^?) 才被解为 Backspace。^H 中的 Ctrl 是编码的一部分，必须移除，
+/// 否则 composer 会误走 Ctrl+Backspace 的删词路径。真正的 Ctrl+Backspace 不变。
+pub(crate) fn normalize_key(mut key: KeyEvent) -> KeyEvent {
+    match key.code {
+        KeyCode::Char('h') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            key.code = KeyCode::Backspace;
+            key.modifiers.remove(KeyModifiers::CONTROL);
+        }
+        // 兼容直接上报控制字符的事件源（如扩展键盘协议）。
+        KeyCode::Char('\x08' | '\x7f') => key.code = KeyCode::Backspace,
+        _ => {}
+    }
+    key
+}
+
 /// 全局快捷键意图（与 App 状态解耦的纯映射结果）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum GlobalKey {
@@ -127,6 +145,52 @@ mod tests {
 
     fn key(code: KeyCode, mods: KeyModifiers) -> KeyEvent {
         KeyEvent::new(code, mods)
+    }
+
+    #[test]
+    fn legacy_backspace_removes_only_the_encoding_ctrl_modifier() {
+        use ratatui::crossterm::event::{KeyEventKind, KeyEventState};
+
+        for modifiers in [
+            KeyModifiers::NONE,
+            KeyModifiers::ALT,
+            KeyModifiers::SHIFT,
+            KeyModifiers::ALT | KeyModifiers::SHIFT,
+        ] {
+            let mut event = key(KeyCode::Char('h'), modifiers | KeyModifiers::CONTROL);
+            event.kind = KeyEventKind::Repeat;
+            event.state = KeyEventState::CAPS_LOCK;
+            let mut expected = event;
+            expected.code = KeyCode::Backspace;
+            expected.modifiers = modifiers;
+            assert_eq!(normalize_key(event), expected);
+            assert_eq!(normalize_key(normalize_key(event)), expected);
+        }
+    }
+
+    #[test]
+    fn raw_backspace_control_characters_are_normalized() {
+        for code in [KeyCode::Char('\x08'), KeyCode::Char('\x7f')] {
+            assert_eq!(
+                normalize_key(key(code, KeyModifiers::NONE)),
+                key(KeyCode::Backspace, KeyModifiers::NONE)
+            );
+        }
+    }
+
+    #[test]
+    fn unrelated_keys_and_explicit_ctrl_backspace_are_unchanged() {
+        for event in [
+            key(KeyCode::Char('h'), KeyModifiers::NONE),
+            key(KeyCode::Char('h'), KeyModifiers::ALT),
+            key(KeyCode::Char('H'), KeyModifiers::SHIFT),
+            key(KeyCode::Char('c'), KeyModifiers::CONTROL),
+            key(KeyCode::Backspace, KeyModifiers::NONE),
+            key(KeyCode::Backspace, KeyModifiers::CONTROL),
+            key(KeyCode::Delete, KeyModifiers::NONE),
+        ] {
+            assert_eq!(normalize_key(event), event);
+        }
     }
 
     #[test]
