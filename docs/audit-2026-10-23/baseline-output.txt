@@ -1,0 +1,35 @@
+warning: function `params_object` is never used
+  --> /run/media/qaqyamsy/b91da210-859e-4b30-8a23-0cc6b61e6b53/project/qaqh-backend/crates/qaqh-client/src/service.rs:94:15
+   |
+94 | pub(crate) fn params_object(
+   |               ^^^^^^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `qaqh-client` (lib) generated 1 warning
+   Compiling qaqh-tui v2.0.0 (/run/media/qaqyamsy/b91da210-859e-4b30-8a23-0cc6b61e6b53/project/qaqh-tui-app)
+warning: method `render_misses_for_test` is never used
+    --> src/terminal/agent/fullscreen.rs:1327:19
+     |
+1281 | impl TranscriptCaches {
+     | --------------------- method in this implementation
+...
+1327 |     pub(super) fn render_misses_for_test(&self, session_id: &str) -> usize {
+     |                   ^^^^^^^^^^^^^^^^^^^^^^
+     |
+     = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `qaqh-tui` (bin "qaqh-tui" test) generated 1 warning
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 24.83s
+     Running unittests src/main.rs (target/debug/deps/qaqh_tui-dd644edc854ef096)
+
+running 598 tests
+....................................................................................... 87/598
+....................................................................................... 174/598
+....................................................................................... 261/598
+....................................................................................... 348/598
+....................................................................................... 435/598
+....................................................................................... 522/598
+............................................................................
+test result: ok. 598 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.80s
+

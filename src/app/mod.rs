@@ -2549,22 +2549,44 @@ impl App {
                     // 账号行摘要/模型候选要跟着补一次（否则账号档会显示成 BYOK）。
                     self.after_config_loaded();
                 }
-                Err(e) => self.toast(NoticeLevel::Error, format!("config.load 解析失败: {e}")),
+                Err(e) => {
+                    let hint = if e.to_string().contains("missing field `sandbox`") {
+                        "；daemon 未返回新版沙箱配置，请更新并重启当前连接的 daemon"
+                    } else {
+                        ""
+                    };
+                    self.toast(
+                        NoticeLevel::Error,
+                        format!("config.load 解析失败: {e}{hint}"),
+                    );
+                }
             },
             ActionResult::ConfigLoaded(Err(e)) => {
                 self.toast(NoticeLevel::Error, format!("config.load: {e}"));
             }
             ActionResult::ConfigWrite { label, result } => match result {
-                Ok(_) => {
+                Ok(value) => {
                     self.toast(NoticeLevel::Info, format!("{label} 已保存"));
-                    if label == "设置" {
-                        // 保存成功：清草稿（loaded 由 ConfigChanged 重拉替换，
-                        // 此处显式重拉一次兜底 SSE 延迟）。
-                        self.settings_saving = false;
-                        if let Some(Overlay::Settings(st)) = self.overlays.last_mut() {
-                            st.draft = settings::SettingsState::default().draft;
-                        }
+                    if label != "设置" {
                         self.fetch_config();
+                    }
+                    if label == "设置" {
+                        self.settings_saving = false;
+                        match serde_json::from_value::<ConfigDto>(value) {
+                            Ok(dto) => {
+                                self.config = Some(dto);
+                                for overlay in &mut self.overlays {
+                                    if let Overlay::Settings(st) = overlay {
+                                        st.draft = Default::default();
+                                    }
+                                }
+                                self.after_config_loaded();
+                            }
+                            Err(error) => self.toast(
+                                NoticeLevel::Error,
+                                format!("设置已写入，但配置回读失败（保留草稿）：{error}"),
+                            ),
+                        }
                     }
                 }
                 Err(e) => {

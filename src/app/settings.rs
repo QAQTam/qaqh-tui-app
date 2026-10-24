@@ -91,6 +91,7 @@ pub enum FieldId {
     ContextLength,
     ReasoningEffort,
     AutoCompactThreshold,
+    SandboxEnabled,
     PermissionLevel,
     ActiveProfile,
     ExecDefaultShell,
@@ -198,6 +199,12 @@ pub const ROWS: &[Row] = &[
         label: "自动压缩阈值",
         kind: FieldKind::Float,
         section: "生成参数",
+    },
+    Row {
+        id: FieldId::SandboxEnabled,
+        label: "沙箱隔离",
+        kind: FieldKind::Toggle,
+        section: "运行时",
     },
     Row {
         id: FieldId::PermissionLevel,
@@ -350,6 +357,11 @@ impl SettingsState {
     /// 当前字段是否已有未保存草稿值。
     pub fn dirty(&self, id: FieldId) -> bool {
         match id {
+            FieldId::SandboxEnabled => self
+                .draft
+                .sandbox
+                .as_ref()
+                .is_some_and(|s| s.enabled.is_some()),
             FieldId::PerformanceMode => self.performance_draft.is_some(),
             FieldId::Credential => self.draft.credential.is_some(),
             FieldId::BaseUrl => self.draft.base_url.is_some(),
@@ -508,16 +520,19 @@ impl SettingsState {
                     Some(v) => format!("{v:.2}"),
                 }
             }
+            FieldId::SandboxEnabled => self.effective(loaded, |d, c| {
+                if d.sandbox
+                    .as_ref()
+                    .and_then(|s| s.enabled)
+                    .unwrap_or(c.sandbox.enabled)
+                {
+                    "开启".into()
+                } else {
+                    "关闭".into()
+                }
+            }),
             FieldId::PermissionLevel => loaded
-                .map(|c| match c.permission_level {
-                    0..=3 => format!("L{}（按 1-3 即时生效）", c.permission_level),
-                    // 档位 4（SandboxRun）已在后端 `qaqh-policy` 落地，但写口
-                    // （`ConfigPatch::validate` 与 `config.set_permission_level`）仍是
-                    // 1..=3，本页**给不出**这个选项；daemon 侧要是报上来，只读展示，
-                    // 且不许按数字大小解释语义（ADR 2026-10-09 的单调性例外：4 数值
-                    // 最大，网络工具却仍然走审批）。
-                    n => format!("L{n}（daemon 侧档位，本页只读）"),
-                })
+                .map(|c| format!("{}（按 1-4 即时生效）", permission_tier(c.permission_level)))
                 .unwrap_or_else(|| "…".into()),
             FieldId::ActiveProfile => {
                 let cur = self
@@ -695,6 +710,7 @@ impl SettingsState {
             | FieldId::Wire
             | FieldId::ReasoningEffort
             | FieldId::ComplianceEnabled
+            | FieldId::SandboxEnabled
             | FieldId::PermissionLevel
             | FieldId::PerformanceMode
             | FieldId::ActiveProfile => return None,
@@ -797,6 +813,7 @@ impl SettingsState {
             | FieldId::Wire
             | FieldId::ReasoningEffort
             | FieldId::ComplianceEnabled
+            | FieldId::SandboxEnabled
             | FieldId::PermissionLevel
             | FieldId::PerformanceMode
             | FieldId::ActiveProfile => {
@@ -811,6 +828,20 @@ impl SettingsState {
     pub fn cycle(&mut self, loaded: Option<&ConfigDto>, delta: i32) -> Result<bool, String> {
         let id = self.row().id;
         match id {
+            FieldId::SandboxEnabled => {
+                let current = self
+                    .draft
+                    .sandbox
+                    .as_ref()
+                    .and_then(|s| s.enabled)
+                    .or_else(|| loaded.map(|c| c.sandbox.enabled))
+                    .unwrap_or(true);
+                self.draft
+                    .sandbox
+                    .get_or_insert_with(Default::default)
+                    .enabled = Some(!current);
+                Ok(true)
+            }
             FieldId::PerformanceMode => {
                 let next = !self
                     .performance_draft
@@ -854,8 +885,16 @@ impl SettingsState {
                 // 而用户这一下只改了一个字段。先把 wire 归位，否则用户会经历
                 // 「改一个 → 保存报错 → 回来再改另一个」。与桌面端 `switchFields` 同口径。
                 //
-                // 但**不碰 baseUrl**：端点仍须由用户自己声明对（gemini/套餐/账号
-                // 三家的端点形态各不相同，猜一个 URL 填进用户配置是最坏的兜底）。
+                // 账号模式禁用端点编辑，因此必须同时清除旧 BYOK 路由。
+                match next {
+                    "chatgpt_plan" => {
+                        self.draft.base_url = Some("https://api.openai.com/v1".into())
+                    }
+                    "deepseek_account" => {
+                        self.draft.base_url = Some("https://api.deepseek.com".into())
+                    }
+                    _ => {}
+                }
                 match next {
                     "chatgpt_plan" if self.current_wire(loaded).as_deref() != Some("responses") => {
                         self.draft.wire = Some("responses".into());
@@ -959,6 +998,16 @@ impl SettingsState {
     }
 }
 
+pub fn permission_tier(level: u8) -> &'static str {
+    match level {
+        1 => "read-only",
+        2 => "workspace-write",
+        3 => "skip-permissions",
+        4 => "sandbox-run",
+        _ => "未知权限档位",
+    }
+}
+
 fn owned_or(draft: Option<String>, loaded: Option<&str>, empty: &str) -> String {
     if let Some(v) = draft {
         return v;
@@ -1052,6 +1101,40 @@ mod tests {
 
     fn row_index(id: FieldId) -> usize {
         ROWS.iter().position(|r| r.id == id).unwrap()
+    }
+
+    #[test]
+    fn sandbox_toggle_round_trips_through_merge_patch() {
+        let mut c = cfg();
+        c.sandbox.enabled = true;
+        let mut st = SettingsState {
+            focus: row_index(FieldId::SandboxEnabled),
+            ..Default::default()
+        };
+        assert_eq!(st.display(Some(&c), FieldId::SandboxEnabled), "开启");
+        st.cycle(Some(&c), 1).unwrap();
+        assert!(st.dirty(FieldId::SandboxEnabled));
+        assert_eq!(st.display(Some(&c), FieldId::SandboxEnabled), "关闭");
+        let patch = serde_json::to_value(&st.draft).unwrap();
+        assert_eq!(patch, json!({ "sandbox": { "enabled": false } }));
+        st.draft.validate().unwrap();
+    }
+
+    #[test]
+    fn permission_display_names_all_four_tiers() {
+        let mut c = cfg();
+        for (level, name) in [
+            (1, "read-only"),
+            (2, "workspace-write"),
+            (3, "skip-permissions"),
+            (4, "sandbox-run"),
+        ] {
+            c.permission_level = level;
+            assert_eq!(
+                SettingsState::default().display(Some(&c), FieldId::PermissionLevel),
+                format!("{name}（按 1-4 即时生效）")
+            );
+        }
     }
 
     #[test]
@@ -1280,7 +1363,10 @@ mod tests {
             Some("responses"),
             "套餐直连只提供 Responses API：不归位就会在保存期被拒"
         );
-        assert_eq!(st.draft.base_url, None, "切凭据来源不得凭空写 baseUrl");
+        assert_eq!(
+            st.draft.base_url.as_deref(),
+            Some("https://api.openai.com/v1")
+        );
         st.draft.validate().expect("归位后的草稿必须过得去值域校验");
 
         // 账号额度：当前 anthropic → 必须归位到 chat（写拼写 = openai）。
@@ -1294,6 +1380,10 @@ mod tests {
         st2.cycle(Some(&c2), 1).unwrap();
         assert_eq!(st2.draft.credential.as_deref(), Some("deepseek_account"));
         assert_eq!(st2.draft.wire.as_deref(), Some("openai"));
+        assert_eq!(
+            st2.draft.base_url.as_deref(),
+            Some("https://api.deepseek.com")
+        );
         st2.draft.validate().expect("值域合法");
 
         // 诚实性：账号档下 API Key 行必须说清「不用此键」。
@@ -1482,6 +1572,7 @@ mod tests {
         assert!(!st.is_field_disabled(FieldId::BaseUrl, Some(&c)));
         assert!(!st.is_field_disabled(FieldId::Wire, Some(&c)));
         assert!(!st.is_field_disabled(FieldId::ApiKey, Some(&c)));
+        st.focus = row_index(FieldId::BaseUrl);
         assert!(st.start_edit(Some(&c)).is_some());
     }
 }

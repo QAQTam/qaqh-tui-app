@@ -199,9 +199,16 @@ impl App {
         self.settings_saving = true;
         let payload = serde_json::to_value(&st.draft).unwrap_or(serde_json::Value::Null);
         self.spawn_api(move |api, tx| async move {
-            let result = api
+            let result = match api
                 .action(ActionRequest::ConfigSave { fields: payload })
-                .await;
+                .await
+            {
+                Ok(_) => api
+                    .query(QueryRequest::ConfigLoad)
+                    .await
+                    .map_err(|error| format!("已写入，但配置回读失败（保留草稿）：{error}")),
+                Err(error) => Err(error),
+            };
             let _ = tx.send(AppMsg::Action(ActionResult::ConfigWrite {
                 label: "设置",
                 result,
@@ -213,7 +220,7 @@ impl App {
     pub(super) fn settings_port_activate(&mut self, st: &mut SettingsState) {
         match st.row().id {
             settings::FieldId::PermissionLevel => {
-                self.toast(NoticeLevel::Info, "聚焦权限级别后按 1-3 即时生效");
+                self.toast(NoticeLevel::Info, "聚焦权限级别后按 1-4 即时生效");
             }
             settings::FieldId::ActiveProfile => {
                 let name = st
@@ -273,10 +280,12 @@ impl App {
     }
 
     pub fn set_permission_level(&mut self, level: u8) {
+        // 最新 ConfigPatch 接受 1..=4；旧独立写口仍只接受 1..=3。
+        // 使用相同的配置事务与 reload 广播，同时支持 sandbox-run。
         self.spawn_api(move |api, tx| async move {
             let result = api
-                .action(ActionRequest::ConfigSetPermissionLevel {
-                    level: level.into(),
+                .action(ActionRequest::ConfigSave {
+                    fields: serde_json::json!({ "permissionLevel": level }),
                 })
                 .await;
             let _ = tx.send(AppMsg::Action(ActionResult::ConfigWrite {
@@ -319,6 +328,52 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn saved_oauth_snapshot_is_applied_before_draft_is_cleared() {
+        let (mut app, _rx) = App::new_for_test();
+        app.config = Some(ConfigDto {
+            credential: "api_key".into(),
+            ..Default::default()
+        });
+        let mut st = SettingsState::default();
+        st.draft.credential = Some("chatgpt_plan".into());
+        app.overlays.push(Overlay::Settings(st));
+        app.settings_saving = true;
+        let dto = ConfigDto {
+            credential: "chatgpt_plan".into(),
+            wire: "responses".into(),
+            ..Default::default()
+        };
+        app.handle(AppMsg::Action(ActionResult::ConfigWrite {
+            label: "设置",
+            result: Ok(serde_json::to_value(dto).unwrap()),
+        }));
+        let Some(Overlay::Settings(st)) = app.overlays.last() else {
+            panic!("settings")
+        };
+        assert!(st.draft.is_empty());
+        assert_eq!(st.effective_credential(app.config.as_ref()), "chatgpt_plan");
+        assert!(!app.settings_saving);
+    }
+
+    #[tokio::test]
+    async fn failed_settings_readback_keeps_oauth_draft() {
+        let (mut app, _rx) = App::new_for_test();
+        let mut st = SettingsState::default();
+        st.draft.credential = Some("chatgpt_plan".into());
+        app.overlays.push(Overlay::Settings(st));
+        app.settings_saving = true;
+        app.handle(AppMsg::Action(ActionResult::ConfigWrite {
+            label: "设置",
+            result: Ok(serde_json::Value::Null),
+        }));
+        let Some(Overlay::Settings(st)) = app.overlays.last() else {
+            panic!("settings")
+        };
+        assert_eq!(st.draft.credential.as_deref(), Some("chatgpt_plan"));
+        assert!(!app.settings_saving);
+    }
 
     #[tokio::test]
     async fn account_settings_mouse_and_keyboard_keep_the_new_overlay() {

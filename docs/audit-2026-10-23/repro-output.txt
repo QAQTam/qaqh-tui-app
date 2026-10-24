@@ -1,0 +1,113 @@
+warning: function `params_object` is never used
+  --> /run/media/qaqyamsy/b91da210-859e-4b30-8a23-0cc6b61e6b53/project/qaqh-backend/crates/qaqh-client/src/service.rs:94:15
+   |
+94 | pub(crate) fn params_object(
+   |               ^^^^^^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `qaqh-client` (lib) generated 1 warning
+   Compiling qaqh-tui v2.0.0 (/run/media/qaqyamsy/b91da210-859e-4b30-8a23-0cc6b61e6b53/project/qaqh-tui-app)
+warning: method `render_misses_for_test` is never used
+    --> src/terminal/agent/fullscreen.rs:1327:19
+     |
+1281 | impl TranscriptCaches {
+     | --------------------- method in this implementation
+...
+1327 |     pub(super) fn render_misses_for_test(&self, session_id: &str) -> usize {
+     |                   ^^^^^^^^^^^^^^^^^^^^^^
+     |
+     = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `qaqh-tui` (bin "qaqh-tui" test) generated 1 warning
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 14.16s
+     Running unittests src/main.rs (target/debug/deps/qaqh_tui-dd644edc854ef096)
+
+running 13 tests
+test app::audit_repros::audit_browser_gate_must_reject_windows_shell_metacharacters ... 
+thread 'app::audit_repros::audit_browser_gate_must_reject_windows_shell_metacharacters' (123257) panicked at src/app/../../docs/audit-2026-10-23/repros.rs:267:5:
+assertion failed: !browser::is_supported("https://example.invalid/&echo.AUDIT")
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+FAILED
+test app::audit_repros::audit_collapsed_tool_preview_must_bound_visual_rows ... 
+thread 'app::audit_repros::audit_collapsed_tool_preview_must_bound_visual_rows' (123258) panicked at src/app/../../docs/audit-2026-10-23/repros.rs:250:5:
+未展开工具卡却占了 81 屏幕行
+FAILED
+test app::audit_repros::audit_exec_progress_fragments_must_append_without_cr ... 
+thread 'app::audit_repros::audit_exec_progress_fragments_must_append_without_cr' (123259) panicked at src/app/../../docs/audit-2026-10-23/repros.rs:141:5:
+assertion `left == right` failed
+  left: "lo\n"
+ right: "hello\n"
+FAILED
+test app::audit_repros::audit_failed_ask_response_must_remain_retryable ... 
+thread 'app::audit_repros::audit_failed_ask_response_must_remain_retryable' (123260) panicked at src/app/../../docs/audit-2026-10-23/repros.rs:129:5:
+确定发送失败后 ask 仍被永久下架
+FAILED
+test app::audit_repros::audit_failed_send_must_retain_user_text ... 
+thread 'app::audit_repros::audit_failed_send_must_retain_user_text' (123261) panicked at src/app/../../docs/audit-2026-10-23/repros.rs:76:5:
+assertion `left == right` failed
+  left: ""
+ right: "请保留这段未送达的输入"
+FAILED
+test app::audit_repros::audit_offloaded_turn_must_not_look_complete ... 
+thread 'app::audit_repros::audit_offloaded_turn_must_not_look_complete' (123262) panicked at src/app/../../docs/audit-2026-10-23/repros.rs:201:5:
+offload 状态未展示：  ❯ 测试问题                                                                    
+FAILED
+test app::audit_repros::audit_pager_temp_file_must_be_private ... 
+thread 'app::audit_repros::audit_pager_temp_file_must_be_private' (123263) panicked at src/app/../../docs/audit-2026-10-23/repros.rs:281:5:
+assertion `left == right` failed: pager 文件允许组/其他用户读取：644
+  left: 36
+ right: 0
+FAILED
+test app::audit_repros::audit_progress_truncation_must_be_visible ... 
+thread 'app::audit_repros::audit_progress_truncation_must_be_visible' (123264) panicked at src/app/../../docs/audit-2026-10-23/repros.rs:241:5:
+progress_truncated 未传给视图：  ❯ 测试问题                                                                    
+◐ Running
+  └ only retained tail
+FAILED
+test app::audit_repros::audit_rejected_control_must_not_overwrite_chat_draft ... 
+thread 'app::audit_repros::audit_rejected_control_must_not_overwrite_chat_draft' (123265) panicked at src/app/../../docs/audit-2026-10-23/repros.rs:101:5:
+assertion `left == right` failed
+  left: "取消 被拒绝: not_driver read only"
+ right: "用户正在编辑的草稿"
+FAILED
+test app::audit_repros::audit_remote_tls_endpoint_must_be_accepted ... 
+thread 'app::audit_repros::audit_remote_tls_endpoint_must_be_accepted' (123266) panicked at src/app/../../docs/audit-2026-10-23/repros.rs:259:5:
+assertion failed: crate::runtime::RemoteTarget::new("https://192.0.2.10:64413",
+        "audit-fake-token").is_ok()
+FAILED
+test app::audit_repros::audit_remote_token_paste_must_not_reach_chat ... 
+thread 'app::audit_repros::audit_remote_token_paste_must_not_reach_chat' (123267) panicked at src/app/../../docs/audit-2026-10-23/repros.rs:23:5:
+Token 粘贴泄漏到聊天输入框
+FAILED
+test app::audit_repros::audit_settings_ack_must_preserve_edits_after_save ... 
+thread 'app::audit_repros::audit_settings_ack_must_preserve_edits_after_save' (123268) panicked at src/app/../../docs/audit-2026-10-23/repros.rs:55:5:
+assertion `left == right` failed: 保存回包清掉了之后新写的草稿
+  left: None
+ right: Some(4096)
+FAILED
+test app::audit_repros::audit_turn_failure_must_be_visible ... 
+thread 'app::audit_repros::audit_turn_failure_must_be_visible' (123269) panicked at src/app/../../docs/audit-2026-10-23/repros.rs:190:5:
+失败原因消失：  ❯ 测试问题                                                                    
+FAILED
+
+failures:
+
+failures:
+    app::audit_repros::audit_browser_gate_must_reject_windows_shell_metacharacters
+    app::audit_repros::audit_collapsed_tool_preview_must_bound_visual_rows
+    app::audit_repros::audit_exec_progress_fragments_must_append_without_cr
+    app::audit_repros::audit_failed_ask_response_must_remain_retryable
+    app::audit_repros::audit_failed_send_must_retain_user_text
+    app::audit_repros::audit_offloaded_turn_must_not_look_complete
+    app::audit_repros::audit_pager_temp_file_must_be_private
+    app::audit_repros::audit_progress_truncation_must_be_visible
+    app::audit_repros::audit_rejected_control_must_not_overwrite_chat_draft
+    app::audit_repros::audit_remote_tls_endpoint_must_be_accepted
+    app::audit_repros::audit_remote_token_paste_must_not_reach_chat
+    app::audit_repros::audit_settings_ack_must_preserve_edits_after_save
+    app::audit_repros::audit_turn_failure_must_be_visible
+
+test result: FAILED. 0 passed; 13 failed; 0 ignored; 0 measured; 598 filtered out; finished in 0.02s
+
+error: test failed, to rerun pass `--bin qaqh-tui`

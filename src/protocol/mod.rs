@@ -244,8 +244,7 @@ mod tests {
     /// 那几个字段」，而非上游测试的复制。
     #[test]
     fn config_contract_exposes_fields_tui_needs() {
-        // 1) 写路径：权限档位可经 patch 下发并受值域校验（BUG-2026-09-13-15；
-        //    2026-10-03 收敛为三档 1..=3，旧四档值 4 必须被拒）。
+        // 1) 权限档位经 config.save 写入，支持 1..=4。
         let ok = ConfigPatch {
             permission_level: Some(3),
             ..Default::default()
@@ -257,11 +256,8 @@ mod tests {
             permission_level: Some(4),
             ..Default::default()
         };
-        // 2026-10-09 后端 `qaqh-policy` 加了第四档 `SandboxRun = 4`，但写口
-        // （`ConfigPatch::validate` / `config.set_permission_level` / config.toml 的
-        // `permission_tier`）仍是 1..=3 —— 所以档位 4 现在**只能读、不能写**，设置页
-        // 不提供该选项。后端哪天放开值域，这条断言与 `settings.rs` 的只读分支要一起改。
-        assert!(legacy.validate().is_err(), "旧四档值 4 必须被拒");
+        // 最新配置写口支持 sandbox-run = 4。
+        legacy.validate().expect("sandbox-run 档位 4 合法");
 
         let bad = ConfigPatch {
             permission_level: Some(5),
