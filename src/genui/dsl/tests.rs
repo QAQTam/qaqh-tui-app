@@ -15,7 +15,7 @@ use std::collections::BTreeMap;
 
 use serde_json::Value;
 
-use super::decoder::{ContentPart, UiFormat, split_content_parts};
+use super::decoder::{ContentPart, split_content_parts};
 use super::ingest_ui_part;
 use super::ir::GenUiResult;
 use super::{compile_source, translate};
