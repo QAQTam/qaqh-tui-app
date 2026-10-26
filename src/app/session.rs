@@ -523,7 +523,7 @@ pub struct SessionState {
     /// conversation 频道快照的**类型化**视图（权威类型，本仓不再手解）；快照里
     /// 其余字段由 `TimelineModel` 与实时事件承担。
     pub conversation: Option<ConversationState>,
-    /// canonical v2 会话状态机：epoch/log/cursor、reset、interaction、driver。
+    /// canonical v2 会话状态机：epoch/log/cursor、reset、interaction。
     pub ringing_v2: RingingV2SessionModel,
     pub activity: Option<ActivityState>,
     /// **最近一次请求**的 provider 真值用量（`AssistantBlockSealed` /
@@ -694,23 +694,12 @@ impl SessionState {
             || self.pending_plan.is_some()
     }
 
-    /// 当前客户端是否持有 v2 driver seat。
-    pub fn v2_is_driver(&self, client_session_id: Option<&str>) -> bool {
-        client_session_id.is_some_and(|id| self.ringing_v2.is_driver(id))
-    }
-
-    /// 非 driver 的写控制只读；交互应答仍可继续。
+    /// v2 写控制只读的两种情形：v2 面已启用（存在全局 lease 身份）但本会话
+    /// 权威 bootstrap 尚未落地——写请求还没有本会话的可靠身份；或 reset 等待
+    /// 快照恢复。全会话 driver 席位已移除，可写性不再依赖 seat。
     pub fn v2_is_read_only(&self, client_session_id: Option<&str>) -> bool {
-        self.ringing_v2.is_read_only()
-            || client_session_id.is_some_and(|id| !self.ringing_v2.is_driver(id))
-    }
-
-    /// 无活跃 holder 时允许发起 canonical driver claim。
-    pub fn v2_can_claim(&self) -> bool {
-        self.ringing_v2
-            .driver()
-            .map(|driver| driver.can_claim)
-            .unwrap_or_else(|| self.ringing_v2.server_epoch().is_some())
+        (client_session_id.is_some() && self.ringing_v2.server_epoch().is_none())
+            || self.ringing_v2.is_read_only()
     }
 
     /// 状态栏标签（working / waiting / idle…）。

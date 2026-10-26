@@ -1,13 +1,12 @@
 //! Ringing v2 会话状态机（TUI 侧不变量）。
 //!
 //! **本模块不再持有任何协议类型**：delivery / reset reason / interaction kind /
-//! pending interaction / driver state / bootstrap / 事件信封一律 `use qaqh_client::*`
+//! pending interaction / bootstrap / 事件信封一律 `use qaqh_client::*`
 //! ——wire 视图只有那一份权威实现。这里只剩 TUI 自己的会话级时序规则：
 //! epoch / log / cursor 单调性、重复与过期事件丢弃、交互身份「第一答复胜出」、
-//! driver seat 按 epoch 单调交接。
 //!
 //! 历史（2026-09-30 之前）本模块自带六份手抄协议镜像（`Delivery` /
-//! `InteractionKind` / `ResetReason` / `PendingInteraction` / `DriverState` /
+//! `InteractionKind` / `ResetReason` / `PendingInteraction` /
 //! `BootstrapSnapshot`）加三个适配器（`event_meta_from_client` /
 //! `reset_from_client` / `bootstrap_from_client`）。漂移**已经真实发生，而且
 //! 失败模式是静默的**：
@@ -25,7 +24,7 @@
 use std::collections::BTreeSet;
 
 use qaqh_client::{
-    ClientV2Bootstrap, ClientV2Delivery, ClientV2DriverState, ClientV2Event, ClientV2Reset,
+    ClientV2Bootstrap, ClientV2Delivery, ClientV2Event, ClientV2Reset,
     ClientV2ResetReason,
 };
 
@@ -98,15 +97,6 @@ pub enum InteractionOutcome {
     Unknown,
 }
 
-/// driver seat 交接结果。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DriverOutcome {
-    Applied,
-    Duplicate,
-    Stale,
-    Conflict,
-}
-
 /// 单会话的 Ringing v2 时序状态。
 ///
 /// **只存 TUI 需要的跨事件不变量**：领域载荷（交互正文、工具卡、transcript）一律
@@ -124,7 +114,6 @@ pub struct RingingV2SessionModel {
     /// `ClientV2PendingInteraction`，这里再存一份就会漏字段（历史缺陷）。
     pending_interactions: BTreeSet<String>,
     terminal_interactions: BTreeSet<String>,
-    driver: Option<ClientV2DriverState>,
     /// 待处理 reset 的**权威原帧**：保留它才能在新 bootstrap 到达时逐字段校验。
     reset: Option<ClientV2Reset>,
 }
@@ -141,7 +130,6 @@ impl RingingV2SessionModel {
             state_revision: 0,
             pending_interactions: BTreeSet::new(),
             terminal_interactions: BTreeSet::new(),
-            driver: None,
             reset: None,
         }
     }
@@ -169,17 +157,6 @@ impl RingingV2SessionModel {
         self.reset
             .as_ref()
             .is_some_and(|reset| reset_is_read_only(reset.reason))
-    }
-
-    pub fn driver(&self) -> Option<&ClientV2DriverState> {
-        self.driver.as_ref()
-    }
-
-    pub fn is_driver(&self, client_session_id: &str) -> bool {
-        self.driver
-            .as_ref()
-            .and_then(|driver| driver.holder.as_deref())
-            == Some(client_session_id)
     }
 
     #[cfg(test)]
@@ -233,7 +210,7 @@ impl RingingV2SessionModel {
             && state_revision < self.state_revision
         {
             // 同一 epoch 内 revision 单调；较旧的并发 bootstrap 响应不得把状态
-            // 回滚到更早的 cursor / pending / driver 快照。
+            // 回滚到更早的 cursor / pending 快照。
             return BootstrapOutcome::Stale;
         }
 
@@ -252,7 +229,6 @@ impl RingingV2SessionModel {
             .map(|interaction| interaction.interaction_id.clone())
             .collect();
         self.terminal_interactions.clear();
-        self.driver = bootstrap.control.state.driver.clone();
         self.reset = None;
         BootstrapOutcome::Applied
     }
@@ -380,25 +356,6 @@ impl RingingV2SessionModel {
             InteractionOutcome::Unknown
         }
     }
-
-    pub fn apply_driver_state(&mut self, driver: ClientV2DriverState) -> DriverOutcome {
-        if let Some(current) = &self.driver {
-            if driver.driver_epoch < current.driver_epoch {
-                return DriverOutcome::Stale;
-            }
-            if driver.driver_epoch == current.driver_epoch
-                && driver.holder == current.holder
-                && driver.can_claim == current.can_claim
-            {
-                return DriverOutcome::Duplicate;
-            }
-            if driver.driver_epoch == current.driver_epoch {
-                return DriverOutcome::Conflict;
-            }
-        }
-        self.driver = Some(driver);
-        DriverOutcome::Applied
-    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -457,7 +414,7 @@ mod tests {
         .build()
     }
 
-    /// 权威 bootstrap 被完整吃下：cursor / revision / 未决身份 / driver。
+    /// 权威 bootstrap 被完整吃下：cursor / revision / 未决身份。
     #[test]
     fn bootstrap_adopts_authoritative_snapshot() {
         let bootstrap = fx::bootstrap_typed(
@@ -467,7 +424,6 @@ mod tests {
             42,
             19,
             &[fx::pending("i1", "c1", "t1", "permission")],
-            Some(fx::driver("cs-1", 4, false)),
         );
         let mut model = RingingV2SessionModel::new(SESSION);
         assert_eq!(model.apply_bootstrap(&bootstrap), BootstrapOutcome::Applied);
@@ -476,8 +432,6 @@ mod tests {
         // 三频道 revision 取最大者（control=conversation=tool=19）。
         assert_eq!(model.state_revision(), 19);
         assert_eq!(model.pending_interactions().collect::<Vec<_>>(), ["i1"]);
-        assert_eq!(model.driver().expect("driver").driver_epoch, 4);
-        assert!(model.is_driver("cs-1"));
     }
 
     /// 反闸：TUI 不再自建协议枚举——`kind` 直接是权威类型，新增变体编译期可见。
@@ -712,7 +666,6 @@ mod tests {
                 "ask",
                 "继续？",
             )],
-            None,
         );
         // 权威类型确实带着正文——本状态机只是不复制它。
         let authoritative = &bootstrap.control.state.interactions[0];
@@ -740,7 +693,6 @@ mod tests {
                 7,
                 7,
                 &[fx::pending(&interaction_id, &call_id, &turn_id, wire_kind)],
-                None,
             );
             let mut model = RingingV2SessionModel::new(SESSION);
             assert_eq!(model.apply_bootstrap(&bootstrap), BootstrapOutcome::Applied);
@@ -749,87 +701,6 @@ mod tests {
                 [interaction_id.as_str()]
             );
         }
-    }
-
-    #[test]
-    fn d1_vacant_seat_claim_is_applied_with_monotonic_epoch() {
-        let mut model = model();
-        assert!(model.driver().is_none(), "基线快照没有 driver 段");
-        let claimed = ClientV2DriverState {
-            holder: Some("cs-1".into()),
-            driver_epoch: 4,
-            can_claim: false,
-        };
-        assert_eq!(
-            model.apply_driver_state(claimed.clone()),
-            DriverOutcome::Applied
-        );
-        assert!(model.is_driver("cs-1"));
-        assert_eq!(model.apply_driver_state(claimed), DriverOutcome::Duplicate);
-    }
-
-    #[test]
-    fn d2_busy_driver_rejects_other_claimants_stably() {
-        let mut model = model();
-        assert_eq!(
-            model.apply_driver_state(ClientV2DriverState {
-                holder: Some("cs-1".into()),
-                driver_epoch: 4,
-                can_claim: false,
-            }),
-            DriverOutcome::Applied
-        );
-        assert_eq!(
-            model.apply_driver_state(ClientV2DriverState {
-                holder: Some("cs-2".into()),
-                driver_epoch: 4,
-                can_claim: true,
-            }),
-            DriverOutcome::Conflict
-        );
-        assert!(model.is_driver("cs-1"));
-        assert!(!model.is_driver("cs-2"));
-    }
-
-    #[test]
-    fn d3_handover_rejects_old_epoch_and_same_epoch_conflicts() {
-        let mut model = model();
-        let current = ClientV2DriverState {
-            holder: Some("cs-1".into()),
-            driver_epoch: 4,
-            can_claim: false,
-        };
-        assert_eq!(
-            model.apply_driver_state(current.clone()),
-            DriverOutcome::Applied
-        );
-        assert_eq!(model.apply_driver_state(current), DriverOutcome::Duplicate);
-        assert_eq!(
-            model.apply_driver_state(ClientV2DriverState {
-                holder: Some("cs-2".into()),
-                driver_epoch: 4,
-                can_claim: false,
-            }),
-            DriverOutcome::Conflict
-        );
-        assert_eq!(
-            model.apply_driver_state(ClientV2DriverState {
-                holder: Some("cs-2".into()),
-                driver_epoch: 5,
-                can_claim: false,
-            }),
-            DriverOutcome::Applied
-        );
-        assert!(model.is_driver("cs-2"));
-        assert_eq!(
-            model.apply_driver_state(ClientV2DriverState {
-                holder: Some("cs-1".into()),
-                driver_epoch: 4,
-                can_claim: false,
-            }),
-            DriverOutcome::Stale
-        );
-        assert!(model.is_driver("cs-2"));
     }
 
     #[test]

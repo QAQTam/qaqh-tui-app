@@ -236,7 +236,7 @@ impl App {
     ///
     /// 空输入仍创建一个空会话，行为对齐原来的 Ctrl+N；有输入时不在前端预造
     /// timeline，避免出现“本地临时消息 + 后端回放”双份正文。会话刚开时
-    /// bootstrap / driver seat 可能尚未落地（此时 v2 面只读，直接发送会被
+    /// 权威 bootstrap 可能尚未落地（此时 v2 面只读，直接发送会被
     /// `reject_if_v2_read_only` 拦下），因此就绪即发、未就绪则把文本留在
     /// composer 等就绪信号重试（见 [`App::maybe_autosend_pending_prompt`]）。
     pub(super) fn start_draft_conversation(&mut self) {
@@ -254,7 +254,7 @@ impl App {
     /// 自动发送。
     ///
     /// pending 标记**只在发送真正发生时**消费（[`App::maybe_autosend_pending_prompt`]）：
-    /// 就绪检查未通过时草稿留在 composer、标记保留，等 seat 落地重试。
+    /// 就绪检查未通过时草稿留在 composer、标记保留，等 bootstrap 落地重试。
     pub(super) fn transfer_pending_initial_prompt(&mut self) {
         let Some(text) = self.pending_initial_prompt.clone() else {
             return;
@@ -274,8 +274,8 @@ impl App {
     }
 
     /// 首条草稿的就绪自动发送：仅当目标会话是当前活跃 tab 且 v2 面可写
-    /// （bootstrap/driver seat 已落地）时才真正发送；否则保留 pending 标记与
-    /// composer 文本，等 `D::DriverChanged` 落地后由该处重试。
+    /// （权威 bootstrap 已落地）时才真正发送；否则保留 pending 标记与
+    /// composer 文本，等 bootstrap 落地后由该处重试。
     pub(super) fn maybe_autosend_pending_prompt(&mut self, session_id: &str) {
         if self.pending_initial_prompt.is_none() {
             return;

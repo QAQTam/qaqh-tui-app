@@ -67,21 +67,6 @@ pub fn pending_with_text(
     }
 }
 
-/// driver 段 fixture。
-pub struct DriverFixture {
-    pub holder: Option<String>,
-    pub driver_epoch: u64,
-    pub can_claim: bool,
-}
-
-pub fn driver(holder: &str, driver_epoch: u64, can_claim: bool) -> DriverFixture {
-    DriverFixture {
-        holder: Some(holder.to_string()),
-        driver_epoch,
-        can_claim,
-    }
-}
-
 /// **类型化**的 bootstrap 构造：调用点不必碰 `serde_json`（静态门禁 G2 要求
 /// 展示层与状态机不出现 `serde_json::Value`）。
 pub fn bootstrap_typed(
@@ -91,7 +76,6 @@ pub fn bootstrap_typed(
     cursor_fact_seq: u64,
     state_revision: u64,
     interactions: &[PendingFixture],
-    driver: Option<DriverFixture>,
 ) -> ClientV2Bootstrap {
     let interactions = serde_json::Value::Array(
         interactions
@@ -113,13 +97,6 @@ pub fn bootstrap_typed(
             })
             .collect(),
     );
-    let driver = driver.map(|fixture| {
-        serde_json::json!({
-            "holder": fixture.holder,
-            "driver_epoch": fixture.driver_epoch,
-            "can_claim": fixture.can_claim,
-        })
-    });
     bootstrap_with(
         session_id,
         server_epoch,
@@ -127,7 +104,8 @@ pub fn bootstrap_typed(
         cursor_fact_seq,
         state_revision,
         interactions,
-        driver.unwrap_or(serde_json::Value::Null),
+        // 席位机制已移除：快照 driver 段恒空（wire 字段保留至 v3 清理）。
+        serde_json::Value::Null,
     )
 }
 

@@ -92,14 +92,17 @@ impl App {
             return;
         }
         let (text, attachments) = sess.composer.take();
+        // §6：暂存原草稿——后端在挂起回合期间拒绝普通发送（turn_busy）时，
+        // ack 处理器据此回填 composer，用户不必整段重打。
+        self.last_rejected_send = Some((session_id.clone(), text.clone()));
         sess.pending_user_pin = (!text.is_empty()).then(|| text.clone());
         sess.pinned_user_turn = None;
         sess.scroll.follow = false;
         sess.scroll.offset = 0;
         sess.scroll.tween = None;
-        // 手动发送即视为首屏草稿已处置：清掉自动发送标记，防止 seat 稍后落地
-        // 时对空 composer 触发一次幽灵补发（send_message 对空输入会静默返回，
-        // 标记却会一直挂着）。
+        // 手动发送即视为首屏草稿已处置：清掉自动发送标记，防止 bootstrap 稍后
+        // 落地时对空 composer 触发一次幽灵补发（send_message 对空输入会静默
+        // 返回，标记却会一直挂着）。
         self.pending_initial_prompt = None;
         let content_refs: Vec<ContentRef> = attachments.into_iter().map(|a| a.content).collect();
         self.spawn_api(move |api, tx| async move {
