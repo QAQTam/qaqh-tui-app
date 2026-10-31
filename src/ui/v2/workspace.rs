@@ -15,6 +15,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use crate::app::remote::{RemoteField, RemoteState};
 use crate::app::render_line::edit_window;
 use crate::app::settings::{FieldKind, ROWS, SettingsState};
+use crate::app::timeline_compat::TimelineTurnState;
 use crate::app::{App, Overlay, WorkspaceHit};
 use crate::protocol::ConfigDto;
 use crate::theme::Theme;
@@ -23,7 +24,6 @@ use crate::ui::v2::button::{ButtonState, ButtonVisual};
 use crate::ui::v2::hit::{HitMapBuilder, PointerTarget, line_region, z};
 use crate::ui::v2::route::WorkspaceRoute;
 use crate::ui::v2::transcript::render_transcript;
-use qaqh_client::TimelineTurnState;
 
 pub fn draw(
     f: &mut Frame,
@@ -1090,7 +1090,11 @@ fn account_lines(
     let models = book.models_for(state.kind);
     if !models.is_empty() {
         section(&mut lines, "可用模型（点击切换）");
-        let cur_model = app.config.as_ref().map(|c| c.model.as_str()).unwrap_or_default();
+        let cur_model = app
+            .config
+            .as_ref()
+            .map(|c| c.model.as_str())
+            .unwrap_or_default();
         for (index, opt) in models.iter().enumerate() {
             let is_active = cur_model == opt.value;
             let action = A::SelectModel(index);
@@ -1224,7 +1228,9 @@ fn settings_lines(
         let label_style = if disabled {
             Style::new().fg(theme.text.dim)
         } else if focused {
-            Style::new().fg(theme.text.primary).add_modifier(Modifier::BOLD)
+            Style::new()
+                .fg(theme.text.primary)
+                .add_modifier(Modifier::BOLD)
         } else {
             Style::new().fg(theme.text.secondary)
         };
@@ -1841,7 +1847,7 @@ fn draw_team_roster(
             ),
             Span::styled(
                 format!(" {residency}"),
-                if agent.residency == qaqh_client::ClientV2TeamAgentResidency::Unloaded {
+                if agent.residency == qaqh_client::TeamAgentResidency::Unloaded {
                     Style::new().fg(theme.text.dim)
                 } else {
                     Style::new().fg(theme.accent.assistant)
@@ -2302,10 +2308,10 @@ mod tests {
 
     /// 造一个带两回合的会话（第二回合带一个工具块）。
     fn app_with_turns() -> App {
-        use crate::app::timeline_model::{Block, Round, ToolCard, Turn};
-        use qaqh_client::{
+        use crate::app::timeline_compat::{
             TimelineBlockKind, TimelineBlockState, TimelineToolState, TimelineTurnState,
         };
+        use crate::app::timeline_model::{Block, Round, ToolCard, Turn};
 
         let (mut app, _rx) = App::new_for_test();
         let session_id = "session-history".to_string();
@@ -2472,41 +2478,40 @@ mod tests {
             "root".into(),
             crate::app::session::SessionState::new("root".into()),
         );
-        let snapshot: qaqh_client::ClientV2TeamSnapshot =
-            serde_json::from_value(serde_json::json!({
-                "root_session_id": "root",
-                "agents": [
-                    {
-                        "agent_id": "root",
-                        "agent_path": "/root",
-                        "role": "root",
-                        "status": "running",
-                        "residency": "loaded"
-                    },
-                    {
-                        "agent_id": "child",
-                        "agent_path": "/root/reviewer",
-                        "nickname": "reviewer",
-                        "role": "review",
-                        "status": "running",
-                        "residency": "unloaded",
-                        "parent_agent_path": "/root"
-                    }
-                ],
-                "unread_messages": [
-                    {
-                        "message_id": "msg-1",
-                        "author": "/root",
-                        "recipient": "/root/reviewer",
-                        "task_id": "task-1",
-                        "delivery": "steer",
-                        "created_at_ms": 1
-                    }
-                ],
-                "revision": 3,
-                "last_fact_seq": 9
-            }))
-            .expect("team snapshot");
+        let snapshot: qaqh_client::TeamSnapshot = serde_json::from_value(serde_json::json!({
+            "root_session_id": "root",
+            "agents": [
+                {
+                    "agent_id": "root",
+                    "agent_path": "/root",
+                    "role": "root",
+                    "status": "running",
+                    "residency": "loaded"
+                },
+                {
+                    "agent_id": "child",
+                    "agent_path": "/root/reviewer",
+                    "nickname": "reviewer",
+                    "role": "review",
+                    "status": "running",
+                    "residency": "unloaded",
+                    "parent_agent_path": "/root"
+                }
+            ],
+            "unread_messages": [
+                {
+                    "message_id": "msg-1",
+                    "author": "/root",
+                    "recipient": "/root/reviewer",
+                    "task_id": "task-1",
+                    "delivery": "steer",
+                    "created_at_ms": 1
+                }
+            ],
+            "revision": 3,
+            "last_fact_seq": 9
+        }))
+        .expect("team snapshot");
         app.teams
             .entry("root".into())
             .or_default()

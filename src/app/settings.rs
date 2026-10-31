@@ -43,7 +43,7 @@ pub fn is_account_credential(credential: &str) -> bool {
 /// `{model}` 占位（`:generateContent` / 流式 `:streamGenerateContent`），且鉴权走
 /// `key` **查询参数**而不是 header——所以切到 gemini 时 baseUrl 的含义与前三个
 /// 不同，这正是本表刻意不连带改写 baseUrl 的原因（端点得由用户自己声明对）。
-pub const WIRE_PROTOCOLS: [&str; 4] = ["openai", "responses", "anthropic", "gemini"];
+pub const WIRE_PROTOCOLS: [&str; 4] = ["chat", "responses", "messages", "gemini"];
 
 /// 把**读模型回显的 anywhere 拼写**折回本页词表里的**写模型拼写**。
 ///
@@ -59,10 +59,10 @@ pub const WIRE_PROTOCOLS: [&str; 4] = ["openai", "responses", "anthropic", "gemi
 pub fn wire_daemon_spelling(raw: &str) -> Option<&'static str> {
     match raw.trim().to_ascii_lowercase().as_str() {
         "chat" | "openai" | "openai-compatible" | "chat_completions" | "chat/completions" => {
-            Some("openai")
+            Some("chat")
         }
         "responses" | "openai-responses" => Some("responses"),
-        "messages" | "anthropic" | "claude" => Some("anthropic"),
+        "messages" | "anthropic" | "claude" => Some("messages"),
         "gemini"
         | "google"
         | "generatecontent"
@@ -902,10 +902,10 @@ impl SettingsState {
                     "deepseek_account"
                         if !matches!(
                             self.current_wire(loaded).as_deref(),
-                            Some("openai") | Some("responses")
+                            Some("chat") | Some("responses")
                         ) =>
                     {
-                        self.draft.wire = Some("openai".into());
+                        self.draft.wire = Some("chat".into());
                     }
                     _ => {}
                 }
@@ -1081,7 +1081,7 @@ mod tests {
         let mut payload = serde_json::to_value(ConfigDto::default()).expect("serialize");
         payload["model"] = json!("gpt-5");
         payload["baseUrl"] = json!("https://api.example.com/v1");
-        payload["wire"] = json!("openai");
+        payload["wire"] = json!("chat");
         payload["maxTokens"] = json!(96000);
         payload["contextLength"] = json!(1000000);
         payload["reasoningEffort"] = json!("high");
@@ -1212,7 +1212,7 @@ mod tests {
         st.cycle(Some(&c), -1).unwrap();
         assert_eq!(st.draft.reasoning_effort.as_deref(), Some("high"));
 
-        // wire：四值循环（openai → responses → anthropic → gemini → openai）。
+        // wire：四值循环（chat → responses → messages → gemini → chat）。
         // `gemini` 是 2026-10-08 后端 `Wire::Gemini` 落地后补的第四值；切 wire 仍然
         // **不许**连带改写 baseUrl——目录已退役，任何「顺手填端点」都是凭空发明
         // （gemini 的端点形态还与前三者不同，更不能猜）。
@@ -1220,11 +1220,11 @@ mod tests {
         st.cycle(Some(&c), 1).unwrap();
         assert_eq!(st.draft.wire.as_deref(), Some("responses"));
         st.cycle(Some(&c), 1).unwrap();
-        assert_eq!(st.draft.wire.as_deref(), Some("anthropic"));
+        assert_eq!(st.draft.wire.as_deref(), Some("messages"));
         st.cycle(Some(&c), 1).unwrap();
         assert_eq!(st.draft.wire.as_deref(), Some("gemini"));
         st.cycle(Some(&c), 1).unwrap();
-        assert_eq!(st.draft.wire.as_deref(), Some("openai"));
+        assert_eq!(st.draft.wire.as_deref(), Some("chat"));
         assert_eq!(st.draft.base_url, None, "切 wire 不得落 baseUrl 草稿");
         st.cycle(Some(&c), -1).unwrap();
         assert_eq!(st.draft.wire.as_deref(), Some("gemini"));
@@ -1268,10 +1268,10 @@ mod tests {
         );
     }
 
-    /// 读模型回显**规范名**（`chat`/`messages`），写模型只收**旧拼写**。
+    /// 读写模型都使用后端规范名（`chat`/`messages`）。
     ///
     /// 这条闸的价值不在「能显示」，而在**光标不丢**：不折的话 `position` 落空，
-    /// 用户从 `messages` 点一下就到 `openai`——跨了两个协议却毫无提示。
+    /// 规范值保持在词表中，按键不会意外跳到另一个协议。
     #[test]
     fn canonical_wire_spellings_do_not_reset_the_cycle_cursor() {
         let mut c = cfg();
@@ -1282,8 +1282,8 @@ mod tests {
         };
         assert_eq!(
             st.display(Some(&c), FieldId::Wire),
-            "anthropic",
-            "展示值必须是**写拼写**（按键会写出什么就显示什么）"
+            "messages",
+            "展示值应使用后端规范拼写"
         );
         st.cycle(Some(&c), 1).unwrap();
         assert_eq!(
@@ -1351,7 +1351,7 @@ mod tests {
     /// 凭据来源三档：切换时把 wire 归位，且**不**发明端点；账号档要说明那把键不被使用。
     #[test]
     fn credential_cycle_keeps_wire_compatible_and_flags_the_unused_key() {
-        let c = cfg(); // wire = openai，credential = api_key
+        let c = cfg(); // wire = chat，credential = api_key
         let mut st = SettingsState {
             focus: row_index(FieldId::Credential),
             ..Default::default()
@@ -1369,7 +1369,7 @@ mod tests {
         );
         st.draft.validate().expect("归位后的草稿必须过得去值域校验");
 
-        // 账号额度：当前 anthropic → 必须归位到 chat（写拼写 = openai）。
+        // 账号额度：旧配置的 anthropic → 必须归一并归位到 chat。
         let mut c2 = cfg();
         c2.wire = "anthropic".into();
         let mut st2 = SettingsState {
@@ -1379,7 +1379,7 @@ mod tests {
         st2.draft.credential = Some("chatgpt_plan".into());
         st2.cycle(Some(&c2), 1).unwrap();
         assert_eq!(st2.draft.credential.as_deref(), Some("deepseek_account"));
-        assert_eq!(st2.draft.wire.as_deref(), Some("openai"));
+        assert_eq!(st2.draft.wire.as_deref(), Some("chat"));
         assert_eq!(
             st2.draft.base_url.as_deref(),
             Some("https://api.deepseek.com")
@@ -1400,7 +1400,7 @@ mod tests {
         // 回到 BYOK：credential 归一，wire 不动（它已经是合法的 chat 了）。
         st2.cycle(Some(&c2), 1).unwrap();
         assert_eq!(st2.draft.credential.as_deref(), Some("api_key"));
-        assert_eq!(st2.draft.wire.as_deref(), Some("openai"));
+        assert_eq!(st2.draft.wire.as_deref(), Some("chat"));
     }
 
     /// 后端 2026-10-09 新开的两个可写字段：`exec.defaultShell` 与

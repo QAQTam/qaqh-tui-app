@@ -124,7 +124,7 @@ mod tests {
     /// 解析层，让它在这一轮就变红。
     #[test]
     fn compact_transient_frames_wire_vocabulary_is_locked() {
-        use qaqh_client::{ClientV2CompactStatus, ClientV2ConversationDelta as D};
+        use qaqh_client::fact::{CompactStatus, ConversationDelta as D};
 
         let started: D = serde_json::from_value(serde_json::json!({
             "kind": "compact_started",
@@ -164,7 +164,7 @@ mod tests {
         .expect("CompactFinished 缺可选字段仍须可解析");
         match finished {
             D::CompactFinished { status, .. } => {
-                assert_eq!(status, ClientV2CompactStatus::Cancelled)
+                assert_eq!(status, CompactStatus::Cancelled)
             }
             other => panic!("compact_finished 的 wire 形状变了：{other:?}"),
         }
@@ -196,7 +196,7 @@ mod tests {
     /// 取 `SessionMeta.usage_totals`——两条源都要有闸。
     #[test]
     fn per_turn_usage_and_session_totals_are_the_only_two_sources() {
-        use qaqh_client::ClientV2ConversationDelta as D;
+        use qaqh_client::ConversationDelta as D;
         let finished: D = serde_json::from_value(serde_json::json!({
             "kind": "turn_finished",
             "data": {
@@ -269,11 +269,11 @@ mod tests {
         //     `wire` + `contextLength`——协议由用户声明，词表与值域都得由
         //     权威 crate 兜住，本仓不另立第二张表。
         let wire = ConfigPatch {
-            wire: Some("anthropic".into()),
+            wire: Some("messages".into()),
             ..Default::default()
         };
-        wire.validate().expect("anthropic 是合法 wire");
-        assert_eq!(serde_json::to_value(&wire).unwrap()["wire"], "anthropic");
+        wire.validate().expect("messages 是合法 wire");
+        assert_eq!(serde_json::to_value(&wire).unwrap()["wire"], "messages");
         // 2026-10-19 后端 R3：写侧也收**规范名**（`chat` / `messages`），且判定前
         // 先 trim。于是旧反例 `"responses "` 现在合法（折回 responses）——反例换成
         // 真正无法归一化的拼写，免得这条闸门变成「测一个已经不存在的行为」。
@@ -308,7 +308,7 @@ mod tests {
         // 1c) 第四值 `gemini`（2026-10-08 后端 `Wire::Gemini`）：设置页的循环表
         //     `[&str; 4]` 必须与这里的值域同源——少一个值就是「循环里选不到」，
         //     多一个值就是「保存被 validate 拒」。
-        for word in ["openai", "responses", "anthropic", "gemini"] {
+        for word in ["chat", "responses", "messages", "gemini"] {
             let patch = ConfigPatch {
                 wire: Some(word.into()),
                 ..Default::default()
@@ -363,12 +363,12 @@ mod tests {
         let mut payload = serde_json::to_value(ConfigDto::default()).expect("serialize");
         payload["mcp"]["enabled"] = serde_json::json!(true);
         payload["lsp"]["idleShutdownSecs"] = serde_json::json!(600);
-        payload["wire"] = serde_json::json!("anthropic");
+        payload["wire"] = serde_json::json!("messages");
         payload["contextLength"] = serde_json::json!(1_000_000);
         let dto: ConfigDto = serde_json::from_value(payload).expect("完整载荷必须可解析");
         assert!(dto.mcp.enabled);
         assert_eq!(dto.lsp.idle_shutdown_secs, 600);
-        assert_eq!(dto.wire, "anthropic");
+        assert_eq!(dto.wire, "messages");
         assert_eq!(dto.context_length, 1_000_000);
 
         // 3) 反向闸：**残缺载荷必须失败**。G2 之前这里断言的是相反的行为

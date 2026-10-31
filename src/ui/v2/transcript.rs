@@ -17,11 +17,11 @@ use crate::theme::Theme;
 
 use super::display_tool_name;
 
-/// 思考类别（摘要 / 完整 / 加密 / 已抹除）：显示规则的单一真源在 `qaqh_client`。
-pub use qaqh_client::ReasoningKind;
 /// Path 头部的操作语义（动词事实源）。直接吃权威 wire 类型，本仓不手抄镜像
 /// ——纪律同 protocol/mod.rs。
-pub use qaqh_client::TimelinePathOp as PathOp;
+pub use crate::app::timeline_compat::TimelinePathOp as PathOp;
+/// 思考类别（摘要 / 完整 / 加密 / 已抹除）：显示规则的单一真源在 `qaqh_client`。
+pub use qaqh_client::ReasoningKind;
 const MIN_WIDTH: usize = 20;
 
 /// 工具正文的预览行数（终态）。与三家一致取 3——再多就不是「扫一眼」了。
@@ -96,7 +96,7 @@ impl ToolState {
 /// write→Wrote、patch→Patched、delete→Deleted。没有它，头部只剩
 /// 「改过某个文件」一种说法——改一行、整文件覆盖和删除读起来一样。
 ///
-/// op 用权威 wire 类型 `qaqh_client::TimelinePathOp`（Copy），本仓不手抄镜像
+/// op 用权威 wire 类型 `crate::app::timeline_compat::TimelinePathOp`（Copy），本仓不手抄镜像
 /// ——纪律同 protocol/mod.rs。它没实现 `Hash`，所以这里的 `Hash` derive 全部
 /// 撤除：这些 view 类型从未被哈希过（全仓零使用点），derive 是历史遗留的死
 /// 面——而且 wire 类型缺哪个 trait 都不该倒逼本仓改后端。

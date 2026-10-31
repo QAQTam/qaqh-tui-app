@@ -15,10 +15,10 @@
 //! 的键——后端往快照里加字段时不用回来补 fixture。
 
 use qaqh_client::{
-    Channel, ClientV2Bootstrap, ClientV2ControlState, ClientV2ConversationDelta,
-    ClientV2ConversationState, ClientV2Cursor, ClientV2CursorToken, ClientV2Delivery,
-    ClientV2Event, ClientV2InteractionKind, ClientV2Payload, ClientV2Reset, ClientV2ResetReason,
-    ClientV2StreamKey, ClientV2ToolState, RINGING_SCHEMA, RINGING_V2_VERSION,
+    CanonicalCursor, Channel, ClientV2Bootstrap, ClientV2ControlState, ClientV2ConversationState,
+    ClientV2Event, ClientV2ToolState, ConversationDelta, CursorToken, ProjectionPayload,
+    RINGING_SCHEMA, RINGING_V2_VERSION, RingingV2Delivery, RingingV2InteractionKind,
+    RingingV2ResetReason, RingingV2ResetRequired, RingingV2StreamKey,
 };
 
 /// 未决交互在 fixture 里的最小形状。
@@ -132,7 +132,7 @@ pub fn bootstrap_typed(
 }
 
 /// 权威 audit payload（本仓测试用的「不驱动 UI」载荷）。
-pub fn audit_payload() -> ClientV2Payload {
+pub fn audit_payload() -> ProjectionPayload {
     serde_json::from_value(serde_json::json!({
         "kind": "audit_ref",
         "data": { "audit_seq": 1, "audit_hash": "abc" }
@@ -141,7 +141,7 @@ pub fn audit_payload() -> ClientV2Payload {
 }
 
 /// 权威 interaction kind 的 wire 值（由上游 serde 决定，TUI 不再自己映射）。
-pub fn interaction_kind_wire(kind: ClientV2InteractionKind) -> String {
+pub fn interaction_kind_wire(kind: RingingV2InteractionKind) -> String {
     serde_json::to_value(kind)
         .expect("kind 可序列化")
         .as_str()
@@ -150,7 +150,7 @@ pub fn interaction_kind_wire(kind: ClientV2InteractionKind) -> String {
 }
 
 /// 权威 `ConversationDelta::TurnStarted`（校验 TUI 能直接命名与匹配该变体）。
-pub fn turn_started_delta(turn_id: &str) -> ClientV2ConversationDelta {
+pub fn turn_started_delta(turn_id: &str) -> ConversationDelta {
     serde_json::from_value(serde_json::json!({
         "kind": "turn_started",
         "data": {
@@ -169,7 +169,7 @@ pub fn turn_started_delta(turn_id: &str) -> ClientV2ConversationDelta {
 ///
 /// 函数名与下面的 `"seed"` 键**故意保留 legacy 拼写**——这里测的正是「旧键名
 /// 不再被接受」，把它一起改名会让这条断言失去意义。
-pub fn reset_from_legacy_session_id_key() -> Result<ClientV2Reset, String> {
+pub fn reset_from_legacy_session_id_key() -> Result<RingingV2ResetRequired, String> {
     serde_json::from_value(serde_json::json!({
         "schema": RINGING_SCHEMA,
         "version": RINGING_V2_VERSION,
@@ -181,14 +181,14 @@ pub fn reset_from_legacy_session_id_key() -> Result<ClientV2Reset, String> {
 }
 
 /// snapshot cursor token（`log_id` + `fact_seq` 基线）。
-fn snapshot_cursor(log_id: &str, fact_seq: u64) -> ClientV2CursorToken {
-    ClientV2CursorToken::encode_snapshot(&ClientV2Cursor::snapshot(log_id, fact_seq))
+fn snapshot_cursor(log_id: &str, fact_seq: u64) -> CursorToken {
+    CursorToken::encode_snapshot(&CanonicalCursor::snapshot(log_id, fact_seq))
         .expect("snapshot cursor 可编码")
 }
 
 /// reliable cursor token。
-fn reliable_cursor(log_id: &str, fact_seq: u64, projection_index: u16) -> ClientV2CursorToken {
-    ClientV2CursorToken::encode_reliable(&ClientV2Cursor::new(log_id, fact_seq, projection_index))
+fn reliable_cursor(log_id: &str, fact_seq: u64, projection_index: u16) -> CursorToken {
+    CursorToken::encode_reliable(&CanonicalCursor::new(log_id, fact_seq, projection_index))
         .expect("reliable cursor 可编码")
 }
 
@@ -213,7 +213,7 @@ pub fn bootstrap(
 
 /// 同上，但覆写 `interactions` / `driver` 两段（传 `Value::Null` = 保留基线）。
 ///
-/// `interactions` 是权威 `[ClientV2PendingInteraction]` 的 JSON 形态——
+/// `interactions` 是权威 `[RingingV2PendingInteraction]` 的 JSON 形态——
 /// 传 `#[serde(default)]` 允许的完整形状，不要在调用点抄字段表。
 pub fn bootstrap_with(
     session_id: &str,
@@ -274,7 +274,7 @@ pub struct ReliableEvent {
     pub projection_index: u16,
     pub revision: u64,
     pub ts_ms: Option<u64>,
-    pub payload: ClientV2Payload,
+    pub payload: ProjectionPayload,
 }
 
 impl ReliableEvent {
@@ -284,7 +284,7 @@ impl ReliableEvent {
         log_id: &str,
         fact_seq: u64,
         projection_index: u16,
-        payload: ClientV2Payload,
+        payload: ProjectionPayload,
     ) -> Self {
         Self {
             session_id: session_id.to_string(),
@@ -322,7 +322,7 @@ impl ReliableEvent {
 pub fn ephemeral_event(
     session_id: &str,
     server_epoch: &str,
-    payload: ClientV2Payload,
+    payload: ProjectionPayload,
 ) -> ClientV2Event {
     event_from_json(serde_json::json!({
         "schema": RINGING_SCHEMA,
@@ -341,7 +341,7 @@ pub fn replaceable_event(
     session_id: &str,
     server_epoch: &str,
     revision: u64,
-    payload: ClientV2Payload,
+    payload: ProjectionPayload,
 ) -> ClientV2Event {
     event_from_json(serde_json::json!({
         "schema": RINGING_SCHEMA,
@@ -362,8 +362,8 @@ pub fn reset(
     server_epoch: &str,
     log_id: Option<&str>,
     snapshot_cursor_at: Option<(&str, u64)>,
-    reason: ClientV2ResetReason,
-) -> ClientV2Reset {
+    reason: RingingV2ResetReason,
+) -> RingingV2ResetRequired {
     let cursor = snapshot_cursor_at.map(|(log_id, fact_seq)| snapshot_cursor(log_id, fact_seq));
     serde_json::from_value(serde_json::json!({
         "schema": RINGING_SCHEMA,
@@ -371,10 +371,10 @@ pub fn reset(
         "server_epoch": server_epoch,
         "session_id": session_id,
         "log_id": log_id,
-        "snapshot_cursor": cursor.as_ref().map(ClientV2CursorToken::as_str),
+        "snapshot_cursor": cursor.as_ref().map(CursorToken::as_str),
         "reason": reason,
     }))
-    .expect("权威 ClientV2Reset 可反序列化")
+    .expect("权威 RingingV2ResetRequired 可反序列化")
 }
 
 /// `RingingV2StreamKey::Channel` 的 wire 形态。
@@ -394,11 +394,11 @@ fn event_from_json(value: serde_json::Value) -> ClientV2Event {
 }
 
 /// delivery 的权威取值（用例断言用，避免在测试里重复协议常量）。
-pub fn delivery_of(event: &ClientV2Event) -> ClientV2Delivery {
+pub fn delivery_of(event: &ClientV2Event) -> RingingV2Delivery {
     event.delivery
 }
 
-/// 让 `ClientV2StreamKey` 的构造也经过权威 serde（防止用例手写判别式漂移）。
-pub fn stream_key(channel: Channel) -> ClientV2StreamKey {
+/// 让 `RingingV2StreamKey` 的构造也经过权威 serde（防止用例手写判别式漂移）。
+pub fn stream_key(channel: Channel) -> RingingV2StreamKey {
     serde_json::from_value(stream_key_json(channel)).expect("权威 stream_key 可反序列化")
 }

@@ -47,7 +47,7 @@ impl App {
                 .flat_map(|turn| turn.rounds.iter().rev())
                 .flat_map(|round| round.blocks.iter().rev())
                 .find(|block| {
-                    block.kind == qaqh_client::TimelineBlockKind::Reasoning
+                    block.kind == crate::app::timeline_compat::TimelineBlockKind::Reasoning
                         && !block.text.is_empty()
                 })
                 .map(|block| block.block_id.clone())
@@ -292,7 +292,7 @@ impl App {
             match result {
                 Ok(_) => {
                     // ACK ≠ 完成：轮询 receipt 到终态（对齐 winui，但消费其结果）。
-                    let mut state: Option<ClientV2CommandStatus> = None;
+                    let mut state: Option<RingingV2CommandStatus> = None;
                     for _ in 0..30 {
                         tokio::time::sleep(Duration::from_millis(100)).await;
                         if let Ok(status) = api
@@ -314,7 +314,7 @@ impl App {
                     let _ = tx.send(AppMsg::Action(ActionResult::Receipt {
                         label: "撤销回合",
                         session_id: Some(session_id),
-                        result: Ok(state.unwrap_or(ClientV2CommandStatus {
+                        result: Ok(state.unwrap_or(RingingV2CommandStatus {
                             command_id: String::new(),
                             state: CommandState::Running,
                             payload_fingerprint: String::new(),
@@ -336,54 +336,13 @@ impl App {
     }
 
     pub(super) fn request_rebaseline(&mut self, session_id: &str) {
-        let session_id = session_id.to_owned();
-        self.spawn_api(move |api, tx| async move {
-            let result = api
-                .timeline_page(&session_id, None, crate::runtime::TIMELINE_PAGE_LIMIT)
-                .await
-                .map_err(|e| e.to_string());
-            let _ = tx.send(AppMsg::Action(ActionResult::Rebaseline {
-                session_id,
-                result,
-            }));
-        });
+        self.spawn_bootstrap(session_id.to_owned());
     }
 
     pub fn load_older(&mut self) {
-        let Some(session_id) = self.active_session_id() else {
-            return;
-        };
-        let loading = self
-            .sessions
-            .get(&session_id)
-            .is_some_and(|s| s.loading_older || !s.timeline.has_more);
-        if loading {
-            return;
-        }
-        // 游标 = 本窗口最旧那个回合的**全局序号**。`turn_index` 为 None 时
-        // （实时追加的回合不带序号）说明窗口里没有可当游标的回合，直接放弃。
-        let first_index = self
-            .sessions
-            .get(&session_id)
-            .and_then(|s| s.timeline.turns.first().and_then(|t| t.turn_index));
-        let Some(before) = first_index else { return };
-        if let Some(sess) = self.sessions.get_mut(&session_id) {
-            sess.loading_older = true;
-        }
-        self.spawn_api(move |api, tx| async move {
-            let result = api
-                .timeline_page(
-                    &session_id,
-                    Some(before),
-                    crate::runtime::TIMELINE_PAGE_LIMIT,
-                )
-                .await
-                .map_err(|e| e.to_string());
-            let _ = tx.send(AppMsg::Action(ActionResult::LoadOlder {
-                session_id,
-                result,
-            }));
-        });
+        // The current backend exposes one canonical conversation snapshot and
+        // no legacy timeline paging endpoint. Production snapshots are marked
+        // complete, so the renderer does not offer this action.
     }
 
     // ───────────────────────── 交互响应命令 ─────────────────────────

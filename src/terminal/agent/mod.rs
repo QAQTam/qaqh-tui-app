@@ -28,6 +28,7 @@ use tokio::sync::mpsc;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::app::session::SessionState;
+use crate::app::timeline_compat::TimelineBlockKind;
 use crate::app::{App, AppMsg, ConnPhase, ModalHit, StartupIntent, WorkspaceHit};
 use crate::runtime::{ConnectTarget, RemoteTarget, Runtime, RuntimeMsg};
 use crate::theme::Theme;
@@ -40,7 +41,7 @@ use crate::ui::v2::route::{self, ModalRoute, ScreenRoute};
 use crate::ui::v2::scrollbar::ScrollbarMetrics;
 use crate::ui::v2::transcript::BlockState;
 use crate::ui::v2::workspace;
-use qaqh_client::{ConversationMode, NoticeLevel, TimelineBlockKind};
+use qaqh_client::{ConversationMode, NoticeLevel};
 
 mod fullscreen;
 mod pointer;
@@ -1809,13 +1810,15 @@ mod tests {
     use super::*;
     use crate::app::Overlay;
     use crate::app::session::{PermissionPanel, SessionState};
+    use crate::app::timeline_compat::{
+        TimelineBlock, TimelineBlockKind, TimelineBlockState, TimelineEntry, TimelineEvent,
+    };
     use crate::app::timeline_model::TimelineModel;
     use crate::theme::{ColorSupport, ThemeKind};
     use crate::ui::v2::fullscreen::{FullscreenState, MessageAction, MessageMenu, MessageRole};
     use crate::ui::v2::hit::{AgentTarget, FrameHitMap, HitRegion, PointerTarget, VisualAnchor, z};
     use qaqh_client::{
         PermissionCategory, PermissionRisk, SessionListEntry, SessionMeta, SessionRunStatus,
-        TimelineBlock, TimelineBlockKind, TimelineBlockState, TimelineEntry, TimelineEvent,
     };
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
@@ -2192,7 +2195,7 @@ mod tests {
             3,
             "turn-thinking",
             TimelineEvent::TurnSealed {
-                state: qaqh_client::TimelineTurnState::Completed,
+                state: crate::app::timeline_compat::TimelineTurnState::Completed,
                 failure: None,
             },
         ));
@@ -2219,12 +2222,12 @@ mod tests {
                     state: TimelineBlockState::Sealed,
                     text: String::new(),
                     reasoning_kind: None,
-                    tool: Some(qaqh_client::TimelineTool {
+                    tool: Some(crate::app::timeline_compat::TimelineTool {
                         exit_code: None,
                         completed_at_ms: None,
                         tool_call_id: "call-1".to_string(),
                         name: "exec".to_string(),
-                        state: qaqh_client::TimelineToolState::Succeeded,
+                        state: crate::app::timeline_compat::TimelineToolState::Succeeded,
                         summary: Some("cargo test".to_string()),
                         args_json: None,
                         output: Some("one\ntwo\nthree\nfour\nfive\nsix\nseven\neight".to_string()),
@@ -2256,12 +2259,12 @@ mod tests {
                     state: TimelineBlockState::Sealed,
                     text: String::new(),
                     reasoning_kind: None,
-                    tool: Some(qaqh_client::TimelineTool {
+                    tool: Some(crate::app::timeline_compat::TimelineTool {
                         exit_code: None,
                         completed_at_ms: None,
                         tool_call_id: "call-todo".to_string(),
                         name: "todo_write".to_string(),
-                        state: qaqh_client::TimelineToolState::Succeeded,
+                        state: crate::app::timeline_compat::TimelineToolState::Succeeded,
                         summary: None,
                         args_json: Some(
                             r#"{"items":[
@@ -2345,12 +2348,12 @@ mod tests {
                         state: TimelineBlockState::Sealed,
                         text: String::new(),
                         reasoning_kind: None,
-                        tool: Some(qaqh_client::TimelineTool {
+                        tool: Some(crate::app::timeline_compat::TimelineTool {
                             exit_code: None,
                             completed_at_ms: None,
                             tool_call_id: format!("call-{}", index + 1),
                             name: "read".to_string(),
-                            state: qaqh_client::TimelineToolState::Succeeded,
+                            state: crate::app::timeline_compat::TimelineToolState::Succeeded,
                             summary: None,
                             args_json: None,
                             output: Some(format!("L1: {path}")),
@@ -2359,15 +2362,17 @@ mod tests {
                             progress_truncated: false,
                             progress_stream: None,
                             progress_bytes_total: 0,
-                            display: Some(qaqh_client::TimelineToolDisplay {
+                            display: Some(crate::app::timeline_compat::TimelineToolDisplay {
                                 summary: None,
                                 diff: None,
                                 lines_added: 0,
                                 lines_removed: 0,
-                                header: Some(qaqh_client::TimelineToolHeader::Path {
-                                    path: path.to_string(),
-                                    op: qaqh_client::TimelinePathOp::Read,
-                                }),
+                                header: Some(
+                                    crate::app::timeline_compat::TimelineToolHeader::Path {
+                                        path: path.to_string(),
+                                        op: crate::app::timeline_compat::TimelinePathOp::Read,
+                                    },
+                                ),
                                 body: None,
                                 metrics: None,
                                 outcome: None,
@@ -2467,7 +2472,7 @@ mod tests {
             3,
             "t2",
             TimelineEvent::TurnSealed {
-                state: qaqh_client::TimelineTurnState::Completed,
+                state: crate::app::timeline_compat::TimelineTurnState::Completed,
                 failure: None,
             },
         ));
@@ -2486,7 +2491,7 @@ mod tests {
     }
 
     /// root（会话）+ 一个指定状态的子代理：预览条的数据源是 **roster status**。
-    fn subagent_team_snapshot(status: &str) -> qaqh_client::ClientV2TeamSnapshot {
+    fn subagent_team_snapshot(status: &str) -> qaqh_client::TeamSnapshot {
         serde_json::from_value(serde_json::json!({
             "root_session_id": "session-1",
             "agents": [
@@ -3252,7 +3257,7 @@ mod tests {
             4,
             "turn-1",
             TimelineEvent::TurnSealed {
-                state: qaqh_client::TimelineTurnState::Completed,
+                state: crate::app::timeline_compat::TimelineTurnState::Completed,
                 failure: None,
             },
         ));
@@ -3272,7 +3277,7 @@ mod tests {
         let mut session = app.sessions["session-1"].clone();
         let mut cache = FullscreenTranscriptCache::default();
         assert_lazy_matches_reference(&session, &mut cache, 79);
-        let mut page = qaqh_client::TimelinePage {
+        let mut page = crate::app::timeline_compat::TimelinePage {
             schema: "qaqh.Ringing".into(),
             version: 1,
             server_epoch: "ep".into(),
@@ -3280,18 +3285,18 @@ mod tests {
             has_more: true,
             total_turns: 1,
             truncated_before: false,
-            snapshot: qaqh_client::TimelineSnapshot {
+            snapshot: crate::app::timeline_compat::TimelineSnapshot {
                 watermark: 100,
-                turns: vec![qaqh_client::TimelineTurn {
+                turns: vec![crate::app::timeline_compat::TimelineTurn {
                     turn_id: "turn-1".into(),
                     turn_index: Some(1),
                     created_seq: 1,
                     user_text: "new snapshot prompt".into(),
                     sealed: true,
                     offloaded: false,
-                    state: qaqh_client::TimelineTurnState::Completed,
+                    state: crate::app::timeline_compat::TimelineTurnState::Completed,
                     failure: None,
-                    rounds: vec![qaqh_client::TimelineRound {
+                    rounds: vec![crate::app::timeline_compat::TimelineRound {
                         round_num: 0,
                         sealed: true,
                         is_final: true,
@@ -3323,18 +3328,18 @@ mod tests {
         let mut session = app.sessions["session-1"].clone();
         let mut cache = FullscreenTranscriptCache::default();
         for body in [
-            qaqh_client::TimelineToolBody::Text {
+            crate::app::timeline_compat::TimelineToolBody::Text {
                 text: String::new(),
                 truncated: true,
             },
-            qaqh_client::TimelineToolBody::Streams {
+            crate::app::timeline_compat::TimelineToolBody::Streams {
                 stdout: "out".into(),
                 stderr: "err".into(),
                 exit_code: Some(0),
                 truncated: true,
                 interleaved: false,
             },
-            qaqh_client::TimelineToolBody::Diff {
+            crate::app::timeline_compat::TimelineToolBody::Diff {
                 unified: "diff".into(),
                 files: vec![],
             },

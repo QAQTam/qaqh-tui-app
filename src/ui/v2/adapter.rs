@@ -6,15 +6,15 @@
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
+use crate::app::timeline_compat::{
+    TimelineBlockKind, TimelineBlockState, TimelineToolBody, TimelineToolHeader, TimelineToolState,
+};
 use crate::app::timeline_model::{
     Block, CompactionMark, InFlightCompact, LineStats, TimelineModel, ToolCard, Turn,
 };
 use crate::ui::v2::transcript::{
     BlockId, BlockKind, BlockState, TODO_TOOL_NAME, TodoBlock, ToolBlock, ToolHeader, ToolState,
     ToolStreams, TranscriptBlock,
-};
-use qaqh_client::{
-    TimelineBlockKind, TimelineBlockState, TimelineToolBody, TimelineToolHeader, TimelineToolState,
 };
 pub fn from_turns(turns: &[Turn]) -> Vec<TranscriptBlock> {
     from_turns_with_expanded(turns, &HashSet::new())
@@ -918,7 +918,7 @@ const fn tool_state(state: TimelineToolState) -> ToolState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use qaqh_client::{TimelineFailure, TimelineToolDisplay, TimelineTurnState};
+    use crate::app::timeline_compat::{TimelineFailure, TimelineToolDisplay, TimelineTurnState};
 
     /// `todo_write` 的清单来自入参 `args_json`——服务端输出里只有
     /// `replaced`/`total`/`assigned`/`current_id` 记账，没有清单本身。
@@ -1646,23 +1646,23 @@ mod tests {
     fn path_header_keeps_op_as_verb_fact() {
         for (wire_op, view_op) in [
             (
-                qaqh_client::TimelinePathOp::Edit,
+                crate::app::timeline_compat::TimelinePathOp::Edit,
                 super::super::transcript::PathOp::Edit,
             ),
             (
-                qaqh_client::TimelinePathOp::Write,
+                crate::app::timeline_compat::TimelinePathOp::Write,
                 super::super::transcript::PathOp::Write,
             ),
             (
-                qaqh_client::TimelinePathOp::Patch,
+                crate::app::timeline_compat::TimelinePathOp::Patch,
                 super::super::transcript::PathOp::Patch,
             ),
             (
-                qaqh_client::TimelinePathOp::Delete,
+                crate::app::timeline_compat::TimelinePathOp::Delete,
                 super::super::transcript::PathOp::Delete,
             ),
             (
-                qaqh_client::TimelinePathOp::Read,
+                crate::app::timeline_compat::TimelinePathOp::Read,
                 super::super::transcript::PathOp::Read,
             ),
         ] {
@@ -1794,7 +1794,7 @@ Hint: re-read the file"
             lines_added: 0,
             lines_removed: 0,
             header: None,
-            body: Some(qaqh_client::TimelineToolBody::Shell {
+            body: Some(crate::app::timeline_compat::TimelineToolBody::Shell {
                 output: String::new(),
                 exit_code: Some(7),
                 truncated: false,

@@ -686,7 +686,7 @@ impl App {
 pub(super) fn apply_rejected_ack(
     pending_creates: &mut HashMap<String, Instant>,
     label: &str,
-    ack: &qaqh_client::ClientV2CommandAck,
+    ack: &qaqh_client::RingingV2CommandAck,
     is_create: bool,
 ) -> String {
     let rejected = ack.status == qaqh_client::RingingCommandAckStatus::Rejected;
@@ -714,7 +714,7 @@ pub(super) fn apply_rejected_ack(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use qaqh_client::{ClientV2CommandAck, RingingCommandAckStatus};
+    use qaqh_client::{RingingCommandAckStatus, RingingV2CommandAck};
 
     #[test]
     fn session_refresh_waits_for_both_results_and_backs_off() {
@@ -768,8 +768,8 @@ mod tests {
     // 打穿 `App::handle` 覆盖——两层缺一层就会漏（只测本模块时，把 `mod.rs` 里那行
     // 调用换回旧行为会全绿）。
 
-    fn ack(command_id: &str, status: RingingCommandAckStatus) -> ClientV2CommandAck {
-        ClientV2CommandAck {
+    fn ack(command_id: &str, status: RingingCommandAckStatus) -> RingingV2CommandAck {
+        RingingV2CommandAck {
             command_id: command_id.to_string(),
             status,
             code: Some("rate_limited".into()),
@@ -871,14 +871,14 @@ mod tests {
         );
     }
 
-    fn install_team(app: &mut App, root: &str, snapshot: qaqh_client::ClientV2TeamSnapshot) {
+    fn install_team(app: &mut App, root: &str, snapshot: qaqh_client::TeamSnapshot) {
         app.teams
             .entry(root.into())
             .or_default()
             .replace_from_snapshot(snapshot);
     }
 
-    fn nested_snapshot() -> qaqh_client::ClientV2TeamSnapshot {
+    fn nested_snapshot() -> qaqh_client::TeamSnapshot {
         serde_json::from_value(serde_json::json!({
             "root_session_id": "root",
             "agents": [

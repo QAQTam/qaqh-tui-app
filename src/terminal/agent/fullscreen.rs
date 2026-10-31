@@ -1641,18 +1641,16 @@ mod tests {
     }
 
     fn open_turn(app: &mut App, id: &str, text: &str, seq: u64) {
-        app.sessions
-            .get_mut("layout")
-            .unwrap()
-            .timeline
-            .apply(&qaqh_client::TimelineEntry {
+        app.sessions.get_mut("layout").unwrap().timeline.apply(
+            &crate::app::timeline_compat::TimelineEntry {
                 timeline_seq: seq,
                 turn_id: id.into(),
                 round_num: Some(0),
-                event: qaqh_client::TimelineEvent::TurnOpened {
+                event: crate::app::timeline_compat::TimelineEvent::TurnOpened {
                     user_text: text.into(),
                 },
-            });
+            },
+        );
     }
 
     #[test]
@@ -1708,26 +1706,24 @@ mod tests {
                 .any(|s| s.content.contains("这是刚发送的消息"))
         );
         let first_top = view.visible_start;
-        app.sessions
-            .get_mut("layout")
-            .unwrap()
-            .timeline
-            .apply(&qaqh_client::TimelineEntry {
+        app.sessions.get_mut("layout").unwrap().timeline.apply(
+            &crate::app::timeline_compat::TimelineEntry {
                 timeline_seq: 3,
                 turn_id: "mine".into(),
                 round_num: Some(0),
-                event: qaqh_client::TimelineEvent::BlockOpened {
-                    block: qaqh_client::TimelineBlock {
+                event: crate::app::timeline_compat::TimelineEvent::BlockOpened {
+                    block: crate::app::timeline_compat::TimelineBlock {
                         block_id: "answer".into(),
                         block_order: 0,
                         kind: TimelineBlockKind::Text,
-                        state: qaqh_client::TimelineBlockState::Open,
+                        state: crate::app::timeline_compat::TimelineBlockState::Open,
                         text: "long assistant output\n".repeat(100),
                         tool: None,
                         reasoning_kind: None,
                     },
                 },
-            });
+            },
+        );
         for (width, height) in [(80, 24), (32, 18), (100, 40)] {
             let rendered = render_fullscreen_agent(&app, width, height, &theme, &mut view);
             assert!(
@@ -1805,31 +1801,35 @@ mod tests {
         for i in 0..100 {
             let turn_id = format!("turn-{i}");
             seq += 1;
-            session.timeline.apply(&qaqh_client::TimelineEntry {
-                timeline_seq: seq,
-                turn_id: turn_id.clone(),
-                round_num: Some(0),
-                event: qaqh_client::TimelineEvent::TurnOpened {
-                    user_text: format!("question-{i}"),
-                },
-            });
-            seq += 1;
-            session.timeline.apply(&qaqh_client::TimelineEntry {
-                timeline_seq: seq,
-                turn_id,
-                round_num: Some(0),
-                event: qaqh_client::TimelineEvent::BlockOpened {
-                    block: qaqh_client::TimelineBlock {
-                        block_id: format!("answer-{i}"),
-                        block_order: 0,
-                        kind: TimelineBlockKind::Text,
-                        state: qaqh_client::TimelineBlockState::Open,
-                        text: "a sizeable historical answer\n\n".repeat(20),
-                        tool: None,
-                        reasoning_kind: None,
+            session
+                .timeline
+                .apply(&crate::app::timeline_compat::TimelineEntry {
+                    timeline_seq: seq,
+                    turn_id: turn_id.clone(),
+                    round_num: Some(0),
+                    event: crate::app::timeline_compat::TimelineEvent::TurnOpened {
+                        user_text: format!("question-{i}"),
                     },
-                },
-            });
+                });
+            seq += 1;
+            session
+                .timeline
+                .apply(&crate::app::timeline_compat::TimelineEntry {
+                    timeline_seq: seq,
+                    turn_id,
+                    round_num: Some(0),
+                    event: crate::app::timeline_compat::TimelineEvent::BlockOpened {
+                        block: crate::app::timeline_compat::TimelineBlock {
+                            block_id: format!("answer-{i}"),
+                            block_order: 0,
+                            kind: TimelineBlockKind::Text,
+                            state: crate::app::timeline_compat::TimelineBlockState::Open,
+                            text: "a sizeable historical answer\n\n".repeat(20),
+                            tool: None,
+                            reasoning_kind: None,
+                        },
+                    },
+                });
         }
         let mut cache = FullscreenTranscriptCache::default();
         cache.sync(&session, 79, &theme);
@@ -1841,16 +1841,18 @@ mod tests {
         assert_eq!(previous.len(), 200);
         assert_eq!(cache.materialized_blocks, 200);
         let misses = cache.render_misses;
-        session.timeline.apply(&qaqh_client::TimelineEntry {
-            timeline_seq: seq + 1,
-            turn_id: "turn-99".into(),
-            round_num: Some(0),
-            event: qaqh_client::TimelineEvent::TextDelta {
-                block_id: "answer-99".into(),
-                fragment_seq: 1,
-                delta: "new tail".into(),
-            },
-        });
+        session
+            .timeline
+            .apply(&crate::app::timeline_compat::TimelineEntry {
+                timeline_seq: seq + 1,
+                turn_id: "turn-99".into(),
+                round_num: Some(0),
+                event: crate::app::timeline_compat::TimelineEvent::TextDelta {
+                    block_id: "answer-99".into(),
+                    fragment_seq: 1,
+                    delta: "new tail".into(),
+                },
+            });
         cache.sync(&session, 79, &theme);
         assert_eq!(cache.render_misses, misses + 1);
         assert_eq!(

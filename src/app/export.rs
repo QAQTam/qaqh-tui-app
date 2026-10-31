@@ -8,8 +8,10 @@
 //! （D1 有损客户端纪律）——思考信息以回合头的聚合计数呈现。
 
 use crate::app::session::SessionState;
+use crate::app::timeline_compat::{
+    TimelineBlockKind, TimelineToolBody, TimelineToolState, TimelineTurnState,
+};
 use crate::app::timeline_model::{Block, ToolCard, Turn};
-use qaqh_client::{TimelineBlockKind, TimelineToolBody, TimelineToolState, TimelineTurnState};
 
 /// 渲染整个会话为 Markdown。
 pub(crate) fn export_markdown(sess: &SessionState) -> String {
@@ -140,7 +142,7 @@ fn export_tool(out: &mut String, tool: &ToolCard) {
 
     // header（投影优先）。
     if let Some(h) = d.and_then(|d| d.header.as_ref()) {
-        use qaqh_client::TimelineToolHeader as H;
+        use crate::app::timeline_compat::TimelineToolHeader as H;
         let line = match h {
             H::Path { path, .. } => Some(format!("- 路径：`{path}`")),
             H::Shell { command } => Some(format!("- 命令：`{command}`")),
@@ -278,11 +280,11 @@ fn human_bytes(bytes: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::timeline_model::{Block, Round, ToolCard, Turn};
-    use qaqh_client::{
+    use crate::app::timeline_compat::{
         TimelineBlockState, TimelineFailure, TimelineToolDisplay, TimelineToolState,
         TimelineTurnState,
     };
+    use crate::app::timeline_model::{Block, Round, ToolCard, Turn};
 
     fn block_text(id: &str, order: u32, text: &str) -> Block {
         Block {
@@ -372,7 +374,7 @@ mod tests {
                             diff: None,
                             lines_added: 0,
                             lines_removed: 0,
-                            header: Some(qaqh_client::TimelineToolHeader::Shell {
+                            header: Some(crate::app::timeline_compat::TimelineToolHeader::Shell {
                                 command: "cargo test".into(),
                             }),
                             body: Some(TimelineToolBody::Shell {

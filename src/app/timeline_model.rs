@@ -7,11 +7,11 @@
 
 use std::collections::BTreeMap;
 
-use qaqh_client::ReasoningKind;
-use qaqh_client::{
+use crate::app::timeline_compat::{
     TimelineBlock, TimelineBlockKind, TimelineBlockState, TimelineEntry, TimelineFailure,
     TimelinePage, TimelineTool, TimelineToolState, TimelineTurn, TimelineTurnState,
 };
+use qaqh_client::ReasoningKind;
 
 const MAX_PROGRESS_LEN: usize = 8192;
 const PROGRESS_TAIL_KEEP: usize = 6144;
@@ -204,9 +204,9 @@ pub struct ToolCard {
     /// 契约 §5.1（P2）：进度流标识（"stdout"|"stderr"|"mixed"；未知按 None）。
     pub progress_stream: Option<String>,
     pub failure: Option<TimelineFailure>,
-    pub permission: Option<qaqh_client::TimelineToolPermission>,
+    pub permission: Option<crate::app::timeline_compat::TimelineToolPermission>,
     /// 类型化展示投影（09-18 跨仓契约 §3.3）；None → H16 完整回退旧字段。
-    pub display: Option<qaqh_client::TimelineToolDisplay>,
+    pub display: Option<crate::app::timeline_compat::TimelineToolDisplay>,
     /// 顶层退出码（契约切片 2026-10-03）：runtime 从 display body 提取，
     /// 新数据无需拆 body/JSON 即可拿到。
     pub exit_code: Option<i32>,
@@ -512,7 +512,7 @@ pub struct TimelineModel {
 }
 
 impl TimelineModel {
-    fn bump(&mut self) {
+    pub(crate) fn bump(&mut self) {
         self.version += 1;
     }
 
@@ -649,7 +649,7 @@ impl TimelineModel {
 
     /// 应用一条 timeline 条目（幂等）；返回该条目携带的 turn 终态（若有）。
     pub fn apply(&mut self, entry: &TimelineEntry) -> Option<TurnTerminal> {
-        use qaqh_client::TimelineEvent as E;
+        use crate::app::timeline_compat::TimelineEvent as E;
         let turn_id = entry.turn_id.as_str();
 
         // 流中 usage 采样（后端旁路，发射方自带 ~1s 节流）与 `ToolEstimated` 同族：
@@ -660,7 +660,10 @@ impl TimelineModel {
         // （`app::mod` 写 `sess.usage`）；这条只服务 HUD 表盘的实时刷新，不属于
         // transcript reducer 的状态域，接线在 `app::handle_runtime` 的 timeline 分支
         // （`session::merge_sampled_usage`）。
-        if let E::UsageSampled { .. } = &entry.event {
+        // UsageSampled / ProviderRetrying 都是「渲染层旁路」的瞬态事件：不改
+        // 任何块/回合状态、不进快照，在 reducer 入口直接早退（缺回合也不算
+        // 契约异常，不计入 dropped_missing_turn）。
+        if let E::UsageSampled { .. } | E::ProviderRetrying { .. } = &entry.event {
             return None;
         }
 
@@ -912,7 +915,9 @@ impl TimelineModel {
                 }
             }
             // 上方已早退（HUD 旁路，不进 transcript 状态）。
-            E::UsageSampled { .. } => unreachable!("UsageSampled 在 apply 入口已早退"),
+            E::UsageSampled { .. } | E::ProviderRetrying { .. } => {
+                unreachable!("旁路事件（usage/重试）在 apply 入口已早退")
+            }
             E::BlockSealed { block_id } => {
                 let round_num = entry.round_num.unwrap_or(0);
                 let round = Self::find_round_mut(turn, round_num);
@@ -1023,6 +1028,7 @@ impl TimelineModel {
     }
 
     /// 加载更早的回合（滚动上翻分页）。
+    #[cfg(test)]
     pub fn prepend_older(&mut self, page: &TimelinePage) {
         let older: Vec<Turn> = page
             .snapshot
@@ -1133,7 +1139,7 @@ impl TimelineModel {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use qaqh_client::{TimelineEvent, TimelineToolState, TimelineTurnState};
+    use crate::app::timeline_compat::{TimelineEvent, TimelineToolState, TimelineTurnState};
 
     fn entry(seq: u64, turn: &str, event: TimelineEvent) -> TimelineEntry {
         TimelineEntry {
@@ -1154,7 +1160,7 @@ mod tests {
             has_more: false,
             total_turns: 0,
             truncated_before: false,
-            snapshot: qaqh_client::TimelineSnapshot {
+            snapshot: crate::app::timeline_compat::TimelineSnapshot {
                 watermark: 0,
                 turns: vec![],
             },
@@ -1176,7 +1182,7 @@ mod tests {
             has_more: false,
             total_turns: 0,
             truncated_before: false,
-            snapshot: qaqh_client::TimelineSnapshot {
+            snapshot: crate::app::timeline_compat::TimelineSnapshot {
                 watermark: 0,
                 turns: vec![],
             },
@@ -1187,7 +1193,7 @@ mod tests {
     /// 缺席保持 `None`，绝不用本地时钟兜底。
     #[test]
     fn authoritative_wall_clock_comes_from_the_envelope_and_is_never_faked() {
-        use qaqh_client::TimelineEvent as E;
+        use crate::app::timeline_compat::TimelineEvent as E;
         let mut m = TimelineModel::default();
         m.apply(&entry(
             1,
@@ -1215,7 +1221,7 @@ mod tests {
     /// 信封时间早于 timeline 条目时暂存，回合物化时兑现（两条独立 SSE 的乱序）。
     #[test]
     fn envelope_time_arriving_before_the_turn_is_applied_on_materialization() {
-        use qaqh_client::TimelineEvent as E;
+        use crate::app::timeline_compat::TimelineEvent as E;
         let mut m = TimelineModel::default();
         m.record_turn_time("t-late", Some(42));
         assert!(m.turns.is_empty());
@@ -1233,7 +1239,7 @@ mod tests {
     /// 快照整体替换是权威全量：跨代暂存与压缩锚都必须清除。
     #[test]
     fn snapshot_rebaseline_clears_pending_time_and_compaction_anchors() {
-        use qaqh_client::TimelineEvent as E;
+        use crate::app::timeline_compat::TimelineEvent as E;
         let mut m = TimelineModel::default();
         m.apply(&entry(
             1,
@@ -1264,7 +1270,7 @@ mod tests {
     /// 幂等；锚点回合被淘汰时渲染侧应把分隔条顶到最前。
     #[test]
     fn compaction_anchor_follows_the_last_turn_and_is_idempotent() {
-        use qaqh_client::TimelineEvent as E;
+        use crate::app::timeline_compat::TimelineEvent as E;
         let mut m = TimelineModel::default();
         // 窗口里还没有回合：锚为 None（渲染在顶部）。
         m.record_compaction(1);
@@ -1346,7 +1352,7 @@ mod tests {
     /// 的正文清空——本仓历史上最忌讳的「真吞字」。
     #[test]
     fn incremental_checkpoint_appends_and_never_wipes() {
-        use qaqh_client::TimelineEvent as E;
+        use crate::app::timeline_compat::TimelineEvent as E;
         let mut m = TimelineModel::default();
         m.apply(&entry(
             1,
@@ -1841,7 +1847,7 @@ mod tests {
             has_more: false,
             total_turns: 200,
             truncated_before: true,
-            snapshot: qaqh_client::TimelineSnapshot {
+            snapshot: crate::app::timeline_compat::TimelineSnapshot {
                 watermark: 0,
                 turns: vec![],
             },
@@ -1874,7 +1880,7 @@ mod tests {
             has_more: false,
             total_turns: 1,
             truncated_before: false,
-            snapshot: qaqh_client::TimelineSnapshot {
+            snapshot: crate::app::timeline_compat::TimelineSnapshot {
                 watermark: 0,
                 turns: vec![],
             },
@@ -1905,10 +1911,10 @@ mod tests {
             has_more: false,
             total_turns: 4,
             truncated_before: false,
-            snapshot: qaqh_client::TimelineSnapshot {
+            snapshot: crate::app::timeline_compat::TimelineSnapshot {
                 watermark: 3,
                 turns: (1..=3)
-                    .map(|i| qaqh_client::TimelineTurn {
+                    .map(|i| crate::app::timeline_compat::TimelineTurn {
                         turn_index: None,
                         turn_id: format!("t{i}"),
                         created_seq: i as u64,
@@ -1952,10 +1958,10 @@ mod tests {
             has_more: true,
             total_turns: 60,
             truncated_before: false,
-            snapshot: qaqh_client::TimelineSnapshot {
+            snapshot: crate::app::timeline_compat::TimelineSnapshot {
                 watermark: 3,
                 turns: (11..=21u64)
-                    .map(|i| qaqh_client::TimelineTurn {
+                    .map(|i| crate::app::timeline_compat::TimelineTurn {
                         turn_index: Some(i),
                         turn_id: format!("t{}", i + 1),
                         created_seq: i,
@@ -2475,9 +2481,9 @@ mod tests {
             has_more: false,
             total_turns: 1,
             truncated_before: false,
-            snapshot: qaqh_client::TimelineSnapshot {
+            snapshot: crate::app::timeline_compat::TimelineSnapshot {
                 watermark: 1,
-                turns: vec![qaqh_client::TimelineTurn {
+                turns: vec![crate::app::timeline_compat::TimelineTurn {
                     turn_index: None,
                     turn_id: "t1".into(),
                     created_seq: 1,
@@ -2486,7 +2492,7 @@ mod tests {
                     offloaded: false,
                     state: TimelineTurnState::Completed,
                     failure: None,
-                    rounds: vec![qaqh_client::TimelineRound {
+                    rounds: vec![crate::app::timeline_compat::TimelineRound {
                         round_num: 0,
                         sealed: true,
                         is_final: true,
@@ -2636,9 +2642,9 @@ mod tests {
             has_more: false,
             total_turns: 1,
             truncated_before: false,
-            snapshot: qaqh_client::TimelineSnapshot {
+            snapshot: crate::app::timeline_compat::TimelineSnapshot {
                 watermark: 10,
-                turns: vec![qaqh_client::TimelineTurn {
+                turns: vec![crate::app::timeline_compat::TimelineTurn {
                     turn_index: None,
                     turn_id: "t1".into(),
                     created_seq: 1,
@@ -2647,7 +2653,7 @@ mod tests {
                     offloaded: false,
                     state: TimelineTurnState::Running,
                     failure: None,
-                    rounds: vec![qaqh_client::TimelineRound {
+                    rounds: vec![crate::app::timeline_compat::TimelineRound {
                         round_num: 0,
                         sealed: false,
                         is_final: false,
@@ -2854,9 +2860,9 @@ mod tests {
             has_more: false,
             total_turns: 1,
             truncated_before: false,
-            snapshot: qaqh_client::TimelineSnapshot {
+            snapshot: crate::app::timeline_compat::TimelineSnapshot {
                 watermark: 2,
-                turns: vec![qaqh_client::TimelineTurn {
+                turns: vec![crate::app::timeline_compat::TimelineTurn {
                     turn_index: None,
                     turn_id: "t1".into(),
                     created_seq: 1,
@@ -2931,7 +2937,7 @@ mod tests {
     // ── D1（M2）：seal 丢 reasoning body，聚合计数入回合头 ────
 
     fn reasoning_turn_model() -> TimelineModel {
-        use qaqh_client::TimelineEvent as E;
+        use crate::app::timeline_compat::TimelineEvent as E;
         let mut m = TimelineModel::default();
         m.apply(&entry(
             1,
@@ -2969,7 +2975,7 @@ mod tests {
 
     #[test]
     fn turn_seal_counts_reasoning_and_keeps_body_for_expansion() {
-        use qaqh_client::{TimelineEvent as E, TimelineTurnState};
+        use crate::app::timeline_compat::{TimelineEvent as E, TimelineTurnState};
         let mut m = reasoning_turn_model();
         m.apply(&entry(
             4,
@@ -2997,7 +3003,7 @@ mod tests {
 
     #[test]
     fn rebaseline_replay_discards_idempotently() {
-        use qaqh_client::TimelineTurnState;
+        use crate::app::timeline_compat::TimelineTurnState;
         // 分页/re-baseline 重放：sealed reasoning 经 from_wire 保留 body 并重算计数。
         let wire_turn = TimelineTurn {
             turn_index: Some(1),
@@ -3008,7 +3014,7 @@ mod tests {
             offloaded: false,
             state: TimelineTurnState::Completed,
             failure: None,
-            rounds: vec![qaqh_client::TimelineRound {
+            rounds: vec![crate::app::timeline_compat::TimelineRound {
                 round_num: 0,
                 sealed: true,
                 is_final: true,
@@ -3032,7 +3038,7 @@ mod tests {
             has_more: false,
             total_turns: 1,
             truncated_before: false,
-            snapshot: qaqh_client::TimelineSnapshot {
+            snapshot: crate::app::timeline_compat::TimelineSnapshot {
                 watermark: 1,
                 turns: vec![wire_turn],
             },
@@ -3052,7 +3058,7 @@ mod tests {
 
     #[test]
     fn reopen_resets_thinking_stats() {
-        use qaqh_client::{TimelineEvent as E, TimelineTurnState};
+        use crate::app::timeline_compat::{TimelineEvent as E, TimelineTurnState};
         let mut m = reasoning_turn_model();
         m.apply(&entry(
             4,
@@ -3087,7 +3093,7 @@ mod tests {
     // 未知变体容忍。JSON 形状以契约 §3.3 为准（后端 qaqh-domain 同源类型）。
 
     fn wire_tool(raw: &str) -> ToolCard {
-        let tool: qaqh_client::TimelineTool =
+        let tool: crate::app::timeline_compat::TimelineTool =
             serde_json::from_str(raw).expect("wire fixture 必须可解析");
         ToolCard::from(tool)
     }
@@ -3117,7 +3123,7 @@ mod tests {
     }
 
     fn turn_with_tool(raw_tool: &str) -> Turn {
-        let tool: qaqh_client::TimelineTool =
+        let tool: crate::app::timeline_compat::TimelineTool =
             serde_json::from_str(raw_tool).expect("mock 端点载荷必须可解析");
         let card = ToolCard::from(tool);
         Turn {
@@ -3332,11 +3338,11 @@ mod tests {
         let d = card.display.as_ref().expect("display");
         assert!(matches!(
             d.header,
-            Some(qaqh_client::TimelineToolHeader::Shell { ref command }) if command == "cargo test"
+            Some(crate::app::timeline_compat::TimelineToolHeader::Shell { ref command }) if command == "cargo test"
         ));
         assert!(matches!(
             d.body,
-            Some(qaqh_client::TimelineToolBody::Shell {
+            Some(crate::app::timeline_compat::TimelineToolBody::Shell {
                 exit_code: Some(0),
                 ..
             })
@@ -3362,7 +3368,7 @@ mod tests {
         ));
         assert!(matches!(
             card.display.as_ref().and_then(|d| d.body.as_ref()),
-            Some(qaqh_client::TimelineToolBody::Shell {
+            Some(crate::app::timeline_compat::TimelineToolBody::Shell {
                 truncated: true,
                 exit_code: Some(1),
                 ..
@@ -3385,7 +3391,7 @@ mod tests {
         let card = wire_tool(raw);
         assert!(matches!(
             card.display.as_ref().and_then(|d| d.header.as_ref()),
-            Some(qaqh_client::TimelineToolHeader::Path { path, op }) if path == "src/main.rs" && *op == qaqh_client::TimelinePathOp::Read
+            Some(crate::app::timeline_compat::TimelineToolHeader::Path { path, op }) if path == "src/main.rs" && *op == crate::app::timeline_compat::TimelinePathOp::Read
         ));
     }
 
@@ -3406,9 +3412,12 @@ mod tests {
         let d = card.display.as_ref().expect("display");
         assert!(matches!(
             d.header.as_ref(),
-            Some(qaqh_client::TimelineToolHeader::Other { label }) if label == "mcp__github__list_issues"
+            Some(crate::app::timeline_compat::TimelineToolHeader::Other { label }) if label == "mcp__github__list_issues"
         ));
-        assert!(matches!(d.body, Some(qaqh_client::TimelineToolBody::None)));
+        assert!(matches!(
+            d.body,
+            Some(crate::app::timeline_compat::TimelineToolBody::None)
+        ));
         assert_eq!(
             d.metrics
                 .as_ref()
@@ -3450,11 +3459,11 @@ mod tests {
         let d = card.display.as_ref().expect("display 不丢");
         assert!(matches!(
             d.header,
-            Some(qaqh_client::TimelineToolHeader::Unknown)
+            Some(crate::app::timeline_compat::TimelineToolHeader::Unknown)
         ));
         assert!(matches!(
             d.body,
-            Some(qaqh_client::TimelineToolBody::Unknown)
+            Some(crate::app::timeline_compat::TimelineToolBody::Unknown)
         ));
     }
 }

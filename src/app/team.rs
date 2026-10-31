@@ -8,10 +8,9 @@ use std::collections::BTreeMap;
 
 use super::*;
 use qaqh_client::{
-    ClientV2TeamAgentResidency as Residency, ClientV2TeamAgentSnapshot as Agent,
-    ClientV2TeamAgentStatus as Status, ClientV2TeamDelivery as Delivery,
-    ClientV2TeamDelta as Delta, ClientV2TeamInboxSummary as InboxMessage,
-    ClientV2TeamSnapshot as Snapshot,
+    InterAgentDelivery as Delivery, TeamAgentResidency as Residency, TeamAgentSnapshot as Agent,
+    TeamAgentStatus as Status, TeamDelta as Delta, TeamInboxSummary as InboxMessage,
+    TeamSnapshot as Snapshot,
 };
 
 /// Per-root-session view of the backend Team projection.
@@ -339,12 +338,12 @@ impl App {
     pub(super) fn apply_child_activity_hint(
         &mut self,
         child: &str,
-        activity: qaqh_client::ClientV2ActivityState,
+        activity: qaqh_client::ActivityState,
     ) {
         let status = match activity {
-            qaqh_client::ClientV2ActivityState::Running => Status::Running,
-            qaqh_client::ClientV2ActivityState::Interrupted => Status::Interrupted,
-            qaqh_client::ClientV2ActivityState::Idle => return,
+            qaqh_client::ActivityState::Running => Status::Running,
+            qaqh_client::ActivityState::Interrupted => Status::Interrupted,
+            qaqh_client::ActivityState::Idle => return,
         };
         let Some(root) = self
             .teams

@@ -1801,14 +1801,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "qaqh-agentloop-core"
+version = "2.1.20261031-1"
+dependencies = [
+ "tokio",
+]
+
+[[package]]
 name = "qaqh-client"
-version = "2.0.0"
+version = "2.1.20261031-1"
 dependencies = [
  "bytes",
  "futures-util",
  "log",
  "qaqh-domain",
  "qaqh-ringing",
+ "qaqh-ringing-contract",
  "qaqh-session",
  "qaqh-types",
  "reqwest",
@@ -1824,25 +1832,15 @@ dependencies = [
 
 [[package]]
 name = "qaqh-config-api"
-version = "2.0.0"
+version = "2.1.20261031-1"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "qaqh-domain"
-version = "2.0.0"
+version = "2.1.20261031-1"
 dependencies = [
- "qaqh-types",
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "qaqh-message"
-version = "2.0.0"
-dependencies = [
- "log",
  "qaqh-types",
  "serde",
  "serde_json",
@@ -1850,7 +1848,7 @@ dependencies = [
 
 [[package]]
 name = "qaqh-ringing"
-version = "2.0.0"
+version = "2.1.20261031-1"
 dependencies = [
  "base64 0.22.1",
  "qaqh-domain",
@@ -1859,14 +1857,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "qaqh-ringing-contract"
+version = "2.1.20261031-1"
+dependencies = [
+ "qaqh-ringing",
+ "qaqh-session",
+ "serde",
+]
+
+[[package]]
 name = "qaqh-session"
-version = "2.0.0"
+version = "2.1.20261031-1"
 dependencies = [
  "hex",
  "log",
+ "qaqh-agentloop-core",
  "qaqh-domain",
- "qaqh-message",
- "qaqh-ringing",
  "qaqh-types",
  "serde",
  "serde_json",
@@ -1903,7 +1909,7 @@ dependencies = [
 
 [[package]]
 name = "qaqh-types"
-version = "2.0.0"
+version = "2.1.20261031-1"
 dependencies = [
  "serde",
  "serde_json",

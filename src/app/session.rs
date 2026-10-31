@@ -1,11 +1,12 @@
 //! 单会话状态：timeline 模型、流式相位、挂起交互面板、composer、滚动。
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant};
 
 use crate::app::ringing_v2::RingingV2SessionModel;
+use crate::app::timeline_compat::TimelineBlockKind;
 use crate::app::timeline_model::TimelineModel;
-use qaqh_client::{ConversationMode, TimelineBlockKind};
+use qaqh_client::ConversationMode;
 use serde::Deserialize;
 // 权威类型与 `qaqh-client` 自身类型重名者带 `Domain` 前缀；在本模块内换回本地惯用名，
 // 这样下文的引用点不必逐个改（映射只此一处）。
@@ -519,6 +520,14 @@ pub struct SessionState {
     pub title: Option<String>,
     pub mode: ConversationMode,
     pub timeline: TimelineModel,
+    /// Accepted inputs waiting for their `TurnStarted` association.
+    pub pending_input_text: HashMap<String, String>,
+    /// Bodies fetched from Ringing v2 content refs, keyed by canonical content hash.
+    pub transcript_content: HashMap<String, String>,
+    /// Content refs currently being fetched; prevents duplicate requests on replay.
+    pub pending_transcript_content: HashSet<String>,
+    /// Most recent canonical model round for each active turn.
+    pub current_rounds: HashMap<String, u32>,
     /// bootstrap 的 conversation 快照视图（model）。
     /// conversation 频道快照的**类型化**视图（权威类型，本仓不再手解）；快照里
     /// 其余字段由 `TimelineModel` 与实时事件承担。
@@ -565,9 +574,8 @@ pub struct SessionState {
     pub ready: bool,
     /// 加载更早：in-flight 去重。
     pub loading_older: bool,
-    /// 后台 tab 停流标记：非可见 tab 的 timeline 流被退订以省事件处理，
-    /// 本地模型保持"切走时"的快照；切回由 activate_timeline 的初始快照
-    /// 自动重基线（TimelineRebaseline），无需显式 bootstrap。
+    /// 后台 tab 停流标记：非可见 tab 的 v2 stream 被退订以省事件处理，
+    /// 本地模型保持“切走时”的快照；切回时由 v2 bootstrap 自动重基线。
     /// 由 [`App::sync_tracked`] 单点维护，不要手工赋值。
     pub suspended: bool,
 }
@@ -580,6 +588,10 @@ impl SessionState {
             title: None,
             mode: ConversationMode::Code,
             timeline: TimelineModel::default(),
+            pending_input_text: HashMap::new(),
+            transcript_content: HashMap::new(),
+            pending_transcript_content: HashSet::new(),
+            current_rounds: HashMap::new(),
             conversation: None,
             ringing_v2,
             activity: None,
@@ -694,23 +706,11 @@ impl SessionState {
             || self.pending_plan.is_some()
     }
 
-    /// 当前客户端是否持有 v2 driver seat。
-    pub fn v2_is_driver(&self, client_session_id: Option<&str>) -> bool {
-        client_session_id.is_some_and(|id| self.ringing_v2.is_driver(id))
-    }
-
-    /// 非 driver 的写控制只读；交互应答仍可继续。
-    pub fn v2_is_read_only(&self, client_session_id: Option<&str>) -> bool {
+    /// 只读仅由 reset 状态决定：上游已移除全会话 driver 席位（runtime 对
+    /// `DriverClaim`/`DriverRelease` 一律回 `driver_removed`），sends 不再被
+    /// driver gate；交互应答仍可继续。
+    pub fn v2_is_read_only(&self) -> bool {
         self.ringing_v2.is_read_only()
-            || client_session_id.is_some_and(|id| !self.ringing_v2.is_driver(id))
-    }
-
-    /// 无活跃 holder 时允许发起 canonical driver claim。
-    pub fn v2_can_claim(&self) -> bool {
-        self.ringing_v2
-            .driver()
-            .map(|driver| driver.can_claim)
-            .unwrap_or_else(|| self.ringing_v2.server_epoch().is_some())
     }
 
     /// 状态栏标签（working / waiting / idle…）。
@@ -762,11 +762,11 @@ pub const STREAM_GHOST_GRACE: Duration = Duration::from_secs(2);
 ///
 /// `waiting_user` 不由 activity 表达，而由挂起交互面板（permission / ask /
 /// plan）判定，见 [`SessionState::is_waiting_user`]。
-pub fn activity_from_v2(activity: qaqh_client::ClientV2ActivityState) -> ActivityState {
+pub fn activity_from_v2(activity: qaqh_client::ActivityState) -> ActivityState {
     match activity {
-        qaqh_client::ClientV2ActivityState::Idle => ActivityState::Idle,
-        qaqh_client::ClientV2ActivityState::Running => ActivityState::Working,
-        qaqh_client::ClientV2ActivityState::Interrupted => ActivityState::Disconnected,
+        qaqh_client::ActivityState::Idle => ActivityState::Idle,
+        qaqh_client::ActivityState::Running => ActivityState::Working,
+        qaqh_client::ActivityState::Interrupted => ActivityState::Disconnected,
     }
 }
 
@@ -783,7 +783,7 @@ pub fn conversation_cache_from_v2(
     let mut cache = ConversationState::default();
     let mut usage = None;
     for entry in snapshot.context.iter().rev() {
-        if let qaqh_client::ClientV2ConversationContextKind::AssistantBlock(block) = &entry.kind {
+        if let qaqh_client::ConversationContextKind::AssistantBlock(block) = &entry.kind {
             cache.model = Some(block.model.clone());
             usage = block.usage.clone();
             break;
@@ -803,6 +803,7 @@ pub fn conversation_cache_from_v2(
 /// 「prompt 刚涨、总数还是旧的」这种自相矛盾。
 ///
 /// 返回是否真的有字段变化——调用方据此决定要不要强制重绘（采样 ~1/s，不必帧帧重画）。
+#[cfg(test)]
 pub fn merge_sampled_usage(slot: &mut Option<UsageInfo>, sample: &UsageInfo) -> bool {
     let before = slot.clone();
     let target = slot.get_or_insert_with(UsageInfo::default);
@@ -1047,8 +1048,8 @@ mod tests {
 
     // ───────────── streaming ↔ timeline 收敛（"working 卡死"回归） ─────────────
 
+    use crate::app::timeline_compat::TimelineTurnState;
     use crate::app::timeline_model::Turn;
-    use qaqh_client::TimelineTurnState;
 
     fn turn(id: &str, state: TimelineTurnState) -> Turn {
         Turn {
@@ -1082,8 +1083,10 @@ mod tests {
 
     #[test]
     fn tool_expansion_toggles_only_existing_tool_blocks() {
+        use crate::app::timeline_compat::{
+            TimelineBlockKind, TimelineBlockState, TimelineToolState,
+        };
         use crate::app::timeline_model::{Block, Round, ToolCard};
-        use qaqh_client::{TimelineBlockKind, TimelineBlockState, TimelineToolState};
 
         let mut s = SessionState::new("session".into());
         let mut turn = turn("t1", TimelineTurnState::Running);
@@ -1135,8 +1138,8 @@ mod tests {
 
     #[test]
     fn thinking_expansion_toggles_only_reasoning_blocks() {
+        use crate::app::timeline_compat::{TimelineBlockKind, TimelineBlockState};
         use crate::app::timeline_model::{Block, Round};
-        use qaqh_client::{TimelineBlockKind, TimelineBlockState};
 
         let mut s = SessionState::new("session".into());
         let mut turn = turn("t1", TimelineTurnState::Completed);

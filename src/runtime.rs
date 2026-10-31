@@ -1,12 +1,11 @@
 //! 运行时适配层：`qaqh_client::Client` ↔ 本仓 `RuntimeMsg`。
 //!
-//! T-01 阶段一之后，连接生命周期**不再由本仓实现**——open/续租/重新协商、
-//! 三条频道 SSE 流、per-session_id timeline 流（含 gap 重定基、epoch 重基线、终止帧
-//! 归一、BOM 剥离、退避重连）全部由 `qaqh-client` 承担。本文件只剩三件事：
+//! 连接生命周期**不再由本仓实现**——open/续租/重新协商、per-session v2 stream
+//! （cursor replay、epoch 重基线、退避重连）全部由 `qaqh-client` 承担。本文件只剩三件事：
 //!
 //! 1. 把 `ClientHandlers` 回调转投为本仓既有的 `RuntimeMsg`（app 层因此几乎
 //!    不用改）；
-//! 2. 把 app 维护的 session_id 集合 diff 成 `activate_timeline` / `deactivate_timeline`
+//! 2. 把 app 维护的 session_id 集合 diff 成 `activate_stream` / `deactivate_stream`
 //!    调用；
 //! 3. 订阅 `session_ctx`（epoch/client_session_id）向 app 报告连接相位。
 //!
@@ -23,16 +22,11 @@ use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use qaqh_client::{
-    Client, ClientError, ClientHandlers, ClientOptions, ReconnectReason, TimelineStatus,
-    V2StreamStatus,
+    Client, ClientError, ClientHandlers, ClientOptions, ReconnectReason, V2StreamStatus,
 };
 use tokio::sync::mpsc;
 
 use qaqh_client::ClientV2Event;
-use qaqh_client::{TimelineEntry, TimelinePage};
-
-/// timeline 翻页窗口（`request_rebaseline` / `load_older` 使用）。
-pub const TIMELINE_PAGE_LIMIT: u32 = 60;
 
 /// 「与 daemon 失联」的判据：这么久没有任何频道处于 `Open`。
 ///
@@ -54,20 +48,15 @@ pub const TIMELINE_PAGE_LIMIT: u32 = 60;
 const STALL_AFTER: Duration = Duration::from_secs(20);
 const STALL_TICK: Duration = Duration::from_secs(1);
 
-/// timeline 激活时等 attach 落地的重试窗口（见 `activate_with_attach_retry`）。
+/// v2 stream 激活时等 attach 落地的重试窗口（见 `activate_with_attach_retry`）。
 const ATTACH_RETRY_INTERVAL: Duration = Duration::from_millis(400);
 const ATTACH_RETRY_ATTEMPTS: u32 = 75; // ≈30s
 
-/// 流的身份：三条主频道流 + 每个 session_id 的 timeline 流。
-///
-/// 告警与恢复必须**按流**记账：某条 timeline 流断开的同时另一条频道流恰好重连
-/// 成功，不能把前者的告警当成「一切正常」清掉（反向顺序下文案也会串成后者）。
+/// canonical v2 单流的身份。告警与恢复按 session_id 记账。
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum StreamKey {
     /// 某个 session_id 的 canonical v2 单流（control / conversation / tool / … 全在一条上）。
     V2(String),
-    /// 某个 session_id 的 timeline 流。
-    Timeline(String),
 }
 
 /// 连接相位事件。
@@ -110,16 +99,16 @@ pub enum RuntimeMsg {
     },
     ResetRequired {
         session_id: String,
-        reset: Box<qaqh_client::ClientV2Reset>,
+        reset: Box<qaqh_client::RingingV2ResetRequired>,
     },
+    // Test-only path for the TUI transcript reducer's legacy fixtures. Production
+    // transcript updates come from `V2Event` and `ClientV2Bootstrap`.
+    #[cfg(test)]
     Timeline {
         session_id: String,
-        entry: Box<TimelineEntry>,
+        entry: Box<crate::app::timeline_compat::TimelineEntry>,
     },
-    TimelineRebaseline {
-        session_id: String,
-        page: Box<TimelinePage>,
-    },
+    #[cfg(test)]
     TimelineLost {
         session_id: String,
         /// **结构化**原因：字符串化会抹掉「404 = 会话真的没了」与「超时/网络
@@ -128,11 +117,12 @@ pub enum RuntimeMsg {
     },
 }
 
-/// timeline 流丢失的原因。
+/// v2 stream丢失的原因。
 ///
 /// 只有 [`Self::SessionMissing`] 能证明会话已不存在（服务端 404）；其余一切
 /// （401 租约尚未落地、超时、网络错、流被主动停止）都只说明**这条流**没了，
 /// 会话本身可能还活着。
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TimelineLostReason {
     /// 服务端明确回答「该会话不存在」（HTTP 404）。
@@ -141,15 +131,8 @@ pub enum TimelineLostReason {
     Other(String),
 }
 
+#[cfg(test)]
 impl TimelineLostReason {
-    /// 由 `activate_timeline` 的错误归一。**404 是唯一**的「会话不存在」判据。
-    fn from_client_error(err: &ClientError) -> Self {
-        match err {
-            ClientError::Http { status: 404, .. } => Self::SessionMissing,
-            other => Self::Other(other.to_string()),
-        }
-    }
-
     /// 展示用描述（toast）。
     pub fn describe(&self) -> String {
         match self {
@@ -306,7 +289,7 @@ pub struct Runtime {
     /// 「没有连接也要照跑」的路径走 [`Runtime::client_opt`]。
     client: RwLock<Option<Arc<Client>>>,
     msg_tx: mpsc::UnboundedSender<RuntimeMsg>,
-    /// app 当前跟踪的 session_id 集（重连后据此恢复 timeline 流）。
+    /// app 当前跟踪的 session_id 集（重连后据此恢复 v2 stream）。
     tracked: std::sync::Mutex<HashSet<String>>,
     /// 重建串行化：并发重建会得到两个 Client、两套 SSE 流。
     rebuilding: AtomicBool,
@@ -426,7 +409,7 @@ impl Runtime {
     /// 当前客户端；没有连接时返回 `None`（只有 [`Runtime::stub_for_test`] 会这样）。
     ///
     /// 给「没有连接也要走完」的路径用：`spawn_api`（任务照起，取用连接时才失败）
-    /// 与 [`Runtime::set_tracked_session_ids`]（没有连接就没有 timeline 流可建/可撤）。
+    /// 与 [`Runtime::set_tracked_session_ids`]（没有连接就没有 v2 stream可建/可撤）。
     pub fn client_opt(&self) -> Option<Arc<Client>> {
         self.client.read().expect("client lock").clone()
     }
@@ -487,7 +470,7 @@ impl Runtime {
         let generation = self.generation.load(Ordering::SeqCst);
         tokio::spawn(async move {
             for session_id in to_remove {
-                client.deactivate_timeline(&session_id).await;
+                client.deactivate_stream(&session_id).await;
             }
             for session_id in to_add {
                 activate_with_attach_retry(&client, &session_id, &msg_tx, generation).await;
@@ -501,7 +484,7 @@ impl Runtime {
         }
     }
 
-    /// **手动重连**（T-03）：关掉当前客户端并重建一个，随后恢复跟踪的 timeline。
+    /// **手动重连**（T-03）：关掉当前客户端并重建一个，随后恢复跟踪的 v2 streams。
     ///
     /// 重建会重新读 `daemon.json`（带 pid 判活过滤），所以 daemon 换端口/token、
     /// 甚至没在跑（允许拉起时）都能恢复。失败时保持 `Lost`，用户可再按一次。
@@ -544,7 +527,7 @@ impl Runtime {
             tokio::spawn(watch_session(this, new.clone(), generation));
         }
 
-        // 恢复 timeline：daemon 侧 session_id 归属随旧 client_session_id 一起消失，
+        // 恢复 v2 streams：daemon 侧 session_id 归属随旧 client_session_id 一起消失，
         // 必须重新 attach 才能读 session_id 域（否则一路 401）。app 会由
         // `ConnEvent::Ready` 触发它自己的 attach + bootstrap。
         let session_ids: Vec<String> = self
@@ -564,11 +547,10 @@ impl Runtime {
     }
 }
 
-/// 激活一个 session_id 的 timeline；attach 尚未落地时按 401 重试。
+/// 激活一个 session_id 的 v2 stream；attach 尚未落地时按 401 重试。
 ///
-/// `open_session_tab` 是「发 SessionResume 命令」与「sync_tracked」两条并行的
-/// 路径，激活可能先于 attach 完成——此时 daemon 回 401。旧实现同样以 400ms
-/// 间隔重试直到 attach 落地；这里保留该行为并加一个上限，避免永久重试。
+/// `open_session_tab` 与 `sync_tracked` 两条路径并行，激活可能先于 attach 完成；
+/// 此时按 400ms 间隔重试直到 attach 落地，避免丢掉首次 bootstrap/replay。
 async fn activate_with_attach_retry(
     client: &Client,
     session_id: &str,
@@ -576,17 +558,20 @@ async fn activate_with_attach_retry(
     generation: u64,
 ) {
     for attempt in 0..ATTACH_RETRY_ATTEMPTS {
-        match client.activate_timeline(session_id).await {
-            Ok(_) => return, // 快照经 on_timeline_snapshot 转投 TimelineRebaseline
+        match client.attach(session_id).await {
+            Ok(_) => {
+                client.activate_stream(session_id).await;
+                return;
+            }
             Err(ClientError::Http { status: 401, .. }) if attempt + 1 < ATTACH_RETRY_ATTEMPTS => {
                 tokio::time::sleep(ATTACH_RETRY_INTERVAL).await;
             }
             Err(e) => {
                 let _ = generation;
-                let _ = msg_tx.send(RuntimeMsg::TimelineLost {
-                    session_id: session_id.to_string(),
-                    reason: TimelineLostReason::from_client_error(&e),
-                });
+                let _ = msg_tx.send(RuntimeMsg::Conn(ConnEvent::StreamIssue {
+                    stream: StreamKey::V2(session_id.to_string()),
+                    error: format!("无法 attach 会话 {session_id}: {e}"),
+                }));
                 return;
             }
         }
@@ -741,7 +726,7 @@ fn build_handlers(
         on_v2_reset: {
             let msg_tx = msg_tx.clone();
             Arc::new(
-                move |session_id: String, reset: qaqh_client::ClientV2Reset| {
+                move |session_id: String, reset: qaqh_client::RingingV2ResetRequired| {
                     // reset → app 标记 rebaseline 并重新 bootstrap；旧 UI 状态保留到
                     // 新 bootstrap 校验通过后再由 reducer 原子替换。
                     let _ = msg_tx.send(RuntimeMsg::ResetRequired {
@@ -750,66 +735,6 @@ fn build_handlers(
                     });
                 },
             )
-        },
-        on_timeline_entry: {
-            let msg_tx = msg_tx.clone();
-            // 类型已权威化：不再过桥，回调给的就是 `qaqh_client` 的类型。
-            Arc::new(
-                move |session_id: String, entry: qaqh_client::TimelineEntry| {
-                    let _ = msg_tx.send(RuntimeMsg::Timeline {
-                        session_id,
-                        entry: Box::new(entry),
-                    });
-                },
-            )
-        },
-        on_timeline_status: {
-            let msg_tx = msg_tx.clone();
-            Arc::new(move |status: TimelineStatus| match status {
-                // 流结束（主动停用 / 客户端关闭）**不等于**会话消失：`reason`
-                // 只是流侧描述，故归入 `Other`——app 不会再据此把子代理标 Closed。
-                // 「会话真的没了」只能由 `activate_timeline` 的 404 证明。
-                TimelineStatus::Closed { session_id, reason } => {
-                    let _ = msg_tx.send(RuntimeMsg::TimelineLost {
-                        session_id: session_id.clone(),
-                        reason: TimelineLostReason::Other(format!("timeline 流结束：{reason}")),
-                    });
-                    // 这条 timeline 流到此为止（会话被 GC / 停止跟踪），不会再发
-                    // `Open`：若不在这里撤掉它的告警，那条告警会永久留在账本里。
-                    let _ = msg_tx.send(RuntimeMsg::Conn(ConnEvent::StreamRecovered {
-                        stream: StreamKey::Timeline(session_id),
-                    }));
-                }
-                TimelineStatus::Reconnecting {
-                    session_id,
-                    retry_ms,
-                    reason,
-                    ..
-                } => {
-                    let label = format!("timeline[{session_id}]");
-                    let _ = msg_tx.send(RuntimeMsg::Conn(ConnEvent::StreamIssue {
-                        stream: StreamKey::Timeline(session_id),
-                        error: reconnect_message(&label, reason.as_ref(), retry_ms),
-                    }));
-                }
-                TimelineStatus::Open { session_id, .. } => {
-                    // timeline 重连/重定基成功：撤掉它自己的告警。
-                    let _ = msg_tx.send(RuntimeMsg::Conn(ConnEvent::StreamRecovered {
-                        stream: StreamKey::Timeline(session_id),
-                    }));
-                }
-                _ => {}
-            })
-        },
-        on_timeline_snapshot: {
-            let msg_tx = msg_tx.clone();
-            Arc::new(move |page: qaqh_client::TimelinePage| {
-                let session_id = page.session_id.clone();
-                let _ = msg_tx.send(RuntimeMsg::TimelineRebaseline {
-                    session_id,
-                    page: Box::new(page),
-                });
-            })
         },
     }
 }
@@ -900,57 +825,5 @@ mod tests {
             800,
         );
         assert!(terminated.contains("protocol_version"), "{terminated}");
-    }
-
-    /// timeline 流的告警/恢复也必须按 session_id 记账；被关闭（不再重连）的流要撤销告警，
-    /// 否则那条告警会永久留在 app 的账本里。
-    #[test]
-    fn timeline_events_are_scoped_to_their_session_id() {
-        let (handlers, mut rx) = handlers_and_rx();
-        let a = StreamKey::Timeline("A".into());
-        let b = StreamKey::Timeline("B".into());
-
-        (handlers.on_timeline_status)(TimelineStatus::Reconnecting {
-            session_id: "A".into(),
-            retry_ms: 800,
-            cursor: 1,
-            reason: None,
-        });
-        (handlers.on_timeline_status)(TimelineStatus::Open {
-            session_id: "A".into(),
-            server_epoch: "e1".into(),
-            cursor: 2,
-        });
-        (handlers.on_timeline_status)(TimelineStatus::Closed {
-            session_id: "B".into(),
-            reason: "stopped".into(),
-        });
-
-        let msgs = drain(&mut rx);
-        assert!(
-            msgs.iter().any(|m| is_issue(m, &a)),
-            "A 的重连只标 A：{msgs:?}"
-        );
-        assert!(
-            msgs.iter().any(|m| is_recovered(m, &a)),
-            "A 重连成功必须撤掉 A 自己的告警：{msgs:?}"
-        );
-        assert!(
-            msgs.iter().any(|m| matches!(
-                m,
-                RuntimeMsg::TimelineLost { session_id, .. } if session_id == "B"
-            )),
-            "B 关闭仍要报 TimelineLost：{msgs:?}"
-        );
-        assert!(
-            msgs.iter().any(|m| is_recovered(m, &b)),
-            "B 已停止跟踪、不会再发 Open，必须在这里撤销它的告警：{msgs:?}"
-        );
-        assert!(
-            !msgs
-                .iter()
-                .any(|m| is_recovered(m, &StreamKey::V2("C".into()))),
-            "timeline 事件不得影响频道流的账本：{msgs:?}"
-        );
     }
 }

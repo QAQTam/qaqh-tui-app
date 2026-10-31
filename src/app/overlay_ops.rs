@@ -1,7 +1,7 @@
 //! 覆盖层/首页按键路由（自 app/mod.rs 拆分，行为不变）。
 
 use super::*;
-use qaqh_client::TimelineBlockKind;
+use crate::app::timeline_compat::TimelineBlockKind;
 
 fn move_index(current: usize, count: usize, delta: isize) -> usize {
     if delta < 0 {

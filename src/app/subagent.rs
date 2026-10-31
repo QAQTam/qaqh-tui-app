@@ -50,9 +50,7 @@ impl App {
             .filter(|agent_id| {
                 self.team_for_agent(agent_id)
                     .and_then(|(_, team)| team.agent_by_id(agent_id))
-                    .is_some_and(|agent| {
-                        agent.status == qaqh_client::ClientV2TeamAgentStatus::Running
-                    })
+                    .is_some_and(|agent| agent.status == qaqh_client::TeamAgentStatus::Running)
             })
             .collect()
     }
@@ -208,38 +206,37 @@ mod tests {
         app.tabs.push("root".into());
         app.sessions
             .insert("root".into(), SessionState::new("root".into()));
-        let snapshot: qaqh_client::ClientV2TeamSnapshot =
-            serde_json::from_value(serde_json::json!({
-                "root_session_id": "root",
-                "agents": [
-                    {
-                        "agent_id": "root",
-                        "agent_path": "/root",
-                        "role": "root",
-                        "status": "running",
-                        "residency": "loaded"
-                    },
-                    {
-                        "agent_id": "child",
-                        "agent_path": "/root/child",
-                        "nickname": "child",
-                        "status": "running",
-                        "residency": "loaded",
-                        "parent_agent_path": "/root"
-                    },
-                    {
-                        "agent_id": "grand",
-                        "agent_path": "/root/child/grand",
-                        "status": "completed",
-                        "residency": "unloaded",
-                        "parent_agent_path": "/root/child"
-                    }
-                ],
-                "unread_messages": [],
-                "revision": 1,
-                "last_fact_seq": 1
-            }))
-            .expect("team snapshot");
+        let snapshot: qaqh_client::TeamSnapshot = serde_json::from_value(serde_json::json!({
+            "root_session_id": "root",
+            "agents": [
+                {
+                    "agent_id": "root",
+                    "agent_path": "/root",
+                    "role": "root",
+                    "status": "running",
+                    "residency": "loaded"
+                },
+                {
+                    "agent_id": "child",
+                    "agent_path": "/root/child",
+                    "nickname": "child",
+                    "status": "running",
+                    "residency": "loaded",
+                    "parent_agent_path": "/root"
+                },
+                {
+                    "agent_id": "grand",
+                    "agent_path": "/root/child/grand",
+                    "status": "completed",
+                    "residency": "unloaded",
+                    "parent_agent_path": "/root/child"
+                }
+            ],
+            "unread_messages": [],
+            "revision": 1,
+            "last_fact_seq": 1
+        }))
+        .expect("team snapshot");
         app.teams
             .entry("root".into())
             .or_default()

@@ -25,8 +25,8 @@
 use std::collections::BTreeSet;
 
 use qaqh_client::{
-    ClientV2Bootstrap, ClientV2Delivery, ClientV2DriverState, ClientV2Event, ClientV2Reset,
-    ClientV2ResetReason,
+    ClientV2Bootstrap, ClientV2Event, RingingV2Delivery, RingingV2DriverState,
+    RingingV2ResetReason, RingingV2ResetRequired,
 };
 
 /// reset 原因是否让会话进入只读。
@@ -34,22 +34,22 @@ use qaqh_client::{
 /// **这是 TUI 的展示策略**（没有可写基线就不给写入口），不是 wire 语义；策略
 /// 必须挂在权威枚举上。这里刻意写成**穷尽 match 而不是 `matches!`**：后端将来
 /// 新增 reset reason 时本函数编译失败，逼一次显式决策，而不是默默归入「可写」。
-pub fn reset_is_read_only(reason: ClientV2ResetReason) -> bool {
+pub fn reset_is_read_only(reason: RingingV2ResetReason) -> bool {
     match reason {
-        ClientV2ResetReason::SnapshotMissing | ClientV2ResetReason::UpgradeRequired => true,
-        ClientV2ResetReason::CursorExpired
-        | ClientV2ResetReason::LogIdMismatch
-        | ClientV2ResetReason::UnknownFact
-        | ClientV2ResetReason::ReplayOverflow
-        | ClientV2ResetReason::EpochMismatch
-        | ClientV2ResetReason::CrossSession
-        | ClientV2ResetReason::SnapshotExpired
-        | ClientV2ResetReason::SnapshotHashMismatch
-        | ClientV2ResetReason::StaleWriter
-        | ClientV2ResetReason::ContentQuotaExceeded
-        | ClientV2ResetReason::PerConnectionOverflow
-        | ClientV2ResetReason::ProgressBufferOverflow
-        | ClientV2ResetReason::ActorMailboxOverflow => false,
+        RingingV2ResetReason::SnapshotMissing | RingingV2ResetReason::UpgradeRequired => true,
+        RingingV2ResetReason::CursorExpired
+        | RingingV2ResetReason::LogIdMismatch
+        | RingingV2ResetReason::UnknownFact
+        | RingingV2ResetReason::ReplayOverflow
+        | RingingV2ResetReason::EpochMismatch
+        | RingingV2ResetReason::CrossSession
+        | RingingV2ResetReason::SnapshotExpired
+        | RingingV2ResetReason::SnapshotHashMismatch
+        | RingingV2ResetReason::StaleWriter
+        | RingingV2ResetReason::ContentQuotaExceeded
+        | RingingV2ResetReason::PerConnectionOverflow
+        | RingingV2ResetReason::ProgressBufferOverflow
+        | RingingV2ResetReason::ActorMailboxOverflow => false,
     }
 }
 
@@ -121,12 +121,12 @@ pub struct RingingV2SessionModel {
     last_projection_index: u16,
     state_revision: u64,
     /// 未决交互**只记身份**：正文与 kind 属权威 payload，UI 层直接消费
-    /// `ClientV2PendingInteraction`，这里再存一份就会漏字段（历史缺陷）。
+    /// `RingingV2PendingInteraction`，这里再存一份就会漏字段（历史缺陷）。
     pending_interactions: BTreeSet<String>,
     terminal_interactions: BTreeSet<String>,
-    driver: Option<ClientV2DriverState>,
+    driver: Option<RingingV2DriverState>,
     /// 待处理 reset 的**权威原帧**：保留它才能在新 bootstrap 到达时逐字段校验。
-    reset: Option<ClientV2Reset>,
+    reset: Option<RingingV2ResetRequired>,
 }
 
 impl RingingV2SessionModel {
@@ -146,6 +146,8 @@ impl RingingV2SessionModel {
         }
     }
 
+    /// 生产路径已不再读取 server epoch（driver 席位移除后仅测试断言使用）。
+    #[cfg(test)]
     pub fn server_epoch(&self) -> Option<&str> {
         self.server_epoch.as_deref()
     }
@@ -171,10 +173,12 @@ impl RingingV2SessionModel {
             .is_some_and(|reset| reset_is_read_only(reset.reason))
     }
 
-    pub fn driver(&self) -> Option<&ClientV2DriverState> {
+    pub fn driver(&self) -> Option<&RingingV2DriverState> {
         self.driver.as_ref()
     }
 
+    /// 席位本身已从协议移除，本方法仅服务 reducer 兼容消费的测试断言。
+    #[cfg(test)]
     pub fn is_driver(&self, client_session_id: &str) -> bool {
         self.driver
             .as_ref()
@@ -258,7 +262,7 @@ impl RingingV2SessionModel {
     }
 
     /// 标记 reset；保留旧 UI 状态，直到新 bootstrap 通过校验。
-    pub fn begin_reset(&mut self, reset: &ClientV2Reset) -> bool {
+    pub fn begin_reset(&mut self, reset: &RingingV2ResetRequired) -> bool {
         if reset.session_id != self.session_id {
             return false;
         }
@@ -279,9 +283,9 @@ impl RingingV2SessionModel {
         }
 
         match event.delivery {
-            ClientV2Delivery::Reliable => self.apply_reliable(event),
-            ClientV2Delivery::Replaceable => self.apply_replaceable(event),
-            ClientV2Delivery::Ephemeral => ApplyOutcome::Ephemeral,
+            RingingV2Delivery::Reliable => self.apply_reliable(event),
+            RingingV2Delivery::Replaceable => self.apply_replaceable(event),
+            RingingV2Delivery::Ephemeral => ApplyOutcome::Ephemeral,
         }
     }
 
@@ -381,7 +385,7 @@ impl RingingV2SessionModel {
         }
     }
 
-    pub fn apply_driver_state(&mut self, driver: ClientV2DriverState) -> DriverOutcome {
+    pub fn apply_driver_state(&mut self, driver: RingingV2DriverState) -> DriverOutcome {
         if let Some(current) = &self.driver {
             if driver.driver_epoch < current.driver_epoch {
                 return DriverOutcome::Stale;
@@ -415,14 +419,15 @@ mod tests {
     use super::*;
     use crate::app::v2_fixtures as fx;
     use qaqh_client::{
-        Channel, ClientV2DeltaInteractionKind, ClientV2InteractionKind, ClientV2ResetReason,
+        Channel, RingingV2InteractionKind, RingingV2ResetReason,
+        fact::InteractionKind as FactInteractionKind,
     };
 
     const SESSION: &str = "session-1";
     const EPOCH: &str = "epoch-1";
     const LOG: &str = "log-1";
 
-    fn audit_payload() -> qaqh_client::ClientV2Payload {
+    fn audit_payload() -> qaqh_client::ProjectionPayload {
         fx::audit_payload()
     }
 
@@ -484,13 +489,13 @@ mod tests {
     #[test]
     fn interaction_kind_is_the_authoritative_enum() {
         let kinds = [
-            ClientV2InteractionKind::Permission,
-            ClientV2InteractionKind::Ask,
-            ClientV2InteractionKind::PlanReview,
+            RingingV2InteractionKind::Permission,
+            RingingV2InteractionKind::Ask,
+            RingingV2InteractionKind::PlanReview,
         ];
         assert_eq!(kinds.len(), 3);
         assert_eq!(
-            fx::interaction_kind_wire(ClientV2InteractionKind::PlanReview),
+            fx::interaction_kind_wire(RingingV2InteractionKind::PlanReview),
             "plan",
             "wire 值由权威 serde 承担，TUI 不再自己映射"
         );
@@ -575,7 +580,7 @@ mod tests {
             EPOCH,
             Some("log-2"),
             Some(("log-2", 8)),
-            ClientV2ResetReason::LogIdMismatch,
+            RingingV2ResetReason::LogIdMismatch,
         );
         assert!(model.begin_reset(&reset));
         assert!(model.is_reset_pending());
@@ -595,7 +600,7 @@ mod tests {
             EPOCH,
             Some(LOG),
             Some((LOG, 8)),
-            ClientV2ResetReason::CursorExpired,
+            RingingV2ResetReason::CursorExpired,
         );
         assert!(model.begin_reset(&reset));
         assert!(model.is_reset_pending());
@@ -622,7 +627,7 @@ mod tests {
             EPOCH,
             None,
             None,
-            ClientV2ResetReason::SnapshotMissing,
+            RingingV2ResetReason::SnapshotMissing,
         );
 
         assert!(model.begin_reset(&reset));
@@ -638,30 +643,30 @@ mod tests {
 
     /// reset 只读策略的穷尽映射：每个后端原因都必须有明确归属。
     ///
-    /// 证伪方式：往 `ClientV2ResetReason` 加一个变体而不改 `reset_is_read_only`
+    /// 证伪方式：往 `RingingV2ResetReason` 加一个变体而不改 `reset_is_read_only`
     /// —— 本仓**编译失败**（穷尽 match），而不是默默当成「可写」。
     #[test]
     fn reset_read_only_policy_covers_every_authoritative_reason() {
         for reason in [
-            ClientV2ResetReason::CursorExpired,
-            ClientV2ResetReason::LogIdMismatch,
-            ClientV2ResetReason::UnknownFact,
-            ClientV2ResetReason::UpgradeRequired,
-            ClientV2ResetReason::ReplayOverflow,
-            ClientV2ResetReason::EpochMismatch,
-            ClientV2ResetReason::CrossSession,
-            ClientV2ResetReason::SnapshotMissing,
-            ClientV2ResetReason::SnapshotExpired,
-            ClientV2ResetReason::SnapshotHashMismatch,
-            ClientV2ResetReason::StaleWriter,
-            ClientV2ResetReason::ContentQuotaExceeded,
-            ClientV2ResetReason::PerConnectionOverflow,
-            ClientV2ResetReason::ProgressBufferOverflow,
-            ClientV2ResetReason::ActorMailboxOverflow,
+            RingingV2ResetReason::CursorExpired,
+            RingingV2ResetReason::LogIdMismatch,
+            RingingV2ResetReason::UnknownFact,
+            RingingV2ResetReason::UpgradeRequired,
+            RingingV2ResetReason::ReplayOverflow,
+            RingingV2ResetReason::EpochMismatch,
+            RingingV2ResetReason::CrossSession,
+            RingingV2ResetReason::SnapshotMissing,
+            RingingV2ResetReason::SnapshotExpired,
+            RingingV2ResetReason::SnapshotHashMismatch,
+            RingingV2ResetReason::StaleWriter,
+            RingingV2ResetReason::ContentQuotaExceeded,
+            RingingV2ResetReason::PerConnectionOverflow,
+            RingingV2ResetReason::ProgressBufferOverflow,
+            RingingV2ResetReason::ActorMailboxOverflow,
         ] {
             let expected = matches!(
                 reason,
-                ClientV2ResetReason::SnapshotMissing | ClientV2ResetReason::UpgradeRequired
+                RingingV2ResetReason::SnapshotMissing | RingingV2ResetReason::UpgradeRequired
             );
             assert_eq!(reset_is_read_only(reason), expected, "{reason:?}");
         }
@@ -755,7 +760,7 @@ mod tests {
     fn d1_vacant_seat_claim_is_applied_with_monotonic_epoch() {
         let mut model = model();
         assert!(model.driver().is_none(), "基线快照没有 driver 段");
-        let claimed = ClientV2DriverState {
+        let claimed = RingingV2DriverState {
             holder: Some("cs-1".into()),
             driver_epoch: 4,
             can_claim: false,
@@ -772,7 +777,7 @@ mod tests {
     fn d2_busy_driver_rejects_other_claimants_stably() {
         let mut model = model();
         assert_eq!(
-            model.apply_driver_state(ClientV2DriverState {
+            model.apply_driver_state(RingingV2DriverState {
                 holder: Some("cs-1".into()),
                 driver_epoch: 4,
                 can_claim: false,
@@ -780,7 +785,7 @@ mod tests {
             DriverOutcome::Applied
         );
         assert_eq!(
-            model.apply_driver_state(ClientV2DriverState {
+            model.apply_driver_state(RingingV2DriverState {
                 holder: Some("cs-2".into()),
                 driver_epoch: 4,
                 can_claim: true,
@@ -794,7 +799,7 @@ mod tests {
     #[test]
     fn d3_handover_rejects_old_epoch_and_same_epoch_conflicts() {
         let mut model = model();
-        let current = ClientV2DriverState {
+        let current = RingingV2DriverState {
             holder: Some("cs-1".into()),
             driver_epoch: 4,
             can_claim: false,
@@ -805,7 +810,7 @@ mod tests {
         );
         assert_eq!(model.apply_driver_state(current), DriverOutcome::Duplicate);
         assert_eq!(
-            model.apply_driver_state(ClientV2DriverState {
+            model.apply_driver_state(RingingV2DriverState {
                 holder: Some("cs-2".into()),
                 driver_epoch: 4,
                 can_claim: false,
@@ -813,7 +818,7 @@ mod tests {
             DriverOutcome::Conflict
         );
         assert_eq!(
-            model.apply_driver_state(ClientV2DriverState {
+            model.apply_driver_state(RingingV2DriverState {
                 holder: Some("cs-2".into()),
                 driver_epoch: 5,
                 can_claim: false,
@@ -822,7 +827,7 @@ mod tests {
         );
         assert!(model.is_driver("cs-2"));
         assert_eq!(
-            model.apply_driver_state(ClientV2DriverState {
+            model.apply_driver_state(RingingV2DriverState {
                 holder: Some("cs-1".into()),
                 driver_epoch: 4,
                 can_claim: false,
@@ -853,7 +858,7 @@ mod tests {
             "epoch-2",
             Some("log-2"),
             None,
-            ClientV2ResetReason::CursorExpired,
+            RingingV2ResetReason::CursorExpired,
         )));
 
         let stale = fx::bootstrap(SESSION, EPOCH, LOG, 1, 7);
@@ -885,7 +890,7 @@ mod tests {
             EPOCH,
             Some(LOG),
             Some(("v2.reset.9", 9)),
-            ClientV2ResetReason::CursorExpired,
+            RingingV2ResetReason::CursorExpired,
         )));
 
         let old = fx::bootstrap(SESSION, EPOCH, LOG, 8, 8);
@@ -914,7 +919,7 @@ mod tests {
             EPOCH,
             None,
             None,
-            ClientV2ResetReason::CursorExpired
+            RingingV2ResetReason::CursorExpired
         )));
     }
 
@@ -941,7 +946,7 @@ mod tests {
                 projection_index: 1
             }
         );
-        assert_eq!(fx::delivery_of(&built), ClientV2Delivery::Reliable);
+        assert_eq!(fx::delivery_of(&built), RingingV2Delivery::Reliable);
         assert_eq!(
             built.ts_ms,
             Some(1_759_000_000_123),
@@ -960,12 +965,12 @@ mod tests {
     /// 权威交互 delta 的 kind 名与新状态机无映射层（直接断言枚举可命名即可）。
     #[test]
     fn delta_interaction_kind_is_authoritative() {
-        let _ = ClientV2DeltaInteractionKind::Ask;
+        let _ = FactInteractionKind::Ask;
         // 权威 delta 能被 TUI 直接命名与匹配（不再经 TUI 自己的 kind 枚举）。
         let delta = fx::turn_started_delta("t1");
         assert!(matches!(
             delta,
-            qaqh_client::ClientV2ConversationDelta::TurnStarted { .. }
+            qaqh_client::ConversationDelta::TurnStarted { .. }
         ));
     }
 }
