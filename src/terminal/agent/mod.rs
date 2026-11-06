@@ -41,7 +41,7 @@ use crate::ui::v2::route::{self, ModalRoute, ScreenRoute};
 use crate::ui::v2::scrollbar::ScrollbarMetrics;
 use crate::ui::v2::transcript::BlockState;
 use crate::ui::v2::workspace;
-use qaqh_client::{ConversationMode, NoticeLevel};
+use crate::app::NoticeLevel;
 
 mod fullscreen;
 mod pointer;
@@ -83,9 +83,17 @@ pub async fn run(no_spawn: bool, resume: bool, remote: Option<RemoteTarget>) -> 
             launch_daemon_if_missing: !no_spawn,
         },
     };
-    let runtime = Runtime::start(rt_tx, target)
-        .await
-        .context("连接 daemon 失败")?;
+    let runtime = Runtime::start(rt_tx, target).await.map_err(|error| {
+        // 协议代差（open 426）是「两端版本不匹配」而不是网络故障——
+        // 统一文案会让用户去查网络/防火墙，方向全错。
+        if matches!(error, qaqh_client::ClientError::Negotiation(_)) {
+            anyhow::anyhow!(
+                "协议代差：TUI 与 daemon 的 Ringing 契约版本不匹配（open 被拒）。\n                 请把两端都更新到同一代 backend（qaqh-tui doctor 可看详细拒绝原因）"
+            )
+        } else {
+            anyhow::anyhow!("连接 daemon 失败: {error}")
+        }
+    })?;
 
     let mut app = App::new(runtime.clone(), app_tx.clone());
     app.load_local_settings();
@@ -1534,10 +1542,7 @@ fn status_line(app: &App, width: u16, theme: &Theme) -> Line<'static> {
             optional.push(Span::styled(
                 format!(
                     " · {}",
-                    match session.mode {
-                        ConversationMode::Plan => "plan",
-                        ConversationMode::Code => "code",
-                    }
+                    session.mode.label()
                 ),
                 Style::new().fg(theme.text.dim),
             ));
@@ -1817,9 +1822,8 @@ mod tests {
     use crate::theme::{ColorSupport, ThemeKind};
     use crate::ui::v2::fullscreen::{FullscreenState, MessageAction, MessageMenu, MessageRole};
     use crate::ui::v2::hit::{AgentTarget, FrameHitMap, HitRegion, PointerTarget, VisualAnchor, z};
-    use qaqh_client::{
-        PermissionCategory, PermissionRisk, SessionListEntry, SessionMeta, SessionRunStatus,
-    };
+    use crate::app::session::{PermissionCategory, PermissionRisk};
+    use qaqh_client::{SessionListEntry, SessionMeta, SessionRunStatus};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton};
@@ -2101,8 +2105,8 @@ mod tests {
         session.pending_ask = Some(crate::app::session::AskPanel::new(
             "interaction-1".into(),
             "turn-1".into(),
-            qaqh_client::AskMode::Single,
-            vec![qaqh_client::DomainAskQuestion {
+            crate::app::session::AskMode::Single,
+            vec![crate::app::session::AskQuestion {
                 id: "q1".into(),
                 question: "选哪个？".into(),
                 options: vec!["A".into(), "B".into()],
@@ -2491,7 +2495,7 @@ mod tests {
     }
 
     /// root（会话）+ 一个指定状态的子代理：预览条的数据源是 **roster status**。
-    fn subagent_team_snapshot(status: &str) -> qaqh_client::TeamSnapshot {
+    fn subagent_team_snapshot(status: &str) -> qaqh_ringing_contract::TeamSnapshot {
         serde_json::from_value(serde_json::json!({
             "root_session_id": "session-1",
             "agents": [
@@ -3116,7 +3120,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fullscreen_page_up_requests_older_at_top() {
+    async fn fullscreen_page_up_does_not_paginate_in_v3() {
+        // backend-v3：bootstrap 是完整快照（`has_more` 恒为 false），没有
+        // 历史分页端点——在顶再 PgUp 也只是滚动/夹紧，不得进入加载路径。
         let mut app = app_with_model(model_with_many_sealed_turns(30));
         app.show_workspace = false;
         let theme = test_theme();
@@ -3134,7 +3140,10 @@ mod tests {
 
         view.page_up(&mut app);
 
-        assert!(app.sessions["session-1"].loading_older);
+        assert!(
+            !app.sessions["session-1"].loading_older,
+            "v3 无历史分页：PgUp 不得触发加载更早"
+        );
     }
 
     #[test]
@@ -3621,7 +3630,7 @@ mod tests {
         ];
         app.activity_cache.insert(
             "session-2".into(),
-            qaqh_client::DomainActivityState::Working,
+            qaqh_ringing_contract::fact::ActivityState::Running,
         );
         app.show_workspace = false;
 
@@ -4192,8 +4201,10 @@ mod tests {
     }
 
     /// 菜单与「回到最新」按钮重叠时，菜单必须赢——z 层级而不是绘制顺序决定命中。
+    /// （backend-v3 起该按钮不再出现于生产快照；此处用 fixture 的 has_more 保住
+    /// 命中路径的几何回归，点击后的分页行为已随协议移除。）
     #[tokio::test]
-    async fn load_older_button_is_clickable_and_starts_pagination() {
+    async fn load_older_button_click_keeps_hit_geometry() {
         let mut app = app_with_model(model_with_many_sealed_turns(3));
         app.show_workspace = false;
         {
@@ -4235,8 +4246,8 @@ mod tests {
             &mut view,
         );
         assert!(
-            app.sessions["session-1"].loading_older,
-            "clicking the top entry must start the same pagination path as PgUp"
+            !app.sessions["session-1"].loading_older,
+            "v3 无分页：点击只走 no-op，不得置加载标记"
         );
     }
 

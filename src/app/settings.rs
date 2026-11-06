@@ -1,99 +1,70 @@
 //! 设置页状态（`Overlay::Settings`）：行模型 + 草稿脏字段 + 编辑缓冲。
 //!
-//! 写纪律（镜像后端 `docs/config-revamp-plan.md` 硬性约束）：
-//! - 文本/数值/枚举/开关字段：编辑只累积 [`ConfigPatch`] 脏字段（K3 Merge
-//!   Patch），`s` 一次性 `config.save`——**禁止整包写回**；
-//! - permissionLevel / activeProfile / workspace.mode 是服务端独立写端口，
-//!   不在 Patch 内：回车/数字即时生效（App 层发起 service 调用）；
-//! - apiKey 只进不出：掩码/空 = 保持现值，用户显式输入才写；
+//! 写纪律（对齐 qaqh-electron 的「两套读模型、三个写口」+ 后端 E25/E26 裁定）：
+//! - **应用设置**：文本/数值/枚举/开关字段只累积 [`ConfigPatch`] 脏字段（K3
+//!   Merge Patch），`s` 一次性 `config.save`——禁止整包写回；
+//! - **模型目录**（provider/模型/默认模型）：`provider.*` 与
+//!   `model.selection.set_default` **即时写**（`config_revision` CAS），不进
+//!   config.save 草稿——目录权威是 `provider.list`，不是 ConfigDto；
+//! - permissionLevel 是服务端独立写端口（数字即时生效）；
+//! - apiKey 只进不出（SecretWrite::Set，空 = 保持现值）；
 //! - ConfigChanged 重拉只替换 loaded 快照，脏字段草稿值优先（B5 回声拉回教训）。
 //!
-//! BYOK（2026-10-06 后端 provider 预设目录退役）：设置面就是那六个字段自身
-//! ——`baseUrl` / `wire` / `apiKey` / `model` / `maxTokens` / `contextLength`。
-//! daemon 不再下发 provider/endpoint 目录，协议由用户直接声明（[`WIRE_PROTOCOLS`]），
-//! 切 wire 也**不许**顺手改写 baseUrl——那正是「改 maxTokens 后端点被改回预设」
-//! 那个缺陷的入口，webui 同批删除了 `applyEndpoint()`。
+//! 历史（2026-11-06 v3 对齐）：旧「端点与模型（BYOK）」六字段 + activeProfile
+//! 从 config.save 草稿整体退役——endpoint/协议/密钥/模型定义全部迁入 provider
+//! 目录（`provider.upsert` / `provider.model.upsert`），全局默认模型走
+//! `model.selection.set_default`（不再依赖 default_profile）。
 
 use crate::protocol::{ConfigDto, ConfigPatch, ExecPatch, SubagentPatch};
 
-/// 后端 `validate` 允许的思考强度枚举。
+/// provider 编辑表单的 wire 词表（`qaqh_types::Wire` 的规范 serde 拼写）。
 ///
-/// `ultra` 是 2026-10-14 后端随 `mutil-ai 0.6.0` 放开的一档（`qaqh-config-api`
-/// 的 `patch_validate_*` 里「ultra 曾当非法样本」那条测试同步改了口径）。
-/// 少这一档的后果不是编译错：`config.load` 读回 `"ultra"` 时循环表 `position`
-/// 落空，用户一点方向键就从 ultra 跳到 medium——界面在替他改配置。
-pub const REASONING_EFFORTS: [&str; 6] = ["low", "medium", "high", "xhigh", "max", "ultra"];
-
-/// 凭据来源三档（`qaqh_client::CredentialSource` 的 serde 拼写）。
-///
-/// 这不是"又一个开关"：它就是配置里的 `credential` 本身——换个端（桌面端、
-/// 手改 `config.toml`）看到的是同一件事，不会出现「UI 说开着、daemon 说没开」。
-pub const CREDENTIALS: [&str; 3] = ["api_key", "chatgpt_plan", "deepseek_account"];
-
-/// 是否处于账号额度模式（ChatGPT 套餐 或 DeepSeek 账号）。
-/// 与桌面端 `isAccountCredential` 保持严格同源。
-pub fn is_account_credential(credential: &str) -> bool {
-    matches!(credential.trim(), "chatgpt_plan" | "deepseek_account")
-}
-
-/// BYOK 的四条 wire（`ConfigPatch::validate` 的值域）。provider 目录已退役，
-/// 协议没有可查的表，由用户在设置页直接声明。
-///
-/// `gemini` 是 2026-10-08 后端 `Wire::Gemini` 落地后加的：它的 canonical path 带
-/// `{model}` 占位（`:generateContent` / 流式 `:streamGenerateContent`），且鉴权走
-/// `key` **查询参数**而不是 header——所以切到 gemini 时 baseUrl 的含义与前三个
-/// 不同，这正是本表刻意不连带改写 baseUrl 的原因（端点得由用户自己声明对）。
+/// v3 起这是**目录字段**（`provider.upsert` 的 `wire`），不再是 ConfigPatch 的
+/// 旧拼写值域——规范名直发，无需任何读写侧拼写映射。
 pub const WIRE_PROTOCOLS: [&str; 4] = ["chat", "responses", "messages", "gemini"];
 
-/// 把**读模型回显的 anywhere 拼写**折回本页词表里的**写模型拼写**。
-///
-/// 2026-10-15 起后端 `Wire` 的序列化键换成了官方短名（`chat` / `messages`，
-/// `qaqh-types/src/provider.rs:66-80`），而 `ConfigPatch::validate` 的值域**仍是**
-/// 旧拼写（`qaqh-config-api/src/lib.rs:314`：直发 `chat` = 400 `action_failed`；
-/// 桌面端同一条闸 `settings/patch::wireForDaemon`）。于是读回来是 `chat`、写出去
-/// 必须是 `openai`——两边不一致，必须有一处转换。
-///
-/// 转换放在**读侧**：词表继续只存写模型拼写（出网永远不会带规范名），而循环/
-/// 展示先把读回来的值折进来，`position` 才认得当前值。否则用户点一下方向键，
-/// 界面就从 `messages` 跳到 `openai`——替用户改了配置还看不出来。
-pub fn wire_daemon_spelling(raw: &str) -> Option<&'static str> {
-    match raw.trim().to_ascii_lowercase().as_str() {
-        "chat" | "openai" | "openai-compatible" | "chat_completions" | "chat/completions" => {
-            Some("chat")
-        }
-        "responses" | "openai-responses" => Some("responses"),
-        "messages" | "anthropic" | "claude" => Some("messages"),
-        "gemini"
-        | "google"
-        | "generatecontent"
-        | "generate_content"
-        | "gemini-generate-content" => Some("gemini"),
-        _ => None,
-    }
-}
+/// provider 编辑表单的凭据来源（`qaqh_types::CredentialSource` 的 serde 拼写）。
+pub const CREDENTIALS: [&str; 3] = ["api_key", "chatgpt_plan", "deepseek_account"];
 
 /// 可聚焦字段的稳定标识（行序即 UI 顺序）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FieldId {
-    /// 凭据来源（`api_key` / `chatgpt_plan` / `deepseek_account`）—— BYOK 与
-    /// 账号额度的总开关，排在 BYOK 字段之前。
-    Credential,
     /// 账号登录（`chatgpt_plan` / `deepseek_account` 两档的登录与用量入口）。
     ///
     /// 它是**入口**而不是可编辑值：Enter 打开账号面板，值由
     /// `app::account::AccountBook` 的最近快照给出（`account_summary`）。
     Account,
-    BaseUrl,
-    Wire,
-    Model,
-    ApiKey,
-    MaxTokens,
-    ContextLength,
-    ReasoningEffort,
+    // ── 模型目录（即时写：provider.* / model.selection.set_default）──
+    /// 全局默认模型：←→ 在目录模型间循环，Enter 应用（`set_default`）。
+    DefaultModel,
+    /// 新增模型：目标 provider（←→ 循环已有 provider）。
+    AddModelProvider,
+    /// 新增模型：模型 ID（手填；v3 已删预置目录，ID 由用户声明）。
+    AddModelId,
+    /// 新增模型：上下文窗口（tokens）。
+    AddModelContext,
+    /// 新增模型：单次输出上限（tokens）。
+    AddModelMaxTokens,
+    /// 新增模型：提交（`provider.model.upsert`）。
+    AddModelApply,
+    /// 新增 provider：ID（目录主键，[a-z0-9_-]）。
+    NewProviderId,
+    NewProviderName,
+    NewProviderBaseUrl,
+    /// provider 协议形态（规范名，直发）。
+    NewProviderWire,
+    /// provider 凭据来源。
+    NewProviderCredential,
+    /// provider API Key（SecretWrite::Set；空 = 不设/保持）。
+    NewProviderApiKey,
+    NewProviderApply,
+    /// 删除模型：←→ 循环目录模型；Enter 提交删除（预检默认引用）。
+    DeleteModelSel,
+    DeleteModelApply,
+    // ── 应用设置（config.save 草稿）──
     AutoCompactThreshold,
     SandboxEnabled,
     PermissionLevel,
-    ActiveProfile,
     ExecDefaultShell,
     SessionIdleUnloadSecs,
     SubModel,
@@ -135,64 +106,106 @@ pub struct Row {
 
 pub const ROWS: &[Row] = &[
     Row {
-        id: FieldId::Credential,
-        label: "凭据来源",
-        kind: FieldKind::Enum,
-        section: "凭据来源",
-    },
-    Row {
         id: FieldId::Account,
         label: "账号登录",
         kind: FieldKind::Port,
-        section: "凭据来源",
+        section: "账号",
+    },
+    Row {
+        id: FieldId::DefaultModel,
+        label: "默认模型",
+        kind: FieldKind::Port,
+        section: "模型目录（即时生效）",
+    },
+    Row {
+        id: FieldId::AddModelProvider,
+        label: "└ 目标 provider",
+        kind: FieldKind::Port,
+        section: "模型目录（即时生效）",
+    },
+    Row {
+        id: FieldId::AddModelId,
+        label: "└ 模型 ID",
+        kind: FieldKind::Text,
+        section: "模型目录（即时生效）",
+    },
+    Row {
+        id: FieldId::AddModelContext,
+        label: "└ 上下文窗口",
+        kind: FieldKind::Number,
+        section: "模型目录（即时生效）",
+    },
+    Row {
+        id: FieldId::AddModelMaxTokens,
+        label: "└ 输出上限",
+        kind: FieldKind::Number,
+        section: "模型目录（即时生效）",
+    },
+    Row {
+        id: FieldId::AddModelApply,
+        label: "└ 添加模型 ⏎",
+        kind: FieldKind::Port,
+        section: "模型目录（即时生效）",
+    },
+    Row {
+        id: FieldId::NewProviderId,
+        label: "新 provider ID",
+        kind: FieldKind::Text,
+        section: "模型目录（即时生效）",
+    },
+    Row {
+        id: FieldId::NewProviderName,
+        label: "└ 名称",
+        kind: FieldKind::Text,
+        section: "模型目录（即时生效）",
+    },
+    Row {
+        id: FieldId::NewProviderBaseUrl,
+        label: "└ Base URL",
+        kind: FieldKind::Text,
+        section: "模型目录（即时生效）",
+    },
+    Row {
+        id: FieldId::NewProviderWire,
+        label: "└ wire 协议",
+        kind: FieldKind::Enum,
+        section: "模型目录（即时生效）",
+    },
+    Row {
+        id: FieldId::NewProviderCredential,
+        label: "└ 凭据来源",
+        kind: FieldKind::Enum,
+        section: "模型目录（即时生效）",
+    },
+    Row {
+        id: FieldId::NewProviderApiKey,
+        label: "└ API Key",
+        kind: FieldKind::Secret,
+        section: "模型目录（即时生效）",
+    },
+    Row {
+        id: FieldId::NewProviderApply,
+        label: "└ 保存 provider ⏎",
+        kind: FieldKind::Port,
+        section: "模型目录（即时生效）",
+    },
+    Row {
+        id: FieldId::DeleteModelSel,
+        label: "删除模型",
+        kind: FieldKind::Port,
+        section: "模型目录（即时生效）",
+    },
+    Row {
+        id: FieldId::DeleteModelApply,
+        label: "└ 确认删除 ⏎",
+        kind: FieldKind::Port,
+        section: "模型目录（即时生效）",
     },
     Row {
         id: FieldId::PerformanceMode,
         label: "渲染",
         kind: FieldKind::Enum,
         section: "TUI 本地（不发送 daemon）",
-    },
-    Row {
-        id: FieldId::BaseUrl,
-        label: "Base URL",
-        kind: FieldKind::Text,
-        section: "端点与模型（BYOK）",
-    },
-    Row {
-        id: FieldId::Wire,
-        label: "wire 协议",
-        kind: FieldKind::Enum,
-        section: "端点与模型（BYOK）",
-    },
-    Row {
-        id: FieldId::Model,
-        label: "模型",
-        kind: FieldKind::Text,
-        section: "端点与模型（BYOK）",
-    },
-    Row {
-        id: FieldId::ApiKey,
-        label: "API Key",
-        kind: FieldKind::Secret,
-        section: "端点与模型（BYOK）",
-    },
-    Row {
-        id: FieldId::MaxTokens,
-        label: "maxTokens",
-        kind: FieldKind::Number,
-        section: "生成参数",
-    },
-    Row {
-        id: FieldId::ContextLength,
-        label: "contextLength",
-        kind: FieldKind::Number,
-        section: "生成参数",
-    },
-    Row {
-        id: FieldId::ReasoningEffort,
-        label: "思考强度",
-        kind: FieldKind::Enum,
-        section: "生成参数",
     },
     Row {
         id: FieldId::AutoCompactThreshold,
@@ -209,12 +222,6 @@ pub const ROWS: &[Row] = &[
     Row {
         id: FieldId::PermissionLevel,
         label: "权限级别",
-        kind: FieldKind::Port,
-        section: "运行时",
-    },
-    Row {
-        id: FieldId::ActiveProfile,
-        label: "Profile",
         kind: FieldKind::Port,
         section: "运行时",
     },
@@ -290,31 +297,72 @@ pub struct EditBuffer {
 }
 
 /// 设置页 UI 状态。随 `Overlay::Settings` 持有，Esc 关闭即丢弃草稿（取消）。
+///
+/// 目录分区**没有草稿**：provider/model/默认模型全部即时写（`config_revision`
+/// CAS），Esc 取消不了已生效的目录变更——与 electron 的 `registry.perform()`
+/// 同一口径。
 #[derive(Debug, Clone, Default)]
 pub struct SettingsState {
     pub focus: usize,
     pub editing: Option<EditBuffer>,
-    /// 脏字段累积器（K3：只发改过的字段）。
+    /// 脏字段累积器（K3：只发改过的字段）——**只承载应用设置**。
     pub draft: ConfigPatch,
     /// 与协议 ConfigPatch 分离，本机配置永不序列化进 daemon 写请求。
     pub local_loaded: crate::local_config::LocalConfig,
     pub performance_draft: Option<bool>,
-    /// Profile 端口的候选名（None = 展示服务端现值）。
-    pub profile_sel: Option<String>,
     /// 「账号登录」行的一行摘要。
-    ///
-    /// 由 App 在打开设置页与账号结果到达时写入（与 `profile_sel` 同款：设置页
-    /// 不自己发请求，也就不可能因为「忘了刷」而显示过期状态）。
     pub account_summary: String,
-    /// 账号档的模型目录（`siwc.models` / `dsaccount.models`）。
-    ///
-    /// 非空时 model 行用 ←→ 在目录里切换；空表（BYOK / 目录还没取回）退回自由文本。
-    /// 目录**按档隔离**，换档时必须重取（见 `account_ops::apply_account_models`）。
-    pub model_options: Vec<crate::app::account::ModelOption>,
-    /// 用户自由滚动偏移（滚轮/PgUp/PgDn 调整）。焦点移动时自动跟随焦点行，
-    /// 其余时候尊重用户的视口——旧实现只能「跟随焦点滚」，顶部内容在焦点
-    /// 位于底部行时永远不可见。
+    /// provider 目录快照（`provider.list`）。App 在打开设置页与目录更新时写入；
+    /// 目录分区的循环候选与展示全部读它。
+    pub catalog: crate::app::session::ProviderCatalog,
+    /// 目录分区的循环/编辑状态（与 ConfigPatch 草稿彻底隔离）。
+    pub catalog_draft: CatalogDraft,
+    /// 用户自由滚动偏移（滚轮/PgUp/PgDn 调整）。
     pub scroll: usize,
+}
+
+/// 模型目录分区的编辑缓冲（即时写，不经 config.save）。
+#[derive(Debug, Clone, Default)]
+pub struct CatalogDraft {
+    /// 「新增模型」目标 provider（None = 目录第一个）。
+    pub add_model_provider: Option<String>,
+    pub add_model_id: String,
+    pub add_model_context: Option<u64>,
+    pub add_model_max_tokens: Option<u64>,
+    pub new_provider_id: String,
+    pub new_provider_name: String,
+    pub new_provider_base_url: String,
+    /// None = 展示 `chat`（wire 缺省值）。
+    pub new_provider_wire: Option<String>,
+    /// None = 展示 `api_key`。
+    pub new_provider_credential: Option<String>,
+    /// 空提交 = 保持/不设密钥（SecretWrite::Keep 语义由 apply 侧决定）。
+    pub new_provider_api_key: String,
+    /// 「删除模型」循环状态（"provider/model"）。
+    pub delete_model_sel: Option<String>,
+    /// 「默认模型」循环状态（"provider/model"）；None = 展示目录现值。
+    pub default_model_sel: Option<String>,
+}
+
+impl CatalogDraft {
+    /// 新增模型的目标 provider（缓冲优先，回落目录第一个）。
+    pub fn add_model_target(&self, catalog: &crate::app::session::ProviderCatalog) -> Option<String> {
+        if let Some(p) = &self.add_model_provider {
+            return Some(p.clone());
+        }
+        catalog.providers.keys().next().cloned()
+    }
+
+    /// 「删除模型」的候选列表（"provider/model" 字符串）。
+    pub fn delete_candidates(catalog: &crate::app::session::ProviderCatalog) -> Vec<String> {
+        let mut out = Vec::new();
+        for (provider_id, entry) in &catalog.providers {
+            for model_id in entry.models.keys() {
+                out.push(format!("{provider_id}/{model_id}"));
+            }
+        }
+        out
+    }
 }
 
 impl SettingsState {
@@ -355,6 +403,8 @@ impl SettingsState {
     }
 
     /// 当前字段是否已有未保存草稿值。
+    ///
+    /// 目录分区全部**即时写**，永远没有草稿——返回 false 是语义（不是偷懒）。
     pub fn dirty(&self, id: FieldId) -> bool {
         match id {
             FieldId::SandboxEnabled => self
@@ -363,14 +413,6 @@ impl SettingsState {
                 .as_ref()
                 .is_some_and(|s| s.enabled.is_some()),
             FieldId::PerformanceMode => self.performance_draft.is_some(),
-            FieldId::Credential => self.draft.credential.is_some(),
-            FieldId::BaseUrl => self.draft.base_url.is_some(),
-            FieldId::Wire => self.draft.wire.is_some(),
-            FieldId::Model => self.draft.model.is_some(),
-            FieldId::ApiKey => self.draft.api_key.is_some(),
-            FieldId::MaxTokens => self.draft.max_tokens.is_some(),
-            FieldId::ContextLength => self.draft.context_length.is_some(),
-            FieldId::ReasoningEffort => self.draft.reasoning_effort.is_some(),
             FieldId::AutoCompactThreshold => self.draft.auto_compact_threshold.is_some(),
             FieldId::ExecDefaultShell => self
                 .draft
@@ -399,50 +441,42 @@ impl SettingsState {
                     _ => false,
                 }
             }
-            // 端口字段即时生效，无草稿。
-            FieldId::PermissionLevel | FieldId::ActiveProfile | FieldId::Account => false,
+            // 端口字段与目录分区即时生效，无草稿。
+            FieldId::PermissionLevel
+            | FieldId::Account
+            | FieldId::DefaultModel
+            | FieldId::AddModelProvider
+            | FieldId::AddModelId
+            | FieldId::AddModelContext
+            | FieldId::AddModelMaxTokens
+            | FieldId::AddModelApply
+            | FieldId::NewProviderId
+            | FieldId::NewProviderName
+            | FieldId::NewProviderBaseUrl
+            | FieldId::NewProviderWire
+            | FieldId::NewProviderCredential
+            | FieldId::NewProviderApiKey
+            | FieldId::NewProviderApply
+            | FieldId::DeleteModelSel
+            | FieldId::DeleteModelApply => false,
         }
     }
 
-    /// 当前生效的凭据来源（草稿优先；两边都没有/空串 = 后端缺省 `api_key`）。
+    /// 当前生效的凭据来源（读模型；v3 起这是只读展示——provider 目录接管凭据）。
     ///
-    /// 空串要折成 `api_key`：`ConfigDto::default()` 就是这个形状，而真实 daemon
-    /// 永远显式下发三值之一——把 `""` 当成"第三种状态"会让下面的「这把 key 用不用」
-    /// 判断在没有 `config.load` 的路径上（测试、未连通）翻转。
+    /// 空串要折成 `api_key`：`ConfigDto::default()` 就是这个形状。
     pub fn effective_credential(&self, loaded: Option<&ConfigDto>) -> String {
-        self.draft
-            .credential
-            .clone()
-            .or_else(|| loaded.map(|c| c.credential.clone()))
+        loaded
+            .map(|c| c.credential.clone())
             .filter(|c| !c.is_empty())
             .unwrap_or_else(|| "api_key".to_string())
     }
 
-    /// 判定字段在当前生效凭据下是否被禁用（由账号模式接管端点与密钥）。
-    pub fn is_field_disabled(&self, id: FieldId, loaded: Option<&ConfigDto>) -> bool {
-        let cred = self.effective_credential(loaded);
-        if is_account_credential(&cred) {
-            matches!(id, FieldId::BaseUrl | FieldId::Wire | FieldId::ApiKey)
-        } else {
-            false
-        }
-    }
-
-    fn credential_now(&self, loaded: Option<&ConfigDto>) -> String {
-        self.effective_credential(loaded)
-    }
-
-    /// 当前生效的 wire，已折成**写模型拼写**（见 [`wire_daemon_spelling`]）。
-    fn current_wire(&self, loaded: Option<&ConfigDto>) -> Option<String> {
-        let raw = self
-            .draft
-            .wire
-            .clone()
-            .or_else(|| loaded.map(|c| c.wire.clone()))?;
-        Some(match wire_daemon_spelling(&raw) {
-            Some(canonical) => canonical.to_string(),
-            None => raw,
-        })
+    /// 字段是否禁用。v3 起设置页没有「账号档接管 BYOK 字段」的禁用面
+    /// （端点/密钥已迁目录，账号档登录入口独立）——恒 false，保留给调用方
+    /// 免改渲染层。
+    pub fn is_field_disabled(&self, _id: FieldId, _loaded: Option<&ConfigDto>) -> bool {
+        false
     }
 
     /// 展示值：草稿值优先于 loaded 快照。
@@ -455,61 +489,97 @@ impl SettingsState {
                     .unwrap_or(self.local_loaded.performance_mode);
                 if on { "性能模式" } else { "动效模式" }.into()
             }
-            FieldId::BaseUrl => {
-                owned_or(d.base_url.clone(), loaded.map(|c| c.base_url.as_str()), "—")
-            }
-            FieldId::Credential => match self.credential_now(loaded).as_str() {
-                "api_key" => "api_key（自带密钥）".into(),
-                "chatgpt_plan" => "chatgpt_plan（ChatGPT 套餐额度）".into(),
-                "deepseek_account" => "deepseek_account（DeepSeek 账号余额）".into(),
-                other => format!("{other}（未识别取值）"),
-            },
             FieldId::Account => {
                 let credential = self.effective_credential(loaded);
                 match crate::app::account::AccountKind::from_credential(&credential) {
-                    // BYOK 档没有账号概念：明说「无需登录」，别让用户去找一个不存在的入口。
-                    None => "（BYOK 档，无需登录）".into(),
+                    None => "回车打开账号面板".into(),
                     Some(_) if self.account_summary.is_empty() => "回车打开账号面板".into(),
                     Some(_) => self.account_summary.clone(),
                 }
             }
-            // 读模型回显**规范名**（`chat`/`messages`），本页词表只存**写拼写**。
-            // 先折一次再展示：用户看到的必须等于「按一下会写出什么」。
-            FieldId::Wire => match d.wire.clone().or_else(|| loaded.map(|c| c.wire.clone())) {
-                Some(raw) => wire_daemon_spelling(&raw).map_or(raw, str::to_string),
-                None => "—".into(),
-            },
-            FieldId::Model => owned_or(d.model.clone(), loaded.map(|c| c.model.as_str()), "—"),
-            FieldId::ApiKey => {
-                let base = match (&d.api_key, loaded) {
-                    (Some(_), _) => "●●●●（待保存）".to_string(),
-                    (None, Some(c)) if c.api_key == "****" => "(已配置 ****)".to_string(),
-                    (None, _) => "(未配置)".to_string(),
-                };
-                // 账号额度不用这把键。继续显示「已配置」正是后端 `CredentialSource`
-                // 注释里点名的最坏情形：用户以为在用套餐，实际打的是自己的 key。
-                //
-                // 只认这两个**已知**账号档：将来后端再加第四种来源时，这里不会被
-                // 误判成"这把 key 没用"（那种误判会让人删掉真正在用的密钥）。
-                let account = matches!(
-                    self.credential_now(loaded).as_str(),
-                    "chatgpt_plan" | "deepseek_account"
-                );
-                if account {
-                    format!("{base} · 当前凭据来源不使用此键")
-                } else {
-                    base
+            // ── 模型目录（即时生效，读 catalog 快照）──
+            FieldId::DefaultModel => {
+                let current = self
+                    .catalog_draft
+                    .default_model_sel
+                    .clone()
+                    .or_else(|| self.catalog.default_selection().map(|(p, m)| format!("{p}/{m}")));
+                match current {
+                    Some(sel) if self.catalog.default_selection().is_some() => sel,
+                    Some(sel) => format!("{sel}（回车设为默认）"),
+                    None if self.catalog.selections().is_empty() => {
+                        "（目录为空：先添加 provider 与模型）".into()
+                    }
+                    None => "…".into(),
                 }
             }
-            FieldId::MaxTokens => num_or(d.max_tokens, loaded.map(|c| c.max_tokens)),
-            FieldId::ContextLength => num_or(d.context_length, loaded.map(|c| c.context_length)),
-            FieldId::ReasoningEffort => owned_or(
-                d.reasoning_effort.clone(),
-                loaded
-                    .map(|c| c.reasoning_effort.as_str())
-                    .filter(|s| !s.is_empty()),
-                "—",
+            FieldId::AddModelProvider => self
+                .catalog_draft
+                .add_model_target(&self.catalog)
+                .unwrap_or_else(|| "（无 provider）".into()),
+            FieldId::AddModelId => {
+                let v = &self.catalog_draft.add_model_id;
+                if v.is_empty() { "⏎ 编辑".into() } else { v.clone() }
+            }
+            FieldId::AddModelContext => num_or(
+                self.catalog_draft.add_model_context,
+                self.catalog_draft
+                    .add_model_target(&self.catalog)
+                    .and_then(|p| self.catalog.providers.get(&p))
+                    .and_then(|_| None),
             ),
+            FieldId::AddModelMaxTokens => {
+                match self.catalog_draft.add_model_max_tokens {
+                    Some(v) => v.to_string(),
+                    None => "…".into(),
+                }
+            }
+            FieldId::AddModelApply => "回车写入目录".into(),
+            FieldId::NewProviderId => {
+                let v = &self.catalog_draft.new_provider_id;
+                if v.is_empty() { "⏎ 编辑".into() } else { v.clone() }
+            }
+            FieldId::NewProviderName => {
+                let v = &self.catalog_draft.new_provider_name;
+                if v.is_empty() { "⏎ 编辑".into() } else { v.clone() }
+            }
+            FieldId::NewProviderBaseUrl => {
+                let v = &self.catalog_draft.new_provider_base_url;
+                if v.is_empty() { "⏎ 编辑".into() } else { v.clone() }
+            }
+            FieldId::NewProviderWire => {
+                let v = self
+                    .catalog_draft
+                    .new_provider_wire
+                    .clone()
+                    .unwrap_or_else(|| "chat".into());
+                wire_label(&v)
+            }
+            FieldId::NewProviderCredential => {
+                let v = self
+                    .catalog_draft
+                    .new_provider_credential
+                    .clone()
+                    .unwrap_or_else(|| "api_key".into());
+                credential_label(&v)
+            }
+            FieldId::NewProviderApiKey => {
+                let v = self.catalog_draft.new_provider_api_key.as_str();
+                if v.is_empty() {
+                    "(未填写；同 ID 已有密钥 = 保持)".into()
+                } else {
+                    "●●●●（保存时写入）".into()
+                }
+            }
+            FieldId::NewProviderApply => "回车写入目录".into(),
+            FieldId::DeleteModelSel => {
+                let candidates = CatalogDraft::delete_candidates(&self.catalog);
+                match self.catalog_draft.delete_model_sel.clone().or_else(|| candidates.first().cloned()) {
+                    Some(sel) => sel,
+                    None => "（目录为空）".into(),
+                }
+            }
+            FieldId::DeleteModelApply => "回车删除（设为默认的模型不可删）".into(),
             FieldId::AutoCompactThreshold => {
                 let v = d
                     .auto_compact_threshold
@@ -534,25 +604,6 @@ impl SettingsState {
             FieldId::PermissionLevel => loaded
                 .map(|c| format!("{}（按 1-4 即时生效）", permission_tier(c.permission_level)))
                 .unwrap_or_else(|| "…".into()),
-            FieldId::ActiveProfile => {
-                let cur = self
-                    .profile_sel
-                    .clone()
-                    .or_else(|| loaded.map(|c| c.active_profile.clone()));
-                match cur {
-                    Some(name) => {
-                        let active = loaded
-                            .map(|c| c.active_profile.as_str() == name.as_str())
-                            .unwrap_or(true);
-                        if active {
-                            name
-                        } else {
-                            format!("{name}（回车应用）")
-                        }
-                    }
-                    None => "…".into(),
-                }
-            }
             FieldId::ExecDefaultShell => {
                 let v = d
                     .exec
@@ -626,18 +677,30 @@ impl SettingsState {
         }
     }
 
-    /// 开始编辑：Text/Secret/Number/Float 返回预填缓冲（Secret 恒空），
+    /// 开始编辑：Text/Secret/Number/Float 返回预填缓冲，
     /// Enum/Toggle/Port 返回 None（由 cycle/端口逻辑处理）。
     pub fn start_edit(&self, loaded: Option<&ConfigDto>) -> Option<EditBuffer> {
-        if self.is_field_disabled(self.row().id, loaded) {
-            return None;
-        }
         let session_id = match self.row().id {
-            FieldId::Model => self.effective(loaded, |d, c| {
-                d.model.clone().unwrap_or_else(|| c.model.clone())
-            }),
-            FieldId::BaseUrl => self.effective(loaded, |d, c| {
-                d.base_url.clone().unwrap_or_else(|| c.base_url.clone())
+            FieldId::AddModelId => self.catalog_draft.add_model_id.clone(),
+            FieldId::AddModelContext => self
+                .catalog_draft
+                .add_model_context
+                .map(|v| v.to_string())
+                .unwrap_or_default(),
+            FieldId::AddModelMaxTokens => self
+                .catalog_draft
+                .add_model_max_tokens
+                .map(|v| v.to_string())
+                .unwrap_or_default(),
+            FieldId::NewProviderId => self.catalog_draft.new_provider_id.clone(),
+            FieldId::NewProviderName => self.catalog_draft.new_provider_name.clone(),
+            FieldId::NewProviderBaseUrl => self.catalog_draft.new_provider_base_url.clone(),
+            // 密钥类：输入即替换，缓冲恒空。
+            FieldId::NewProviderApiKey | FieldId::SubApiKey => String::new(),
+            FieldId::TokenizerPath => self.effective(loaded, |d, c| {
+                d.tokenizer_path
+                    .clone()
+                    .unwrap_or_else(|| c.tokenizer_path.clone().unwrap_or_default())
             }),
             FieldId::SubModel => self.effective(loaded, |d, c| {
                 d.subagent
@@ -651,17 +714,6 @@ impl SettingsState {
                     .and_then(|s| s.base_url.clone())
                     .unwrap_or_else(|| c.subagent.base_url.clone())
             }),
-            FieldId::TokenizerPath => self.effective(loaded, |d, c| {
-                d.tokenizer_path
-                    .clone()
-                    .unwrap_or_else(|| c.tokenizer_path.clone().unwrap_or_default())
-            }),
-            FieldId::MaxTokens => self.effective(loaded, |d, c| {
-                d.max_tokens.unwrap_or(c.max_tokens).to_string()
-            }),
-            FieldId::ContextLength => self.effective(loaded, |d, c| {
-                d.context_length.unwrap_or(c.context_length).to_string()
-            }),
             FieldId::SubMaxTokens => self.effective(loaded, |d, c| {
                 d.subagent
                     .as_ref()
@@ -674,11 +726,6 @@ impl SettingsState {
                     .as_ref()
                     .and_then(|s| s.timeout_secs)
                     .unwrap_or(c.subagent.timeout_secs)
-                    .to_string()
-            }),
-            FieldId::AutoCompactThreshold => self.effective(loaded, |d, c| {
-                d.auto_compact_threshold
-                    .unwrap_or(c.auto_compact_threshold)
                     .to_string()
             }),
             FieldId::SubDefaultTools => self.effective(loaded, |d, c| {
@@ -704,16 +751,24 @@ impl SettingsState {
                     .unwrap_or(c.session_idle_unload_secs)
                     .to_string()
             }),
-            FieldId::ApiKey | FieldId::SubApiKey => String::new(),
-            FieldId::Credential
-            | FieldId::Account
-            | FieldId::Wire
-            | FieldId::ReasoningEffort
+            FieldId::AutoCompactThreshold => self.effective(loaded, |d, c| {
+                d.auto_compact_threshold
+                    .unwrap_or(c.auto_compact_threshold)
+                    .to_string()
+            }),
+            FieldId::Account
+            | FieldId::DefaultModel
+            | FieldId::AddModelProvider
+            | FieldId::AddModelApply
+            | FieldId::NewProviderWire
+            | FieldId::NewProviderCredential
+            | FieldId::NewProviderApply
+            | FieldId::DeleteModelSel
+            | FieldId::DeleteModelApply
             | FieldId::ComplianceEnabled
             | FieldId::SandboxEnabled
             | FieldId::PermissionLevel
-            | FieldId::PerformanceMode
-            | FieldId::ActiveProfile => return None,
+            | FieldId::PerformanceMode => return None,
         };
         let cursor = session_id.chars().count();
         Some(EditBuffer {
@@ -722,7 +777,10 @@ impl SettingsState {
         })
     }
 
-    /// 提交编辑缓冲到草稿（逐字段校验；失败返回 Err 且不落地）。
+    /// 提交编辑缓冲（逐字段校验；失败返回 Err 且不落地）。
+    ///
+    /// 应用设置写 `draft`（config.save 草稿）；目录分区写 `catalog_draft`
+    ///（即时写，由 App 层的端口激活发命令）。
     pub fn commit_edit(
         &mut self,
         loaded: Option<&ConfigDto>,
@@ -732,28 +790,33 @@ impl SettingsState {
         let raw: String = buf.buf.iter().collect();
         let text = raw.trim().to_string();
         match id {
-            FieldId::MaxTokens
-            | FieldId::ContextLength
-            | FieldId::SubMaxTokens
-            | FieldId::SubTimeoutSecs => {
+            FieldId::AddModelContext | FieldId::AddModelMaxTokens => {
                 let v: u64 = text.parse().map_err(|_| format!("{text:?} 不是有效整数"))?;
                 if v == 0 {
                     return Err("数值必须大于 0".into());
                 }
-                self.set_sub_or_top(id, v);
-            }
-            FieldId::AutoCompactThreshold => {
-                let v: f64 = text.parse().map_err(|_| format!("{text:?} 不是有效数字"))?;
-                if v.is_nan() || !(0.0..=1.0).contains(&v) {
-                    return Err("自动压缩阈值必须在 [0, 1]（0 = 关闭）".into());
+                if id == FieldId::AddModelContext {
+                    self.catalog_draft.add_model_context = Some(v);
+                } else {
+                    self.catalog_draft.add_model_max_tokens = Some(v);
                 }
-                self.draft.auto_compact_threshold = Some(v);
             }
-            FieldId::ApiKey => {
-                // 空提交 = 保持现值（守卫语义）；只有显式输入才写。
-                if !text.is_empty() {
-                    self.draft.api_key = Some(text);
+            FieldId::AddModelId => self.catalog_draft.add_model_id = text,
+            FieldId::NewProviderId => {
+                if !text.is_empty()
+                    && !text
+                        .chars()
+                        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
+                {
+                    return Err("provider ID 只允许 [a-z0-9_-]（后端目录主键约束）".into());
                 }
+                self.catalog_draft.new_provider_id = text;
+            }
+            FieldId::NewProviderName => self.catalog_draft.new_provider_name = text,
+            FieldId::NewProviderBaseUrl => self.catalog_draft.new_provider_base_url = text,
+            FieldId::NewProviderApiKey => {
+                // 空提交 = 保持（已存在的密钥不动）。
+                self.catalog_draft.new_provider_api_key = text;
             }
             FieldId::SubApiKey => {
                 if !text.is_empty() {
@@ -763,8 +826,13 @@ impl SettingsState {
                         .api_key = Some(text);
                 }
             }
-            FieldId::Model => self.draft.model = Some(text),
-            FieldId::BaseUrl => self.draft.base_url = Some(text),
+            FieldId::AutoCompactThreshold => {
+                let v: f64 = text.parse().map_err(|_| format!("{text:?} 不是有效数字"))?;
+                if v.is_nan() || !(0.0..=1.0).contains(&v) {
+                    return Err("自动压缩阈值必须在 [0, 1]（0 = 关闭）".into());
+                }
+                self.draft.auto_compact_threshold = Some(v);
+            }
             FieldId::TokenizerPath => self.draft.tokenizer_path = Some(text),
             FieldId::SubModel => {
                 self.draft
@@ -801,22 +869,31 @@ impl SettingsState {
                     .default_shell = Some(text);
             }
             FieldId::SessionIdleUnloadSecs => {
-                // 与其它 Number 字段不同：**0 是合法值**（0 = 禁用空闲卸载，后端缺省），
-                // 所以不走上面那条「必须大于 0」的共用分支。
+                // **0 是合法值**（0 = 禁用空闲卸载，后端缺省）。
                 let v: u64 = text.parse().map_err(|_| format!("{text:?} 不是有效整数"))?;
                 self.draft.session_idle_unload_secs = Some(v);
             }
-            // 不可编辑字段：静默忽略（理论上不会到达）。`Credential` 是 Enum 行，
-            // 走 `cycle`；Enter 不会进编辑态（`start_edit` 返回 None）。
-            FieldId::Credential
-            | FieldId::Account
-            | FieldId::Wire
-            | FieldId::ReasoningEffort
+            FieldId::SubMaxTokens | FieldId::SubTimeoutSecs => {
+                let v: u64 = text.parse().map_err(|_| format!("{text:?} 不是有效整数"))?;
+                if v == 0 {
+                    return Err("数值必须大于 0".into());
+                }
+                self.set_sub_or_top(id, v);
+            }
+            // 不可编辑字段：静默忽略（理论上不会到达）。
+            FieldId::Account
+            | FieldId::DefaultModel
+            | FieldId::AddModelProvider
+            | FieldId::AddModelApply
+            | FieldId::NewProviderWire
+            | FieldId::NewProviderCredential
+            | FieldId::NewProviderApply
+            | FieldId::DeleteModelSel
+            | FieldId::DeleteModelApply
             | FieldId::ComplianceEnabled
             | FieldId::SandboxEnabled
             | FieldId::PermissionLevel
-            | FieldId::PerformanceMode
-            | FieldId::ActiveProfile => {
+            | FieldId::PerformanceMode => {
                 let _ = loaded;
             }
         }
@@ -850,21 +927,6 @@ impl SettingsState {
                     (next != self.local_loaded.performance_mode).then_some(next);
                 Ok(true)
             }
-            FieldId::ReasoningEffort => {
-                let cur = self
-                    .draft
-                    .reasoning_effort
-                    .clone()
-                    .or_else(|| loaded.map(|c| c.reasoning_effort.clone()))
-                    .unwrap_or_else(|| "medium".into());
-                let idx = REASONING_EFFORTS
-                    .iter()
-                    .position(|e| *e == cur)
-                    .unwrap_or(1);
-                let next = (idx as i32 + delta).rem_euclid(REASONING_EFFORTS.len() as i32) as usize;
-                self.draft.reasoning_effort = Some(REASONING_EFFORTS[next].to_string());
-                Ok(true)
-            }
             FieldId::ComplianceEnabled => {
                 let cur = self
                     .draft
@@ -874,90 +936,83 @@ impl SettingsState {
                 self.draft.compliance_enabled = Some(!cur);
                 Ok(true)
             }
-            FieldId::Credential => {
-                let cur = self.credential_now(loaded);
-                let idx = CREDENTIALS.iter().position(|c| *c == cur).unwrap_or(0);
-                let next =
-                    CREDENTIALS[(idx as i32 + delta).rem_euclid(CREDENTIALS.len() as i32) as usize];
-                self.draft.credential = Some(next.to_string());
-                // 后端的组合校验在**保存期**才拒绝（`qaqh-config/src/dto.rs:139-161`：
-                // `chatgpt_plan` 只认 `responses`；`deepseek_account` 只认 chat/responses），
-                // 而用户这一下只改了一个字段。先把 wire 归位，否则用户会经历
-                // 「改一个 → 保存报错 → 回来再改另一个」。与桌面端 `switchFields` 同口径。
-                //
-                // 账号模式禁用端点编辑，因此必须同时清除旧 BYOK 路由。
-                match next {
-                    "chatgpt_plan" => {
-                        self.draft.base_url = Some("https://api.openai.com/v1".into())
-                    }
-                    "deepseek_account" => {
-                        self.draft.base_url = Some("https://api.deepseek.com".into())
-                    }
-                    _ => {}
+            // ── 模型目录：循环候选全部读 catalog 快照 ──
+            FieldId::DefaultModel => {
+                let selections = self.catalog.selections();
+                if selections.is_empty() {
+                    return Ok(true); // 目录为空：吃了按键但不做任何事（展示已说明）。
                 }
-                match next {
-                    "chatgpt_plan" if self.current_wire(loaded).as_deref() != Some("responses") => {
-                        self.draft.wire = Some("responses".into());
-                    }
-                    "deepseek_account"
-                        if !matches!(
-                            self.current_wire(loaded).as_deref(),
-                            Some("chat") | Some("responses")
-                        ) =>
-                    {
-                        self.draft.wire = Some("chat".into());
-                    }
-                    _ => {}
-                }
-                Ok(true)
-            }
-            FieldId::Wire => {
-                if self.is_field_disabled(FieldId::Wire, loaded) {
-                    return Err("账号额度模式下 wire 协议由账号服务商接管，无需配置".into());
-                }
-                // BYOK：协议由用户声明，daemon 不给目录，所以词表就是本地常量。
-                // 刻意**不**跟着改 baseUrl——切 wire 只切 wire。
-                //
-                // `cur` 必须先折回写拼写：读模型回显规范名（`chat`/`messages`），
-                // 直接拿去做 `position` 会落空 → 用户点一下就从 messages 跳到 openai。
-                let cur = self.current_wire(loaded).unwrap_or_default();
-                let idx = WIRE_PROTOCOLS.iter().position(|w| *w == cur).unwrap_or(0);
-                let next = (idx as i32 + delta).rem_euclid(WIRE_PROTOCOLS.len() as i32) as usize;
-                self.draft.wire = Some(WIRE_PROTOCOLS[next].to_string());
-                Ok(true)
-            }
-            // 账号档有服务端下发的模型目录时，←→ 在目录里切换（切档/切账户后
-            // 目录会被重取，见 `account_ops::apply_account_models`）。
-            //
-            // 目录为空（BYOK 档，或目录还没取回）时**不猜**任何候选，退回自由文本。
-            FieldId::Model if !self.model_options.is_empty() => {
-                let current = self
-                    .draft
-                    .model
+                let candidates: Vec<String> =
+                    selections.iter().map(|(p, m)| format!("{p}/{m}")).collect();
+                let cur = self
+                    .catalog_draft
+                    .default_model_sel
                     .clone()
-                    .or_else(|| loaded.map(|c| c.model.clone()))
-                    .unwrap_or_default();
-                let len = self.model_options.len() as i32;
-                let next = match self
-                    .model_options
-                    .iter()
-                    .position(|option| option.value == current)
-                {
-                    Some(idx) => self.model_options[(idx as i32 + delta).rem_euclid(len) as usize]
-                        .value
-                        .clone(),
-                    // 当前值不在目录里（手写的 slug / 另一档的模型）：按方向取首/末项，
-                    // 而不是跳过一项。
-                    None if delta >= 0 => self.model_options[0].value.clone(),
-                    None => self.model_options[len as usize - 1].value.clone(),
-                };
-                self.draft.model = Some(next);
+                    .or_else(|| self.catalog.default_selection().map(|(p, m)| format!("{p}/{m}")))
+                    .unwrap_or_else(|| candidates[0].clone());
+                let idx = candidates.iter().position(|c| *c == cur).unwrap_or(0);
+                let next =
+                    candidates[(idx as i32 + delta).rem_euclid(candidates.len() as i32) as usize].clone();
+                self.catalog_draft.default_model_sel = Some(next);
+                Ok(true)
+            }
+            FieldId::AddModelProvider => {
+                let providers: Vec<String> = self.catalog.providers.keys().cloned().collect();
+                if providers.is_empty() {
+                    return Ok(true);
+                }
+                let cur = self
+                    .catalog_draft
+                    .add_model_target(&self.catalog)
+                    .unwrap_or_else(|| providers[0].clone());
+                let idx = providers.iter().position(|p| *p == cur).unwrap_or(0);
+                let next =
+                    providers[(idx as i32 + delta).rem_euclid(providers.len() as i32) as usize].clone();
+                self.catalog_draft.add_model_provider = Some(next);
+                Ok(true)
+            }
+            FieldId::NewProviderWire => {
+                let cur = self
+                    .catalog_draft
+                    .new_provider_wire
+                    .clone()
+                    .unwrap_or_else(|| "chat".into());
+                let idx = WIRE_PROTOCOLS.iter().position(|w| *w == cur).unwrap_or(0);
+                self.catalog_draft.new_provider_wire =
+                    Some(WIRE_PROTOCOLS[(idx as i32 + delta).rem_euclid(WIRE_PROTOCOLS.len() as i32) as usize].to_string());
+                Ok(true)
+            }
+            FieldId::NewProviderCredential => {
+                let cur = self
+                    .catalog_draft
+                    .new_provider_credential
+                    .clone()
+                    .unwrap_or_else(|| "api_key".into());
+                let idx = CREDENTIALS.iter().position(|c| *c == cur).unwrap_or(0);
+                self.catalog_draft.new_provider_credential =
+                    Some(CREDENTIALS[(idx as i32 + delta).rem_euclid(CREDENTIALS.len() as i32) as usize].to_string());
+                Ok(true)
+            }
+            FieldId::DeleteModelSel => {
+                let candidates = CatalogDraft::delete_candidates(&self.catalog);
+                if candidates.is_empty() {
+                    return Ok(true);
+                }
+                let cur = self
+                    .catalog_draft
+                    .delete_model_sel
+                    .clone()
+                    .unwrap_or_else(|| candidates[0].clone());
+                let idx = candidates.iter().position(|c| *c == cur).unwrap_or(0);
+                let next =
+                    candidates[(idx as i32 + delta).rem_euclid(candidates.len() as i32) as usize].clone();
+                self.catalog_draft.delete_model_sel = Some(next);
                 Ok(true)
             }
             // 端口字段 cycle 返回 Ok(false)，由 App 层处理。
-            FieldId::PermissionLevel | FieldId::ActiveProfile | FieldId::Account => Ok(false),
-            // model/baseUrl 是自由文本（BYOK 后没有目录可循环）：←→ 无操作，
-            // Enter 进编辑态。
+            FieldId::PermissionLevel | FieldId::Account | FieldId::AddModelApply
+            | FieldId::NewProviderApply | FieldId::DeleteModelApply => Ok(false),
+            // 文本/数值字段：←→ 无操作，Enter 进编辑态。
             _ => Ok(false),
         }
     }
@@ -979,8 +1034,6 @@ impl SettingsState {
 
     fn set_sub_or_top(&mut self, id: FieldId, v: u64) {
         match id {
-            FieldId::MaxTokens => self.draft.max_tokens = Some(v),
-            FieldId::ContextLength => self.draft.context_length = Some(v),
             FieldId::SubMaxTokens => {
                 self.draft
                     .subagent
@@ -998,6 +1051,27 @@ impl SettingsState {
     }
 }
 
+/// provider wire 规范名的展示拼写（词表本身就是规范名，直接复用）。
+pub fn wire_label(wire: &str) -> String {
+    match wire {
+        "chat" => "chat（Chat Completions）".into(),
+        "responses" => "responses（OpenAI Responses）".into(),
+        "messages" => "messages（Anthropic Messages）".into(),
+        "gemini" => "gemini（Google generateContent）".into(),
+        other => other.to_owned(),
+    }
+}
+
+/// provider 凭据来源的展示拼写。
+pub fn credential_label(credential: &str) -> String {
+    match credential {
+        "api_key" => "api_key（自带密钥）".into(),
+        "chatgpt_plan" => "chatgpt_plan（ChatGPT 套餐）".into(),
+        "deepseek_account" => "deepseek_account（DeepSeek 账号）".into(),
+        other => other.to_owned(),
+    }
+}
+
 pub fn permission_tier(level: u8) -> &'static str {
     match level {
         1 => "read-only",
@@ -1005,16 +1079,6 @@ pub fn permission_tier(level: u8) -> &'static str {
         3 => "skip-permissions",
         4 => "sandbox-run",
         _ => "未知权限档位",
-    }
-}
-
-fn owned_or(draft: Option<String>, loaded: Option<&str>, empty: &str) -> String {
-    if let Some(v) = draft {
-        return v;
-    }
-    match loaded {
-        Some(v) if !v.is_empty() => v.to_owned(),
-        _ => empty.to_owned(),
     }
 }
 
@@ -1067,29 +1131,11 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    /// 完整读模型载荷。
-    ///
-    /// **由权威类型自身生成**（`ConfigDto::default()` 序列化出来就是完整形状），
-    /// 只覆盖本测试真正关心的那几个字段——这样后端新增字段时这里不会因为
-    /// 「少写一个键」而红，而要钉住的东西（BYOK 六字段、subagent）仍是显式写出来的。
-    ///
-    /// 历史：原先这份 fixture 还手搭一棵 `providers` 目录树（两个 provider、各自的
-    /// endpoints 与 models），靠 `qaqh-config-api` 的 struct 级 `#[serde(default)]`
-    /// 才解析得动。2026-10-06 BYOK 之后 daemon 不再下发目录，那棵树连同
-    /// `providerId`/`endpoint` 两个键一起删了。
+    /// 完整读模型载荷（v3 应用设置面：不再有 BYOK 六字段/activeProfile 断言）。
     fn cfg() -> ConfigDto {
         let mut payload = serde_json::to_value(ConfigDto::default()).expect("serialize");
-        payload["model"] = json!("gpt-5");
-        payload["baseUrl"] = json!("https://api.example.com/v1");
-        payload["wire"] = json!("chat");
-        payload["maxTokens"] = json!(96000);
-        payload["contextLength"] = json!(1000000);
-        payload["reasoningEffort"] = json!("high");
         payload["autoCompactThreshold"] = json!(0.95);
         payload["permissionLevel"] = json!(3);
-        payload["apiKey"] = json!("****");
-        payload["activeProfile"] = json!("default");
-        payload["profiles"] = json!(["default", "fast"]);
         payload["notificationsEnabled"] = json!(true);
         payload["complianceEnabled"] = json!(false);
         payload["subagent"] = json!({
@@ -1101,6 +1147,33 @@ mod tests {
 
     fn row_index(id: FieldId) -> usize {
         ROWS.iter().position(|r| r.id == id).unwrap()
+    }
+
+    /// 目录 fixture（两个 provider / 各一模型 + 默认选择）。
+    fn catalog() -> crate::app::session::ProviderCatalog {
+        serde_json::from_value(json!({
+            "revision": 2,
+            "default_model_selection": {
+                "provider_id": "probe", "model_id": "m1", "options": {}
+            },
+            "providers": {
+                "probe": {
+                    "name": "Probe", "base_url": "https://p.example.com/v1",
+                    "wire": "chat", "credential": "api_key", "api_key": "set",
+                    "models": {
+                        "m1": {"enabled": true, "display_name": "M1",
+                               "context_window": 128000, "max_output_tokens": 8192},
+                        "m2": {"enabled": false}
+                    }
+                },
+                "another": {
+                    "name": "Another", "base_url": "https://a.example.com",
+                    "wire": "responses", "credential": "chatgpt_plan",
+                    "models": {"a1": {"enabled": true}}
+                }
+            }
+        }))
+        .expect("目录 fixture 可解析")
     }
 
     #[test]
@@ -1132,447 +1205,179 @@ mod tests {
             c.permission_level = level;
             assert_eq!(
                 SettingsState::default().display(Some(&c), FieldId::PermissionLevel),
-                format!("{name}（按 1-4 即时生效）")
+                format!("{name}（按 1-4 即时生效）"),
             );
         }
     }
 
     #[test]
     fn focus_moves_and_wraps() {
-        let mut st = SettingsState {
-            focus: row_index(FieldId::Model),
-            ..Default::default()
-        };
-        st.move_focus(1);
-        assert_eq!(st.row().id, FieldId::ApiKey);
-        st.move_focus(-2);
-        assert_eq!(st.row().id, FieldId::Wire);
-        st.focus = ROWS.len() - 1;
-        st.move_focus(1);
-        assert_eq!(st.focus, 0);
-    }
-
-    #[test]
-    fn display_prefers_draft_over_loaded() {
-        let c = cfg();
         let mut st = SettingsState::default();
-        assert_eq!(st.display(Some(&c), FieldId::Model), "gpt-5");
-        st.draft.model = Some("other".into());
-        assert_eq!(st.display(Some(&c), FieldId::Model), "other");
-        assert!(st.dirty(FieldId::Model));
-        assert_eq!(st.display(Some(&c), FieldId::ApiKey), "(已配置 ****)");
-        st.draft.api_key = Some("sk-new".into());
-        assert_eq!(st.display(Some(&c), FieldId::ApiKey), "●●●●（待保存）");
-        assert_eq!(st.display(Some(&c), FieldId::AutoCompactThreshold), "0.95");
-        st.draft.auto_compact_threshold = Some(0.0);
+        let n = ROWS.len();
+        st.move_focus(1);
+        assert_eq!(st.focus, 1);
+        st.move_focus(-2);
+        assert_eq!(st.focus, n - 1, "向上绕回尾部");
+        st.move_focus(1);
+        assert_eq!(st.focus, 0, "从尾部向下绕回首行");
+    }
+
+    /// 目录分区展示：默认模型读 `default_model_selection`；目录草稿字段的编辑
+    /// 状态互不污染 config.save 草稿。
+    #[test]
+    fn catalog_section_displays_default_and_form_fields() {
+        let cat = catalog();
+        let mut st = SettingsState {
+            focus: row_index(FieldId::DefaultModel),
+            catalog: cat.clone(),
+            ..Default::default()
+        };
+        // 默认模型行读目录默认。
         assert_eq!(
-            st.display(Some(&c), FieldId::AutoCompactThreshold),
-            "0（关闭）"
+            st.display(None, FieldId::DefaultModel),
+            "probe/m1",
+            "default_model_selection 直接展示"
+        );
+        // 循环切到另一个模型：状态进 catalog_draft，config.save 草稿仍为空。
+        st.cycle(None, 1).unwrap();
+        assert!(st.draft.is_empty(), "目录操作不得污染 config.save 草稿");
+        let sel = st.catalog_draft.default_model_sel.as_deref().expect("cycle 写入");
+        assert!(sel == "another/a1" || sel == "probe/m1", "候选必须在目录里: {sel}");
+        // 显示值不再是目录默认。
+        assert_ne!(st.display(None, FieldId::DefaultModel), "probe/m1");
+    }
+
+    /// 删除模型候选 = 目录里全部模型（provider/model 拼接），删除预检所需。
+    #[test]
+    fn delete_candidates_cover_the_whole_catalog() {
+        let cat = catalog();
+        let candidates = CatalogDraft::delete_candidates(&cat);
+        assert_eq!(
+            candidates,
+            ["another/a1", "probe/m1", "probe/m2"],
+            "BTreeMap 字典序"
         );
     }
 
+    /// provider 编辑表单：ID 词表校验（目录主键约束在本地先拦）。
     #[test]
-    fn commit_edit_validates_ranges() {
-        let c = cfg();
+    fn new_provider_id_validated_locally() {
         let mut st = SettingsState {
-            focus: row_index(FieldId::MaxTokens),
+            focus: row_index(FieldId::NewProviderId),
             ..Default::default()
         };
-        let buf = |s: &str| EditBuffer {
-            buf: s.chars().collect(),
-            cursor: s.len(),
+        let buf = |text: &str| EditBuffer {
+            buf: text.chars().collect(),
+            cursor: text.chars().count(),
         };
-        assert!(st.commit_edit(Some(&c), buf("0")).is_err());
-        assert!(st.commit_edit(Some(&c), buf("abc")).is_err());
-        st.commit_edit(Some(&c), buf("128000")).unwrap();
-        assert_eq!(st.draft.max_tokens, Some(128000));
+        assert!(st.commit_edit(None, buf("my-provider_1")).is_ok());
+        assert_eq!(st.catalog_draft.new_provider_id, "my-provider_1");
+        let err = st.commit_edit(None, buf("Bad ID!")).unwrap_err();
+        assert!(err.contains("[a-z0-9_-]"), "{err}");
+    }
 
+    /// 新增模型表单：数字字段进 catalog_draft 而非 config.save 草稿。
+    #[test]
+    fn add_model_fields_write_catalog_draft_only() {
+        let mut st = SettingsState {
+            focus: row_index(FieldId::AddModelContext),
+            ..Default::default()
+        };
+        let buf = EditBuffer { buf: "200000".chars().collect(), cursor: 6 };
+        st.commit_edit(None, buf).unwrap();
+        assert_eq!(st.catalog_draft.add_model_context, Some(200_000));
+        assert!(st.draft.is_empty(), "目录字段不得进 config.save 草稿");
+        assert!(st.dirty(FieldId::AddModelContext) == false, "目录字段无草稿语义");
+    }
+
+    /// config.save 草稿在 v3 应用设置面上只含剩余字段（无 wire/model/credential）。
+    #[test]
+    fn draft_merge_patch_has_no_byok_keys() {
+        let mut st = SettingsState::default();
         st.focus = row_index(FieldId::AutoCompactThreshold);
-        assert!(st.commit_edit(Some(&c), buf("1.5")).is_err());
-        st.commit_edit(Some(&c), buf("0")).unwrap();
-        assert_eq!(st.draft.auto_compact_threshold, Some(0.0));
-
-        // apiKey：空 = 保持，非空 = 写草稿。
-        st.focus = row_index(FieldId::ApiKey);
-        st.commit_edit(Some(&c), buf("")).unwrap();
-        assert!(st.draft.api_key.is_none());
-        st.commit_edit(Some(&c), buf("sk-new")).unwrap();
-        assert_eq!(st.draft.api_key.as_deref(), Some("sk-new"));
-    }
-
-    #[test]
-    fn cycle_effort_toggles_and_wire() {
-        let c = cfg();
-        let mut st = SettingsState {
-            focus: row_index(FieldId::ReasoningEffort),
-            ..Default::default()
-        };
-        st.cycle(Some(&c), 1).unwrap();
-        assert_eq!(st.draft.reasoning_effort.as_deref(), Some("xhigh"));
-        st.cycle(Some(&c), -1).unwrap();
-        assert_eq!(st.draft.reasoning_effort.as_deref(), Some("high"));
-
-        // wire：四值循环（chat → responses → messages → gemini → chat）。
-        // `gemini` 是 2026-10-08 后端 `Wire::Gemini` 落地后补的第四值；切 wire 仍然
-        // **不许**连带改写 baseUrl——目录已退役，任何「顺手填端点」都是凭空发明
-        // （gemini 的端点形态还与前三者不同，更不能猜）。
-        st.focus = row_index(FieldId::Wire);
-        st.cycle(Some(&c), 1).unwrap();
-        assert_eq!(st.draft.wire.as_deref(), Some("responses"));
-        st.cycle(Some(&c), 1).unwrap();
-        assert_eq!(st.draft.wire.as_deref(), Some("messages"));
-        st.cycle(Some(&c), 1).unwrap();
-        assert_eq!(st.draft.wire.as_deref(), Some("gemini"));
-        st.cycle(Some(&c), 1).unwrap();
-        assert_eq!(st.draft.wire.as_deref(), Some("chat"));
-        assert_eq!(st.draft.base_url, None, "切 wire 不得落 baseUrl 草稿");
-        st.cycle(Some(&c), -1).unwrap();
-        assert_eq!(st.draft.wire.as_deref(), Some("gemini"));
-        // 已加载的 wire 不在词表里（旧配置）：从表首开始，不 panic。
-        st.draft.wire = Some("legacy".into());
-        st.cycle(Some(&c), 1).unwrap();
-        assert_eq!(st.draft.wire.as_deref(), Some("responses"));
-
-        // BYOK 后没有模型目录：model 行 ←→ 无操作（Ok(false)），Enter 才进编辑。
-        st.focus = row_index(FieldId::Model);
-        assert!(!st.cycle(Some(&c), 1).unwrap());
-
-        // 端口字段 cycle 返回 Ok(false)，由 App 层处理。
-        st.focus = row_index(FieldId::ActiveProfile);
-        assert!(!st.cycle(Some(&c), 1).unwrap());
-    }
-
-    /// `ultra`（2026-10-14 后端随 `mutil-ai 0.6.0` 放开的一档）必须进词表。
-    ///
-    /// 反例是它缺席时的真实行为：`position` 落空 → `unwrap_or(1)` → 用户看到的是
-    /// ultra，按一下方向键却落到 medium，再按回来变成 low——界面静默替用户改了配置。
-    #[test]
-    fn ultra_effort_survives_the_cycle_table() {
-        let mut c = cfg();
-        c.reasoning_effort = "ultra".into();
-        let mut st = SettingsState {
-            focus: row_index(FieldId::ReasoningEffort),
-            ..Default::default()
-        };
-        st.cycle(Some(&c), 1).unwrap();
-        assert_eq!(
-            st.draft.reasoning_effort.as_deref(),
-            Some("low"),
-            "ultra 是最后一档：前进回到表首"
-        );
-        st.cycle(Some(&c), -1).unwrap();
-        assert_eq!(
-            st.draft.reasoning_effort.as_deref(),
-            Some("ultra"),
-            "后退必须回到 ultra，而不是 medium"
-        );
-    }
-
-    /// 读写模型都使用后端规范名（`chat`/`messages`）。
-    ///
-    /// 这条闸的价值不在「能显示」，而在**光标不丢**：不折的话 `position` 落空，
-    /// 规范值保持在词表中，按键不会意外跳到另一个协议。
-    #[test]
-    fn canonical_wire_spellings_do_not_reset_the_cycle_cursor() {
-        let mut c = cfg();
-        c.wire = "messages".into();
-        let mut st = SettingsState {
-            focus: row_index(FieldId::Wire),
-            ..Default::default()
-        };
-        assert_eq!(
-            st.display(Some(&c), FieldId::Wire),
-            "messages",
-            "展示值应使用后端规范拼写"
-        );
-        st.cycle(Some(&c), 1).unwrap();
-        assert_eq!(
-            st.draft.wire.as_deref(),
-            Some("gemini"),
-            "从 messages 前进到 gemini，而不是跳回 openai"
-        );
-
-        c.wire = "chat".into();
-        let mut st = SettingsState {
-            focus: row_index(FieldId::Wire),
-            ..Default::default()
-        };
-        st.cycle(Some(&c), 1).unwrap();
-        assert_eq!(st.draft.wire.as_deref(), Some("responses"));
-    }
-
-    /// 上游 `Wire::as_str()` 的每个输出都必须折得回本地词表。
-    ///
-    /// 这是**漂移护栏**：后端再改一次序列化拼写时，这条会立刻红，而不是等到
-    /// 用户在设置页发现「点一下跳两格」。
-    #[test]
-    fn every_upstream_wire_spelling_maps_into_the_local_vocabulary() {
-        for wire in [
-            qaqh_client::Wire::Chat,
-            qaqh_client::Wire::Responses,
-            qaqh_client::Wire::Messages,
-            qaqh_client::Wire::Gemini,
-        ] {
-            let canonical = wire.as_str();
-            let daemon = wire_daemon_spelling(canonical)
-                .unwrap_or_else(|| panic!("`{canonical}` 没有折回写拼写"));
-            assert!(
-                WIRE_PROTOCOLS.contains(&daemon),
-                "`{canonical}` → `{daemon}`，但写词表里没有 `{daemon}`"
-            );
+        let buf = EditBuffer { buf: "0.5".chars().collect(), cursor: 3 };
+        st.commit_edit(None, buf).unwrap();
+        let patch = serde_json::to_value(&st.draft).unwrap();
+        assert_eq!(patch, json!({ "autoCompactThreshold": 0.5 }));
+        for legacy in ["wire", "model", "baseUrl", "credential", "apiKey", "activeProfile"] {
+            assert!(patch.get(legacy).is_none(), "{legacy} 不得再出现在草稿里");
         }
+        st.draft.validate().unwrap();
     }
 
-    /// 写词表与后端值域**两向**对齐（R3 之后的漂移护栏）。
-    ///
-    /// - 本页能写出的每个拼写都必须过 `ConfigPatch::validate`（否则「选得到、存不下」）；
-    /// - 后端规范名也必须合法（读回来的值不该在保存时被判非法——R3 已放开，
-    ///   这条测试把那句话钉住；哪天收紧，这里先红）。
-    #[test]
-    fn write_table_and_upstream_value_domain_agree() {
-        for wire in WIRE_PROTOCOLS {
-            ConfigPatch {
-                wire: Some(wire.to_string()),
-                ..Default::default()
-            }
-            .validate()
-            .unwrap_or_else(|e| panic!("写词表里的 {wire} 被后端拒绝：{e}"));
-        }
-        for canonical in ["chat", "responses", "messages", "gemini"] {
-            ConfigPatch {
-                wire: Some(canonical.to_string()),
-                ..Default::default()
-            }
-            .validate()
-            .unwrap_or_else(|e| panic!("规范名 {canonical} 必须可写：{e}"));
-        }
-    }
-
-    /// 凭据来源三档：切换时把 wire 归位，且**不**发明端点；账号档要说明那把键不被使用。
-    #[test]
-    fn credential_cycle_keeps_wire_compatible_and_flags_the_unused_key() {
-        let c = cfg(); // wire = chat，credential = api_key
-        let mut st = SettingsState {
-            focus: row_index(FieldId::Credential),
-            ..Default::default()
-        };
-        st.cycle(Some(&c), 1).unwrap();
-        assert_eq!(st.draft.credential.as_deref(), Some("chatgpt_plan"));
-        assert_eq!(
-            st.draft.wire.as_deref(),
-            Some("responses"),
-            "套餐直连只提供 Responses API：不归位就会在保存期被拒"
-        );
-        assert_eq!(
-            st.draft.base_url.as_deref(),
-            Some("https://api.openai.com/v1")
-        );
-        st.draft.validate().expect("归位后的草稿必须过得去值域校验");
-
-        // 账号额度：旧配置的 anthropic → 必须归一并归位到 chat。
-        let mut c2 = cfg();
-        c2.wire = "anthropic".into();
-        let mut st2 = SettingsState {
-            focus: row_index(FieldId::Credential),
-            ..Default::default()
-        };
-        st2.draft.credential = Some("chatgpt_plan".into());
-        st2.cycle(Some(&c2), 1).unwrap();
-        assert_eq!(st2.draft.credential.as_deref(), Some("deepseek_account"));
-        assert_eq!(st2.draft.wire.as_deref(), Some("chat"));
-        assert_eq!(
-            st2.draft.base_url.as_deref(),
-            Some("https://api.deepseek.com")
-        );
-        st2.draft.validate().expect("值域合法");
-
-        // 诚实性：账号档下 API Key 行必须说清「不用此键」。
-        assert!(
-            st2.display(Some(&c2), FieldId::ApiKey)
-                .contains("不使用此键"),
-            "账号额度不用那把 key，继续显示「已配置」会让人以为在花自己的钱"
-        );
-        assert!(
-            st2.display(Some(&c2), FieldId::Credential)
-                .contains("DeepSeek")
-        );
-
-        // 回到 BYOK：credential 归一，wire 不动（它已经是合法的 chat 了）。
-        st2.cycle(Some(&c2), 1).unwrap();
-        assert_eq!(st2.draft.credential.as_deref(), Some("api_key"));
-        assert_eq!(st2.draft.wire.as_deref(), Some("chat"));
-    }
-
-    /// 后端 2026-10-09 新开的两个可写字段：`exec.defaultShell` 与
-    /// `sessionIdleUnloadSecs`。各自要守住的语义不一样：
-    /// - exec 的**空串是有意义取值**（= 平台自动探测），不是「没填」；
-    /// - idle 的 **0 是合法值**（后端缺省，= 禁用空闲卸载），所以它不能走
-    ///   `maxTokens` 那条「必须大于 0」的共用数值校验。
     #[test]
     fn exec_shell_and_idle_unload_roundtrip() {
-        let c = cfg();
-        let buf = |s: &str| EditBuffer {
-            buf: s.chars().collect(),
-            cursor: s.chars().count(),
-        };
+        let mut c = cfg();
         let mut st = SettingsState {
             focus: row_index(FieldId::ExecDefaultShell),
             ..Default::default()
         };
-        st.commit_edit(Some(&c), buf("pwsh")).unwrap();
-        assert_eq!(
-            st.draft
-                .exec
-                .as_ref()
-                .and_then(|e| e.default_shell.as_deref()),
-            Some("pwsh")
-        );
-        assert!(st.dirty(FieldId::ExecDefaultShell));
+        let buf = EditBuffer { buf: "/bin/zsh".chars().collect(), cursor: 8 };
+        st.commit_edit(Some(&c), buf).unwrap();
         assert_eq!(
             st.display(Some(&c), FieldId::ExecDefaultShell),
-            "pwsh",
-            "草稿值必须盖过 loaded"
+            "/bin/zsh"
         );
-
-        st.commit_edit(Some(&c), buf("")).unwrap();
-        assert_eq!(
-            st.draft
-                .exec
-                .as_ref()
-                .and_then(|e| e.default_shell.as_deref()),
-            Some("")
-        );
+        // 空串 = 自动探测（有意的取值）。
+        let buf = EditBuffer::default();
+        st.commit_edit(Some(&c), buf).unwrap();
         assert_eq!(
             st.display(Some(&c), FieldId::ExecDefaultShell),
-            "自动探测",
-            "空串要显示成它的语义，而不是空白"
+            "自动探测"
         );
 
         st.focus = row_index(FieldId::SessionIdleUnloadSecs);
-        st.commit_edit(Some(&c), buf("0")).unwrap();
-        assert_eq!(st.draft.session_idle_unload_secs, Some(0));
+        let buf = EditBuffer { buf: "0".chars().collect(), cursor: 1 };
+        st.commit_edit(Some(&c), buf).unwrap();
         assert_eq!(
             st.display(Some(&c), FieldId::SessionIdleUnloadSecs),
             "0（不卸载）"
         );
-        st.commit_edit(Some(&c), buf("900")).unwrap();
-        assert_eq!(st.draft.session_idle_unload_secs, Some(900));
-
-        // 非整数照旧拒绝。
-        assert!(st.commit_edit(Some(&c), buf("abc")).is_err());
-        // 反向确认：0 的限制没有被这两条分支互相污染。
-        st.focus = row_index(FieldId::MaxTokens);
-        assert!(
-            st.commit_edit(Some(&c), buf("0")).is_err(),
-            "maxTokens = 0 仍须被拒"
-        );
+        let patch = serde_json::to_value(&st.draft).unwrap();
+        assert_eq!(patch["sessionIdleUnloadSecs"], json!(0));
     }
 
     #[test]
     fn patch_roundtrip_and_validation_on_save() {
-        let c = cfg();
-        let mut st = SettingsState {
-            focus: row_index(FieldId::ContextLength),
-            ..Default::default()
-        };
-        st.commit_edit(
-            Some(&c),
-            EditBuffer {
-                buf: "2000000".chars().collect(),
-                cursor: 7,
-            },
-        )
-        .unwrap();
-        // BYOK：切 wire 与改 contextLength 一起发，键名跟齐权威 crate。
-        st.focus = row_index(FieldId::Wire);
-        st.cycle(Some(&c), 1).unwrap();
-        assert!(!st.draft.is_empty());
-        st.draft.validate().unwrap();
-        let v = serde_json::to_value(&st.draft).unwrap();
-        assert_eq!(v["contextLength"], 2_000_000);
-        assert_eq!(v["wire"], "responses");
-        assert!(v.get("model").is_none(), "未改动字段不得出现在 wire 上");
-        assert!(
-            v.get("providerId").is_none() && v.get("endpoint").is_none(),
-            "provider 目录已退役，patch 上不得出现目录键：{v}"
-        );
-    }
-
-    /// 「账号登录」行：BYOK 档明说无需登录；账号档显示最近快照；它没有草稿。
-    #[test]
-    fn account_row_speaks_the_snapshot_and_byok_has_no_login() {
-        use crate::app::account::ModelOption;
-
-        let c = cfg(); // credential = api_key
-        let mut st = SettingsState {
-            focus: row_index(FieldId::Account),
-            ..Default::default()
-        };
-        assert!(
-            st.display(Some(&c), FieldId::Account).contains("无需登录"),
-            "BYOK 档没有账号概念，不许暗示有一个可登录的东西"
-        );
-        assert!(!st.dirty(FieldId::Account));
-        assert!(st.start_edit(Some(&c)).is_none(), "账号行不是文本字段");
-        assert!(
-            !st.cycle(Some(&c), 1).unwrap(),
-            "账号行由 App 层处理（Enter 打开面板），cycle 不消费"
-        );
-
-        st.draft.credential = Some("chatgpt_plan".into());
-        assert_eq!(st.display(Some(&c), FieldId::Account), "回车打开账号面板");
-        st.account_summary = "工作 (a@b.c)".into();
-        assert_eq!(st.display(Some(&c), FieldId::Account), "工作 (a@b.c)");
-
-        // 模型目录：有目录时 ←→ 在目录里循环，回绕且不跳项。
-        let mut st = SettingsState {
-            focus: row_index(FieldId::Model),
-            ..Default::default()
-        };
-        st.model_options = vec![
-            ModelOption {
-                value: "gpt-5".into(),
-                label: "GPT-5".into(),
-            },
-            ModelOption {
-                value: "gpt-5-mini".into(),
-                label: "GPT-5 mini".into(),
-            },
-        ];
-        st.cycle(Some(&c), 1).unwrap();
-        assert_eq!(st.draft.model.as_deref(), Some("gpt-5-mini"));
-        st.cycle(Some(&c), 1).unwrap();
-        assert_eq!(st.draft.model.as_deref(), Some("gpt-5"), "目录循环回绕");
-        st.cycle(Some(&c), -1).unwrap();
-        assert_eq!(st.draft.model.as_deref(), Some("gpt-5-mini"));
-
-        // 当前值不在目录里（手写 slug / 另一档模型）：按方向取首/末项，而不是跳过一项。
-        st.draft.model = Some("legacy-slug".into());
-        st.cycle(Some(&c), 1).unwrap();
-        assert_eq!(st.draft.model.as_deref(), Some("gpt-5"));
-    }
-
-    #[test]
-    fn byok_fields_disabled_in_account_mode() {
-        let mut c = cfg();
-        c.credential = "chatgpt_plan".into();
         let mut st = SettingsState::default();
-        assert!(st.is_field_disabled(FieldId::BaseUrl, Some(&c)));
-        assert!(st.is_field_disabled(FieldId::Wire, Some(&c)));
-        assert!(st.is_field_disabled(FieldId::ApiKey, Some(&c)));
-        assert!(!st.is_field_disabled(FieldId::Model, Some(&c)));
+        st.focus = row_index(FieldId::AutoCompactThreshold);
+        let buf = EditBuffer { buf: "0.8".chars().collect(), cursor: 3 };
+        st.commit_edit(None, buf).unwrap();
+        st.draft.validate().expect("剩余字段的 Merge Patch 必须合法");
+    }
 
-        st.focus = row_index(FieldId::BaseUrl);
-        assert!(st.start_edit(Some(&c)).is_none(), "禁用字段禁止进入编辑态");
+    /// 账号行：快照摘要展示；凭据来源来自 loaded 读模型（v3 起不在草稿里）。
+    #[test]
+    fn account_row_speaks_the_snapshot() {
+        let mut st = SettingsState::default();
+        st.account_summary = "已登录 · 用量 12%".into();
+        let c = ConfigDto {
+            credential: "chatgpt_plan".into(),
+            ..cfg()
+        };
+        assert_eq!(st.display(Some(&c), FieldId::Account), "已登录 · 用量 12%");
+        // 未连通（无 loaded）时显示入口提示而不是摘要。
+        assert_eq!(
+            st.display(None, FieldId::Account),
+            "回车打开账号面板"
+        );
+    }
 
-        st.focus = row_index(FieldId::Wire);
-        assert!(st.cycle(Some(&c), 1).is_err(), "禁用字段禁止切换");
-
-        c.credential = "api_key".into();
-        assert!(!st.is_field_disabled(FieldId::BaseUrl, Some(&c)));
-        assert!(!st.is_field_disabled(FieldId::Wire, Some(&c)));
-        assert!(!st.is_field_disabled(FieldId::ApiKey, Some(&c)));
-        st.focus = row_index(FieldId::BaseUrl);
-        assert!(st.start_edit(Some(&c)).is_some());
+    /// wire/credential 表单枚举循环：规范名直发（v3 无拼写映射）。
+    #[test]
+    fn provider_form_enums_cycle_the_canonical_vocabulary() {
+        let mut st = SettingsState {
+            focus: row_index(FieldId::NewProviderWire),
+            ..Default::default()
+        };
+        st.cycle(None, 1).unwrap();
+        assert_eq!(st.catalog_draft.new_provider_wire.as_deref(), Some("responses"));
+        st.focus = row_index(FieldId::NewProviderCredential);
+        st.cycle(None, 1).unwrap();
+        assert_eq!(
+            st.catalog_draft.new_provider_credential.as_deref(),
+            Some("chatgpt_plan")
+        );
+        assert!(st.draft.is_empty(), "表单枚举不进 config.save 草稿");
     }
 }

@@ -1,80 +1,52 @@
-//! Ringing v2 会话状态机（TUI 侧不变量）。
+//! Ringing v3 会话状态机（TUI 侧不变量）。
 //!
-//! **本模块不再持有任何协议类型**：delivery / reset reason / interaction kind /
-//! pending interaction / driver state / bootstrap / 事件信封一律 `use qaqh_client::*`
-//! ——wire 视图只有那一份权威实现。这里只剩 TUI 自己的会话级时序规则：
-//! epoch / log / cursor 单调性、重复与过期事件丢弃、交互身份「第一答复胜出」、
-//! driver seat 按 epoch 单调交接。
+//! **本模块不持有任何手抄协议类型**：bootstrap / 事件帧 / 交互视图 / driver
+//! 全部来自 `qaqh-ringing-contract`（backend-v3 起本仓直接 path 依赖权威契约
+//! crate，类型漂移 = 编译错误）。这里只剩 TUI 自己的会话级时序规则：
 //!
-//! 历史（2026-09-30 之前）本模块自带六份手抄协议镜像（`Delivery` /
-//! `InteractionKind` / `ResetReason` / `PendingInteraction` / `DriverState` /
-//! `BootstrapSnapshot`）加三个适配器（`event_meta_from_client` /
-//! `reset_from_client` / `bootstrap_from_client`）。漂移**已经真实发生，而且
-//! 失败模式是静默的**：
+//! 1. **exclusive 水位**（backend-v3 B01）：`SessionState.seq` 是「下一个将
+//!    分配的事件序号」。bootstrap 后 `next_seq = state.seq`；事件帧
+//!    `seq < next_seq` 已被快照覆盖（丢弃），`seq >= next_seq` 是新事实。
+//!    相等边界必须处理——首帧的 `seq` 恰好等于 `next_seq`。
+//! 2. **resync（旧名 reset）**：服务端判定缺口/过期后发 `resync_required`
+//!    并断流（B01/B09）。TUI 保留旧 UI 状态，直到新 bootstrap 校验通过后
+//!    原子替换；等待期间本地视图已知过期，写入口一律关闭。
+//! 3. **交互身份「第一答复胜出」**：`InteractionRequested` 记身份，
+//!    `InteractionResolved`（含 Expired/Cancelled）封口；终态不得重开。
+//! 4. **driver 席位按 epoch 单调交接**（B02）：`DriverChanged` 的 `None`
+//!    表示席位清空；epoch 回退视为陈旧帧。
 //!
-//! - 后端 bootstrap 把 `session_id` 改名 `session_id`（`refactor(identity)`），镜像与
-//!   手抄 fixture 仍按旧键读；
-//! - 后端信封新增 `ts_ms`（beta-readiness W1/C3），手抄的结构体字面量直接编译
-//!   失败；
-//! - 镜像里的 `PendingInteraction` 漏了权威类型的 `request` 字段（modal 正文），
-//!   零人发现——因为它只有 `#[cfg(test)]` 的读者。
-//!
-//! 与 `src/protocol/mod.rs` 同一条纪律：宁可倒贴一次迁移成本，也不留第二份协议。
-//! 删除纪律（同 T-13）：别指望 `dead_code` 指出残留，逐项 grep 真实调用点。
+//! 历史（2026-09-30 之前）本模块曾自带六份手抄协议镜像；漂移真实发生过且
+//! 失败模式是静默的（详见 git 历史版本注释）。v3 起类型全部直连权威 crate，
+//! 连「等 qaqh-client 补转出口」这一步都不再存在。
 
 use std::collections::BTreeSet;
 
-use qaqh_client::{
-    ClientV2Bootstrap, ClientV2Event, RingingV2Delivery, RingingV2DriverState,
-    RingingV2ResetReason, RingingV2ResetRequired,
-};
+use qaqh_ringing::SESSION_CONTRACT_REVISION;
+use qaqh_ringing_contract::state::DriverState;
+use qaqh_ringing_contract::{SessionBootstrap, SessionEventFrame};
 
-/// reset 原因是否让会话进入只读。
+/// resync 等待期是否只读。
 ///
-/// **这是 TUI 的展示策略**（没有可写基线就不给写入口），不是 wire 语义；策略
-/// 必须挂在权威枚举上。这里刻意写成**穷尽 match 而不是 `matches!`**：后端将来
-/// 新增 reset reason 时本函数编译失败，逼一次显式决策，而不是默默归入「可写」。
-pub fn reset_is_read_only(reason: RingingV2ResetReason) -> bool {
-    match reason {
-        RingingV2ResetReason::SnapshotMissing | RingingV2ResetReason::UpgradeRequired => true,
-        RingingV2ResetReason::CursorExpired
-        | RingingV2ResetReason::LogIdMismatch
-        | RingingV2ResetReason::UnknownFact
-        | RingingV2ResetReason::ReplayOverflow
-        | RingingV2ResetReason::EpochMismatch
-        | RingingV2ResetReason::CrossSession
-        | RingingV2ResetReason::SnapshotExpired
-        | RingingV2ResetReason::SnapshotHashMismatch
-        | RingingV2ResetReason::StaleWriter
-        | RingingV2ResetReason::ContentQuotaExceeded
-        | RingingV2ResetReason::PerConnectionOverflow
-        | RingingV2ResetReason::ProgressBufferOverflow
-        | RingingV2ResetReason::ActorMailboxOverflow => false,
-    }
+/// **这是 TUI 的展示策略**（本地视图已知过期时不给写入口），不是 wire 语义。
+/// v3 的 `resync_required.reason` 是自由字符串（`cursor_gap` / `stream_lagged`，
+/// 见 daemon `axum_impl/v2.rs` 的 resync 分支）——没有可穷举的权威枚举，
+/// 所以策略是「任何 resync 都只读直到 re-baseline」。这比 v3 之前的
+/// 「按原因分类」更保守，也更符合 B09 的裁定：resync 后未提交的暂态
+/// 本来就不承诺恢复。
+pub fn resync_is_read_only() -> bool {
+    true
 }
 
-/// 一次 `apply_event` 的结果。
+/// 一次 `apply_frame` 的结果。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ApplyOutcome {
-    ReliableApplied {
-        fact_seq: u64,
-        projection_index: u16,
-    },
-    ReplaceableApplied {
-        revision: u64,
-    },
-    Ephemeral,
+    /// 帧被接受；`seq` 是该帧的序号（本帧之后 `next_seq = seq + 1`）。
+    Applied { seq: u64 },
+    /// 帧序号已落在快照水位之下（bootstrap 已覆盖 / 重放）。
     Duplicate,
-    Stale,
-    EpochMismatch,
-    LogMismatch,
     NotInitialized,
-    ResetPending,
-    /// 事件缺了权威信封为该 delivery 声明的必填字段。
-    ///
-    /// 正常情况下 `qaqh-client` 已在 SSE 解码处调用 `ClientV2Event::validate()`
-    /// 拦下；这里只是本状态机**读不到值就没法推进**的自然分支，不是第二套校验。
-    Incomplete(&'static str),
+    ResyncPending,
 }
 
 /// 一次 `apply_bootstrap` 的结果。
@@ -83,7 +55,7 @@ pub enum BootstrapOutcome {
     Applied,
     SessionMismatch,
     Invalid,
-    ResetMismatch,
+    /// 同一 epoch 内水位倒退的旧快照：不得回滚。
     Stale,
 }
 
@@ -107,7 +79,7 @@ pub enum DriverOutcome {
     Conflict,
 }
 
-/// 单会话的 Ringing v2 时序状态。
+/// 单会话的 Ringing v3 时序状态。
 ///
 /// **只存 TUI 需要的跨事件不变量**：领域载荷（交互正文、工具卡、transcript）一律
 /// 由权威 typed payload 直接进入 UI 层，不在这里落副本——副本必然漏字段。
@@ -115,18 +87,16 @@ pub enum DriverOutcome {
 pub struct RingingV2SessionModel {
     session_id: String,
     server_epoch: Option<String>,
-    log_id: Option<String>,
-    cursor: Option<String>,
-    last_fact_seq: u64,
-    last_projection_index: u16,
-    state_revision: u64,
-    /// 未决交互**只记身份**：正文与 kind 属权威 payload，UI 层直接消费
-    /// `RingingV2PendingInteraction`，这里再存一份就会漏字段（历史缺陷）。
+    /// exclusive 水位：下一个允许的事件 seq（bootstrap `state.seq` 起）。
+    next_seq: u64,
+    initialized: bool,
+    /// 未决交互**只记身份**：正文与 kind 属权威 `InteractionView`，UI 层直接
+    /// 消费，这里再存一份就会漏字段（历史缺陷）。
     pending_interactions: BTreeSet<String>,
     terminal_interactions: BTreeSet<String>,
-    driver: Option<RingingV2DriverState>,
-    /// 待处理 reset 的**权威原帧**：保留它才能在新 bootstrap 到达时逐字段校验。
-    reset: Option<RingingV2ResetRequired>,
+    driver: Option<DriverState>,
+    /// 待处理 resync 的**权威原帧**：新 bootstrap 到达前保留（只读窗口）。
+    resync: Option<qaqh_ringing::RingingV2ResyncRequired>,
 }
 
 impl RingingV2SessionModel {
@@ -134,56 +104,40 @@ impl RingingV2SessionModel {
         Self {
             session_id: session_id.into(),
             server_epoch: None,
-            log_id: None,
-            cursor: None,
-            last_fact_seq: 0,
-            last_projection_index: 0,
-            state_revision: 0,
+            next_seq: 0,
+            initialized: false,
             pending_interactions: BTreeSet::new(),
             terminal_interactions: BTreeSet::new(),
             driver: None,
-            reset: None,
+            resync: None,
         }
     }
 
-    /// 生产路径已不再读取 server epoch（driver 席位移除后仅测试断言使用）。
+    /// 生产路径已不再读取 server epoch（仅测试断言使用）。
     #[cfg(test)]
     pub fn server_epoch(&self) -> Option<&str> {
         self.server_epoch.as_deref()
     }
 
+    /// 当前水位（下一帧应为该 seq）。仅测试断言使用。
     #[cfg(test)]
-    pub fn cursor(&self) -> Option<&str> {
-        self.cursor.as_deref()
+    pub fn next_seq(&self) -> u64 {
+        self.next_seq
     }
 
     #[cfg(test)]
-    pub fn state_revision(&self) -> u64 {
-        self.state_revision
-    }
-
-    #[cfg(test)]
-    pub fn is_reset_pending(&self) -> bool {
-        self.reset.is_some()
+    pub fn is_resync_pending(&self) -> bool {
+        self.resync.is_some()
     }
 
     pub fn is_read_only(&self) -> bool {
-        self.reset
-            .as_ref()
-            .is_some_and(|reset| reset_is_read_only(reset.reason))
+        self.resync.is_some() && resync_is_read_only()
     }
 
-    pub fn driver(&self) -> Option<&RingingV2DriverState> {
-        self.driver.as_ref()
-    }
-
-    /// 席位本身已从协议移除，本方法仅服务 reducer 兼容消费的测试断言。
+    /// driver 席位只读视图（测试断言用；生产 UI 接线时再升级为公开访问器）。
     #[cfg(test)]
-    pub fn is_driver(&self, client_session_id: &str) -> bool {
-        self.driver
-            .as_ref()
-            .and_then(|driver| driver.holder.as_deref())
-            == Some(client_session_id)
+    pub fn driver_for_test(&self) -> Option<&DriverState> {
+        self.driver.as_ref()
     }
 
     #[cfg(test)]
@@ -193,160 +147,71 @@ impl RingingV2SessionModel {
 
     /// 用权威 typed bootstrap 原子替换旧状态。
     ///
-    /// 快照 cursor 是**不透明 token**：这里只解码出 log/fact 基线用于 reset 校验，
-    /// 不解码、不推测 replay 位置——replay 由服务端保证严格大于该基线。
-    pub fn apply_bootstrap(&mut self, bootstrap: &ClientV2Bootstrap) -> BootstrapOutcome {
+    /// `state.seq` 是 exclusive 水位（B01）：快照已覆盖全部 `seq < state.seq`
+    /// 的事件帧，之后的帧从 `state.seq` 起接。
+    pub fn apply_bootstrap(&mut self, bootstrap: &SessionBootstrap) -> BootstrapOutcome {
         if bootstrap.session_id != self.session_id {
             return BootstrapOutcome::SessionMismatch;
         }
         if bootstrap.server_epoch.trim().is_empty() {
             return BootstrapOutcome::Invalid;
         }
-        let Ok(cursor) = bootstrap.snapshot_cursor.decode_snapshot() else {
+        // 契约代际双保险：qaqh-client 在 bootstrap 响应处已硬校验（426 /
+        // ClientError::Protocol），这里再断一次，防未来有人绕过 client 直拉。
+        if bootstrap.session_contract_revision != SESSION_CONTRACT_REVISION {
             return BootstrapOutcome::Invalid;
-        };
-        let log_id = cursor.log_id;
-        let snapshot_fact_seq = cursor.fact_seq;
-        let state_revision = bootstrap
-            .control
-            .state_revision
-            .max(bootstrap.conversation.state_revision)
-            .max(bootstrap.tool.state_revision);
+        }
 
-        // reset 之后的 bootstrap 必须仍指向 reset 宣告的 epoch/log/基线。这样即使
-        // 旧请求的响应比新请求晚到，也不能清掉 reset 或覆盖新快照。
-        if let Some(reset) = &self.reset {
-            if bootstrap.server_epoch != reset.server_epoch {
-                return BootstrapOutcome::ResetMismatch;
-            }
-            if let Some(reset_log_id) = reset.log_id.as_deref()
-                && log_id != reset_log_id
-            {
-                return BootstrapOutcome::ResetMismatch;
-            }
-            if let Some(reset_fact_seq) = reset
-                .snapshot_cursor
-                .as_ref()
-                .and_then(|token| token.decode_snapshot().ok())
-                .map(|cursor| cursor.fact_seq)
-                && snapshot_fact_seq < reset_fact_seq
-            {
-                return BootstrapOutcome::ResetMismatch;
-            }
-        } else if self.server_epoch.as_deref() == Some(bootstrap.server_epoch.as_str())
-            && state_revision < self.state_revision
+        // 同 epoch 水位倒退：较旧的并发 bootstrap 响应不得把状态回滚——
+        // resync 等待期也不豁免（旧 in-flight 响应不能抢先解除 resync）。
+        if self.initialized
+            && self.server_epoch.as_deref() == Some(bootstrap.server_epoch.as_str())
+            && bootstrap.state.seq < self.next_seq
         {
-            // 同一 epoch 内 revision 单调；较旧的并发 bootstrap 响应不得把状态
-            // 回滚到更早的 cursor / pending / driver 快照。
             return BootstrapOutcome::Stale;
         }
 
         self.server_epoch = Some(bootstrap.server_epoch.clone());
-        self.log_id = Some(log_id);
-        self.cursor = Some(bootstrap.snapshot_cursor.as_str().to_string());
-        self.last_fact_seq = 0;
-        self.last_projection_index = 0;
-        self.state_revision = state_revision;
-        // 权威 bootstrap 的 `interactions` 已是 daemon 过滤后的未决集合。
+        self.next_seq = bootstrap.state.seq;
+        self.initialized = true;
+        // 权威 bootstrap 的 `interactions` 已是 daemon 维护的未决集合。
         self.pending_interactions = bootstrap
-            .control
             .state
             .interactions
             .iter()
-            .map(|interaction| interaction.interaction_id.clone())
+            .map(|interaction| interaction.interaction_id.as_ref().to_owned())
             .collect();
         self.terminal_interactions.clear();
-        self.driver = bootstrap.control.state.driver.clone();
-        self.reset = None;
+        self.driver = bootstrap.state.driver.clone();
+        self.resync = None;
         BootstrapOutcome::Applied
     }
 
-    /// 标记 reset；保留旧 UI 状态，直到新 bootstrap 通过校验。
-    pub fn begin_reset(&mut self, reset: &RingingV2ResetRequired) -> bool {
-        if reset.session_id != self.session_id {
+    /// 标记 resync；保留旧 UI 状态，直到新 bootstrap 通过校验。
+    pub fn begin_resync(&mut self, resync: &qaqh_ringing::RingingV2ResyncRequired) -> bool {
+        if resync.session_id != self.session_id {
             return false;
         }
-        self.reset = Some(reset.clone());
+        self.resync = Some(resync.clone());
         true
     }
 
-    /// 消费一条权威 v2 投影事件。
-    pub fn apply_event(&mut self, event: &ClientV2Event) -> ApplyOutcome {
-        if self.reset.is_some() {
-            return ApplyOutcome::ResetPending;
+    /// 消费一条权威 v3 事件帧。
+    ///
+    /// 帧不携带 epoch / delivery / revision——单流单游标，epoch 与重连都由
+    /// `qaqh-client` 的流状态机负责；这里只管水位与身份。
+    pub fn apply_frame(&mut self, frame: &SessionEventFrame) -> ApplyOutcome {
+        if self.resync.is_some() {
+            return ApplyOutcome::ResyncPending;
         }
-        let Some(current_epoch) = self.server_epoch.as_deref() else {
+        if !self.initialized {
             return ApplyOutcome::NotInitialized;
-        };
-        if event.server_epoch != current_epoch {
-            return ApplyOutcome::EpochMismatch;
         }
-
-        match event.delivery {
-            RingingV2Delivery::Reliable => self.apply_reliable(event),
-            RingingV2Delivery::Replaceable => self.apply_replaceable(event),
-            RingingV2Delivery::Ephemeral => ApplyOutcome::Ephemeral,
-        }
-    }
-
-    /// reliable 事件推进 canonical cursor；`(fact_seq, projection_index)` 全局字典序。
-    fn apply_reliable(&mut self, event: &ClientV2Event) -> ApplyOutcome {
-        let Some(log_id) = event.log_id.as_deref() else {
-            return ApplyOutcome::Incomplete("reliable requires log_id");
-        };
-        let Some(fact_seq) = event.fact_seq else {
-            return ApplyOutcome::Incomplete("reliable requires fact_seq");
-        };
-        let Some(projection_index) = event.projection_index else {
-            return ApplyOutcome::Incomplete("reliable requires projection_index");
-        };
-        let Some(cursor) = event.cursor.as_ref() else {
-            return ApplyOutcome::Incomplete("reliable requires cursor");
-        };
-        let Some(revision) = event.revision else {
-            return ApplyOutcome::Incomplete("reliable requires revision");
-        };
-
-        if let Some(current_log) = self.log_id.as_deref() {
-            if current_log != log_id {
-                return ApplyOutcome::LogMismatch;
-            }
-        } else {
-            self.log_id = Some(log_id.to_string());
-        }
-
-        let incoming = (fact_seq, projection_index);
-        let current = (self.last_fact_seq, self.last_projection_index);
-        if incoming == current {
+        if frame.seq < self.next_seq {
             return ApplyOutcome::Duplicate;
         }
-        if incoming < current {
-            return ApplyOutcome::Stale;
-        }
-
-        self.cursor = Some(cursor.as_str().to_string());
-        self.last_fact_seq = fact_seq;
-        self.last_projection_index = projection_index;
-        self.state_revision = self.state_revision.max(revision);
-        ApplyOutcome::ReliableApplied {
-            fact_seq,
-            projection_index,
-        }
-    }
-
-    /// replaceable 事件只推 revision，不碰 canonical cursor。
-    fn apply_replaceable(&mut self, event: &ClientV2Event) -> ApplyOutcome {
-        let Some(revision) = event.revision else {
-            return ApplyOutcome::Incomplete("replaceable requires revision");
-        };
-        if revision < self.state_revision {
-            return ApplyOutcome::Stale;
-        }
-        if revision == self.state_revision {
-            return ApplyOutcome::Duplicate;
-        }
-        self.state_revision = revision;
-        ApplyOutcome::ReplaceableApplied { revision }
+        self.next_seq = frame.seq + 1;
+        ApplyOutcome::Applied { seq: frame.seq }
     }
 
     pub fn apply_interaction_requested(&mut self, interaction_id: &str) -> InteractionOutcome {
@@ -385,295 +250,156 @@ impl RingingV2SessionModel {
         }
     }
 
-    pub fn apply_driver_state(&mut self, driver: RingingV2DriverState) -> DriverOutcome {
-        if let Some(current) = &self.driver {
-            if driver.driver_epoch < current.driver_epoch {
-                return DriverOutcome::Stale;
-            }
-            if driver.driver_epoch == current.driver_epoch
-                && driver.holder == current.holder
-                && driver.can_claim == current.can_claim
-            {
+    /// driver 席位交接（B02）。`None` = 席位清空（release 后）。
+    pub fn apply_driver(&mut self, driver: Option<&DriverState>) -> DriverOutcome {
+        let Some(incoming) = driver else {
+            if self.driver.is_none() {
                 return DriverOutcome::Duplicate;
             }
-            if driver.driver_epoch == current.driver_epoch {
+            self.driver = None;
+            return DriverOutcome::Applied;
+        };
+        if let Some(current) = &self.driver {
+            if incoming.epoch < current.epoch {
+                return DriverOutcome::Stale;
+            }
+            if incoming.epoch == current.epoch && incoming.holder == current.holder {
+                return DriverOutcome::Duplicate;
+            }
+            if incoming.epoch == current.epoch {
                 return DriverOutcome::Conflict;
             }
         }
-        self.driver = Some(driver);
+        self.driver = Some(incoming.clone());
         DriverOutcome::Applied
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────
-// 「权威元数据」访问器
-//
-// 事件信封的跨事件元数据（epoch / log / cursor / fact_seq / projection_index /
-// revision / delivery / ts_ms）**就是** `ClientV2Event` 的字段。历史上有过一层
-// `EventMeta` 镜像 + `event_meta_from_client` 适配器；它唯一的效果是让后端新增
-// 字段（`ts_ms`）时 TUI 静默拿不到。现在消费方直接用 `&ClientV2Event`。
-// ─────────────────────────────────────────────────────────────────────────
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::v2_fixtures as fx;
-    use qaqh_client::{
-        Channel, RingingV2InteractionKind, RingingV2ResetReason,
-        fact::InteractionKind as FactInteractionKind,
-    };
+    use qaqh_ringing_contract::state::TurnView;
+use qaqh_ringing_contract::SessionState;
 
     const SESSION: &str = "session-1";
     const EPOCH: &str = "epoch-1";
-    const LOG: &str = "log-1";
 
-    fn audit_payload() -> qaqh_client::ProjectionPayload {
-        fx::audit_payload()
+    fn bootstrap(seq: u64) -> SessionBootstrap {
+        SessionBootstrap {
+            schema: "qaqh.ringing.session/v2".into(),
+            version: qaqh_ringing::RINGING_V2_VERSION,
+            session_contract_revision: SESSION_CONTRACT_REVISION.into(),
+            server_epoch: EPOCH.into(),
+            session_id: SESSION.into(),
+            state: SessionState {
+                seq,
+                ..SessionState::default()
+            },
+        }
     }
 
-    /// snapshot 基线：`CanonicalCursor::snapshot` 要求 `fact_seq >= 1`。
-    fn baseline() -> ClientV2Bootstrap {
-        fx::bootstrap(SESSION, EPOCH, LOG, 1, 7)
-    }
-
-    /// 权威 snapshot cursor 的字符串形态（用例断言用；不再手写假 cursor）。
-    fn baseline_cursor() -> String {
-        baseline().snapshot_cursor.as_str().to_string()
+    fn frame(seq: u64) -> SessionEventFrame {
+        SessionEventFrame {
+            seq,
+            event: qaqh_ringing_contract::SessionEvent::SessionMetaChanged { title: None },
+        }
     }
 
     fn model() -> RingingV2SessionModel {
         let mut model = RingingV2SessionModel::new(SESSION);
         assert_eq!(
-            model.apply_bootstrap(&baseline()),
+            model.apply_bootstrap(&bootstrap(7)),
             BootstrapOutcome::Applied
         );
         model
     }
 
-    fn reliable(fact_seq: u64, projection_index: u16) -> ClientV2Event {
-        fx::ReliableEvent::new(
-            SESSION,
-            EPOCH,
-            LOG,
-            fact_seq,
-            projection_index,
-            audit_payload(),
-        )
-        .build()
+    /// B01：bootstrap 后首帧恰好是 `state.seq`（相等边界必须处理）。
+    #[test]
+    fn first_frame_after_bootstrap_is_exactly_the_watermark() {
+        let mut model = model();
+        assert_eq!(model.next_seq(), 7);
+        assert_eq!(model.apply_frame(&frame(7)), ApplyOutcome::Applied { seq: 7 });
+        assert_eq!(model.apply_frame(&frame(8)), ApplyOutcome::Applied { seq: 8 });
     }
 
-    /// 权威 bootstrap 被完整吃下：cursor / revision / 未决身份 / driver。
+    /// B01：`seq < state.seq` 的帧已被快照覆盖，必须丢弃（重放不双计）。
     #[test]
-    fn bootstrap_adopts_authoritative_snapshot() {
-        let bootstrap = fx::bootstrap_typed(
-            SESSION,
-            EPOCH,
-            LOG,
-            42,
-            19,
-            &[fx::pending("i1", "c1", "t1", "permission")],
-            Some(fx::driver("cs-1", 4, false)),
+    fn frames_below_the_watermark_are_duplicates() {
+        let mut model = model();
+        assert_eq!(model.apply_frame(&frame(3)), ApplyOutcome::Duplicate);
+        assert_eq!(model.next_seq(), 7, "丢弃的帧不得推进水位");
+        assert_eq!(model.apply_frame(&frame(7)), ApplyOutcome::Applied { seq: 7 });
+        assert_eq!(model.apply_frame(&frame(7)), ApplyOutcome::Duplicate);
+    }
+
+    #[test]
+    fn bootstrap_for_another_session_is_rejected() {
+        let mut model = RingingV2SessionModel::new("session-2");
+        assert_eq!(
+            model.apply_bootstrap(&bootstrap(1)),
+            BootstrapOutcome::SessionMismatch
         );
+    }
+
+    #[test]
+    fn stale_same_epoch_bootstrap_cannot_rollback_the_watermark() {
+        let mut model = model();
+        assert_eq!(
+            model.apply_bootstrap(&bootstrap(42)),
+            BootstrapOutcome::Applied
+        );
+        assert_eq!(model.apply_bootstrap(&bootstrap(9)), BootstrapOutcome::Stale);
+        assert_eq!(model.next_seq(), 42);
+        // 新 epoch（daemon 重启）不算 stale：水位随新代际走。
+        let mut fresh = bootstrap(1);
+        fresh.server_epoch = "epoch-2".into();
+        assert_eq!(model.apply_bootstrap(&fresh), BootstrapOutcome::Applied);
+        assert_eq!(model.next_seq(), 1);
+    }
+
+    #[test]
+    fn wrong_revision_is_invalid() {
         let mut model = RingingV2SessionModel::new(SESSION);
-        assert_eq!(model.apply_bootstrap(&bootstrap), BootstrapOutcome::Applied);
-        assert_eq!(model.server_epoch(), Some(EPOCH));
-        assert_eq!(model.cursor(), Some(bootstrap.snapshot_cursor.as_str()));
-        // 三频道 revision 取最大者（control=conversation=tool=19）。
-        assert_eq!(model.state_revision(), 19);
-        assert_eq!(model.pending_interactions().collect::<Vec<_>>(), ["i1"]);
-        assert_eq!(model.driver().expect("driver").driver_epoch, 4);
-        assert!(model.is_driver("cs-1"));
+        let mut wrong = bootstrap(1);
+        wrong.session_contract_revision = "ringing-session-1".into();
+        assert_eq!(model.apply_bootstrap(&wrong), BootstrapOutcome::Invalid);
     }
 
-    /// 反闸：TUI 不再自建协议枚举——`kind` 直接是权威类型，新增变体编译期可见。
+    /// resync → 只读、事件被拒；新 bootstrap（同会话）解除并接上新水位。
     #[test]
-    fn interaction_kind_is_the_authoritative_enum() {
-        let kinds = [
-            RingingV2InteractionKind::Permission,
-            RingingV2InteractionKind::Ask,
-            RingingV2InteractionKind::PlanReview,
-        ];
-        assert_eq!(kinds.len(), 3);
-        assert_eq!(
-            fx::interaction_kind_wire(RingingV2InteractionKind::PlanReview),
-            "plan",
-            "wire 值由权威 serde 承担，TUI 不再自己映射"
-        );
-    }
-
-    #[test]
-    fn c1_snapshot_then_subscribe_is_gap_free_and_duplicate_free() {
+    fn resync_freezes_writes_until_rebaseline() {
         let mut model = model();
-        assert_eq!(model.cursor(), Some(baseline_cursor().as_str()));
-
-        let first = reliable(8, 1);
-        assert_eq!(
-            model.apply_event(&first),
-            ApplyOutcome::ReliableApplied {
-                fact_seq: 8,
-                projection_index: 1
-            }
-        );
-        // cursor 是**权威 token 本身**，不是 TUI 拼出来的字符串。
-        assert_eq!(
-            model.cursor(),
-            first.cursor.as_ref().map(|cursor| cursor.as_str())
-        );
-        assert_eq!(model.apply_event(&first), ApplyOutcome::Duplicate);
-    }
-
-    #[test]
-    fn c2_reliable_reconnect_advances_in_global_lexicographic_order() {
-        let mut model = model();
-        for (fact_seq, projection_index) in [(8, 0), (8, 1), (9, 0)] {
-            assert_eq!(
-                model.apply_event(&reliable(fact_seq, projection_index)),
-                ApplyOutcome::ReliableApplied {
-                    fact_seq,
-                    projection_index
-                }
-            );
-        }
-        assert_eq!(model.apply_event(&reliable(8, 99)), ApplyOutcome::Stale);
-    }
-
-    #[test]
-    fn c3_replaceable_reconnect_is_latest_current_without_cursor_advance() {
-        let mut model = model();
-        let cursor = model.cursor().map(str::to_string);
-        let event = fx::replaceable_event(SESSION, EPOCH, 8, audit_payload());
-        assert_eq!(
-            model.apply_event(&event),
-            ApplyOutcome::ReplaceableApplied { revision: 8 }
-        );
-        assert_eq!(model.cursor(), cursor.as_deref());
-        assert_eq!(model.state_revision(), 8);
-        assert_eq!(model.apply_event(&event), ApplyOutcome::Duplicate);
-    }
-
-    #[test]
-    fn c4_ephemeral_never_persists_or_replays() {
-        let mut model = model();
-        let before = model.clone();
-        let event = fx::ephemeral_event(SESSION, EPOCH, audit_payload());
-        assert_eq!(model.apply_event(&event), ApplyOutcome::Ephemeral);
-        assert_eq!(model, before);
-    }
-
-    #[test]
-    fn c5_epoch_and_log_mismatch_are_rejected() {
-        let mut model = model();
-        let wrong_epoch =
-            fx::ReliableEvent::new(SESSION, "epoch-2", LOG, 8, 1, audit_payload()).build();
-        assert_eq!(model.apply_event(&wrong_epoch), ApplyOutcome::EpochMismatch);
-
-        let wrong_log =
-            fx::ReliableEvent::new(SESSION, EPOCH, "log-2", 8, 1, audit_payload()).build();
-        assert_eq!(model.apply_event(&wrong_log), ApplyOutcome::LogMismatch);
-    }
-
-    #[test]
-    fn c5_log_id_reset_keeps_state_until_rebaseline() {
-        let mut model = model();
-        let reset = fx::reset(
-            SESSION,
-            EPOCH,
-            Some("log-2"),
-            Some(("log-2", 8)),
-            RingingV2ResetReason::LogIdMismatch,
-        );
-        assert!(model.begin_reset(&reset));
-        assert!(model.is_reset_pending());
-        assert!(!model.is_read_only());
-        assert_eq!(
-            model.apply_event(&reliable(8, 1)),
-            ApplyOutcome::ResetPending
-        );
-    }
-
-    #[test]
-    fn c6_cursor_expired_keeps_old_state_until_rebaseline() {
-        let mut model = model();
-        let old_cursor = model.cursor().map(str::to_string);
-        let reset = fx::reset(
-            SESSION,
-            EPOCH,
-            Some(LOG),
-            Some((LOG, 8)),
-            RingingV2ResetReason::CursorExpired,
-        );
-        assert!(model.begin_reset(&reset));
-        assert!(model.is_reset_pending());
-        assert_eq!(model.cursor(), old_cursor.as_deref());
-        assert_eq!(
-            model.apply_event(&reliable(8, 1)),
-            ApplyOutcome::ResetPending
-        );
-
-        let next = fx::bootstrap(SESSION, EPOCH, LOG, 8, 9);
-        assert_eq!(model.apply_bootstrap(&next), BootstrapOutcome::Applied);
-        assert!(!model.is_reset_pending());
-        assert_eq!(model.cursor(), Some(next.snapshot_cursor.as_str()));
-        assert_eq!(model.state_revision(), 9);
-    }
-
-    #[test]
-    fn c7_snapshot_missing_is_read_only_and_does_not_guess_history() {
-        let mut model = model();
-        let old_cursor = model.cursor().map(str::to_string);
-        let old_revision = model.state_revision();
-        let reset = fx::reset(
-            SESSION,
-            EPOCH,
-            None,
-            None,
-            RingingV2ResetReason::SnapshotMissing,
-        );
-
-        assert!(model.begin_reset(&reset));
-        assert!(model.is_reset_pending());
+        let resync = qaqh_ringing::RingingV2ResyncRequired {
+            session_id: SESSION.into(),
+            reason: "cursor_gap".into(),
+        };
+        assert!(model.begin_resync(&resync));
         assert!(model.is_read_only());
-        assert_eq!(model.cursor(), old_cursor.as_deref());
-        assert_eq!(model.state_revision(), old_revision);
+        assert_eq!(model.apply_frame(&frame(7)), ApplyOutcome::ResyncPending);
         assert_eq!(
-            model.apply_event(&reliable(8, 1)),
-            ApplyOutcome::ResetPending
+            model.apply_bootstrap(&bootstrap(50)),
+            BootstrapOutcome::Applied
         );
-    }
-
-    /// reset 只读策略的穷尽映射：每个后端原因都必须有明确归属。
-    ///
-    /// 证伪方式：往 `RingingV2ResetReason` 加一个变体而不改 `reset_is_read_only`
-    /// —— 本仓**编译失败**（穷尽 match），而不是默默当成「可写」。
-    #[test]
-    fn reset_read_only_policy_covers_every_authoritative_reason() {
-        for reason in [
-            RingingV2ResetReason::CursorExpired,
-            RingingV2ResetReason::LogIdMismatch,
-            RingingV2ResetReason::UnknownFact,
-            RingingV2ResetReason::UpgradeRequired,
-            RingingV2ResetReason::ReplayOverflow,
-            RingingV2ResetReason::EpochMismatch,
-            RingingV2ResetReason::CrossSession,
-            RingingV2ResetReason::SnapshotMissing,
-            RingingV2ResetReason::SnapshotExpired,
-            RingingV2ResetReason::SnapshotHashMismatch,
-            RingingV2ResetReason::StaleWriter,
-            RingingV2ResetReason::ContentQuotaExceeded,
-            RingingV2ResetReason::PerConnectionOverflow,
-            RingingV2ResetReason::ProgressBufferOverflow,
-            RingingV2ResetReason::ActorMailboxOverflow,
-        ] {
-            let expected = matches!(
-                reason,
-                RingingV2ResetReason::SnapshotMissing | RingingV2ResetReason::UpgradeRequired
-            );
-            assert_eq!(reset_is_read_only(reason), expected, "{reason:?}");
-        }
+        assert!(!model.is_read_only());
+        assert_eq!(model.next_seq(), 50);
+        assert_eq!(model.apply_frame(&frame(50)), ApplyOutcome::Applied { seq: 50 });
     }
 
     #[test]
-    fn r4_first_answer_wins_and_terminal_interaction_cannot_reopen() {
+    fn resync_for_another_session_is_ignored() {
+        let mut model = model();
+        let resync = qaqh_ringing::RingingV2ResyncRequired {
+            session_id: "other".into(),
+            reason: "cursor_gap".into(),
+        };
+        assert!(!model.begin_resync(&resync));
+        assert!(!model.is_read_only());
+    }
+
+    /// 交互身份：第一答复胜出、终态不得重开（R4 语义延续到 v3）。
+    #[test]
+    fn first_answer_wins_and_terminal_interaction_cannot_reopen() {
         let mut model = model();
         assert_eq!(
             model.apply_interaction_requested("i2"),
@@ -695,282 +421,130 @@ mod tests {
             model.apply_interaction_resolved("i2"),
             InteractionOutcome::AlreadyTerminal
         );
+        // 未知 id 的 resolved 也进入终态集合（服务端权威），返回 Unknown。
+        assert_eq!(
+            model.apply_interaction_expired("i9"),
+            InteractionOutcome::Unknown
+        );
     }
 
-    /// 未决集合**只记身份**：正文（`request`）不在这里落副本。
-    ///
-    /// 历史缺陷：镜像 `PendingInteraction` 漏了权威类型的 `request` 字段，而它
-    /// 只有 `#[cfg(test)]` 读者，所以没人发现。现在正文直接由 typed payload 进
-    /// UI 层，本状态机连存的地方都没有。
+    /// bootstrap 的未决交互按身份收编（含 contract `InteractionId` 新类型）。
     #[test]
-    fn pending_set_tracks_identity_only() {
-        let bootstrap = fx::bootstrap_typed(
-            SESSION,
-            EPOCH,
-            LOG,
-            7,
-            7,
-            &[fx::pending_with_text(
-                "int-ask",
-                "call-ask",
-                "turn-ask",
-                "ask",
-                "继续？",
-            )],
-            None,
-        );
-        // 权威类型确实带着正文——本状态机只是不复制它。
-        let authoritative = &bootstrap.control.state.interactions[0];
-        assert!(authoritative.request.is_some(), "正文在权威 payload 上");
-
+    fn bootstrap_adopts_pending_interaction_identities() {
+        let mut state = SessionState {
+            seq: 7,
+            ..SessionState::default()
+        };
+        state.interactions.push(qaqh_ringing_contract::state::InteractionView {
+            interaction_id: qaqh_ringing_contract::fact::InteractionId::new(
+                "int-1".to_string(),
+            ),
+            call_id: None,
+            turn_id: None,
+            kind: qaqh_ringing_contract::fact::InteractionKind::Ask,
+            request: qaqh_ringing_contract::fact::ContentValue::Inline {
+                text: "{\"input\":\"ASK v1\"}".into(),
+            },
+            choices: vec![],
+            expires_at_ms: None,
+            resolution: None,
+        });
+        let bootstrap = SessionBootstrap {
+            schema: "qaqh.ringing.session/v2".into(),
+            version: qaqh_ringing::RINGING_V2_VERSION,
+            session_contract_revision: SESSION_CONTRACT_REVISION.into(),
+            server_epoch: EPOCH.into(),
+            session_id: SESSION.into(),
+            state,
+        };
         let mut model = RingingV2SessionModel::new(SESSION);
         assert_eq!(model.apply_bootstrap(&bootstrap), BootstrapOutcome::Applied);
         assert_eq!(
             model.pending_interactions().collect::<Vec<_>>(),
-            ["int-ask"]
+            ["int-1"]
         );
     }
 
-    /// 三种交互 kind 在 bootstrap 上都被认作未决身份（不再有 TUI 枚举映射层）。
+    /// driver 席位：epoch 单调、同 epoch 冲突、None 清席（B02）。
     #[test]
-    fn r1_r3_reconnect_restores_permission_ask_and_plan_by_stable_id() {
-        for wire_kind in ["permission", "ask", "plan"] {
-            let interaction_id = format!("int-{wire_kind}");
-            let call_id = format!("call-{wire_kind}");
-            let turn_id = format!("turn-{wire_kind}");
-            let bootstrap = fx::bootstrap_typed(
-                SESSION,
-                EPOCH,
-                LOG,
-                7,
-                7,
-                &[fx::pending(&interaction_id, &call_id, &turn_id, wire_kind)],
-                None,
-            );
-            let mut model = RingingV2SessionModel::new(SESSION);
-            assert_eq!(model.apply_bootstrap(&bootstrap), BootstrapOutcome::Applied);
-            assert_eq!(
-                model.pending_interactions().collect::<Vec<_>>(),
-                [interaction_id.as_str()]
-            );
-        }
-    }
-
-    #[test]
-    fn d1_vacant_seat_claim_is_applied_with_monotonic_epoch() {
+    fn driver_seat_handover_is_epoch_monotonic() {
         let mut model = model();
-        assert!(model.driver().is_none(), "基线快照没有 driver 段");
-        let claimed = RingingV2DriverState {
-            holder: Some("cs-1".into()),
-            driver_epoch: 4,
-            can_claim: false,
-        };
+        assert!(model.driver.is_none());
         assert_eq!(
-            model.apply_driver_state(claimed.clone()),
-            DriverOutcome::Applied
-        );
-        assert!(model.is_driver("cs-1"));
-        assert_eq!(model.apply_driver_state(claimed), DriverOutcome::Duplicate);
-    }
-
-    #[test]
-    fn d2_busy_driver_rejects_other_claimants_stably() {
-        let mut model = model();
-        assert_eq!(
-            model.apply_driver_state(RingingV2DriverState {
+            model.apply_driver(Some(&DriverState {
                 holder: Some("cs-1".into()),
-                driver_epoch: 4,
-                can_claim: false,
-            }),
+                epoch: 4,
+            })),
             DriverOutcome::Applied
         );
+        assert_eq!(model.driver.as_ref().and_then(|d| d.holder.as_deref()), Some("cs-1"));
+        // 同 epoch 同 holder = Duplicate。
         assert_eq!(
-            model.apply_driver_state(RingingV2DriverState {
+            model.apply_driver(Some(&DriverState {
+                holder: Some("cs-1".into()),
+                epoch: 4,
+            })),
+            DriverOutcome::Duplicate
+        );
+        // 同 epoch 换 holder = Conflict。
+        assert_eq!(
+            model.apply_driver(Some(&DriverState {
                 holder: Some("cs-2".into()),
-                driver_epoch: 4,
-                can_claim: true,
-            }),
+                epoch: 4,
+            })),
             DriverOutcome::Conflict
         );
-        assert!(model.is_driver("cs-1"));
-        assert!(!model.is_driver("cs-2"));
-    }
-
-    #[test]
-    fn d3_handover_rejects_old_epoch_and_same_epoch_conflicts() {
-        let mut model = model();
-        let current = RingingV2DriverState {
-            holder: Some("cs-1".into()),
-            driver_epoch: 4,
-            can_claim: false,
-        };
+        // epoch 前进 = Applied。
         assert_eq!(
-            model.apply_driver_state(current.clone()),
+            model.apply_driver(Some(&DriverState {
+                holder: Some("cs-2".into()),
+                epoch: 5,
+            })),
             DriverOutcome::Applied
         );
-        assert_eq!(model.apply_driver_state(current), DriverOutcome::Duplicate);
+        // epoch 回退 = Stale。
         assert_eq!(
-            model.apply_driver_state(RingingV2DriverState {
-                holder: Some("cs-2".into()),
-                driver_epoch: 4,
-                can_claim: false,
-            }),
-            DriverOutcome::Conflict
-        );
-        assert_eq!(
-            model.apply_driver_state(RingingV2DriverState {
-                holder: Some("cs-2".into()),
-                driver_epoch: 5,
-                can_claim: false,
-            }),
-            DriverOutcome::Applied
-        );
-        assert!(model.is_driver("cs-2"));
-        assert_eq!(
-            model.apply_driver_state(RingingV2DriverState {
+            model.apply_driver(Some(&DriverState {
                 holder: Some("cs-1".into()),
-                driver_epoch: 4,
-                can_claim: false,
-            }),
+                epoch: 4,
+            })),
             DriverOutcome::Stale
         );
-        assert!(model.is_driver("cs-2"));
+        assert_eq!(model.driver.as_ref().and_then(|d| d.holder.as_deref()), Some("cs-2"));
+        // None 清席；重复 None = Duplicate。
+        assert_eq!(model.apply_driver(None), DriverOutcome::Applied);
+        assert!(model.driver.is_none());
+        assert_eq!(model.apply_driver(None), DriverOutcome::Duplicate);
     }
 
+    /// v3 的空 turn 列表可以零值往返（回归：bootstrap 消费不得要求多余字段）。
     #[test]
-    fn t2_stale_bootstrap_cannot_rollback_newer_snapshot() {
-        let mut model = model();
-
-        let newer = fx::bootstrap(SESSION, EPOCH, "v2.new", 1, 9);
-        assert_eq!(model.apply_bootstrap(&newer), BootstrapOutcome::Applied);
-
-        let stale = fx::bootstrap(SESSION, EPOCH, "v2.old", 1, 8);
-        assert_eq!(model.apply_bootstrap(&stale), BootstrapOutcome::Stale);
-        assert_eq!(model.cursor(), Some(newer.snapshot_cursor.as_str()));
-        assert_eq!(model.state_revision(), 9);
-    }
-
-    #[test]
-    fn t2_old_bootstrap_after_reset_must_match_reset_epoch_and_log() {
-        let mut model = model();
-        assert!(model.begin_reset(&fx::reset(
-            SESSION,
-            "epoch-2",
-            Some("log-2"),
-            None,
-            RingingV2ResetReason::CursorExpired,
-        )));
-
-        let stale = fx::bootstrap(SESSION, EPOCH, LOG, 1, 7);
+    fn bootstrap_with_empty_state_applies() {
+        let mut model = RingingV2SessionModel::new(SESSION);
         assert_eq!(
-            model.apply_bootstrap(&stale),
-            BootstrapOutcome::ResetMismatch
+            model.apply_bootstrap(&bootstrap(0)),
+            BootstrapOutcome::Applied
         );
-        assert!(model.is_reset_pending());
-        assert_eq!(model.server_epoch(), Some(EPOCH));
-
-        let wrong_log = fx::bootstrap(SESSION, "epoch-2", LOG, 1, 7);
-        assert_eq!(
-            model.apply_bootstrap(&wrong_log),
-            BootstrapOutcome::ResetMismatch
-        );
-        assert!(model.is_reset_pending());
-
-        let fresh = fx::bootstrap(SESSION, "epoch-2", "log-2", 1, 1);
-        assert_eq!(model.apply_bootstrap(&fresh), BootstrapOutcome::Applied);
-        assert!(!model.is_reset_pending());
-        assert_eq!(model.server_epoch(), Some("epoch-2"));
+        // 空快照水位 0：首帧 seq 0 也要被接受（相等边界）。
+        assert_eq!(model.apply_frame(&frame(0)), ApplyOutcome::Applied { seq: 0 });
     }
 
+    /// 未初始化（无 bootstrap）时事件帧必须被拒。
     #[test]
-    fn t2_old_bootstrap_before_reset_baseline_is_rejected() {
-        let mut model = model();
-        assert!(model.begin_reset(&fx::reset(
-            SESSION,
-            EPOCH,
-            Some(LOG),
-            Some(("v2.reset.9", 9)),
-            RingingV2ResetReason::CursorExpired,
-        )));
-
-        let old = fx::bootstrap(SESSION, EPOCH, LOG, 8, 8);
-        assert_eq!(model.apply_bootstrap(&old), BootstrapOutcome::ResetMismatch);
-        assert!(model.is_reset_pending());
-
-        let fresh = fx::bootstrap(SESSION, EPOCH, LOG, 9, 9);
-        assert_eq!(model.apply_bootstrap(&fresh), BootstrapOutcome::Applied);
-        assert!(!model.is_reset_pending());
+    fn frames_before_bootstrap_are_rejected() {
+        let mut model = RingingV2SessionModel::new(SESSION);
+        assert_eq!(model.apply_frame(&frame(0)), ApplyOutcome::NotInitialized);
     }
 
-    /// 会话身份不匹配的快照必须被拒（`session_id` 是权威键，不是 `session_id` 别名）。
+    /// `TurnView` 形状不被本模块依赖——只要编译过就说明契约字段兼容。
     #[test]
-    fn bootstrap_for_another_session_is_rejected() {
-        let mut model = model();
-        let other = fx::bootstrap("session-2", EPOCH, LOG, 1, 99);
-        assert_eq!(
-            model.apply_bootstrap(&other),
-            BootstrapOutcome::SessionMismatch
-        );
-        assert_eq!(model.state_revision(), 7);
-
-        let mut other_model = RingingV2SessionModel::new("session-2");
-        assert!(!other_model.begin_reset(&fx::reset(
-            SESSION,
-            EPOCH,
-            None,
-            None,
-            RingingV2ResetReason::CursorExpired
-        )));
-    }
-
-    /// reset 帧带 session_id；不带它的旧形状根本解不出来（fail-loud）。
-    #[test]
-    fn reset_frame_requires_authoritative_session_id() {
-        assert!(
-            fx::reset_from_legacy_session_id_key().is_err(),
-            "legacy session_id 键必须解析失败——这正是镜像时代静默漂移的那一类"
-        );
-    }
-
-    /// `ts_ms`（beta-readiness W1/C3）是权威信封字段，TUI 直接读，不再自建时间戳。
-    #[test]
-    fn envelope_ts_ms_is_consumed_from_the_authoritative_source() {
-        let mut event = fx::ReliableEvent::new(SESSION, EPOCH, LOG, 8, 1, audit_payload());
-        event.ts_ms = Some(1_759_000_000_123);
-        let built = event.build();
-        let mut model = model();
-        assert_eq!(
-            model.apply_event(&built),
-            ApplyOutcome::ReliableApplied {
-                fact_seq: 8,
-                projection_index: 1
-            }
-        );
-        assert_eq!(fx::delivery_of(&built), RingingV2Delivery::Reliable);
-        assert_eq!(
-            built.ts_ms,
-            Some(1_759_000_000_123),
-            "权威信封把源 fact 墙钟带到了 TUI"
-        );
-        // 缺席时 `#[serde(default)]` 给 None：合成 ephemeral 事件就是这样。
-        let synthetic = fx::ephemeral_event(SESSION, EPOCH, audit_payload());
-        assert_eq!(synthetic.ts_ms, None);
-        assert_eq!(
-            fx::stream_key(Channel::Conversation),
-            synthetic.stream_key,
-            "stream_key 也走权威 serde"
-        );
-    }
-
-    /// 权威交互 delta 的 kind 名与新状态机无映射层（直接断言枚举可命名即可）。
-    #[test]
-    fn delta_interaction_kind_is_authoritative() {
-        let _ = FactInteractionKind::Ask;
-        // 权威 delta 能被 TUI 直接命名与匹配（不再经 TUI 自己的 kind 枚举）。
-        let delta = fx::turn_started_delta("t1");
-        assert!(matches!(
-            delta,
-            qaqh_client::ConversationDelta::TurnStarted { .. }
-        ));
+    fn contract_types_are_nameable() {
+        let _ = TurnView {
+            turn_id: qaqh_ringing_contract::fact::TurnId::new("t1".to_string()),
+            input_id: None,
+            mode: None,
+            phase: None,
+            outcome: None,
+        };
     }
 }

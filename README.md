@@ -1,6 +1,13 @@
 # qaqh-tui
 
-QAQ-Harness 的终端前端（ratatui + tokio），基于 `qaqh.Ringing` v2 单流协议直连本地 daemon。
+QAQ-Harness 的终端前端（ratatui + tokio），基于 Ringing v3（wire 仍是 RingingV2 单流协议，`session_contract_revision = ringing-session-2`）直连本地 daemon。
+
+> **backend-v3 适配（2026-11-06）**：本仓在 path 依赖 `qaqh-client`/`qaqh-config-api`
+> 之外，**直接 path 依赖权威契约 crate**（`qaqh-ringing` / `qaqh-ringing-contract` /
+> `qaqh-types`）——wire 类型改名/加字段当场编译报错，不再可能拿到过期镜像。
+> 会话创建强制 `model_selection`（backend-v3）：来源为 `provider.list` 目录快照
+> （`QAQH_MODEL_SELECTION=provider/model` 可覆盖）；`/remote` 的 https 直连支持
+> 证书指纹锚定（`--tls-fp` / `QAQH_REMOTE_TLS_FP`）。
 当前唯一 UI 是 **V2 Fullscreen**；旧 TUI v1 全屏与 V2 inline 设计已删除。
 
 ## 下载 2.0.0
@@ -154,12 +161,13 @@ src/
   protocol/      只剩两个 re-export 面：qaqh-config-api 的配置读写模型；
                  历史手工镜像（9 文件 2481 行）已按类型镜像纪律全部删除
   app/           App 状态机 + 投影消费 + 渲染 IR
-    ringing_v2.rs  canonical v2 会话状态机：epoch/log/cursor 单调性、重复与
-                   过期事件丢弃、交互身份第一答复胜出、driver seat 单调交接。
-                   **不持有协议类型**（全部来自 qaqh-client）
+    ringing_v2.rs  canonical v3 会话状态机：exclusive 水位（B01）、resync 只读、
+                   交互身份第一答复胜出、driver 席位按 epoch 单调交接（B02）。
+                   **不持有协议类型**（全部来自 qaqh-ringing-contract 直连）
     timeline_model.rs  timeline reducer（幂等可重放）+ 压缩分隔锚 + 权威墙钟
     session.rs     单会话 UI 状态（transcript/滚动/composer/挂起交互/dashboard）
-    team.rs        TeamSnapshot/TeamDelta roster + inbox 归并（AgentPath 为主键）
+    team.rs        TeamSnapshot roster + inbox 归并（AgentPath 为主键）；
+                   v3 流上无 TeamDelta，roster 以 /team 快照 + ActivityChanged 推断
     subagent.rs    子代理 timeline 跟踪与视图栈导航（Ctrl+↑/↓）
     export.rs      Markdown 导出
   ui/v2/         v2 视图模型与渲染：adapter（timeline → block）/ transcript /

@@ -50,7 +50,7 @@ impl App {
             .filter(|agent_id| {
                 self.team_for_agent(agent_id)
                     .and_then(|(_, team)| team.agent_by_id(agent_id))
-                    .is_some_and(|agent| agent.status == qaqh_client::TeamAgentStatus::Running)
+                    .is_some_and(|agent| agent.status == qaqh_ringing_contract::team::TeamAgentStatus::Running)
             })
             .collect()
     }
@@ -81,9 +81,7 @@ impl App {
             let attach = api
                 .send_command(
                     Some(&session_id),
-                    RingingCommand::Control(ControlCommand::SessionAttach {
-                        session_id: session_id.clone(),
-                    }),
+                    RingingCommand::SessionAttach {},
                     Default::default(),
                 )
                 .await;
@@ -206,7 +204,7 @@ mod tests {
         app.tabs.push("root".into());
         app.sessions
             .insert("root".into(), SessionState::new("root".into()));
-        let snapshot: qaqh_client::TeamSnapshot = serde_json::from_value(serde_json::json!({
+        let snapshot: qaqh_ringing_contract::TeamSnapshot = serde_json::from_value(serde_json::json!({
             "root_session_id": "root",
             "agents": [
                 {

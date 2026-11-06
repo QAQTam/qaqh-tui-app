@@ -1247,12 +1247,9 @@ mod tests {
         app.handle(AppMsg::Action(ActionResult::Uploaded {
             session_id: "gone".into(),
             path: "/tmp/x.png".into(),
-            result: Ok(qaqh_client::ContentRef {
-                content_id: "c1".into(),
-                media_type: "image/png".into(),
-                sha256: "0".repeat(64),
-                truncated: false,
-            }),
+            result: Ok(qaqh_ringing_contract::fact::ContentRef::new(
+                qaqh_ringing_contract::fact::ContentHash::new("0".repeat(64)),
+            )),
         }));
         assert!(
             app.toasts
@@ -1270,12 +1267,9 @@ mod tests {
         app.handle(AppMsg::Action(ActionResult::Uploaded {
             session_id: "A".into(),
             path: "/tmp/shot.png".into(),
-            result: Ok(qaqh_client::ContentRef {
-                content_id: "c1".into(),
-                media_type: "image/png".into(),
-                sha256: "0".repeat(64),
-                truncated: false,
-            }),
+            result: Ok(qaqh_ringing_contract::fact::ContentRef::new(
+                qaqh_ringing_contract::fact::ContentHash::new("0".repeat(64)),
+            )),
         }));
         assert_eq!(
             app.sessions["A"].composer.attachments.len(),

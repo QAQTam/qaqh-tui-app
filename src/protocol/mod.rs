@@ -59,20 +59,19 @@ mod tests {
             "created_at": 1757800000000u64,
             "updated_at": 1757900000000u64,
             "model": "m1",
-            "message_count": 3,
             "title": "Bun 引导 daemon",
             "cwd": "/home/x/Projects/qaqh-backend",
             "mode": 1,
             "archived": true,
             "ephemeral": false,
-            "status": "working",
+            "status": "running",
         });
         let entry: SessionListEntry =
             serde_json::from_value(wire.clone()).expect("会话列表条目可解析");
         // 列表渲染真正读的每一个字段（ui/home.rs、ui/overlays.rs、app/overlay_ops.rs）。
         assert_eq!(entry.meta.session_id, "0123abcd");
         assert!(entry.meta.archived && !entry.meta.ephemeral);
-        assert_eq!(entry.status, SessionRunStatus::Working);
+        assert_eq!(entry.status, SessionRunStatus::Running);
         assert_eq!(entry.meta.updated_at, 1757900000000);
         assert_eq!(entry.meta.display_title(), "Bun 引导 daemon");
         // 未分组/旧 daemon 不带 workspace_id 时必须仍是 `None` 而不是解析失败。
@@ -86,18 +85,11 @@ mod tests {
             serde_json::from_value(legacy).expect("缺 status 的旧回包仍须可解析");
         assert_eq!(legacy.status, SessionRunStatus::NotRunning);
 
-        // **严格度差异（须知会）**：`session_id`/`created_at`/`updated_at`/`model`/
-        // `message_count` 在 `SessionMeta` 上没有 `#[serde(default)]`，缺一个整条就被
-        // 跳过；而 G2 之前那份手解把这些全当可选。实际不受影响——产出方就是
-        // `SessionMeta` 本身，缺这些键的记录在 daemon 读盘那一步就已经被丢了，
-        // 根本发不到 wire。这条断言是为了让「严格在哪」写成可执行的，而不是靠记忆。
-        for required in [
-            "session_id",
-            "created_at",
-            "updated_at",
-            "model",
-            "message_count",
-        ] {
+        // **严格度（v3 现状须知会）**：`message_count` 已随 backend-v3 删除；
+        // `SessionMeta` 的派生字段带 `#[serde(default)]`（未知键宽容），身份键
+        // `session_id`/`created_at` 仍无 default——缺了必须解析失败。这条断言把
+        // 「严格在哪」写成可执行的，而不是靠记忆。
+        for required in ["session_id", "created_at"] {
             let mut partial = wire.clone();
             partial.as_object_mut().unwrap().remove(required);
             assert!(
@@ -107,139 +99,110 @@ mod tests {
         }
 
         // 活动快照：本仓只用 session_id + state 两个键（app/mod.rs 的 activity_cache）。
+        // v3 活动词表（`state::SessionActivityState`，snake_case 4 值）。
         let acts: Vec<SessionActivity> = serde_json::from_value(serde_json::json!([
-            { "session_id": "0123abcd", "state": "working", "turn_id": "t1", "seq": 3, "updated_at": 1 },
+            { "session_id": "0123abcd", "state": "running", "turn_id": "t1", "seq": 3, "updated_at": 1 },
         ]))
         .expect("活动快照可解析");
         assert_eq!(acts[0].session_id, "0123abcd");
-        assert_eq!(acts[0].state, qaqh_client::DomainActivityState::Working);
+        assert_eq!(
+            acts[0].state,
+            qaqh_ringing_contract::state::SessionActivityState::Running
+        );
         assert_eq!(acts[0].turn_id.as_deref(), Some("t1"));
     }
 
-    /// **压缩三态的消费侧闸门**（2026-10-09 后端把压缩的瞬态镜像并进 v2
-    /// conversation 流）：三帧的 wire kind 名与本仓读的字段都得钉住。
-    ///
-    /// 这三帧**不入 fact 链、不进快照**，没有「回放补齐」这层安全网：后端改名或
-    /// 挪字段，TUI 只会表现为「压缩卡永远不出现」——静默且难复现。所以断言写在
-    /// 解析层，让它在这一轮就变红。
+    /// **v3 事件词表闸**（backend-v3）：单流 `SessionEventFrame` 的 20 个变体
+    /// 在 serde 层可解析，transcript 家族的关键字段 TUI 真的会读。
     #[test]
-    fn compact_transient_frames_wire_vocabulary_is_locked() {
-        use qaqh_client::fact::{CompactStatus, ConversationDelta as D};
+    fn session_event_frame_wire_vocabulary_is_locked() {
+        use qaqh_ringing_contract::{SessionEvent, SessionEventFrame};
 
-        let started: D = serde_json::from_value(serde_json::json!({
-            "kind": "compact_started",
-            "data": { "revision": 7, "compact_id": "c1", "turns_total": 12, "turns_keeping": 3 },
+        // 水位帧 + meta 变更（TUI 消费 title）。
+        let frame: SessionEventFrame = serde_json::from_value(serde_json::json!({
+            "seq": 7,
+            "type": "session_meta_changed",
+            "title": "新标题",
         }))
-        .expect("CompactStarted 必须可解析");
-        match started {
-            D::CompactStarted {
-                compact_id,
-                turns_total,
-                turns_keeping,
-                ..
-            } => {
-                assert_eq!(compact_id, "c1");
-                assert_eq!((turns_total, turns_keeping), (12, 3));
-            }
-            other => panic!("compact_started 的 wire 形状变了：{other:?}"),
-        }
+        .expect("meta 帧可解析");
+        assert_eq!(frame.seq, 7);
+        assert!(matches!(
+            frame.event,
+            SessionEvent::SessionMetaChanged { ref title } if title.as_deref() == Some("新标题")
+        ));
 
-        // `delta` 是**累计全文**快照而不是 chunk 增量：本仓据此整帧替换。
-        let progress: D = serde_json::from_value(serde_json::json!({
-            "kind": "compact_progress",
-            "data": { "revision": 8, "compact_id": "c1", "delta": "摘要全文" },
+        // MessageDelta：块级替换语义的四个键 TUI 全读。
+        let frame: SessionEventFrame = serde_json::from_value(serde_json::json!({
+            "seq": 8,
+            "type": "message_delta",
+            "turn_id": "t1",
+            "block_id": "b1",
+            "block_kind": "answer",
+            "text": "增量",
         }))
-        .expect("CompactProgress 必须可解析");
-        match progress {
-            D::CompactProgress { delta, .. } => assert_eq!(delta, "摘要全文"),
-            other => panic!("compact_progress 的 wire 形状变了：{other:?}"),
-        }
+        .expect("message_delta 帧可解析");
+        assert!(matches!(
+            frame.event,
+            SessionEvent::MessageDelta { ref text, .. } if text == "增量"
+        ));
 
-        // 终态：四个 status 词都要认；`summaryChars` / `turns*` 是可选键
-        //（后端 `skip_serializing_if` 掉了就整键缺席），缺席必须仍可解析。
-        let finished: D = serde_json::from_value(serde_json::json!({
-            "kind": "compact_finished",
-            "data": { "revision": 9, "compact_id": "c1", "status": "cancelled" },
+        // ToolDeclared：v3 新增 tool_name + args（B03）。
+        let frame: SessionEventFrame = serde_json::from_value(serde_json::json!({
+            "seq": 9,
+            "type": "tool_declared",
+            "call_id": "c1",
+            "turn_id": "t1",
+            "tool_name": "exec",
+            "args": {"command": "ls"},
         }))
-        .expect("CompactFinished 缺可选字段仍须可解析");
-        match finished {
-            D::CompactFinished { status, .. } => {
-                assert_eq!(status, CompactStatus::Cancelled)
-            }
-            other => panic!("compact_finished 的 wire 形状变了：{other:?}"),
-        }
-        for word in ["completed", "skipped", "failed"] {
-            let frame = serde_json::json!({
-                "kind": "compact_finished",
-                "data": { "revision": 1, "compact_id": "c", "status": word },
-            });
-            match serde_json::from_value::<D>(frame).expect("终态词表可解析") {
-                D::CompactFinished { .. } => {}
-                other => panic!("期望 CompactFinished，得到 {other:?}"),
-            }
-        }
-        // 词表是闭集：未知终态不得被兜成某个已知值（那会把失败读成完成）。
-        let bogus = serde_json::json!({
-            "kind": "compact_finished",
-            "data": { "revision": 1, "compact_id": "c", "status": "aborted" },
-        });
-        assert!(
-            serde_json::from_value::<D>(bogus).is_err(),
-            "未知 compact status 必须解析失败"
-        );
+        .expect("tool_declared 帧可解析");
+        assert!(matches!(
+            frame.event,
+            SessionEvent::ToolDeclared { ref tool_name, .. } if tool_name == "exec"
+        ));
     }
 
-    /// 每轮 provider 真值 usage 的落点（`TurnFinished.usage`）。
-    ///
-    /// 后端删掉 conversation 投影上的聚合 `usage` / `usage_totals` 之后，本仓的
-    /// 单次用量只从 `AssistantBlockSealed` / `TurnFinished` 两条 delta 取，累计值
-    /// 取 `SessionMeta.usage_totals`——两条源都要有闸。
+    /// **provider 目录闸**（backend-v3）：`provider.list` 的 result 形状是
+    /// `model_selection` 的唯一来源，键名与 api_key 掩码行为钉死。
     #[test]
-    fn per_turn_usage_and_session_totals_are_the_only_two_sources() {
-        use qaqh_client::ConversationDelta as D;
-        let finished: D = serde_json::from_value(serde_json::json!({
-            "kind": "turn_finished",
-            "data": {
-                "revision": 1,
-                "turn_id": "t1",
-                "terminal": "completed",
-                "usage": {
-                    "prompt_tokens": 1200,
-                    "completion_tokens": 300,
-                    "total_tokens": 1500
+    fn provider_catalog_wire_shape_is_locked() {
+        let catalog: crate::app::session::ProviderCatalog = serde_json::from_value(
+            serde_json::json!({
+                "schema_version": 1,
+                "revision": 2,
+                "providers": {
+                    "probe": {
+                        "name": "Probe",
+                        "base_url": "https://api.example.com/v1",
+                        "wire": "chat",
+                        "credential": "api_key",
+                        "api_key": "set",
+                        "models": {
+                            "m1": {
+                                "enabled": true,
+                                "display_name": "M1",
+                                "context_window": 128000,
+                                "max_output_tokens": 8192,
+                                "reasoning_levels": [],
+                                "capabilities": {},
+                                "defaults": {},
+                            },
+                            "m2-disabled": { "enabled": false },
+                        },
+                    },
                 },
-            },
-        }))
-        .expect("TurnFinished 带 usage 可解析");
-        match finished {
-            D::TurnFinished { usage, .. } => {
-                let usage = usage.expect("usage 有值就必须解得出");
-                assert_eq!(usage.prompt_tokens, 1200);
-                assert_eq!(usage.completion_tokens, 300);
-            }
-            other => panic!("turn_finished 的 wire 形状变了：{other:?}"),
-        }
-
-        // 累计值：`session.list` 的 meta.usage_totals（cache% 的唯一分母之一）。
-        let entry: SessionListEntry = serde_json::from_value(serde_json::json!({
-            "session_id": "0123abcd",
-            "created_at": 1,
-            "updated_at": 2,
-            "model": "m1",
-            "message_count": 1,
-            "status": "working",
-            "usage_totals": {
-                "prompt_tokens": 900,
-                "completion_tokens": 100,
-                "total_tokens": 1000
-            },
-        }))
-        .expect("带 usage_totals 的条目可解析");
-        assert_eq!(entry.meta.usage_totals.prompt_tokens, 900);
-        assert_eq!(entry.meta.usage_totals.completion_tokens, 100);
+                "profiles": {},
+            }),
+        )
+        .expect("provider.list result 可解析");
+        assert_eq!(catalog.revision, 2);
+        let (provider_id, model_id) =
+            catalog.first_enabled_selection().expect("有启用模型");
+        assert_eq!((provider_id.as_str(), model_id.as_str()), ("probe", "m1"));
+        assert!(catalog.providers["probe"].models.contains_key("m2-disabled"));
     }
 
-    /// T-11 回归闸：这几条断言**必须**对着权威 crate 成立，否则说明本仓又
+/// T-11 回归闸：这几条断言**必须**对着权威 crate 成立，否则说明本仓又
     /// 悄悄接回了手抄件（或依赖被换成了缩小版）。断言刻意贴着「TUI 实际要用的
     /// 那几个字段」，而非上游测试的复制。
     #[test]

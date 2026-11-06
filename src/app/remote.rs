@@ -3,8 +3,10 @@
 //! 三条边界写在这里，改代码前先读：
 //! 1. **token 只在进程内**。`draft_token` / `RemoteTarget.token` 都不落盘、不写日志、
 //!    不进 argv；界面一律画 `●●●●`。
-//! 2. **本客户端自己的连接面只走 `http://`**（见 [`crate::runtime::RemoteTarget::new`]：
-//!    客户端没有指纹锚定能力，自签证书会在握手期失败）。
+//! 2. **本客户端自己的连接面优先 `http://`**（见 [`crate::runtime::RemoteTarget::new`]）。
+//!    backend-v3 后客户端已支持自签证书指纹锚定（`tls_fp`），`https://` 需要指纹：
+//!    CLI/环境变量可显式给（`--tls-fp` / `QAQH_REMOTE_TLS_FP`）；本页草稿 URL 若
+//!    恰好是本机 daemon 的局域网面，会自动带上它自报的指纹（见 `draft_target`）。
 //! 3. **二维码里的 `base_url` 是手机的入口，不是我们自己的**：它取 daemon.json 的
 //!    `lan_endpoint`，那是 daemon 在**非回环 bind** 上开的 TLS 面，所以二维码里出现
 //!    `https://` 是对的，别按第 2 条"顺手改成 http"——原生端拿 `tls_fp` 做 pinning。
@@ -302,8 +304,16 @@ impl RemoteState {
     }
 
     /// 草稿是否够发起一次直连。
+    ///
+    /// 草稿 URL 恰好是本机 daemon 的局域网面时，自动带上它自报的证书指纹：
+    /// 不加任何输入 UI 就能锚定自签 https（指纹本来就在 daemon.json 里）。
     pub fn draft_target(&self) -> Result<RemoteTarget, String> {
-        RemoteTarget::new(&self.draft_url, &self.draft_token)
+        let tls_fp = self
+            .lan
+            .as_ref()
+            .filter(|lan| lan.lan_endpoint.as_deref() == Some(self.draft_url.trim()))
+            .and_then(|lan| lan.tls_fingerprint.clone());
+        RemoteTarget::new(&self.draft_url, &self.draft_token, tls_fp)
     }
 
     pub fn set_status(&mut self, text: impl Into<String>, is_error: bool) {

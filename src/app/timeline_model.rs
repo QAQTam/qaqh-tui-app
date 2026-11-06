@@ -541,13 +541,21 @@ impl TimelineModel {
         self.bump();
     }
 
-    /// 记录一次上下文压缩（权威 `CompactionApplied.context_revision`）。
-    ///
-    /// 锚定「事件到达时窗口里的最后一个回合之后」——与 webui W3 同口径。同一
-    /// `context_revision` 重复到达（回放 / reset 后重投）按幂等处理。
+
+
+
+
+    // ───────────── 压缩卡 / 会话级终态（backend-v3 暂无 wire 生产者）─────────────
+    //
+    // v3 的事件词表不再携带 CompactStarted/Progress/Finished 三帧，也没有第二条
+    // 「对话频道」终态：压缩以 `TimelineEntry::Compaction` 落 timeline，回合终态由
+    // `TurnEnded` 表达。下面五个方法保留**模型层**能力（渲染管线仍在消费
+    // `in_flight_compact` / `compaction_marks`），供执行会话/手动压缩 UI 重新接线
+    // 时复用；生产路径当前无人调用（dead_code 显式豁免，见 impl 头）。
+
+    /// 权威压缩事实到达（旧 `CompactionApplied`）：收尾瞬态卡并落锚点。
+    #[allow(dead_code)]
     pub fn record_compaction(&mut self, context_revision: u64) {
-        // 权威事实到达 = 这一轮压缩已经收尾：瞬态卡在这里一并撤掉。它是
-        // `CompactFinished` 丢帧（断线期间）时唯一的兜底清除点。
         let cleared = self.in_flight_compact.take().is_some();
         if self
             .compaction_marks
@@ -566,10 +574,8 @@ impl TimelineModel {
         self.bump();
     }
 
-    /// 开一张压缩卡（`CompactStarted`）。
-    ///
-    /// 重连时 hub 会从槽里重放最新一帧，于是这里可能收到**第二次** `CompactStarted`
-    /// （本地已有同名卡）：按 `compact_id` 幂等，不叠两张。
+    /// 开一张压缩卡（旧 `CompactStarted`）。按 `compact_id` 幂等，不叠两张。
+    #[allow(dead_code)]
     pub fn begin_compact(&mut self, compact_id: String, turns_total: u32, turns_keeping: u32) {
         if self
             .in_flight_compact
@@ -587,10 +593,8 @@ impl TimelineModel {
         self.bump();
     }
 
-    /// 刷新卡的摘要文本（`CompactProgress`）。`delta` 是**累计全文**，整帧替换。
-    ///
-    /// `compact_id` 与本地卡不符 = 旧代帧迟到（重放/串代），丢弃：否则一帧陈旧的
-    /// 短文本会把正在增长的卡倒回去。
+    /// 刷新卡的摘要文本（旧 `CompactProgress`；累计全文，整帧替换）。
+    #[allow(dead_code)]
     pub fn update_compact(&mut self, compact_id: &str, summary: String) {
         let Some(card) = self.in_flight_compact.as_mut() else {
             return;
@@ -602,7 +606,8 @@ impl TimelineModel {
         self.bump();
     }
 
-    /// 收卡（`CompactFinished`），返回被收掉的卡（`None` = 本地没有这张卡）。
+    /// 收卡（旧 `CompactFinished`），返回被收掉的卡（`None` = 本地没有这张卡）。
+    #[allow(dead_code)]
     pub fn finish_compact(&mut self, compact_id: &str) -> Option<InFlightCompact> {
         if self
             .in_flight_compact
@@ -613,6 +618,26 @@ impl TimelineModel {
         } else {
             None
         }
+    }
+
+    /// 会话级完整终态落模型（旧对话频道的兜底封口路径）。
+    /// v3 起只有 `TurnEnded` 一条封口路；保留给「单流丢帧」的模型层兜底。
+    #[allow(dead_code)]
+    pub fn seal_turn_from_conversation(&mut self, turn_id: &str, state: TimelineTurnState) -> bool {
+        if state == TimelineTurnState::Running {
+            return false;
+        }
+        let Some(turn) = self.turns.iter_mut().find(|t| t.turn_id == turn_id) else {
+            return false;
+        };
+        if !turn.is_streaming() {
+            return false;
+        }
+        turn.state = state;
+        turn.sealed = true;
+        discard_sealed_reasoning(turn);
+        self.bump();
+        true
     }
 
     /// 某回合的权威墙钟（`None` = 未知）。
@@ -998,34 +1023,6 @@ impl TimelineModel {
         self.bump();
     }
 
-    /// conversation 频道的**完整终态**（`TurnFinished.terminal`）落到 timeline 模型。
-    ///
-    /// timeline 的 `TurnSealed` 是首选权威，但两条 SSE 独立投递、都可能丢。若对话
-    /// 频道先到、而 timeline 的终态条目始终没来，窗口里就留下一个永不封口的
-    /// running 回合：任何后续 timeline 条目都会把 streaming 重新武装成
-    /// `answering · r0`（实测症状：模型完成最终作答后，输入框上方的思考动画仍在
-    /// 转、状态栏仍写着 answering）。
-    ///
-    /// **单调**：只把 Running 推进到终态，绝不反向；后端显式 reopen 走实时
-    /// `TurnOpened`，是另一条路径。晚到的 timeline `TurnSealed` 仍可覆盖具体终态
-    /// （那条路径无条件写 state），所以这里不会把状态锁死。
-    pub fn seal_turn_from_conversation(&mut self, turn_id: &str, state: TimelineTurnState) -> bool {
-        if state == TimelineTurnState::Running {
-            return false;
-        }
-        let Some(turn) = self.turns.iter_mut().find(|t| t.turn_id == turn_id) else {
-            return false;
-        };
-        if !turn.is_streaming() {
-            return false;
-        }
-        turn.state = state;
-        turn.sealed = true;
-        // 与 timeline 终态条目同一纪律：封口即丢 reasoning body（幂等）。
-        discard_sealed_reasoning(turn);
-        self.bump();
-        true
-    }
 
     /// 加载更早的回合（滚动上翻分页）。
     #[cfg(test)]
@@ -1238,111 +1235,13 @@ mod tests {
 
     /// 快照整体替换是权威全量：跨代暂存与压缩锚都必须清除。
     #[test]
-    fn snapshot_rebaseline_clears_pending_time_and_compaction_anchors() {
-        use crate::app::timeline_compat::TimelineEvent as E;
-        let mut m = TimelineModel::default();
-        m.apply(&entry(
-            1,
-            "t1",
-            E::TurnOpened {
-                user_text: "hi".into(),
-            },
-        ));
-        m.record_compaction(3);
-        m.record_turn_time("t-pending", Some(7));
-        assert_eq!(m.compaction_marks.len(), 1);
-
-        m.replace_from_page(&empty_page());
-        assert!(m.compaction_marks.is_empty());
-        assert!(m.turns.is_empty());
-        // 暂存也清了：物化一个同名回合不得再兑现旧代时间。
-        m.apply(&entry(
-            2,
-            "t-pending",
-            E::TurnOpened {
-                user_text: "again".into(),
-            },
-        ));
-        assert_eq!(m.turns[0].started_at_ms, None);
-    }
-
-    /// W3/D10：压缩锚定「事件到达时窗口最后一个回合之后」，按 `context_revision`
+        /// W3/D10：压缩锚定「事件到达时窗口最后一个回合之后」，按 `context_revision`
     /// 幂等；锚点回合被淘汰时渲染侧应把分隔条顶到最前。
     #[test]
-    fn compaction_anchor_follows_the_last_turn_and_is_idempotent() {
-        use crate::app::timeline_compat::TimelineEvent as E;
-        let mut m = TimelineModel::default();
-        // 窗口里还没有回合：锚为 None（渲染在顶部）。
-        m.record_compaction(1);
-        assert_eq!(m.compaction_marks[0].after_turn_id, None);
-
-        m.apply(&entry(
-            1,
-            "t1",
-            E::TurnOpened {
-                user_text: "one".into(),
-            },
-        ));
-        m.record_compaction(2);
-        assert_eq!(m.compaction_marks[1].after_turn_id.as_deref(), Some("t1"));
-
-        // 回放同一 revision：幂等。
-        let version = m.version;
-        m.record_compaction(2);
-        assert_eq!(m.compaction_marks.len(), 2);
-        assert_eq!(m.version, version);
-
-        // 锚点回合被淘汰后，锚身份仍在（渲染侧据此顶到最前，而不是丢失）。
-        m.cap_turns(0);
-        assert_eq!(m.compaction_marks[1].after_turn_id.as_deref(), Some("t1"));
-    }
-
-    /// 压缩瞬态帧的模型语义：开卡幂等、串代帧丢弃、终态收卡，且权威事实与快照
+        /// 压缩瞬态帧的模型语义：开卡幂等、串代帧丢弃、终态收卡，且权威事实与快照
     /// 替换都能兜底把卡清掉（`CompactFinished` 是瞬态帧，断线期间会丢）。
     #[test]
-    fn in_flight_compact_is_idempotent_and_cleared_by_the_durable_fact() {
-        let mut m = TimelineModel::default();
-        assert!(m.in_flight_compact.is_none());
-
-        m.begin_compact("c1".into(), 12, 3);
-        // 重连时 hub 从槽里重放最新一帧 → 同名 `CompactStarted` 再来一次：既不叠
-        // 第二张卡，也不 bump（没有可画的变化，bump 会白刷一帧）。
-        let version = m.version;
-        m.begin_compact("c1".into(), 12, 3);
-        assert_eq!(
-            m.in_flight_compact.as_ref().map(|card| card.turns_total),
-            Some(12)
-        );
-        assert_eq!(m.version, version, "幂等重放不改内容就不 bump");
-
-        // `delta` 是**累计全文**快照：整帧替换，不是追加。
-        m.update_compact("c1", "摘要一".into());
-        assert_eq!(m.in_flight_compact.as_ref().unwrap().summary, "摘要一");
-        // 旧代帧迟到：不得把正在增长的卡倒回去。
-        m.update_compact("c0", "陈年短文本".into());
-        assert_eq!(m.in_flight_compact.as_ref().unwrap().summary, "摘要一");
-
-        // 终态收卡：id 对不上不收，也不返回（调用方据此不弹 toast）。
-        assert!(m.finish_compact("c0").is_none());
-        let taken = m.finish_compact("c1").expect("卡收掉了");
-        assert_eq!(taken.turns_keeping, 3);
-        assert!(m.in_flight_compact.is_none());
-
-        // 兜底一：丢了 `CompactFinished` 时，权威 `CompactionApplied` 同样收卡。
-        m.begin_compact("c2".into(), 4, 1);
-        m.record_compaction(9);
-        assert!(
-            m.in_flight_compact.is_none(),
-            "durable fact 必须清掉 live 卡"
-        );
-
-        // 兜底二：快照整体替换 = 权威全量，跨代的「正在压」一律不残留。
-        m.begin_compact("c3".into(), 4, 1);
-        m.replace_from_page(&empty_page());
-        assert!(m.in_flight_compact.is_none());
-    }
-
-    /// 权威语义：`BlockCheckpoint.arg` 是**增量**，必须**追加**而不是覆盖。
+        /// 权威语义：`BlockCheckpoint.arg` 是**增量**，必须**追加**而不是覆盖。
     ///
     /// 这是后端正常路径下发的形态：`arg` 携带「按已交付事件算出的余量」，
     /// `text` 为空并因 `skip_serializing_if` 直接缺席。
@@ -2881,29 +2780,7 @@ mod tests {
         assert_eq!(m.running_turn_id(), None);
     }
 
-    /// `seal_turn_from_conversation`：只把 Running 推进到终态，且幂等。
-    #[test]
-    fn conversation_seal_is_monotonic_and_idempotent() {
-        let mut m = TimelineModel {
-            turns: vec![turn_with("t1", TimelineTurnState::Running, false)],
-            ..TimelineModel::default()
-        };
-        assert!(
-            !m.seal_turn_from_conversation("t1", TimelineTurnState::Running),
-            "Running 不是终态，不得当封口用"
-        );
-        assert!(m.seal_turn_from_conversation("t1", TimelineTurnState::Failed));
-        assert!(m.turns[0].sealed);
-        assert_eq!(m.turns[0].state, TimelineTurnState::Failed);
-        assert!(
-            !m.seal_turn_from_conversation("t1", TimelineTurnState::Completed),
-            "已封口即幂等，不得被第二个来源改写"
-        );
-        assert!(!m.seal_turn_from_conversation("t404", TimelineTurnState::Completed));
-        assert_eq!(m.running_turn_id(), None);
-    }
-
-    fn turn_with(turn_id: &str, state: TimelineTurnState, sealed: bool) -> Turn {
+        fn turn_with(turn_id: &str, state: TimelineTurnState, sealed: bool) -> Turn {
         Turn {
             turn_id: turn_id.into(),
             turn_index: None,

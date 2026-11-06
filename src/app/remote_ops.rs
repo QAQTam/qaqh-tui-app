@@ -357,9 +357,7 @@ impl App {
                             let attach = api
                                 .send_command(
                                     Some(&session_id),
-                                    RingingCommand::Control(ControlCommand::SessionResume {
-                                        session_id: session_id.clone(),
-                                    }),
+                                    RingingCommand::SessionResume {},
                                     Default::default(),
                                 )
                                 .await;
@@ -522,6 +520,7 @@ mod tests {
             RemoteTarget {
                 base_url: "http://10.0.0.5:64413".into(),
                 token: "supersecret".into(),
+                tls_fp: None,
             },
         ));
         app.open_remote();

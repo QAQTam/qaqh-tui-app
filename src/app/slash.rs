@@ -103,6 +103,8 @@ pub enum SlashCmd {
     Account,
     /// `/remote`：远端 daemon 直连 + 设备配对页。
     Remote,
+    /// `/model`：会话级模型切换（目录循环，`session.settings.patch` 即时生效）。
+    Model,
     History,
     Subagents,
     Workspace,
@@ -149,6 +151,7 @@ pub fn parse(input: &str) -> Option<SlashCmd> {
         "settings" => Some(SlashCmd::Settings),
         "account" => Some(SlashCmd::Account),
         "remote" => Some(SlashCmd::Remote),
+        "model" => Some(SlashCmd::Model),
         "history" => Some(SlashCmd::History),
         "subagents" => Some(SlashCmd::Subagents),
         "workspace" => Some(SlashCmd::Workspace),

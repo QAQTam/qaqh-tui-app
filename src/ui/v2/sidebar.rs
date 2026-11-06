@@ -11,13 +11,17 @@
 //! 但事实源相同。
 
 use ratatui::Frame;
+
+/// 侧栏固定宽度（布局常量；绘制与命中共享）。
+#[cfg(test)]
+pub const RAIL_WIDTH: u16 = 28;
 use ratatui::crossterm::event::MouseButton;
 use ratatui::layout::{Position, Rect};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
-use qaqh_client::DomainActivityState;
+use qaqh_ringing_contract::fact::ActivityState as DomainActivityState;
 
 use crate::app::App;
 use crate::app::anim;
@@ -28,8 +32,6 @@ use crate::ui::v2::hit::{
     AgentTarget, HitMapBuilder, PointerTarget, VisualAnchor, anchor_region, z,
 };
 
-/// 侧栏标准宽度（状态 glyph + 标题）。
-pub const RAIL_WIDTH: u16 = 28;
 /// 终端总宽低于该值时侧栏自动隐藏，给正文让路。
 pub const RAIL_MIN_TOTAL_WIDTH: u16 = 90;
 
@@ -53,9 +55,9 @@ pub fn rail_width(total_width: u16) -> u16 {
 
 /// 会话行的状态 glyph 与前景色。
 ///
-/// 星芒（Working/Starting）每帧变化；WaitingUser=黄、Failed=红、
-/// Idle=绿、Disconnected=灰。无活动记录但已加载（`status != not_running`）的
-/// 会话退化为空心圆。
+/// 星芒（Running）每帧变化；WaitingUser=黄、Cancelling=红、Idle=绿。
+/// v3 活动词表没有 Failed/Disconnected：失败经回合终态与 session.list 呈现。
+/// 无活动记录但已加载（`status != not_running`）的会话退化为空心圆。
 fn status_glyph(
     state: Option<DomainActivityState>,
     loaded: bool,
@@ -64,15 +66,14 @@ fn status_glyph(
 ) -> (&'static str, Style) {
     let running_style = Style::new().fg(theme.accent.running);
     match (state, loaded) {
-        (Some(DomainActivityState::Working | DomainActivityState::Starting), _) => {
+        (Some(DomainActivityState::Running), _) => {
             (anim::claude_spinner_glyph(frame), running_style)
         }
         (Some(DomainActivityState::WaitingUser), _) => {
             ("◆", Style::new().fg(theme.semantic.warning))
         }
-        (Some(DomainActivityState::Failed), _) => ("✖", Style::new().fg(theme.accent.error)),
+        (Some(DomainActivityState::Cancelling), _) => ("✖", Style::new().fg(theme.accent.error)),
         (Some(DomainActivityState::Idle), _) => ("●", Style::new().fg(theme.accent.success)),
-        (Some(DomainActivityState::Disconnected), _) => ("○", Style::new().fg(theme.text.dim)),
         (None, true) => ("○", Style::new().fg(theme.text.dim)),
         (None, false) => ("·", Style::new().fg(theme.text.dim)),
     }
@@ -109,10 +110,8 @@ pub fn draw(
             pointer.sidebar_pressed == Some(index),
         );
         let (glyph, glyph_style) = if app.local_config.performance_mode
-            && matches!(
-                row.activity,
-                Some(DomainActivityState::Working | DomainActivityState::Starting)
-            ) {
+            && row.activity == Some(DomainActivityState::Running)
+        {
             anim::working_indicator(true, app.local_dot_dim, frame_no, theme.accent.running)
         } else {
             status_glyph(row.activity, row.loaded, frame_no, theme)
@@ -205,12 +204,12 @@ mod tests {
         let theme = theme();
         // Working = 星芒流动（前景 running 色）
         let (working_glyph, working_style) =
-            status_glyph(Some(DomainActivityState::Working), true, 0, &theme);
+            status_glyph(Some(DomainActivityState::Running), true, 0, &theme);
         assert_eq!(anim::claude_spinner_glyph(0), working_glyph);
         assert_eq!(style_fg(working_style), Some(theme.accent.running));
         // 星芒随帧推进（"星光流动"）
-        let (frame0, _) = status_glyph(Some(DomainActivityState::Working), true, 0, &theme);
-        let (frame3, _) = status_glyph(Some(DomainActivityState::Working), true, 3, &theme);
+        let (frame0, _) = status_glyph(Some(DomainActivityState::Running), true, 0, &theme);
+        let (frame3, _) = status_glyph(Some(DomainActivityState::Running), true, 3, &theme);
         assert_ne!(frame0, frame3);
 
         let (waiting, waiting_style) =
@@ -219,7 +218,7 @@ mod tests {
         assert_eq!(style_fg(waiting_style), Some(theme.semantic.warning));
 
         let (failed, failed_style) =
-            status_glyph(Some(DomainActivityState::Failed), true, 0, &theme);
+            status_glyph(Some(DomainActivityState::Cancelling), true, 0, &theme);
         assert_eq!(failed, "✖");
         assert_eq!(style_fg(failed_style), Some(theme.accent.error));
 
@@ -227,14 +226,11 @@ mod tests {
         assert_eq!(idle, "●");
         assert_eq!(style_fg(idle_style), Some(theme.accent.success));
 
-        let (dead, dead_style) =
-            status_glyph(Some(DomainActivityState::Disconnected), false, 0, &theme);
-        assert_eq!(dead, "○");
-        assert_eq!(style_fg(dead_style), Some(theme.text.dim));
-
-        // 无活动记录但在跑：空心圆兜底，不出现"·"（那是未激活的占位）。
-        let (running_unknown, _) = status_glyph(None, true, 0, &theme);
-        assert_eq!(running_unknown, "○");
+        // 无活动记录但已加载：空心圆兜底，不出现"·"（那是未激活的占位）。
+        // v3 活动词表没有 Disconnected/Failed：断连/失败经回合终态呈现。
+        let (unknown, unknown_style) = status_glyph(None, true, 0, &theme);
+        assert_eq!(unknown, "○");
+        assert_eq!(style_fg(unknown_style), Some(theme.text.dim));
     }
 
     #[test]

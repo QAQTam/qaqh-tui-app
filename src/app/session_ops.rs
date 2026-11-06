@@ -197,9 +197,7 @@ impl App {
             let ack = api
                 .send_command(
                     Some(&session_id),
-                    RingingCommand::Control(ControlCommand::SessionResume {
-                        session_id: session_id.clone(),
-                    }),
+                    RingingCommand::SessionResume {},
                     Default::default(),
                 )
                 .await;
@@ -347,16 +345,29 @@ impl App {
         // `new_session_with_cwd` 的长注释——`Created` 事件在实践中不保证到达，
         // 不能把「新会话开出来」只押在那一条路径上。
         self.session_list_at = None;
+        // backend-v3 强制 model_selection：目录/env 决定（见 default_model_selection）。
+        // 目录为空时不预拒——让 daemon 的权威错误落到 ack（文案同源），同时本地
+        // 给出可操作提示。
+        let model_selection = self.default_model_selection();
+        if model_selection.is_none() {
+            self.toast(
+                NoticeLevel::Warn,
+                "daemon 尚未配置任何服务商/模型：请先配置 provider（QAQH_MODEL_SELECTION 或设置页）再新建会话",
+            );
+        }
         self.spawn_api(move |api, tx| async move {
             let result = api
                 .send_command(
                     None,
-                    RingingCommand::Control(ControlCommand::SessionCreate {
-                        close_current: false,
+                    RingingCommand::SessionCreate {
                         cwd,
+                        title: None,
+                        profile: None,
+                        effort: None,
+                        model_selection,
                         tool_mode: None,
-                        custom_tools: vec![],
-                    }),
+                        custom_tools: None,
+                    },
                     qaqh_client::CommandOptions {
                         command_id: Some(command_id),
                         ..Default::default()
@@ -401,7 +412,7 @@ impl App {
     ///
     /// 先收集整个后代集合再统一删除——边删边找会把孙代一起弄丢（父条目随
     /// 快照删除后，父子关系就无从查起）。
-    fn reclaim_subagents(&mut self, session_id: &str) {
+    pub(super) fn reclaim_subagents(&mut self, session_id: &str) {
         let mut descendants: Vec<String> = Vec::new();
         let mut frontier = vec![session_id.to_owned()];
         while let Some(parent) = frontier.pop() {
@@ -481,27 +492,15 @@ impl App {
     }
 
     pub fn archive_session(&mut self, session_id: String) {
-        self.send_control_command(
-            session_id.clone(),
-            ControlCommand::SessionArchive { session_id },
-            "归档",
-        );
+        self.send_session_command(session_id, RingingCommand::SessionArchive {}, "归档");
     }
 
     pub fn unarchive_session(&mut self, session_id: String) {
-        self.send_control_command(
-            session_id.clone(),
-            ControlCommand::SessionUnarchive { session_id },
-            "取消归档",
-        );
+        self.send_session_command(session_id, RingingCommand::SessionUnarchive {}, "取消归档");
     }
 
     pub fn delete_session(&mut self, session_id: String) {
-        self.send_control_command(
-            session_id.clone(),
-            ControlCommand::SessionDelete { session_id },
-            "删除",
-        );
+        self.send_session_command(session_id, RingingCommand::SessionDelete {}, "删除");
     }
 
     pub(super) fn fetch_dashboard(&mut self, session_id: String) {
@@ -515,64 +514,17 @@ impl App {
                     session_id: session_id.clone(),
                 })
                 .await;
-            let parsed: Result<qaqh_client::DomainDashboardSnapshot, String> = match value {
+            let parsed: Result<session::DashboardSnapshot, String> = match value {
                 Ok(v) => {
-                    // session.dashboard 返回 {tasks: [{id,subject,status…}], recent_edits: […]}；
-                    // DashboardSnapshot 额外含 session_id/documents/current_todo_id。
-                    let tasks = if let Some(arr) = v.get("tasks").and_then(|x| x.as_array()) {
-                        arr.iter()
-                            .filter_map(|item| {
-                                Some(qaqh_client::DashboardTask {
-                                    id: item.get("id")?.as_str()?.to_owned(),
-                                    subject: item.get("subject")?.as_str().unwrap_or("").to_owned(),
-                                    description: item
-                                        .get("description")?
-                                        .as_str()
-                                        .unwrap_or("")
-                                        .to_owned(),
-                                    status: item
-                                        .get("status")?
-                                        .as_str()
-                                        .unwrap_or("idle")
-                                        .to_owned(),
-                                    evidence: item
-                                        .get("evidence")
-                                        .and_then(|e| e.as_str())
-                                        .map(str::to_owned),
-                                })
-                            })
-                            .collect::<Vec<_>>()
-                    } else {
-                        Vec::new()
-                    };
-                    let recent_edits = v
-                        .get("recent_edits")
-                        .and_then(|x| x.as_array())
-                        .map(|arr| {
-                            arr.iter()
-                                .filter_map(|s| s.as_str().map(str::to_owned))
-                                .collect()
-                        })
-                        .unwrap_or_default();
-                    let session_id_out = v
-                        .get("session_id")
-                        .and_then(|x| x.as_str())
-                        .unwrap_or(&session_id)
-                        .to_owned();
-                    Ok(qaqh_client::DomainDashboardSnapshot {
-                        session_id: session_id_out,
-                        documents: Vec::new(),
-                        recent_edits,
-                        tasks,
-                        current_todo_id: v
-                            .get("current_todo_id")
-                            .and_then(|x| x.as_str())
-                            .map(str::to_owned),
-                    })
+                    // backend-v3（B08）：`session.dashboard` 是 typed DTO
+                    // `{tasks, recent_edits}`，serde 直落（本地形状由 protocol
+                    // 闸测试对照 daemon handler 锁定，键改名当场红）。
+                    serde_json::from_value::<session::DashboardSnapshot>(v)
+                        .map_err(|error| format!("session.dashboard 解析失败: {error}"))
                 }
                 Err(e) => {
                     let msg = e.to_string();
-                    // fallback: todo.status 是同一数据源的另一视图
+                    // fallback: todo.status 是同一数据源的另一视图（items → 任务卡）。
                     let v2 = api
                         .query(QueryRequest::TodoStatus {
                             session_id: session_id.clone(),
@@ -588,7 +540,7 @@ impl App {
                             let tasks = items
                                 .iter()
                                 .filter_map(|item| {
-                                    Some(qaqh_client::DashboardTask {
+                                    Some(session::DashboardTask {
                                         id: item.get("id")?.as_str()?.to_owned(),
                                         subject: item
                                             .get("title")
@@ -596,13 +548,13 @@ impl App {
                                             .as_str()?
                                             .to_owned(),
                                         description: item
-                                            .get("description")?
-                                            .as_str()
+                                            .get("description")
+                                            .and_then(|d| d.as_str())
                                             .unwrap_or("")
                                             .to_owned(),
                                         status: item
-                                            .get("status")?
-                                            .as_str()
+                                            .get("status")
+                                            .and_then(|s| s.as_str())
                                             .unwrap_or("idle")
                                             .to_owned(),
                                         evidence: item
@@ -615,15 +567,9 @@ impl App {
                             if tasks.is_empty() {
                                 Err(msg)
                             } else {
-                                Ok(qaqh_client::DomainDashboardSnapshot {
-                                    session_id: session_id.clone(),
-                                    documents: Vec::new(),
-                                    recent_edits: Vec::new(),
+                                Ok(session::DashboardSnapshot {
                                     tasks,
-                                    current_todo_id: v
-                                        .get("current_id")
-                                        .and_then(|x| x.as_str())
-                                        .map(str::to_owned),
+                                    recent_edits: Vec::new(),
                                 })
                             }
                         }
@@ -686,7 +632,7 @@ impl App {
 pub(super) fn apply_rejected_ack(
     pending_creates: &mut HashMap<String, Instant>,
     label: &str,
-    ack: &qaqh_client::RingingV2CommandAck,
+    ack: &qaqh_ringing::RingingV2CommandAck,
     is_create: bool,
 ) -> String {
     let rejected = ack.status == qaqh_client::RingingCommandAckStatus::Rejected;
@@ -714,7 +660,8 @@ pub(super) fn apply_rejected_ack(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use qaqh_client::{RingingCommandAckStatus, RingingV2CommandAck};
+    use qaqh_client::RingingCommandAckStatus;
+    use qaqh_ringing::RingingV2CommandAck;
 
     #[test]
     fn session_refresh_waits_for_both_results_and_backs_off() {
@@ -776,6 +723,9 @@ mod tests {
             message: Some("too many sessions".into()),
             retry_after_ms: Some(500),
             existing: None,
+            result: None,
+            operation: None,
+            revision: None,
         }
     }
 
@@ -871,14 +821,14 @@ mod tests {
         );
     }
 
-    fn install_team(app: &mut App, root: &str, snapshot: qaqh_client::TeamSnapshot) {
+    fn install_team(app: &mut App, root: &str, snapshot: qaqh_ringing_contract::TeamSnapshot) {
         app.teams
             .entry(root.into())
             .or_default()
             .replace_from_snapshot(snapshot);
     }
 
-    fn nested_snapshot() -> qaqh_client::TeamSnapshot {
+    fn nested_snapshot() -> qaqh_ringing_contract::TeamSnapshot {
         serde_json::from_value(serde_json::json!({
             "root_session_id": "root",
             "agents": [

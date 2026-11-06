@@ -1,20 +1,178 @@
 //! 单会话状态：timeline 模型、流式相位、挂起交互面板、composer、滚动。
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant};
 
 use crate::app::ringing_v2::RingingV2SessionModel;
 use crate::app::timeline_compat::TimelineBlockKind;
 use crate::app::timeline_model::TimelineModel;
-use qaqh_client::ConversationMode;
 use serde::Deserialize;
-// 权威类型与 `qaqh-client` 自身类型重名者带 `Domain` 前缀；在本模块内换回本地惯用名，
-// 这样下文的引用点不必逐个改（映射只此一处）。
-use qaqh_client::ConversationState;
-use qaqh_client::{
-    AskMode, ContentRef, DomainActivityState as ActivityState, DomainAskQuestion as AskQuestion,
-    DomainError, PermissionCategory, PermissionRisk, UsageInfo,
-};
+// 权威契约类型（backend-v3 直连 `qaqh-ringing-contract`，无镜像）。
+// TUI 自有的展示层类型（AskMode / AskQuestion / PermissionCategory /
+// PermissionRisk / SessionMode / ConversationCache / DashboardSnapshot）在
+// 本模块定义——它们是渲染概念，不是 wire 概念。
+use qaqh_ringing_contract::fact::{ActivityState, ContentRef, TurnError, UsageInfo};
+use qaqh_ringing_contract::SessionState as ContractSessionState;
+
+// ───────────────────────── 展示层本地类型 ─────────────────────────
+
+/// 会话模式（状态栏展示 + `session.settings.patch` 的 `mode` 字段，"code"/"plan"）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SessionMode {
+    #[default]
+    Code,
+    Plan,
+}
+
+impl SessionMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            SessionMode::Code => "code",
+            SessionMode::Plan => "plan",
+        }
+    }
+
+    pub fn wire(self) -> &'static str {
+        self.label()
+    }
+}
+
+/// ask 面板的单题模式（v3 正文是 ASK v1 散文，题数 ≥2 即 batch）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AskMode {
+    #[default]
+    Single,
+    Batch,
+}
+
+/// ASK v1 解析出的单个问题（与后端 `NormalizedAskQuestion` 同形状：
+/// id 形如 `q1`/`q2`，答复按该 id 回传）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AskQuestion {
+    pub id: String,
+    pub question: String,
+    pub options: Vec<String>,
+    pub allow_custom: bool,
+}
+
+/// 权限面板类别（canonical body 的 `category` 字符串的展示层枚举）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PermissionCategory {
+    Read,
+    Write,
+    Exec,
+    Net,
+}
+
+/// 权限面板风险（canonical body 的 `risk` 字符串的展示层枚举）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PermissionRisk {
+    Low,
+    Medium,
+    High,
+}
+
+/// 会话缓存（backend-v3 快照里只剩 model 单值；用量由 `usage` / `usage_totals` 承担）。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ConversationCache {
+    pub model: Option<String>,
+}
+
+/// `session.dashboard` 的 typed 读模型（B08 权威 DTO 的 TUI 侧形状，
+/// 由 `protocol` 闸测试对照 daemon handler 锁定）。
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize)]
+pub struct DashboardSnapshot {
+    pub tasks: Vec<DashboardTask>,
+    pub recent_edits: Vec<String>,
+}
+
+/// `session.dashboard` 的单条任务卡。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+pub struct DashboardTask {
+    pub id: String,
+    pub subject: String,
+    pub description: String,
+    pub status: String,
+    pub evidence: Option<String>,
+}
+
+// ───────────────────── provider 目录（model_selection 来源）─────────────
+
+/// `provider.list` 命令结果的 typed 读模型（实测 wire 形状，见
+/// `protocol` 闸测试；`api_key` 只有 "set" 标记，无明文）。
+///
+/// 这是 backend-v3 设置面的**目录权威**（对齐 qaqh-electron `registry.ts`）：
+/// providers、模型定义与全局默认模型选择都从这里读；`revision` 是五种目录写
+/// 命令（provider.upsert/delete、provider.model.upsert/delete、
+/// model.selection.set_default）的 `config_revision` CAS 基线。
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize)]
+pub struct ProviderCatalog {
+    #[serde(default)]
+    pub revision: u64,
+    /// 全局默认模型（`model.selection.set_default` 的读回）。缺席 = 未设置。
+    #[serde(default)]
+    pub default_model_selection: Option<qaqh_types::ModelSelection>,
+    #[serde(default)]
+    pub providers: BTreeMap<String, ProviderEntry>,
+}
+
+impl ProviderCatalog {
+    /// 目录里的全部可选模型（provider 字典序 × 模型字典序，只含 enabled）。
+    pub fn selections(&self) -> Vec<(String, String)> {
+        let mut out = Vec::new();
+        for (provider_id, entry) in &self.providers {
+            for (model_id, model) in &entry.models {
+                if model.enabled {
+                    out.push((provider_id.clone(), model_id.clone()));
+                }
+            }
+        }
+        out
+    }
+
+    /// 第一个（字典序）含启用模型的 provider + 模型。
+    pub fn first_enabled_selection(&self) -> Option<(String, String)> {
+        self.selections().into_iter().next()
+    }
+
+    /// 当前生效的全局默认（目录的 default_model_selection，按 (provider, model) 摊平）。
+    pub fn default_selection(&self) -> Option<(String, String)> {
+        self.default_model_selection
+            .as_ref()
+            .map(|s| (s.provider_id.clone(), s.model_id.clone()))
+    }
+}
+
+/// 目录里的单个 provider。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+pub struct ProviderEntry {
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub base_url: String,
+    #[serde(default)]
+    pub wire: String,
+    #[serde(default)]
+    pub credential: String,
+    /// 只回 "set"/"unset" 标记，无明文。
+    #[serde(default)]
+    pub api_key: Option<String>,
+    #[serde(default)]
+    pub models: BTreeMap<String, ProviderModelDef>,
+}
+
+/// 目录里的单个模型（`provider.list` 的宽松投影；多余字段忽略）。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+pub struct ProviderModelDef {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub display_name: Option<String>,
+    #[serde(default)]
+    pub context_window: u32,
+    #[serde(default)]
+    pub max_output_tokens: u32,
+}
 
 // ───────────────────────── 流式相位 ─────────────────────────
 
@@ -225,16 +383,23 @@ pub struct PlanPanel {
     pub turn_id: String,
     pub plan_content: String,
     pub review_type: String,
-    /// P3 交底（后端 `docs/spec/2026-09-23-TUI-typed-todo消费路径-spec.md` §2）：
-    /// 旧 `qaqh_client::TodoItem` 已改名为 `PlanReviewItem`，**纯改名、字段一字未动**
-    /// （id / title / description / complexity），wire 形状无变化。
-    /// 注意：它只服务 plan review 预览，与 workspace todo 面板用的 `DashboardTask`
-    /// 不是同一个语义面。
-    pub todo_items: Vec<qaqh_client::PlanReviewItem>,
+    /// plan 正文的 todo 预览项（TUI 本地展示形状；解析失败按空处理）。
+    /// 注意：它只服务 plan review 预览，与 workspace todo 面板用的
+    /// [`DashboardTask`] 不是同一个语义面。
+    pub todo_items: Vec<PlanTodoItem>,
     /// 拒绝理由输入。
     pub message: String,
     pub entering_message: bool,
     pub scroll: usize,
+}
+
+/// plan 正文的单条 todo 预览（backend plan body 的宽松投影）。
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct PlanTodoItem {
+    pub id: String,
+    pub title: String,
+    pub description: String,
+    pub complexity: Option<String>,
 }
 
 /// 工具权限面板。
@@ -518,9 +683,11 @@ impl ScrollState {
 pub struct SessionState {
     pub session_id: String,
     pub title: Option<String>,
-    pub mode: ConversationMode,
+    /// 会话模式（code/plan）。乐观更新 + `session.settings.patch`。
+    pub mode: SessionMode,
     pub timeline: TimelineModel,
-    /// Accepted inputs waiting for their `TurnStarted` association.
+    /// Accepted inputs waiting for their turn-opening `Input` block
+    /// （v3 时序：TurnStarted 先于 Input 块；按 turn_id 暂存）。
     pub pending_input_text: HashMap<String, String>,
     /// Bodies fetched from Ringing v2 content refs, keyed by canonical content hash.
     pub transcript_content: HashMap<String, String>,
@@ -528,15 +695,12 @@ pub struct SessionState {
     pub pending_transcript_content: HashSet<String>,
     /// Most recent canonical model round for each active turn.
     pub current_rounds: HashMap<String, u32>,
-    /// bootstrap 的 conversation 快照视图（model）。
-    /// conversation 频道快照的**类型化**视图（权威类型，本仓不再手解）；快照里
-    /// 其余字段由 `TimelineModel` 与实时事件承担。
-    pub conversation: Option<ConversationState>,
-    /// canonical v2 会话状态机：epoch/log/cursor、reset、interaction、driver。
+    /// bootstrap 快照的 conversation 缓存（model 单值）。
+    pub conversation: Option<ConversationCache>,
+    /// canonical v3 会话状态机：水位、resync、interaction、driver。
     pub ringing_v2: RingingV2SessionModel,
     pub activity: Option<ActivityState>,
-    /// **最近一次请求**的 provider 真值用量（`AssistantBlockSealed` /
-    /// `TurnFinished` 两条 delta 都带，逐条覆盖）。
+    /// **最近一次请求**的 provider 真值用量（`AssistantBlock` / `TurnEnded` 携带）。
     pub usage: Option<UsageInfo>,
     /// 会话累计用量：`SessionMeta.usage_totals` 随 `session.list` 刷新，是后端
     /// 唯一的聚合点（本仓不再自己按轮累加，避免与 daemon 口径漂移）。
@@ -544,9 +708,8 @@ pub struct SessionState {
     /// 最近**已结束**回合的 `(turn_id, 信封 ts_ms)`。
     ///
     /// 只服务「输出速率」这一个指标：tok/s 需要一个时长，而两端都必须是权威
-    /// 墙钟——起点是 `TurnStarted` 的信封时间（已存在 `Turn::started_at_ms`），
-    /// 终点是本条 `TurnFinished` / `TurnInterrupted` 的信封时间。只留最近一条
-    /// （不按回合累积）：界面上也只看得到最近一次的速率。
+    /// 墙钟——起点是 `TurnStarted` 的时间（timeline 侧暂存兑现），终点是本条
+    /// `TurnEnded` 的到达时刻。只留最近一条（不按回合累积）。
     pub last_turn_finished: Option<(String, u64)>,
     pub streaming: Option<StreamingState>,
     pub pending_ask: Option<AskPanel>,
@@ -554,9 +717,9 @@ pub struct SessionState {
     pub pending_permissions: Vec<PermissionPanel>,
     /// 已解决的权限请求 id（防「幽灵面板」补投，见 [`RespondedPermissions`]）。
     pub responded_permissions: RespondedPermissions,
-    /// workspace 面板数据（bootstrap control state + DashboardSnapshot 推送）。
-    pub dashboard: Option<qaqh_client::DomainDashboardSnapshot>,
-    pub last_error: Option<DomainError>,
+    /// workspace 面板数据（`session.dashboard` typed 拉取）。
+    pub dashboard: Option<DashboardSnapshot>,
+    pub last_error: Option<TurnError>,
     pub composer: Composer,
     pub scroll: ScrollState,
     /// 本地发送等待权威 TurnOpened；绑定后按回合 user 行吸顶，不随流输出滚走。
@@ -586,7 +749,7 @@ impl SessionState {
         Self {
             session_id,
             title: None,
-            mode: ConversationMode::Code,
+            mode: SessionMode::Code,
             timeline: TimelineModel::default(),
             pending_input_text: HashMap::new(),
             transcript_content: HashMap::new(),
@@ -706,9 +869,8 @@ impl SessionState {
             || self.pending_plan.is_some()
     }
 
-    /// 只读仅由 reset 状态决定：上游已移除全会话 driver 席位（runtime 对
-    /// `DriverClaim`/`DriverRelease` 一律回 `driver_removed`），sends 不再被
-    /// driver gate；交互应答仍可继续。
+    /// 只读仅由 resync 状态决定：本地视图已知过期时不给写入口；
+    /// 交互应答仍可继续。
     pub fn v2_is_read_only(&self) -> bool {
         self.ringing_v2.is_read_only()
     }
@@ -728,11 +890,9 @@ impl SessionState {
             return format!("{} · r{}", s.phase.label(), s.round_num);
         }
         match self.activity {
-            Some(ActivityState::Starting) => "starting".into(),
-            Some(ActivityState::Working) => "working".into(),
+            Some(ActivityState::Running) => "working".into(),
             Some(ActivityState::WaitingUser) => "waiting_user".into(),
-            Some(ActivityState::Disconnected) => "disconnected".into(),
-            Some(ActivityState::Failed) => "failed".into(),
+            Some(ActivityState::Cancelling) => "cancelling".into(),
             _ => "idle".into(),
         }
     }
@@ -757,35 +917,31 @@ pub fn streaming_done(session: &mut SessionState, turn_id: Option<&str>) {
 /// "timeline 暂时还没出现这个 turn" 不被误判成 "turn 已终结"。
 pub const STREAM_GHOST_GRACE: Duration = Duration::from_secs(2);
 
-/// v2 control 投影的 activity 词汇（idle / running / interrupted）→ 领域
-/// `ActivityState`（本仓状态栏仍用领域词汇）。
-///
-/// `waiting_user` 不由 activity 表达，而由挂起交互面板（permission / ask /
-/// plan）判定，见 [`SessionState::is_waiting_user`]。
-pub fn activity_from_v2(activity: qaqh_client::ActivityState) -> ActivityState {
-    match activity {
-        qaqh_client::ActivityState::Idle => ActivityState::Idle,
-        qaqh_client::ActivityState::Running => ActivityState::Working,
-        qaqh_client::ActivityState::Interrupted => ActivityState::Disconnected,
-    }
-}
+/// v3 权威活动词表即本仓状态栏词表（`fact::ActivityState` 4 值：
+/// idle / running / waiting_user / cancelling）——恒等直用，不再映射。
+/// `waiting_user` 同时由挂起交互面板（permission / ask / plan）判定，
+/// 见 [`SessionState::is_waiting_user`]。
 
-/// 从 v2 conversation 投影抽出本仓 `conversation` 缓存（只剩 model），另返回
-/// **最新** assistant block 的单次请求用量。
+/// 从 v3 `SessionState` 快照抽出本仓 `conversation` 缓存（只剩 model），
+/// 另返回**最新** assistant block 的单次请求用量。
 ///
-/// 后端把投影上的 `usage_totals` / `context_limit` 删了（Info 面板时代的遗留视图
-/// 字段，全仓无生产者）。换源口径：累计用量取 `SessionMeta.usage_totals`（后端
-/// 明写的唯一聚合点，随 `session.list` 到达），上下文窗口分母取
-/// `ConfigDto.context_length`（daemon 本地压缩的同源分母）。
-pub fn conversation_cache_from_v2(
-    snapshot: &qaqh_client::ClientV2ConversationState,
-) -> (ConversationState, Option<UsageInfo>) {
-    let mut cache = ConversationState::default();
+/// 换源口径：累计用量取 `SessionMeta.usage_totals`（后端唯一的聚合点，随
+/// `session.list` 到达），上下文窗口分母取 `ConfigDto.context_length`
+/// （daemon 本地压缩的同源分母）。
+pub fn conversation_cache_from_state(
+    state: &ContractSessionState,
+) -> (ConversationCache, Option<UsageInfo>) {
+    let mut cache = ConversationCache::default();
     let mut usage = None;
-    for entry in snapshot.context.iter().rev() {
-        if let qaqh_client::ConversationContextKind::AssistantBlock(block) = &entry.kind {
-            cache.model = Some(block.model.clone());
-            usage = block.usage.clone();
+    for entry in state.timeline.iter().rev() {
+        if let qaqh_ringing_contract::state::TimelineEntry::AssistantBlock {
+            model,
+            usage: block_usage,
+            ..
+        } = entry
+        {
+            cache.model = Some(model.clone());
+            usage = block_usage.clone();
             break;
         }
     }
@@ -901,6 +1057,7 @@ pub fn permission_risk_from_tag(tag: &str) -> PermissionRisk {
     match tag {
         "high" => PermissionRisk::High,
         "medium" => PermissionRisk::Medium,
+        "low" => PermissionRisk::Low,
         _ => PermissionRisk::Medium,
     }
 }
@@ -965,15 +1122,12 @@ pub fn sync_streaming_from_timeline_at(session: &mut SessionState, now: Instant)
     }
 }
 
-/// timeline 已证伪 busy：把 control 域残留的 Working/Starting 降级为 Idle。
+/// timeline 已证伪 busy：把残留的 Running 降级为 Idle。
 ///
 /// 只在 timeline 给出"无 running turn"证据时调用——daemon 真的卡在流式中时
 /// timeline 仍是 Running，此处不会说谎（两类 "working" 因此可区分）。
 fn clear_busy_activity(session: &mut SessionState) {
-    if matches!(
-        session.activity,
-        Some(ActivityState::Working | ActivityState::Starting)
-    ) {
+    if session.activity == Some(ActivityState::Running) {
         session.activity = Some(ActivityState::Idle);
     }
 }
@@ -1177,7 +1331,7 @@ mod tests {
             vec![turn("t1", TimelineTurnState::Completed)],
             Some(("t1", now - STREAM_GHOST_GRACE * 2)),
         );
-        s.activity = Some(ActivityState::Working);
+        s.activity = Some(ActivityState::Running);
         sync_streaming_from_timeline_at(&mut s, now);
         assert!(s.streaming.is_none(), "sealed turn must clear streaming");
         assert_eq!(
@@ -1194,7 +1348,7 @@ mod tests {
         // 且因 (Some, false) 分支不清理而永久停在 working。
         let now = Instant::now();
         let mut s = session_with(vec![turn("t1", TimelineTurnState::Running)], None);
-        s.activity = Some(ActivityState::Working);
+        s.activity = Some(ActivityState::Running);
         sync_streaming_from_timeline_at(&mut s, now);
         assert!(s.streaming.is_some(), "running turn still arms streaming");
 

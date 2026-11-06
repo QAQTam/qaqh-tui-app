@@ -24,9 +24,9 @@ use std::time::{Duration, Instant};
 use qaqh_client::{
     Client, ClientError, ClientHandlers, ClientOptions, ReconnectReason, V2StreamStatus,
 };
+use qaqh_ringing::RingingV2ResyncRequired;
+use qaqh_ringing_contract::SessionEventFrame;
 use tokio::sync::mpsc;
-
-use qaqh_client::ClientV2Event;
 
 /// 「与 daemon 失联」的判据：这么久没有任何频道处于 `Open`。
 ///
@@ -83,10 +83,14 @@ pub enum ConnEvent {
 #[derive(Debug)]
 pub enum RuntimeMsg {
     Conn(ConnEvent),
-    /// 一条 canonical v2 投影事件（每 session_id 一条单流）。
+    /// 一条 canonical v2 会话事件帧（每 session_id 一条单流）。
+    ///
+    /// backend-v3：旧 `ClientV2Event` rename wall 已拆，回调直接携带权威
+    /// `SessionEventFrame { seq, event }`——单流单游标，消息/工具/交互/执行会话
+    /// 全在这一条里（`qaqh-ringing-contract::events`）。
     V2Event {
         session_id: String,
-        event: Box<ClientV2Event>,
+        frame: Box<SessionEventFrame>,
     },
     /// v2 单流刚建立（或重连成功）：app 必须重新 bootstrap 该会话。
     ///
@@ -97,9 +101,9 @@ pub enum RuntimeMsg {
     V2StreamOpen {
         session_id: String,
     },
-    ResetRequired {
+    ResyncRequired {
         session_id: String,
-        reset: Box<qaqh_client::RingingV2ResetRequired>,
+        resync: Box<RingingV2ResyncRequired>,
     },
     // Test-only path for the TUI transcript reducer's legacy fixtures. Production
     // transcript updates come from `V2Event` and `ClientV2Bootstrap`.
@@ -150,31 +154,37 @@ impl TimelineLostReason {
 pub struct RemoteTarget {
     pub base_url: String,
     pub token: String,
+    /// 可选的自签证书 sha256 指纹（`sha256:<hex>` 或裸 hex）。给了它，`qaqh-client`
+    /// 会以该指纹为唯一信任锚（fail-closed），从而允许 https:// 自签目标。
+    pub tls_fp: Option<String>,
 }
 
 impl RemoteTarget {
     /// 校验并归一化（去掉尾随 `/`）。
     ///
-    /// **只放行 `http://`**：daemon 在非回环 bind 上用的是自签证书，而
-    /// `qaqh-client` 的 reqwest 走系统信任链——既没有 fingerprint pinning，也没有
-    /// 跳过校验的开关（`crates/qaqh-client/src/client.rs:228-231`）。所以 https
-    /// 只会得到一次「UnknownIssuer」握手失败，把它挡在输入阶段比让用户对着一个
-    /// 转圈的连接页猜原因要好。等客户端支持 pinning 再放开。
-    pub fn new(base_url: &str, token: &str) -> Result<Self, String> {
+    /// `http://` 直接放行。`https://` 需要 `tls_fp`（daemon 局域网证书是自签的，
+    /// `qaqh-client` 以指纹为唯一信任锚 fail-closed；无指纹时系统信任链必然
+    /// UnknownIssuer）——指纹来自 `--tls-fp` 或 `QAQH_REMOTE_TLS_FP`。
+    pub fn new(base_url: &str, token: &str, tls_fp: Option<String>) -> Result<Self, String> {
         let base_url = base_url.trim().trim_end_matches('/');
         if token.trim().is_empty() {
             return Err("token 不能为空（远端 daemon 只认 Authorization: Bearer）".to_string());
         }
-        let Some(authority) = base_url.strip_prefix("http://") else {
-            if base_url.starts_with("https://") {
-                return Err(
-                    "暂不支持 https://：daemon 的局域网证书是自签的，客户端没有指纹锚定能力。\
-                     请连 http://<ip>:<port>，或把 daemon 证书装进系统信任库后再用桌面端。"
-                        .to_string(),
-                );
-            }
-            return Err(format!("目标必须以 http:// 开头，收到 {base_url:?}"));
+        let tls_fp = tls_fp.map(|fp| fp.trim().to_string()).filter(|fp| !fp.is_empty());
+        let is_https = base_url.starts_with("https://");
+        let authority = base_url
+            .strip_prefix("http://")
+            .or_else(|| base_url.strip_prefix("https://"));
+        let Some(authority) = authority else {
+            return Err(format!("目标必须以 http:// 或 https:// 开头，收到 {base_url:?}"));
         };
+        if is_https && tls_fp.is_none() {
+            return Err(
+                "https:// 需要证书指纹锚定：daemon 局域网证书是自签的，请配 \
+                 --tls-fp <sha256> 或环境变量 QAQH_REMOTE_TLS_FP，否则改用 http://。"
+                    .to_string(),
+            );
+        }
         // 拒绝路径/查询/凭证内嵌：`RemoteEndpoint` 直接把 base_url 拼在请求路径前，
         // 多出来的任何一段都会静默改变实际请求的地址。
         if authority.contains('/') || authority.contains('?') || authority.contains('#') {
@@ -205,6 +215,7 @@ impl RemoteTarget {
         Ok(Self {
             base_url: base_url.to_string(),
             token: token.trim().to_string(),
+            tls_fp,
         })
     }
 
@@ -244,7 +255,8 @@ impl ConnectTarget {
     }
 }
 
-/// 解析 `--remote/--token` 与 `QAQH_REMOTE_URL`/`QAQH_REMOTE_TOKEN`（CLI 优先）。
+/// 解析 `--remote/--token/--tls-fp` 与 `QAQH_REMOTE_URL`/`QAQH_REMOTE_TOKEN`/
+/// `QAQH_REMOTE_TLS_FP`（CLI 优先）。
 ///
 /// 与后端 `crates/qaqh-client/examples/remote_fs.rs` 用同一对环境变量名，一套脚本
 /// 两端可用。给了 URL 没给 token 一律报错：远端 daemon 只认 Bearer，缺 token 的
@@ -253,6 +265,7 @@ pub fn resolve_remote_target(
     args: &[String],
     env_url: Option<&str>,
     env_token: Option<&str>,
+    env_tls_fp: Option<&str>,
 ) -> Result<Option<RemoteTarget>, String> {
     let flag = |name: &str| -> Option<String> {
         let mut iter = args.iter();
@@ -268,8 +281,14 @@ pub fn resolve_remote_target(
     };
     let url = flag("--remote").or_else(|| env_url.map(str::to_string));
     let token = flag("--token").or_else(|| env_token.map(str::to_string));
+    let tls_fp = flag("--tls-fp").or_else(|| env_tls_fp.map(str::to_string));
     match (url, token) {
-        (None, None) => Ok(None),
+        (None, None) => {
+            if tls_fp.is_some() {
+                return Err("--tls-fp 只与 --remote 同用".to_string());
+            }
+            Ok(None)
+        }
         (Some(_), None) => Err(
             "--remote 需要配套凭据：给 --token <T>，或用环境变量 QAQH_REMOTE_TOKEN \
              （推荐后者，argv 在同机进程表里可读）"
@@ -278,7 +297,7 @@ pub fn resolve_remote_target(
         (None, Some(_)) => {
             Err("--token 只与 --remote 同用（本地 daemon 的凭据来自 daemon.json）".to_string())
         }
-        (Some(url), Some(token)) => Ok(Some(RemoteTarget::new(&url, &token)?)),
+        (Some(url), Some(token)) => Ok(Some(RemoteTarget::new(&url, &token, tls_fp)?)),
     }
 }
 
@@ -349,6 +368,9 @@ impl Runtime {
         let remote = target.remote().map(|t| qaqh_client::RemoteEndpoint {
             base_url: t.base_url,
             token: t.token,
+            // backend-v3 客户端支持自签证书指纹锚定（`sha256:<hex>` 整 DER）。
+            // TUI 目前不提供指纹输入 UI；`QAQH_REMOTE_TLS_FP` 环境变量可直接喂。
+            tls_fp: t.tls_fp,
         });
         // 远端模式下 `launch_daemon_if_missing` 必须为假：`qaqh-client` 在
         // `remote = Some` 时本就不读 discovery、不判活、不拉起（client.rs:189-239），
@@ -676,11 +698,11 @@ fn build_handlers(
     ClientHandlers {
         on_v2_event: {
             let msg_tx = msg_tx.clone();
-            // 类型已权威化：typed payload 直达 app 层，形状对不上是编译错误。
-            Arc::new(move |session_id: String, event: ClientV2Event| {
+            // 类型已权威化：`SessionEventFrame` 直达 app 层，形状对不上是编译错误。
+            Arc::new(move |session_id: String, frame: SessionEventFrame| {
                 let _ = msg_tx.send(RuntimeMsg::V2Event {
                     session_id,
-                    event: Box::new(event),
+                    frame: Box::new(frame),
                 });
             })
         },
@@ -726,12 +748,12 @@ fn build_handlers(
         on_v2_reset: {
             let msg_tx = msg_tx.clone();
             Arc::new(
-                move |session_id: String, reset: qaqh_client::RingingV2ResetRequired| {
-                    // reset → app 标记 rebaseline 并重新 bootstrap；旧 UI 状态保留到
-                    // 新 bootstrap 校验通过后再由 reducer 原子替换。
-                    let _ = msg_tx.send(RuntimeMsg::ResetRequired {
+                move |session_id: String, resync: qaqh_ringing::RingingV2ResyncRequired| {
+                    // resync_required（旧名 reset）→ app 标记 rebaseline 并重新 bootstrap；
+                    // 旧 UI 状态保留到新 bootstrap 校验通过后再由 reducer 原子替换。
+                    let _ = msg_tx.send(RuntimeMsg::ResyncRequired {
                         session_id,
-                        reset: Box::new(reset),
+                        resync: Box::new(resync),
                     });
                 },
             )

@@ -82,13 +82,13 @@ fn main() -> Result<()> {
                 "环境: QAQH_DATA_DIR（数据目录覆盖）、QAQH_BACKEND_ROOT（daemon 拉起候选）、QAQH_DEFAULT_CWD（新建会话默认目录，支持 ~/ 展开）、QAQH_THEME=night|day|terminal|auto"
             );
             println!(
-                "     QAQH_REMOTE_URL / QAQH_REMOTE_TOKEN（远端直连，等价于 --remote/--token；\
-                 凭据走环境变量比走 argv 安全，argv 在同机进程表里可读）"
+                "     QAQH_REMOTE_URL / QAQH_REMOTE_TOKEN / QAQH_REMOTE_TLS_FP（远端直连，等价于 \
+                 --remote/--token/--tls-fp；凭据走环境变量比走 argv 安全，argv 在同机进程表里可读）"
             );
             println!();
             println!(
-                "远端直连目前只支持 http://：daemon 局域网面用的是自签证书，客户端侧还没有\
-                 指纹锚定能力，https 会在握手期失败。"
+                "远端 https:// 需要证书指纹锚定（--tls-fp 或 QAQH_REMOTE_TLS_FP，daemon 自签证书的 \
+                 sha256）：客户端以该指纹为唯一信任锚。无指纹时请使用 http://。"
             );
             return Ok(());
         }
@@ -110,6 +110,7 @@ fn main() -> Result<()> {
         &args,
         std::env::var("QAQH_REMOTE_URL").ok().as_deref(),
         std::env::var("QAQH_REMOTE_TOKEN").ok().as_deref(),
+        std::env::var("QAQH_REMOTE_TLS_FP").ok().as_deref(),
     )
     .map_err(anyhow::Error::msg)?;
     if remote.is_some() && !no_spawn {

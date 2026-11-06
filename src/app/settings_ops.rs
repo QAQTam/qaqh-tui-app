@@ -27,14 +27,6 @@ impl App {
         st.focus = index.min(settings::ROWS.len().saturating_sub(1));
         st.editing = None;
         let row = st.row();
-        if st.is_field_disabled(row.id, self.config.as_ref()) {
-            self.replace_overlay(Overlay::Settings(st));
-            self.toast(
-                NoticeLevel::Info,
-                "当前处于账号额度模式，端点与密钥由账号统一接管，无需配置 BYOK",
-            );
-            return;
-        }
         match row.kind {
             settings::FieldKind::Text
             | settings::FieldKind::Secret
@@ -94,13 +86,9 @@ impl App {
         let summary = kind
             .map(|kind| self.account.summary(kind))
             .unwrap_or_default();
-        let models = kind
-            .map(|kind| self.account.models_for(kind).to_vec())
-            .unwrap_or_default();
         for overlay in self.overlays.iter_mut() {
             if let Overlay::Settings(st) = overlay {
                 st.account_summary = summary.clone();
-                st.model_options = models.clone();
             }
         }
     }
@@ -142,6 +130,52 @@ impl App {
             let result = api.query(QueryRequest::ConfigLoad).await;
             let _ = tx.send(AppMsg::Action(ActionResult::ConfigLoaded(result)));
         });
+    }
+
+    /// provider 目录快照：`session.create` 强制 `model_selection`（backend-v3），
+    /// 目录是它的唯一权威来源。Ready / 创建失败时刷新。
+    pub fn fetch_provider_catalog(&mut self) {
+        if self.runtime.client_opt().is_none() {
+            return;
+        }
+        self.spawn_api(move |api, tx| async move {
+            let result = api.provider_catalog().await;
+            let _ = tx.send(AppMsg::Action(ActionResult::ProviderCatalog(result)));
+        });
+    }
+
+    /// 新会话的 `model_selection`（backend-v3 强制项）。
+    ///
+    /// 来源优先级（对齐 electron `model-config.ts`：先目录默认，再回退）：
+    /// 1. `QAQH_MODEL_SELECTION=provider/model` 环境变量（显式覆盖）；
+    /// 2. 目录的 `default_model_selection`（设置页「默认模型」写入）；
+    /// 3. 目录里第一个（字典序）启用模型。
+    ///
+    /// 目录为空（全新 daemon 未配置任何 provider）时返回 `None`：daemon 会以
+    /// 「请选择服务商和模型」拒绝创建，调用方据此提示去设置页配置。
+    pub fn default_model_selection(&self) -> Option<qaqh_types::ModelSelection> {
+        if let Ok(raw) = std::env::var("QAQH_MODEL_SELECTION") {
+            let raw = raw.trim();
+            if let Some((provider_id, model_id)) = raw.split_once('/') {
+                if !provider_id.is_empty() && !model_id.is_empty() {
+                    return Some(qaqh_types::ModelSelection {
+                        provider_id: provider_id.to_owned(),
+                        model_id: model_id.to_owned(),
+                        options: Default::default(),
+                    });
+                }
+            }
+            log::warn!("QAQH_MODEL_SELECTION 格式应为 provider/model，收到 {raw:?}（忽略）");
+        }
+        if let Some(selection) = self.provider_catalog.default_model_selection.clone() {
+            return Some(selection);
+        }
+        let (provider_id, model_id) = self.provider_catalog.first_enabled_selection()?;
+        Some(qaqh_types::ModelSelection {
+            provider_id,
+            model_id,
+            options: Default::default(),
+        })
     }
 
     /// 上下文窗口分母：`ConfigDto.context_length`（daemon 本地压缩用的同源分母）。
@@ -200,7 +234,7 @@ impl App {
         let payload = serde_json::to_value(&st.draft).unwrap_or(serde_json::Value::Null);
         self.spawn_api(move |api, tx| async move {
             let result = match api
-                .action(ActionRequest::ConfigSave { fields: payload })
+                .config_action(RingingCommand::ConfigSave { patch: payload })
                 .await
             {
                 Ok(_) => api
@@ -217,22 +251,17 @@ impl App {
     }
 
     /// 端口字段回车：即时走各自的单写口（不进草稿）。
+    ///
+    /// 目录分区（模型/默认模型/新增/删除）在这里发 `provider.*` /
+    /// `model.selection.set_default` 命令——`config_revision` CAS 由
+    /// `catalog_write` 用 `provider.list` 快照的 revision 统一携带。
     pub(super) fn settings_port_activate(&mut self, st: &mut SettingsState) {
         match st.row().id {
             settings::FieldId::PermissionLevel => {
                 self.toast(NoticeLevel::Info, "聚焦权限级别后按 1-4 即时生效");
             }
-            settings::FieldId::ActiveProfile => {
-                let name = st
-                    .profile_sel
-                    .clone()
-                    .or_else(|| self.config.as_ref().map(|c| c.active_profile.clone()));
-                if let Some(name) = name {
-                    self.apply_profile(name);
-                }
-            }
             settings::FieldId::Account => {
-                // 入口只对账号档有意义：BYOK 档没有登录这件事，说清楚而不是开一个空面板。
+                // 入口对两档账号额度有意义；api_key 档没有登录这件事，说明白。
                 match account::AccountKind::from_credential(
                     &st.effective_credential(self.config.as_ref()),
                 ) {
@@ -243,40 +272,251 @@ impl App {
                     ),
                 }
             }
+            settings::FieldId::DefaultModel => {
+                // 回退链与展示一致：循环状态 → 目录当前默认 → 首个启用模型。
+                // 未按过 ←→ 的 Enter 是「把展示值设为默认」（幂等）。
+                let sel = st
+                    .catalog_draft
+                    .default_model_sel
+                    .clone()
+                    .or_else(|| {
+                        st.catalog
+                            .default_selection()
+                            .map(|(p, m)| format!("{p}/{m}"))
+                    })
+                    .or_else(|| {
+                        st.catalog
+                            .first_enabled_selection()
+                            .map(|(p, m)| format!("{p}/{m}"))
+                    });
+                let Some(sel) = sel else {
+                    self.toast(NoticeLevel::Warn, "目录为空：先新增 provider 与模型");
+                    return;
+                };
+                let Some((provider_id, model_id)) = sel.split_once('/') else {
+                    return;
+                };
+                self.apply_default_model(provider_id.to_owned(), model_id.to_owned());
+            }
+            settings::FieldId::AddModelApply => {
+                let Some(provider_id) = st.catalog_draft.add_model_target(&st.catalog) else {
+                    self.toast(NoticeLevel::Warn, "目录为空：先保存一个 provider");
+                    return;
+                };
+                let model_id = st.catalog_draft.add_model_id.trim().to_string();
+                if model_id.is_empty() {
+                    self.toast(NoticeLevel::Warn, "模型 ID 不能为空（先在「模型 ID」行回车输入）");
+                    return;
+                }
+                let context = st
+                    .catalog_draft
+                    .add_model_context
+                    .unwrap_or(128_000)
+                    .min(u32::MAX as u64) as u32;
+                let max_tokens = st
+                    .catalog_draft
+                    .add_model_max_tokens
+                    .unwrap_or(8_192)
+                    .min(u32::MAX as u64) as u32;
+                self.apply_add_model(provider_id, model_id, context, max_tokens);
+            }
+            settings::FieldId::NewProviderApply => {
+                let id = st.catalog_draft.new_provider_id.trim().to_string();
+                if id.is_empty() {
+                    self.toast(NoticeLevel::Warn, "provider ID 不能为空");
+                    return;
+                }
+                let name = st
+                    .catalog_draft
+                    .new_provider_name
+                    .trim()
+                    .to_string()
+                    .replace(&id, &id)
+                    .is_empty()
+                    .then(|| id.clone())
+                    .unwrap_or_else(|| {
+                        let n = st.catalog_draft.new_provider_name.trim();
+                        if n.is_empty() { id.clone() } else { n.to_string() }
+                    });
+                let base_url = st.catalog_draft.new_provider_base_url.trim().to_string();
+                if base_url.is_empty() {
+                    self.toast(NoticeLevel::Warn, "Base URL 不能为空");
+                    return;
+                }
+                let wire = st
+                    .catalog_draft
+                    .new_provider_wire
+                    .clone()
+                    .unwrap_or_else(|| "chat".into());
+                let credential = st
+                    .catalog_draft
+                    .new_provider_credential
+                    .clone()
+                    .unwrap_or_else(|| "api_key".into());
+                let api_key = st.catalog_draft.new_provider_api_key.trim().to_string();
+                self.apply_new_provider(id, name, base_url, wire, credential, api_key);
+            }
+            settings::FieldId::DeleteModelApply => {
+                let Some(sel) = st
+                    .catalog_draft
+                    .delete_model_sel
+                    .clone()
+                    .or_else(|| settings::CatalogDraft::delete_candidates(&st.catalog).first().cloned())
+                else {
+                    self.toast(NoticeLevel::Warn, "目录为空：没有可删除的模型");
+                    return;
+                };
+                let Some((provider_id, model_id)) = sel.split_once('/') else {
+                    return;
+                };
+                // 默认模型引用预检（electron registry.ts 同款：默认指向的模型不可删）。
+                if let Some((dp, dm)) = st.catalog.default_selection()
+                    && dp == provider_id
+                    && dm == model_id
+                {
+                    self.toast(
+                        NoticeLevel::Warn,
+                        format!("{sel} 是全局默认模型：先把默认切到别的模型再删除"),
+                    );
+                    return;
+                }
+                self.apply_delete_model(provider_id.to_owned(), model_id.to_owned());
+            }
             _ => {}
         }
     }
 
-    /// 端口字段 ←→：切换候选（回车才真正应用）。
-    pub(super) fn settings_port_cycle(&mut self, st: &mut SettingsState, delta: i32) {
-        // 唯一剩下的端口字段是 profile（workspace 模式那个随能力下线一起删了）。
-        if !matches!(st.row().id, settings::FieldId::ActiveProfile) {
-            return;
-        }
-        let Some(cfg) = self.config.as_ref() else {
-            return;
-        };
-        if cfg.profiles.is_empty() {
-            return;
-        }
-        let cur = st
-            .profile_sel
-            .clone()
-            .unwrap_or_else(|| cfg.active_profile.clone());
-        let idx = cfg.profiles.iter().position(|n| *n == cur).unwrap_or(0);
-        let next = (idx as i32 + delta).rem_euclid(cfg.profiles.len() as i32) as usize;
-        st.profile_sel = Some(cfg.profiles[next].clone());
-    }
+    /// 端口字段 ←→：候选循环全部在 `SettingsState::cycle` 内消费（目录快照在
+    /// state 上）；权限级别的数字快捷键走 App 层按键路径。
+    pub(super) fn settings_port_cycle(&mut self, _st: &mut SettingsState, _delta: i32) {}
 
-    /// `profile.apply`：切换活跃 profile（服务端单写口，写后广播 reload）。
-    pub fn apply_profile(&mut self, name: String) {
+    // ───────────────────────── 模型目录写口（E26：五种目录命令带 config_revision）─────────
+
+    /// 目录写命令统一出口：携带 `config_revision` CAS，成功后重拉目录。
+    pub(super) fn catalog_write(&mut self, command: RingingCommand, label: &'static str) {
+        let revision = self.provider_catalog.revision;
         self.spawn_api(move |api, tx| async move {
-            let result = api.action(ActionRequest::ProfileApply { name }).await;
+            let options = qaqh_client::CommandOptions {
+                command_id: None,
+                preconditions: vec![qaqh_ringing::CommandPrecondition::ConfigRevision { revision }],
+            };
+            let result = match api.send_command(None, command, options).await {
+                Ok(ack) if ack.status == RingingCommandAckStatus::Rejected => Err(
+                    ack.message.unwrap_or_else(|| "目录写入被拒".to_string()),
+                ),
+                Ok(_) => Ok(serde_json::json!({})),
+                Err(e) => Err(e.to_string()),
+            };
             let _ = tx.send(AppMsg::Action(ActionResult::ConfigWrite {
-                label: "应用 Profile",
+                label,
                 result,
             }));
+            // 目录变了：重拉（ConfigWrite 处理器会 fetch_config；目录单独拉）。
+            let catalog = api.provider_catalog().await;
+            let _ = tx.send(AppMsg::Action(ActionResult::ProviderCatalog(catalog)));
         });
+    }
+
+    /// 全局默认模型：`model.selection.set_default`（不再依赖 default_profile）。
+    pub fn apply_default_model(&mut self, provider_id: String, model_id: String) {
+        self.catalog_write(
+            RingingCommand::ModelSelectionSetDefault {
+                selection: qaqh_types::ModelSelection {
+                    provider_id,
+                    model_id,
+                    options: Default::default(),
+                },
+            },
+            "默认模型",
+        );
+    }
+
+    /// 手动添加/更新模型（v3 已删预置目录，模型定义由用户声明）。
+    pub fn apply_add_model(
+        &mut self,
+        provider_id: String,
+        model_id: String,
+        context_window: u32,
+        max_output_tokens: u32,
+    ) {
+        self.catalog_write(
+            RingingCommand::ProviderModelUpsert {
+                provider_id: provider_id.clone(),
+                model_id: model_id.clone(),
+                model: qaqh_profile::ModelDef {
+                    enabled: true,
+                    display_name: Some(model_id.clone()),
+                    context_window,
+                    max_output_tokens,
+                    reasoning_levels: Vec::new(),
+                    capabilities: Default::default(),
+                    defaults: Default::default(),
+                },
+            },
+            "添加模型",
+        );
+    }
+
+    /// 新增/更新 provider（BYOK 密钥走 SecretWrite：空 = Keep）。
+    pub fn apply_new_provider(
+        &mut self,
+        id: String,
+        name: String,
+        base_url: String,
+        wire: String,
+        credential: String,
+        api_key: String,
+    ) {
+        // wire/credential 走 serde 词表直译（规范名，无 FromStr）。
+        let wire = match wire.as_str() {
+            "chat" => qaqh_types::Wire::Chat,
+            "responses" => qaqh_types::Wire::Responses,
+            "messages" => qaqh_types::Wire::Messages,
+            "gemini" => qaqh_types::Wire::Gemini,
+            other => {
+                self.toast(NoticeLevel::Error, format!("未知 wire 拼写: {other:?}"));
+                return;
+            }
+        };
+        let credential = match credential.as_str() {
+            "api_key" => qaqh_types::CredentialSource::ApiKey,
+            "chatgpt_plan" => qaqh_types::CredentialSource::ChatgptPlan,
+            "deepseek_account" => qaqh_types::CredentialSource::DeepseekAccount,
+            other => {
+                self.toast(NoticeLevel::Error, format!("未知凭据来源: {other:?}"));
+                return;
+            }
+        };
+        self.catalog_write(
+            RingingCommand::ProviderUpsert {
+                id: id.clone(),
+                provider: qaqh_ringing::ProviderUpsertDto {
+                    name,
+                    base_url,
+                    wire,
+                    credential,
+                    headers: Default::default(),
+                    compat: None,
+                    api_key: if api_key.is_empty() {
+                        qaqh_ringing::SecretWrite::Keep
+                    } else {
+                        qaqh_ringing::SecretWrite::Set(api_key)
+                    },
+                },
+            },
+            "保存 provider",
+        );
+    }
+
+    /// 删除模型（默认引用预检在端口激活处完成）。
+    pub fn apply_delete_model(&mut self, provider_id: String, model_id: String) {
+        self.catalog_write(
+            RingingCommand::ProviderModelDelete {
+                provider_id: provider_id.clone(),
+                model_id: model_id.clone(),
+            },
+            "删除模型",
+        );
     }
 
     pub fn set_permission_level(&mut self, level: u8) {
@@ -284,9 +524,8 @@ impl App {
         // 使用相同的配置事务与 reload 广播，同时支持 sandbox-run。
         self.spawn_api(move |api, tx| async move {
             let result = api
-                .action(ActionRequest::ConfigSave {
-                    fields: serde_json::json!({ "permissionLevel": level }),
-                })
+                // backend-v3：权限档位有专用命令（值域 1..=4）。
+                .config_action(RingingCommand::ConfigSetPermissionLevel { level })
                 .await;
             let _ = tx.send(AppMsg::Action(ActionResult::ConfigWrite {
                 label: "权限级别",
@@ -306,8 +545,12 @@ impl App {
             if self.config.is_none() {
                 self.fetch_config();
             }
+            // 目录快照进设置页（模型目录分区的候选来源），同时拉一次最新的
+            // ——目录分区是即时写，快照越新，CAS 冲突越少。
+            self.fetch_provider_catalog();
             self.overlays.push(Overlay::Settings(SettingsState {
                 local_loaded: self.local_config,
+                catalog: self.provider_catalog.clone(),
                 ..SettingsState::default()
             }));
             self.refresh_settings_account_summary();
@@ -384,9 +627,13 @@ mod tests {
             .unwrap();
         for mouse in [false, true] {
             let (mut app, _rx) = App::new_for_test();
+            // v3：凭据来源来自 loaded 读模型（目录接管后 draft 不再承载 credential）。
+            app.config = Some(ConfigDto {
+                credential: "chatgpt_plan".into(),
+                ..Default::default()
+            });
             let mut st = SettingsState::default();
             st.focus = row;
-            st.draft.credential = Some("chatgpt_plan".into());
             app.overlays.push(Overlay::Settings(st));
             if mouse {
                 app.mouse_settings_row(row);
@@ -401,10 +648,10 @@ mod tests {
                 [Overlay::Settings(_), Overlay::Account(_)]
             ));
             app.account_action(account::AccountAction::Close);
-            let Some(Overlay::Settings(st)) = app.overlays.last() else {
-                panic!("返回必须回到设置")
-            };
-            assert_eq!(st.draft.credential.as_deref(), Some("chatgpt_plan"));
+            assert!(matches!(
+                app.overlays.last(),
+                Some(Overlay::Settings(_))
+            ), "返回必须回到设置");
         }
     }
 

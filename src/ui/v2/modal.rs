@@ -596,9 +596,11 @@ fn draw_plan(
         for item in &panel.todo_items {
             rows.push(Line::from(vec![
                 Span::styled(
-                    // `complexity` 是 String（"small"|"medium"|"large"），`{:?}` 会渲染成
-                    // 带引号的 `"small"`——后端交底 §3 专门点了这处。
-                    format!("  [{}] ", item.complexity),
+                    // complexity 是宽松投影的 Option<String>；缺省不渲染括号。
+                    match &item.complexity {
+                        Some(c) => format!("  [{c}] "),
+                        None => "  ".to_owned(),
+                    },
                     Style::new().fg(theme.text.dim),
                 ),
                 Span::styled(item.title.clone(), Style::new().fg(theme.text.secondary)),
@@ -1118,8 +1120,8 @@ fn draw_ask(
 
     f.render_widget(Clear, rect);
     let mode = match panel.mode {
-        qaqh_client::AskMode::Single => "single",
-        qaqh_client::AskMode::Batch => "batch",
+        crate::app::session::AskMode::Single => "single",
+        crate::app::session::AskMode::Batch => "batch",
     };
     f.render_widget(
         card(
@@ -1238,8 +1240,8 @@ mod tests {
     use crate::theme::{ColorSupport, ThemeKind};
     use crate::ui::v2::hit::{FrameHitMap, FrameId, HitRegion};
     use crate::ui::v2::route::ScreenRoute;
-    use qaqh_client::{
-        AskMode, DomainAskQuestion as AskQuestion, PermissionCategory, PermissionRisk,
+    use crate::app::session::{
+        AskMode, AskQuestion as DomainAskQuestion, PermissionCategory, PermissionRisk,
     };
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
@@ -1314,13 +1316,13 @@ mod tests {
             "turn-1".into(),
             AskMode::Batch,
             vec![
-                AskQuestion {
+                DomainAskQuestion {
                     id: "q1".into(),
                     question: "第一题".into(),
                     options: vec!["A".into(), "B".into()],
                     allow_custom: true,
                 },
-                AskQuestion {
+                DomainAskQuestion {
                     id: "q2".into(),
                     question: "第二题：请选择完整方案".into(),
                     options: vec!["方案一".into(), "方案二".into(), "方案三".into()],
@@ -1346,7 +1348,7 @@ mod tests {
             "interaction-1".into(),
             "turn-1".into(),
             AskMode::Single,
-            vec![AskQuestion {
+            vec![DomainAskQuestion {
                 id: "q1".into(),
                 question: "选哪个？".into(),
                 options: vec!["方案甲".into(), "方案乙".into(), "方案丙".into()],

@@ -1,6 +1,7 @@
 //! 挂起交互：permission / ask / plan 的按键与应答（自 app/mod.rs 拆分，行为不变）。
 
 use super::*;
+use crate::app::session::PermissionRisk;
 
 impl App {
     // ───────────────────── 鼠标：弹窗按钮的动作 ─────────────────────
@@ -121,7 +122,7 @@ impl App {
             .collect();
         self.send_interaction_command(
             session_id,
-            ControlCommand::InteractionAskRespond {
+            RingingCommand::InteractionAskRespond {
                 interaction_id,
                 answers,
             },
@@ -147,7 +148,7 @@ impl App {
         }
         self.send_interaction_command(
             session_id,
-            ControlCommand::InteractionAskDismiss { interaction_id },
+            RingingCommand::InteractionAskDismiss { interaction_id },
             "跳过 ask",
         );
     }
@@ -174,7 +175,7 @@ impl App {
         }
         self.send_interaction_command(
             session_id,
-            ControlCommand::PlanReviewRespond {
+            RingingCommand::PlanReviewRespond {
                 interaction_id,
                 approved,
                 message,
@@ -201,11 +202,11 @@ impl App {
             // 下架 + 记入已解决：应答之后补投的同 id 权限请求不再入队（防幽灵面板）。
             sess.resolve_permission(&panel.tool_call_id);
         }
-        let cmd = RingingCommand::Tool(ToolCommand::ToolPermissionRespond {
+        let cmd = RingingCommand::ToolPermissionRespond {
             tool_call_id: panel.tool_call_id,
             approved,
             trust_folder: panel.trust_folder,
-        });
+        };
         self.spawn_api(move |api, tx| async move {
             let result = api
                 .send_interaction_command(Some(&session_id.clone()), cmd)
@@ -692,7 +693,7 @@ impl App {
 mod tests {
     use super::*;
     use crate::app::session::{AskPanel, PermissionPanel, SessionState};
-    use qaqh_client::{AskMode, DomainAskQuestion as AskQuestion};
+    use crate::app::session::{AskMode, AskQuestion};
     use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     fn app_with_ask() -> App {
@@ -724,7 +725,7 @@ mod tests {
     }
 
     fn app_with_permission() -> App {
-        use qaqh_client::{PermissionCategory, PermissionRisk};
+        use crate::app::session::{PermissionCategory, PermissionRisk};
         let (mut app, _rx) = App::new_for_test();
         let session_id = "session-permission".to_string();
         let mut session = SessionState::new(session_id.clone());

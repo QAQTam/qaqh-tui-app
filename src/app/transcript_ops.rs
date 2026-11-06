@@ -1,6 +1,11 @@
-//! 对话动作（发送/取消/压缩/撤销）与滚动（自 app/mod.rs 拆分）。
+//! 对话动作（发送/取消/模式切换）与滚动（自 app/mod.rs 拆分）。
+//!
+//! backend-v3 命令面拍平：`conversation.send_message` 走权威 payload 结构体，
+//! 模式切换并入 `session.settings.patch`；压缩/撤销命令已从协议删除（见各函数）。
 
 use super::*;
+use qaqh_ringing::ConversationSendMessage;
+use qaqh_ringing_contract::fact::InputPurpose;
 
 impl App {
     /// 切换指定工具卡正文；鼠标和键盘共用此语义入口。
@@ -106,22 +111,20 @@ impl App {
             let result = api
                 .send_command(
                     Some(&session_id.clone()),
-                    RingingCommand::Conversation(ConversationCommand::ConversationSendMessage {
+                    // backend-v3：命令面拍平，`conversation.send_message` 的
+                    // payload 是权威结构体（`qaqh_ringing::ConversationSendMessage`）。
+                    RingingCommand::ConversationSendMessage(ConversationSendMessage {
                         text,
                         images: vec![],
                         attachments: (!content_refs.is_empty()).then_some(content_refs),
-                        // 后端锚点 8dbe22e（`45c6b63`）新增的两字段，均为
-                        // `#[serde(default)]`，**行为中性**：
-                        // - `message_id: None` = 回落到 command_id（用户/UI 消息的既定语义）；
-                        // - `input_purpose: TriggerTurn` = 本行改动前「投递并触发回合」的行为。
-                        //   `QueueOnly` 只服务子代理注入，UI 用不到。
-                        //   类型名显式写出依赖后端 PR #289 的再导出（已合入 8dbe22e）；
-                        //   在旧锚点 5ec1900 上只能写 `Default::default()`。
+                        // `message_id: None` = 回落到 command_id（用户/UI 消息的
+                        // 既定语义）；`input_purpose: TriggerTurn` = 投递并触发回合
+                        //（QueueOnly/Steer 只服务子代理注入，UI 用不到）。
                         message_id: None,
-                        input_purpose: ConversationInputPurpose::TriggerTurn,
+                        input_purpose: InputPurpose::TriggerTurn,
                         as_system: false,
-                        // Subagent V2 additions; regular UI messages are neither
-                        // inter-agent deliveries nor terminal notifications.
+                        // regular UI messages are neither inter-agent deliveries
+                        // nor terminal notifications.
                         inter_agent: None,
                         subagent_terminal: None,
                     }),
@@ -155,9 +158,7 @@ impl App {
             let result = api
                 .send_command(
                     Some(&session_id.clone()),
-                    RingingCommand::Conversation(ConversationCommand::ConversationCancel {
-                        turn_id: None,
-                    }),
+                    RingingCommand::ConversationCancel { turn_id: None },
                     Default::default(),
                 )
                 .await
@@ -178,8 +179,8 @@ impl App {
             return;
         };
         let next = match self.sessions.get(&session_id).map(|s| s.mode) {
-            Some(qaqh_client::ConversationMode::Plan) => qaqh_client::ConversationMode::Code,
-            _ => qaqh_client::ConversationMode::Plan,
+            Some(session::SessionMode::Plan) => session::SessionMode::Code,
+            _ => session::SessionMode::Plan,
         };
         if let Some(sess) = self.sessions.get_mut(&session_id) {
             sess.mode = next; // 乐观更新
@@ -188,9 +189,13 @@ impl App {
             let result = api
                 .send_command(
                     Some(&session_id.clone()),
-                    RingingCommand::Conversation(ConversationCommand::ConversationSetMode {
-                        mode: next,
-                    }),
+                    // backend-v3：模式切换并入 session.settings.patch（"code"/"plan"）。
+                    RingingCommand::SessionSettingsPatch {
+                        patch: qaqh_ringing::SessionSettingsPatch {
+                            mode: Some(next.wire().to_owned()),
+                            ..Default::default()
+                        },
+                    },
                     Default::default(),
                 )
                 .await
@@ -210,23 +215,14 @@ impl App {
         let Some(session_id) = self.active_session_id() else {
             return;
         };
-        self.spawn_api(move |api, tx| async move {
-            let result = api
-                .send_command(
-                    Some(&session_id.clone()),
-                    RingingCommand::Conversation(ConversationCommand::ConversationCompact {
-                        turn_id: None,
-                    }),
-                    Default::default(),
-                )
-                .await
-                .map_err(|e| e.to_string());
-            let _ = tx.send(AppMsg::Action(ActionResult::CommandAck {
-                session_id: Some(session_id),
-                label: "compact",
-                result,
-            }));
-        });
+        // backend-v3 移除了手动压缩命令（`ConversationCompact` 不在命令目录）：
+        // 压缩由 daemon 服务端自动执行，以 `TimelineEntry::Compaction` 落 timeline。
+        // 这里保留入口只为了给 slash 调用方一个明确回执，而不是静默无效。
+        self.toast(
+            NoticeLevel::Info,
+            "v3 daemon 会自动压缩上下文（历史以摘要条目呈现），无需手动触发",
+        );
+        let _ = session_id;
     }
 
     pub fn undo_turn(&mut self) {
@@ -273,71 +269,95 @@ impl App {
         });
     }
 
-    pub fn undo_turn_from(&mut self, session_id: String, turn_id: String) {
+    /// `/model`：会话级模型切换（backend-v3 `session.settings.patch`）。
+    ///
+    /// 目录里的模型按（provider, model）字典序循环，选中即写
+    /// `model_selection: Use { value }`，`settings_revision` CAS 基线取
+    /// `session.list` 缓存里该会话的 meta。乐观更新本地 conversation 缓存；
+    /// 409（revision 冲突）= meta 过期，下次列表刷新后再试。
+    pub fn cycle_session_model(&mut self) {
+        let Some(session_id) = self.active_session_id() else {
+            return;
+        };
+        let selections = self.provider_catalog.selections();
+        if selections.is_empty() {
+            self.toast(
+                NoticeLevel::Warn,
+                "模型目录为空：先在设置页「模型目录」里添加 provider 与模型",
+            );
+            return;
+        }
+        let current = self
+            .sessions
+            .get(&session_id)
+            .and_then(|s| s.conversation.as_ref())
+            .and_then(|c| c.model.clone());
+        // 本地缓存的是模型 ID（不含 provider）；目录里按 model_id 匹配首个。
+        let idx = current
+            .as_deref()
+            .and_then(|model| selections.iter().position(|(_, m)| m == model))
+            .map_or(0, |i| (i + 1) % selections.len());
+        let next = selections[idx].clone();
+        let (provider_id, model_id) = next;
+        let settings_revision = self
+            .session_list_cache
+            .iter()
+            .find(|entry| entry.meta.session_id == session_id)
+            .map(|entry| entry.meta.settings_revision)
+            .unwrap_or(0);
+        let session_id_move = session_id.clone();
+        let model_id_move = model_id.clone();
         self.spawn_api(move |api, tx| async move {
-            // command_id 由本侧生成：ack 之后要拿它轮询 receipt。
-            let command_id = uuid::Uuid::new_v4().to_string();
+            let options = qaqh_client::CommandOptions {
+                command_id: None,
+                preconditions: vec![qaqh_ringing::CommandPrecondition::SettingsRevision {
+                    revision: settings_revision,
+                }],
+            };
             let result = api
                 .send_command(
-                    Some(&session_id),
-                    RingingCommand::Conversation(ConversationCommand::ConversationUndoTurn {
-                        turn_id,
-                    }),
-                    qaqh_client::CommandOptions {
-                        command_id: Some(command_id.clone()),
-                        ..Default::default()
+                    Some(&session_id_move),
+                    RingingCommand::SessionSettingsPatch {
+                        patch: qaqh_ringing::SessionSettingsPatch {
+                            model_selection: Some(qaqh_types::SettingValue::Use {
+                                value: qaqh_types::ModelSelection {
+                                    provider_id,
+                                    model_id: model_id_move,
+                                    options: Default::default(),
+                                },
+                            }),
+                            ..Default::default()
+                        },
                     },
+                    options,
                 )
                 .await;
-            match result {
-                Ok(_) => {
-                    // ACK ≠ 完成：轮询 receipt 到终态（对齐 winui，但消费其结果）。
-                    let mut state: Option<RingingV2CommandStatus> = None;
-                    for _ in 0..30 {
-                        tokio::time::sleep(Duration::from_millis(100)).await;
-                        if let Ok(status) = api
-                            .command_status(&command_id)
-                            .await
-                            // 终态 = 成功/失败/拒绝（与旧镜像的 `is_terminal` 同义；
-                            // 权威类型不提供该辅助方法）。
-                            && matches!(
-                                status.state,
-                                qaqh_client::RingingCommandState::Succeeded
-                                    | qaqh_client::RingingCommandState::Failed
-                                    | qaqh_client::RingingCommandState::Rejected
-                            )
-                        {
-                            state = Some(status);
-                            break;
-                        }
-                    }
-                    let _ = tx.send(AppMsg::Action(ActionResult::Receipt {
-                        label: "撤销回合",
-                        session_id: Some(session_id),
-                        result: Ok(state.unwrap_or(RingingV2CommandStatus {
-                            command_id: String::new(),
-                            state: CommandState::Running,
-                            payload_fingerprint: String::new(),
-                            terminal_event_id: None,
-                            error_code: None,
-                            result: None,
-                        })),
-                    }));
-                }
-                Err(e) => {
-                    let _ = tx.send(AppMsg::Action(ActionResult::CommandAck {
-                        session_id: Some(session_id),
-                        label: "撤销回合",
-                        result: Err(e.to_string()),
-                    }));
-                }
-            }
+            let _ = tx.send(AppMsg::Action(ActionResult::CommandAck {
+                session_id: Some(session_id_move),
+                label: "切换模型",
+                result: result.map_err(|e| e.to_string()),
+            }));
         });
+        // 乐观更新：worker 下一轮装配请求即用新模型。
+        if let Some(sess) = self.sessions.get_mut(&session_id) {
+            let cache = sess
+                .conversation
+                .get_or_insert_with(crate::app::session::ConversationCache::default);
+            cache.model = Some(model_id);
+        }
+        self.redraw_requested = true;
     }
 
-    pub(super) fn request_rebaseline(&mut self, session_id: &str) {
-        self.spawn_bootstrap(session_id.to_owned());
+    pub fn undo_turn_from(&mut self, _session_id: String, _turn_id: String) {
+        // backend-v3 移除了 `ConversationUndoTurn` 命令：回合一旦提交即为
+        // 不可回滚事实（B09 裁定的「明确允许丢失暂态」的同一面）。入口保留
+        // 是为了给确认弹窗一个明确回执，而不是静默无效。
+        self.toast(
+            NoticeLevel::Info,
+            "v3 daemon 不支持撤销已提交回合（事实不可回滚）",
+        );
     }
+
 
     pub fn load_older(&mut self) {
         // The current backend exposes one canonical conversation snapshot and
@@ -347,19 +367,17 @@ impl App {
 
     // ───────────────────────── 交互响应命令 ─────────────────────────
 
-    pub(super) fn send_control_command(
+    /// 会话命令统一出口（backend-v3：命令面拍平，target 由
+    /// `ApiCtx::send_command` 按 `Some(session_id)` 映射）。
+    pub(super) fn send_session_command(
         &mut self,
         session_id: String,
-        command: ControlCommand,
+        command: RingingCommand,
         label: &'static str,
     ) {
         self.spawn_api(move |api, tx| async move {
             let result = api
-                .send_command(
-                    Some(&session_id),
-                    RingingCommand::Control(command),
-                    Default::default(),
-                )
+                .send_command(Some(&session_id), command, Default::default())
                 .await;
             let _ = tx.send(AppMsg::Action(ActionResult::CommandAck {
                 session_id: Some(session_id),
@@ -375,13 +393,11 @@ impl App {
     pub(super) fn send_interaction_command(
         &mut self,
         session_id: String,
-        command: ControlCommand,
+        command: RingingCommand,
         label: &'static str,
     ) {
         self.spawn_api(move |api, tx| async move {
-            let result = api
-                .send_interaction_command(Some(&session_id), RingingCommand::Control(command))
-                .await;
+            let result = api.send_interaction_command(Some(&session_id), command).await;
             let _ = tx.send(AppMsg::Action(ActionResult::CommandAck {
                 session_id: Some(session_id),
                 label,

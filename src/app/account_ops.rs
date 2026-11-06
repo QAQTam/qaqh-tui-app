@@ -256,7 +256,7 @@ impl App {
         let payload = json!({ "model": model });
         self.spawn_api(move |api, tx| async move {
             let result = api
-                .action(ActionRequest::ConfigSave { fields: payload })
+                .config_action(RingingCommand::ConfigSave { patch: payload })
                 .await;
             let _ = tx.send(AppMsg::Action(ActionResult::ConfigWrite {
                 label: "模型",
@@ -507,14 +507,9 @@ impl App {
         };
         match models {
             Ok(models) => {
-                self.account.store_models(kind, models.clone());
-                // 设置页正开着就把候选同步进去（切档后必须重取，重取后必须能选）。
-                if let Some(Overlay::Settings(st)) = self.overlays.last_mut() {
-                    let current = st.effective_credential(self.config.as_ref());
-                    if AccountKind::from_credential(&current) == Some(kind) {
-                        st.model_options = models;
-                    }
-                }
+                // backend-v3：账号模型目录不再进设置页（provider 目录是唯一权威）；
+                // 这里只喂账号面板的展示快照。
+                self.account.store_models(kind, models);
                 self.redraw_requested = true;
             }
             Err(message) => {

@@ -140,6 +140,14 @@ impl App {
                 self.open_remote();
                 true
             }
+            SlashCmd::Model => {
+                if let Some(sess) = self.active_session_mut() {
+                    sess.composer.clear();
+                }
+                self.slash_selected = 0;
+                self.cycle_session_model();
+                true
+            }
             SlashCmd::Account => {
                 if let Some(sess) = self.active_session_mut() {
                     sess.composer.clear();

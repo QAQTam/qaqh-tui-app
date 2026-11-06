@@ -120,7 +120,7 @@ pub fn resolve(app: &App) -> ScreenRoute {
 mod tests {
     use super::*;
     use crate::app::session::{AskPanel, PermissionPanel, PlanPanel, SessionState};
-    use qaqh_client::{AskMode, PermissionCategory, PermissionRisk};
+    use crate::app::session::{AskMode, AskQuestion, PermissionCategory, PermissionRisk};
 
     fn app_with_session() -> App {
         let (mut app, _rx) = App::new_for_test();
@@ -135,7 +135,7 @@ mod tests {
             "ask-1".into(),
             "turn-1".into(),
             AskMode::Single,
-            vec![qaqh_client::DomainAskQuestion {
+            vec![AskQuestion {
                 id: "q1".into(),
                 question: "继续？".into(),
                 options: vec!["是".into(), "否".into()],

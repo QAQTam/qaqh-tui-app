@@ -1632,14 +1632,6 @@ fn todo_layout(app: &App, area: Rect, theme: &Theme) -> TodoLayout {
                 theme.accent.running
             }),
         ),
-        Span::styled(
-            dashboard
-                .current_todo_id
-                .as_deref()
-                .map(|id| format!("  · 当前 {id}"))
-                .unwrap_or_default(),
-            Style::new().fg(theme.text.dim),
-        ),
     ]));
     lines.push(Line::default());
     for (task_index, task) in dashboard.tasks.iter().enumerate() {
@@ -1686,28 +1678,6 @@ fn todo_layout(app: &App, area: Rect, theme: &Theme) -> TodoLayout {
             }
         }
         task_ranges.push(range);
-    }
-    if !dashboard.documents.is_empty() {
-        lines.push(Line::default());
-        lines.push(Line::from(Span::styled(
-            " 文档",
-            Style::new()
-                .fg(theme.accent.assistant)
-                .add_modifier(Modifier::BOLD),
-        )));
-        for document in &dashboard.documents {
-            lines.push(Line::from(vec![
-                Span::styled("  · ", Style::new().fg(theme.text.dim)),
-                Span::styled(
-                    fit_width(&document.path, usize::from(area.width).saturating_sub(8)),
-                    Style::new().fg(theme.text.secondary),
-                ),
-                Span::styled(
-                    if document.is_stale { "  ⟡" } else { "" },
-                    Style::new().fg(theme.semantic.warning),
-                ),
-            ]));
-        }
     }
     let top = viewport_top(
         lines.len(),
@@ -1847,7 +1817,7 @@ fn draw_team_roster(
             ),
             Span::styled(
                 format!(" {residency}"),
-                if agent.residency == qaqh_client::TeamAgentResidency::Unloaded {
+                if agent.residency == qaqh_ringing_contract::team::TeamAgentResidency::Unloaded {
                     Style::new().fg(theme.text.dim)
                 } else {
                     Style::new().fg(theme.accent.assistant)
@@ -2046,8 +2016,8 @@ mod tests {
         use crate::app::settings::{EditBuffer, FieldId};
         let api_key_row = ROWS
             .iter()
-            .position(|row| row.id == FieldId::ApiKey)
-            .expect("ROWS 必须包含 API Key");
+            .position(|row| row.id == FieldId::NewProviderApiKey)
+            .expect("ROWS 必须包含目录表单的 Secret 行");
 
         let state = SettingsState {
             focus: api_key_row,
@@ -2478,7 +2448,8 @@ mod tests {
             "root".into(),
             crate::app::session::SessionState::new("root".into()),
         );
-        let snapshot: qaqh_client::TeamSnapshot = serde_json::from_value(serde_json::json!({
+        let snapshot: qaqh_ringing_contract::TeamSnapshot =
+            serde_json::from_value(serde_json::json!({
             "root_session_id": "root",
             "agents": [
                 {
@@ -2738,19 +2709,17 @@ mod tests {
         let (mut app, _rx) = App::new_for_test();
         app.tabs.push("session".into());
         let mut session = SessionState::new("session".into());
-        session.dashboard = Some(qaqh_client::DomainDashboardSnapshot {
-            session_id: "session".into(),
-            documents: Vec::new(),
+        session.dashboard = Some(crate::app::session::DashboardSnapshot {
             recent_edits: Vec::new(),
             tasks: vec![
-                qaqh_client::DashboardTask {
+                crate::app::session::DashboardTask {
                     id: "t1".into(),
                     subject: "完成鼠标交互".into(),
                     description: String::new(),
                     status: "in_progress".into(),
                     evidence: None,
                 },
-                qaqh_client::DashboardTask {
+                crate::app::session::DashboardTask {
                     id: "t2".into(),
                     subject: "补齐命中测试".into(),
                     description: String::new(),
@@ -2758,7 +2727,6 @@ mod tests {
                     evidence: None,
                 },
             ],
-            current_todo_id: Some("t1".into()),
         });
         app.sessions.insert("session".into(), session);
         app
@@ -2802,18 +2770,15 @@ mod tests {
         let (mut app, _rx) = App::new_for_test();
         app.tabs.push("session".into());
         let mut session = SessionState::new("session".into());
-        session.dashboard = Some(qaqh_client::DomainDashboardSnapshot {
-            session_id: "session".into(),
-            documents: Vec::new(),
+        session.dashboard = Some(crate::app::session::DashboardSnapshot {
             recent_edits: Vec::new(),
-            tasks: vec![qaqh_client::DashboardTask {
+            tasks: vec![crate::app::session::DashboardTask {
                 id: "t1".into(),
                 subject: "完成视觉重构".into(),
                 description: "中文描述不应越界".into(),
                 status: "in_progress".into(),
                 evidence: None,
             }],
-            current_todo_id: Some("t1".into()),
         });
         app.sessions.insert("session".into(), session);
         let mut terminal = Terminal::new(TestBackend::new(24, 8)).expect("terminal");

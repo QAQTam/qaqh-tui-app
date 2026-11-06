@@ -7,10 +7,11 @@
 use std::collections::BTreeMap;
 
 use super::*;
-use qaqh_client::{
-    InterAgentDelivery as Delivery, TeamAgentResidency as Residency, TeamAgentSnapshot as Agent,
-    TeamAgentStatus as Status, TeamDelta as Delta, TeamInboxSummary as InboxMessage,
-    TeamSnapshot as Snapshot,
+use qaqh_ringing_contract::fact::ActivityState;
+use qaqh_ringing_contract::fact::InterAgentDelivery as Delivery;
+use qaqh_ringing_contract::team::{
+    TeamAgentResidency as Residency, TeamAgentSnapshot as Agent, TeamAgentStatus as Status,
+    TeamInboxSummary as InboxMessage, TeamSnapshot as Snapshot,
 };
 
 /// Per-root-session view of the backend Team projection.
@@ -81,99 +82,7 @@ impl TeamState {
     ///
     /// Returns `true` when the delta was consumed. Deltas before hydration are
     /// dropped by design; the next snapshot carries the full state.
-    pub fn apply_delta(&mut self, delta: Delta) -> bool {
-        if !self.hydrated {
-            return false;
-        }
-        match delta {
-            Delta::AgentJoined { revision, agent } => {
-                self.revision = self.revision.max(revision);
-                let mut agent = *agent;
-                let agent_id = agent.agent_id.as_str().to_owned();
-                if let Some(status) = self.pending_status.remove(&agent_id) {
-                    agent.status = status;
-                }
-                if let Some(residency) = self.pending_residency.remove(&agent_id) {
-                    agent.residency = residency;
-                }
-                self.agents
-                    .insert(agent.agent_path.as_str().to_owned(), agent);
-            }
-            Delta::AgentStatusChanged {
-                revision,
-                agent_id,
-                status,
-            } => {
-                self.revision = self.revision.max(revision);
-                let agent_id = agent_id.as_str().to_owned();
-                if let Some(agent) = self.agent_mut_by_id(&agent_id) {
-                    agent.status = status;
-                } else {
-                    self.pending_status.insert(agent_id, status);
-                }
-            }
-            Delta::AgentResidencyChanged {
-                revision,
-                agent_id,
-                residency,
-            } => {
-                self.revision = self.revision.max(revision);
-                let agent_id = agent_id.as_str().to_owned();
-                if let Some(agent) = self.agent_mut_by_id(&agent_id) {
-                    agent.residency = residency;
-                } else {
-                    self.pending_residency.insert(agent_id, residency);
-                }
-            }
-            Delta::AgentMessageQueued { revision, message } => {
-                self.revision = self.revision.max(revision);
-                if !self
-                    .inbox
-                    .iter()
-                    .any(|entry| entry.message_id == message.message_id)
-                {
-                    self.inbox.push(*message);
-                }
-            }
-            Delta::AgentMessageDelivered {
-                revision,
-                message_id,
-            } => {
-                self.revision = self.revision.max(revision);
-                self.inbox.retain(|entry| entry.message_id != message_id);
-            }
-            Delta::AgentInterrupted { revision, agent_id } => {
-                self.revision = self.revision.max(revision);
-                let agent_id = agent_id.as_str().to_owned();
-                if let Some(agent) = self.agent_mut_by_id(&agent_id) {
-                    agent.status = Status::Interrupted;
-                } else {
-                    self.pending_status.insert(agent_id, Status::Interrupted);
-                }
-            }
-            Delta::AgentCompleted {
-                revision,
-                agent_id,
-                status,
-            } => {
-                self.revision = self.revision.max(revision);
-                let agent_id = agent_id.as_str().to_owned();
-                if let Some(agent) = self.agent_mut_by_id(&agent_id) {
-                    agent.status = status;
-                    agent.residency = Residency::Unloaded;
-                } else {
-                    self.pending_status.insert(agent_id.clone(), status);
-                    self.pending_residency.insert(agent_id, Residency::Unloaded);
-                }
-            }
-            Delta::TaskChanged { revision, .. } | Delta::BoardChanged { revision, .. } => {
-                self.revision = self.revision.max(revision);
-            }
-        }
-        true
-    }
-
-    fn agent_mut_by_id(&mut self, agent_id: &str) -> Option<&mut Agent> {
+        fn agent_mut_by_id(&mut self, agent_id: &str) -> Option<&mut Agent> {
         self.agents
             .values_mut()
             .find(|agent| agent.agent_id.as_str() == agent_id)
@@ -310,40 +219,21 @@ impl App {
     ///
     /// Deltas for a child are delivered on that child's per-session_id stream; find
     /// the owning root projection before folding them into the roster.
-    pub(super) fn handle_team_delta(&mut self, session_id: String, delta: Delta) {
-        let root = if self.teams.contains_key(&session_id) {
-            session_id.clone()
-        } else {
-            self.teams
-                .iter()
-                .find(|(_, state)| state.agent_by_id(&session_id).is_some())
-                .map(|(root, _)| root.clone())
-                .unwrap_or(session_id)
-        };
-        let applied = self
-            .teams
-            .get_mut(&root)
-            .is_some_and(|state| state.apply_delta(delta));
-        if applied {
-            self.reconcile_team_tracking(&root);
-            self.redraw_requested = true;
-        }
-    }
-
-    /// Fold a child bootstrap's canonical activity into the owning Team view.
+        /// Fold a child's canonical activity into the owning Team view.
     ///
-    /// `TeamDelta` is ephemeral and may have been published before the child
-    /// timeline was attached. Identity still comes exclusively from
-    /// `TeamSnapshot/TeamDelta`; this only repairs the live status display.
+    /// backend-v3 的会话流上没有 TeamDelta；子代理 live 状态只能靠它的
+    /// `ActivityChanged` 事件推断（Identity 仍以 /team 快照为唯一权威，
+    /// 这里只修复 live 状态显示）。
     pub(super) fn apply_child_activity_hint(
         &mut self,
         child: &str,
-        activity: qaqh_client::ActivityState,
+        activity: ActivityState,
     ) {
         let status = match activity {
-            qaqh_client::ActivityState::Running => Status::Running,
-            qaqh_client::ActivityState::Interrupted => Status::Interrupted,
-            qaqh_client::ActivityState::Idle => return,
+            ActivityState::Running => Status::Running,
+            ActivityState::Cancelling => Status::Interrupted,
+            ActivityState::WaitingUser => Status::WaitingUser,
+            ActivityState::Idle => return,
         };
         let Some(root) = self
             .teams
@@ -592,192 +482,11 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_is_keyed_by_agent_path_and_preserves_unloaded_state() {
-        let mut state = TeamState::default();
-        assert!(!state.hydrated());
-        assert!(
-            !state.apply_delta(
-                serde_json::from_value(json!({
-                    "kind": "agent_residency_changed",
-                    "data": {
-                        "revision": 8,
-                        "agent_id": "child-session_id",
-                        "residency": "unloaded"
-                    }
-                }))
-                .expect("delta")
-            )
-        );
-
-        state.replace_from_snapshot(snapshot());
-        assert!(state.hydrated());
-        assert!(
-            state.apply_delta(
-                serde_json::from_value(json!({
-                    "kind": "agent_residency_changed",
-                    "data": {
-                        "revision": 8,
-                        "agent_id": "child-session_id",
-                        "residency": "unloaded"
-                    }
-                }))
-                .expect("delta")
-            )
-        );
-
-        let child = state
-            .agent_by_path("/root/reviewer")
-            .expect("unloaded child remains in roster");
-        assert_eq!(child.agent_id.as_str(), "child-session_id");
-        assert_eq!(child.status, Status::Running);
-        assert_eq!(child.residency, Residency::Unloaded);
-        assert_eq!(state.roster(None).len(), 2);
-    }
-
-    #[test]
-    fn completed_and_residency_are_orthogonal_updates() {
-        let mut state = TeamState::default();
-        state.replace_from_snapshot(snapshot());
-
-        assert!(
-            state.apply_delta(
-                serde_json::from_value(json!({
-                    "kind": "agent_completed",
-                    "data": {
-                        "revision": 9,
-                        "agent_id": "child-session_id",
-                        "status": "completed"
-                    }
-                }))
-                .expect("delta")
-            )
-        );
-
-        let child = state.agent_by_id("child-session_id").expect("child");
-        assert_eq!(child.status, Status::Completed);
-        assert_eq!(child.residency, Residency::Unloaded);
-        assert!(
-            state
-                .roster(None)
-                .iter()
-                .any(|agent| { agent.agent_id.as_str() == "child-session_id" })
-        );
-    }
-
-    #[test]
-    fn bootstrap_activity_hint_recovers_running_without_resurrecting_terminal() {
-        let mut state = TeamState::default();
-        let mut initial = snapshot();
-        initial.agents[1].status = Status::PendingInit;
-        state.replace_from_snapshot(initial);
-
-        assert!(state.apply_status_hint("child-session_id", Status::Running));
-        assert_eq!(
-            state.agent_by_id("child-session_id").unwrap().status,
-            Status::Running
-        );
-        assert!(!state.apply_status_hint("child-session_id", Status::Running));
-
-        assert!(
-            state.apply_delta(
-                serde_json::from_value(json!({
-                    "kind": "agent_completed",
-                    "data": {
-                        "revision": 9,
-                        "agent_id": "child-session_id",
-                        "status": "completed"
-                    }
-                }))
-                .expect("delta")
-            )
-        );
-        assert!(!state.apply_status_hint("child-session_id", Status::Running));
-        assert_eq!(
-            state.agent_by_id("child-session_id").unwrap().status,
-            Status::Completed
-        );
-    }
-
-    #[test]
-    fn delivered_message_leaves_inbox() {
-        let mut state = TeamState::default();
-        state.replace_from_snapshot(snapshot());
-        assert_eq!(state.inbox().len(), 1);
-
-        assert!(
-            state.apply_delta(
-                serde_json::from_value(json!({
-                    "kind": "agent_message_delivered",
-                    "data": {
-                        "revision": 8,
-                        "message_id": "msg-1"
-                    }
-                }))
-                .expect("delta")
-            )
-        );
-        assert!(state.inbox().is_empty());
-    }
-
-    #[test]
-    fn residency_before_agent_joined_is_folded_into_the_entry() {
-        let mut state = TeamState::default();
-        state.replace_from_snapshot(
-            serde_json::from_value(json!({
-                "root_session_id": "root-session_id",
-                "agents": [
-                    {
-                        "agent_id": "root-session_id",
-                        "agent_path": "/root",
-                        "status": "running",
-                        "residency": "loaded"
-                    }
-                ],
-                "unread_messages": [],
-                "revision": 1,
-                "last_fact_seq": 1
-            }))
-            .expect("root snapshot"),
-        );
-
-        assert!(
-            state.apply_delta(
-                serde_json::from_value(json!({
-                    "kind": "agent_residency_changed",
-                    "data": {
-                        "revision": 2,
-                        "agent_id": "child-session_id",
-                        "residency": "loaded"
-                    }
-                }))
-                .expect("residency delta")
-            )
-        );
-        assert!(
-            state.apply_delta(
-                serde_json::from_value(json!({
-                    "kind": "agent_joined",
-                    "data": {
-                        "revision": 3,
-                        "agent": {
-                            "agent_id": "child-session_id",
-                            "agent_path": "/root/reviewer",
-                            "status": "pending_init",
-                            "residency": "unloaded",
-                            "parent_agent_path": "/root"
-                        }
-                    }
-                }))
-                .expect("joined delta")
-            )
-        );
-
-        let child = state.agent_by_id("child-session_id").expect("child");
-        assert_eq!(child.residency, Residency::Loaded);
-        assert_eq!(child.status, Status::PendingInit);
-    }
-
-    #[test]
+        #[test]
+        #[test]
+        #[test]
+        #[test]
+        #[test]
     fn roster_prefix_filter_and_mentions_exclude_root() {
         let mut state = TeamState::default();
         state.replace_from_snapshot(snapshot());
@@ -815,32 +524,4 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn child_session_id_delta_is_folded_into_the_owning_root_projection() {
-        let (mut app, _rx) = App::new_for_test();
-        app.teams
-            .entry("root-session_id".into())
-            .or_default()
-            .replace_from_snapshot(snapshot());
-        app.handle_team_delta(
-            "child-session_id".into(),
-            serde_json::from_value(json!({
-                "kind": "agent_status_changed",
-                "data": {
-                    "revision": 8,
-                    "agent_id": "child-session_id",
-                    "status": "running"
-                }
-            }))
-            .expect("delta"),
-        );
-
-        assert_eq!(
-            app.teams["root-session_id"]
-                .agent_by_id("child-session_id")
-                .expect("child")
-                .status,
-            Status::Running
-        );
-    }
 }
