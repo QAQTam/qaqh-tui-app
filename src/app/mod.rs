@@ -939,8 +939,11 @@ pub struct App {
     pub overlays: Vec<Overlay>,
     pub conn_phase: ConnPhase,
     pub epoch: String,
-    /// 当前 canonical v2 lease 的 client_session_id（driver holder 比较基准）。
+    /// 当前 canonical v2 lease 的 client_session_id（本客户端 v2 身份）。
     pub v2_client_session_id: Option<String>,
+    /// 最近一次发送的原草稿（session_id, text）：发送被拒（如 turn_busy）时
+    /// 回填 composer，避免用户整段重打。发送被接受或回填后清空。
+    pub last_rejected_send: Option<(String, String)>,
     pub conn_error: Option<String>,
     /// 处于告警状态的流账本（相位与 `conn_error` 由它推导，见 [`reconcile_conn`]）。
     pub stream_issues: StreamIssues,
@@ -1150,6 +1153,7 @@ impl App {
             conn_phase: ConnPhase::Opening,
             epoch: String::new(),
             v2_client_session_id: None,
+            last_rejected_send: None,
             conn_error: None,
             stream_issues: StreamIssues::default(),
             modal_hover: None,
@@ -2269,7 +2273,7 @@ impl App {
                             return;
                         }
                         // 只有快照被 reducer 接受后才更新 lease 身份；被拒的旧响应
-                        // 不能连 `client_session_id` 一起把 driver 判断拉回旧代。
+                        // 不能连 `client_session_id` 一起把写身份拉回旧代。
                         if client_session_id.is_some() {
                             self.v2_client_session_id = client_session_id;
                         }
@@ -2440,6 +2444,15 @@ impl App {
                         self.transfer_pending_initial_prompt();
                         self.toast(NoticeLevel::Info, format!("新会话已创建 {created}"));
                     }
+                    if label == "发送"
+                        && ack.status != qaqh_client::RingingCommandAckStatus::Rejected
+                        && let Some(session_id) = session_id.as_deref()
+                        && self.last_rejected_send.as_ref().is_some_and(
+                            |(stashed, _)| stashed == session_id,
+                        )
+                    {
+                        self.last_rejected_send = None;
+                    }
                     if ack.status == qaqh_client::RingingCommandAckStatus::Rejected {
                         // 缺陷 1（CNB issue #4）：拒绝是终态，不会再有
                         // `causation_id == command_id` 的 `Created` 事件。不撤销
@@ -2466,9 +2479,21 @@ impl App {
                             if label == "发送" {
                                 sess.pending_user_pin = None;
                                 sess.pinned_user_turn = None;
+                                // §6：发送被拒（如 turn_busy）时回填**原草稿**，
+                                // 错误经 toast 呈现——不再用错误文本覆盖
+                                // composer（那等于让用户整段重打）。用户在被拒
+                                // 窗口内已输入新内容时不覆盖。
+                                if let Some((_, text)) = self
+                                    .last_rejected_send
+                                    .take_if(|(stashed, _)| stashed == &session_id)
+                                    && sess.composer.is_empty()
+                                {
+                                    sess.composer.insert_str(&text);
+                                }
+                            } else {
+                                sess.composer.input = msg.chars().collect(); // 不丢内容
+                                sess.composer.cursor = sess.composer.input.len();
                             }
-                            sess.composer.input = msg.chars().collect(); // 不丢内容
-                            sess.composer.cursor = sess.composer.input.len();
                         }
                     }
                 }
@@ -3599,6 +3624,42 @@ mod tests {
         }));
         assert!(app.sessions["session"].pending_user_pin.is_none());
         assert!(app.sessions["session"].pinned_user_turn.is_none());
+    }
+
+    #[tokio::test]
+    async fn rejected_send_restores_the_original_draft() {
+        let (mut app, _rx) = app_with_tabs(&["session"], 0);
+        app.sessions
+            .get_mut("session")
+            .unwrap()
+            .composer
+            .insert_str("my prompt");
+        app.send_message();
+        assert!(app.sessions["session"].composer.is_empty());
+
+        // §6：后端在挂起回合期间以 turn_busy 拒绝普通发送——原草稿必须
+        // 回填 composer，错误只经 toast 呈现，不再用错误文本覆盖草稿。
+        app.handle(AppMsg::Action(ActionResult::CommandAck {
+            session_id: Some("session".into()),
+            label: "发送",
+            result: Ok(qaqh_client::ringing_v2::RingingV2CommandAck {
+                command_id: "cmd-1".into(),
+                status: qaqh_client::RingingCommandAckStatus::Rejected,
+                code: Some("turn_busy".into()),
+                message: Some("turn t1 is awaiting an interaction".into()),
+                retry_after_ms: None,
+                existing: None,
+                result: None,
+                operation: None,
+                revision: None,
+            }),
+        }));
+        assert_eq!(
+            app.sessions["session"].composer.value(),
+            "my prompt",
+            "turn_busy 拒绝必须回填原草稿"
+        );
+        assert!(app.last_rejected_send.is_none(), "回填后暂存必须清空");
     }
 
     #[tokio::test]

@@ -1,6 +1,7 @@
 //! qaqh-tui：QAQ-Harness 的终端前端（V2 Fullscreen；Ringing v2）。
 
 mod app;
+mod genui;
 mod local_config;
 mod protocol;
 mod runtime;

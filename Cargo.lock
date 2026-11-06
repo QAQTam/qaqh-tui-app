@@ -1882,6 +1882,7 @@ dependencies = [
  "qaqh-types",
  "qrcode",
  "ratatui",
+ "regex",
  "serde",
  "serde_json",
  "syntect",
